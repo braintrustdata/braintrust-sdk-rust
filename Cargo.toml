@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["braintrust-sdk"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Braintrust"]
+license = "MIT"
+repository = "https://github.com/braintrustdata/braintrust-sdk"

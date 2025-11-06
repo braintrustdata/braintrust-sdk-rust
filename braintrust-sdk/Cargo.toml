@@ -1,0 +1,51 @@
+[package]
+name = "braintrust-sdk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust SDK for Braintrust - AI evaluation and monitoring"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# UUID generation
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Environment variables
+dotenvy = "0.15"
+
+# LLM client
+lingua = { git = "https://github.com/braintrustdata/lingua", branch = "main" }
+
+[dev-dependencies]
+tokio-test = "0.4"
+serial_test = "3.0"
+
+[[example]]
+name = "simple_trace"
+path = "../examples/simple_trace.rs"
+
+[[example]]
+name = "lingua_chat"
+path = "../examples/lingua_chat.rs"
+
+[[example]]
+name = "testing_example"
+path = "../examples/testing_example.rs"
