@@ -13,4 +13,3 @@ pub enum BraintrustError {
 }
 
 pub type Result<T> = std::result::Result<T, BraintrustError>;
-

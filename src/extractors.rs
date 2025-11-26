@@ -273,4 +273,3 @@ mod tests {
         assert_eq!(prompt_details.cache_creation_tokens, Some(5));
     }
 }
-

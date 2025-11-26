@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::error::{BraintrustError, Result};
 use crate::span::SpanSubmitter;
-use crate::types::{LOGS_API_VERSION, Logs3Request, Logs3Row, ParentSpanInfo, SpanPayload};
+use crate::types::{Logs3Request, Logs3Row, ParentSpanInfo, SpanPayload, LOGS_API_VERSION};
 
 const DEFAULT_QUEUE_SIZE: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -493,4 +493,3 @@ mod tests {
         assert!(body.get("rows").is_some());
     }
 }
-

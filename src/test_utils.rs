@@ -85,4 +85,3 @@ pub(crate) fn build_test_span() -> (SpanHandle, TestSpanCollector) {
     let (builder, collector) = mock_span_builder();
     (builder.build(), collector)
 }
-

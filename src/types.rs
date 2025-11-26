@@ -105,4 +105,3 @@ pub struct UsageMetrics {
     pub prompt_tokens_details: Option<PromptTokensDetails>,
     pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
-

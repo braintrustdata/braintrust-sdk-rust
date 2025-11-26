@@ -63,4 +63,3 @@ async fn project_registration_failure_bubbles_up() {
     let result = span.finish().await;
     assert!(result.is_err());
 }
-

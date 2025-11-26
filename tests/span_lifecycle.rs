@@ -81,4 +81,3 @@ fn usage_extractors_return_expected_metrics() {
     assert_eq!(anthropic_usage.completion_tokens, Some(7));
     assert_eq!(anthropic_usage.total_tokens, Some(10));
 }
-
