@@ -84,12 +84,12 @@ impl BraintrustClient {
         parent_info: Option<ParentSpanInfo>,
     ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        let cmd = LogCommand::Submit(SubmitCommand {
+        let cmd = LogCommand::Submit(Box::new(SubmitCommand {
             token,
             payload,
             parent_info,
             response: tx,
-        });
+        }));
         self.inner
             .sender
             .send(cmd)
@@ -126,7 +126,7 @@ impl SpanSubmitter for BraintrustClient {
 }
 
 enum LogCommand {
-    Submit(SubmitCommand),
+    Submit(Box<SubmitCommand>),
     Flush(oneshot::Sender<std::result::Result<(), anyhow::Error>>),
 }
 
