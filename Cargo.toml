@@ -2,7 +2,7 @@
 name = "braintrust-sdk-rust"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.91.1"
+rust-version = "1.86.0"
 authors = ["Braintrust Team <team@braintrust.dev>"]
 description = "Rust SDK for Braintrust logging and tracing"
 repository = "https://github.com/braintrustdata/braintrust-sdk-rust"
