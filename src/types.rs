@@ -121,9 +121,17 @@ pub struct Usage {
     pub total_tokens: u32,
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "cache_read_input_tokens")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "cache_read_input_tokens"
+    )]
     pub prompt_cached_tokens: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "cache_creation_input_tokens")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "cache_creation_input_tokens"
+    )]
     pub prompt_cache_creation_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_reasoning_tokens: Option<u32>,
