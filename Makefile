@@ -1,4 +1,4 @@
-.PHONY: all build test check clippy fmt fmt-check clean doc
+.PHONY: all build test check clippy fmt fmt-check clean doc ci install-hooks
 
 all: check test
 
@@ -40,4 +40,8 @@ clean:
 
 # Run all CI checks
 ci: fmt-check clippy test
+
+# Install git pre-commit hooks
+install-hooks:
+	./scripts/install-hooks.sh
 
