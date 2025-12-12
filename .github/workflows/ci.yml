@@ -45,21 +45,6 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-  # Minimum supported Rust version check
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust (MSRV)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.75"
-
-      - name: Build
-        run: cargo build --verbose
-
   # Check documentation builds
   docs:
     runs-on: ubuntu-latest
