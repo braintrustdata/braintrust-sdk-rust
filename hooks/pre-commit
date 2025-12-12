@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# Pre-commit hook for the braintrust-sdk-rust project.
+# Runs cargo fmt and prevents commits if formatting changes files.
+
+set -euo pipefail
+
+echo "Running pre-commit checks..."
+
+if [ ! -f "Cargo.toml" ]; then
+    echo "Cargo.toml not found. Skipping Rust formatting."
+    exit 0
+fi
+
+echo "Checking Rust formatting with cargo fmt..."
+cargo fmt --all
+
+if ! git diff --quiet; then
+    echo "Rust formatting updated files. Re-stage changes and retry commit."
+    exit 1
+fi
+
+echo "Pre-commit checks passed."
