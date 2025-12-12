@@ -105,3 +105,86 @@ pub struct UsageMetrics {
     pub prompt_tokens_details: Option<PromptTokensDetails>,
     pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
+
+/// Usage statistics that can deserialize from both OpenAI and Anthropic formats.
+///
+/// OpenAI uses `prompt_tokens`/`completion_tokens`, while Anthropic uses
+/// `input_tokens`/`output_tokens`. The serde aliases allow this struct to
+/// deserialize from either format automatically.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Usage {
+    #[serde(default, alias = "input_tokens")]
+    pub prompt_tokens: u32,
+    #[serde(default, alias = "output_tokens")]
+    pub completion_tokens: u32,
+    #[serde(default)]
+    pub total_tokens: u32,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "cache_read_input_tokens")]
+    pub prompt_cached_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "cache_creation_input_tokens")]
+    pub prompt_cache_creation_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_reasoning_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+impl Usage {
+    /// Create a Usage from UsageMetrics, returning None if no metrics are present.
+    pub fn from_metrics(metrics: UsageMetrics) -> Option<Self> {
+        let has_metrics = metrics.prompt_tokens.is_some()
+            || metrics.completion_tokens.is_some()
+            || metrics.total_tokens.is_some()
+            || metrics.reasoning_tokens.is_some()
+            || metrics.prompt_cached_tokens.is_some()
+            || metrics.prompt_cache_creation_tokens.is_some()
+            || metrics.completion_reasoning_tokens.is_some();
+
+        if !has_metrics {
+            return None;
+        }
+
+        let prompt = metrics.prompt_tokens.unwrap_or_default();
+        let completion = metrics.completion_tokens.unwrap_or_default();
+        let total = metrics
+            .total_tokens
+            .or_else(|| {
+                if prompt != 0 || completion != 0 {
+                    Some(prompt + completion)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let prompt_details = metrics.prompt_tokens_details.clone();
+        let completion_details = metrics.completion_tokens_details.clone();
+
+        Some(Self {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: total,
+            reasoning_tokens: metrics.reasoning_tokens,
+            prompt_cached_tokens: metrics.prompt_cached_tokens.or_else(|| {
+                prompt_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens)
+            }),
+            prompt_cache_creation_tokens: metrics.prompt_cache_creation_tokens.or_else(|| {
+                prompt_details
+                    .as_ref()
+                    .and_then(|details| details.cache_creation_tokens)
+            }),
+            completion_reasoning_tokens: metrics.completion_reasoning_tokens.or_else(|| {
+                completion_details
+                    .as_ref()
+                    .and_then(|details| details.reasoning_tokens)
+            }),
+            prompt_tokens_details: prompt_details,
+            completion_tokens_details: completion_details,
+        })
+    }
+}
