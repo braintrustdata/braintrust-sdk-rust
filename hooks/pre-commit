@@ -21,3 +21,4 @@ if ! git diff --quiet; then
 fi
 
 echo "Pre-commit checks passed."
+

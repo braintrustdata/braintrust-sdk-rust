@@ -55,3 +55,4 @@ else
 fi
 
 echo "Hooks installation complete."
+
