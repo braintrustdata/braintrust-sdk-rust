@@ -326,7 +326,11 @@ impl WorkerState {
         };
 
         let final_project_id = computed_project_id.or(project_id);
-        let log_id = if experiment_id.is_some() { None } else { log_id };
+        let log_id = if experiment_id.is_some() {
+            None
+        } else {
+            log_id
+        };
 
         let row = Logs3Row {
             id: row_id,
