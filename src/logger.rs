@@ -18,16 +18,24 @@ const DEFAULT_QUEUE_SIZE: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct BraintrustClientConfig {
+    pub api_url: String,
     pub app_url: String,
     pub queue_size: usize,
 }
 
 impl BraintrustClientConfig {
-    pub fn new(app_url: impl Into<String>) -> Self {
+    pub fn new(api_url: impl Into<String>) -> Self {
+        let api_url = api_url.into();
         Self {
-            app_url: app_url.into(),
+            api_url: api_url.clone(),
+            app_url: api_url,
             queue_size: DEFAULT_QUEUE_SIZE,
         }
+    }
+
+    pub fn with_app_url(mut self, app_url: impl Into<String>) -> Self {
+        self.app_url = app_url.into();
+        self
     }
 }
 
@@ -57,7 +65,7 @@ struct ClientInner {
 impl BraintrustClient {
     pub fn new(config: impl Into<BraintrustClientConfig>) -> Result<Self> {
         let config = config.into();
-        let base_url = Url::parse(&config.app_url)
+        let base_url = Url::parse(&config.api_url)
             .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
 
         let (sender, receiver) = mpsc::channel(config.queue_size.max(32));
