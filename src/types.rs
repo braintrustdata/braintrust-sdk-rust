@@ -3,8 +3,46 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::fmt;
 
 pub const LOGS_API_VERSION: u8 = 2;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SpanObjectType {
+    Experiment = 1,
+    ProjectLogs = 2,
+    PlaygroundLogs = 3,
+}
+
+impl SpanObjectType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpanObjectType::Experiment => "experiment",
+            SpanObjectType::ProjectLogs => "project_logs",
+            SpanObjectType::PlaygroundLogs => "playground_logs",
+        }
+    }
+}
+
+impl fmt::Display for SpanObjectType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<u8> for SpanObjectType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(SpanObjectType::Experiment),
+            2 => Ok(SpanObjectType::ProjectLogs),
+            3 => Ok(SpanObjectType::PlaygroundLogs),
+            _ => Err(()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Logs3Request {
@@ -19,6 +57,8 @@ pub struct Logs3Row {
     pub root_span_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_parents: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
