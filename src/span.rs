@@ -60,6 +60,13 @@ impl SpanBuilder {
     }
 
     pub fn build(self) -> SpanHandle {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .ok();
+
         SpanHandle {
             submitter: Arc::clone(&self.submitter),
             token: self.token,
@@ -68,6 +75,7 @@ impl SpanBuilder {
                 org_id: self.org_id,
                 org_name: self.org_name,
                 project_name: self.project_name,
+                start_time,
                 ..Default::default()
             })),
         }
@@ -181,6 +189,24 @@ impl SpanHandle {
     }
 
     pub async fn finish(&self) -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Capture end time and add start/end to metrics
+        let end_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .ok();
+
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(start) = inner.start_time {
+                inner.metrics.insert("start".to_string(), start);
+            }
+            if let Some(end) = end_time {
+                inner.metrics.insert("end".to_string(), end);
+            }
+        }
+
         let payload: SpanPayload = self.inner.lock().await.clone().into();
         self.submitter
             .submit(self.token.clone(), payload, self.parent_info.clone())
@@ -204,6 +230,7 @@ struct SpanData {
     output: Option<Value>,
     metadata: Map<String, Value>,
     metrics: HashMap<String, f64>,
+    start_time: Option<f64>,
 }
 
 impl From<SpanData> for SpanPayload {

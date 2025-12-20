@@ -12,22 +12,32 @@ use uuid::Uuid;
 
 use crate::error::{BraintrustError, Result};
 use crate::span::SpanSubmitter;
-use crate::types::{Logs3Request, Logs3Row, ParentSpanInfo, SpanPayload, LOGS_API_VERSION};
+use crate::types::{
+    Logs3Request, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload, LOGS_API_VERSION,
+};
 
 const DEFAULT_QUEUE_SIZE: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct BraintrustClientConfig {
+    pub api_url: String,
     pub app_url: String,
     pub queue_size: usize,
 }
 
 impl BraintrustClientConfig {
-    pub fn new(app_url: impl Into<String>) -> Self {
+    pub fn new(api_url: impl Into<String>) -> Self {
+        let api_url = api_url.into();
         Self {
-            app_url: app_url.into(),
+            api_url: api_url.clone(),
+            app_url: api_url,
             queue_size: DEFAULT_QUEUE_SIZE,
         }
+    }
+
+    pub fn with_app_url(mut self, app_url: impl Into<String>) -> Self {
+        self.app_url = app_url.into();
+        self
     }
 }
 
@@ -57,7 +67,7 @@ struct ClientInner {
 impl BraintrustClient {
     pub fn new(config: impl Into<BraintrustClientConfig>) -> Result<Self> {
         let config = config.into();
-        let base_url = Url::parse(&config.app_url)
+        let base_url = Url::parse(&config.api_url)
             .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
 
         let (sender, receiver) = mpsc::channel(config.queue_size.max(32));
@@ -208,89 +218,118 @@ impl WorkerState {
         let row_id = Uuid::new_v4().to_string();
         let new_span_id = Uuid::new_v4().to_string();
 
-        let (span_id, root_span_id, span_parents, computed_project_id, experiment_id) =
-            match parent_info {
-                None => (
+        let (
+            span_id,
+            root_span_id,
+            span_parents,
+            computed_project_id,
+            experiment_id,
+            prompt_session_id,
+            log_id,
+        ) = match parent_info {
+            None => (
+                new_span_id.clone(),
+                new_span_id.clone(),
+                None,
+                project_id.clone(),
+                None,
+                None,
+                Some("g".to_string()),
+            ),
+            Some(ParentSpanInfo::Experiment { object_id }) => (
+                new_span_id.clone(),
+                new_span_id.clone(),
+                None,
+                None,
+                Some(object_id),
+                None,
+                None,
+            ),
+            Some(ParentSpanInfo::ProjectLogs { object_id }) => (
+                new_span_id.clone(),
+                new_span_id.clone(),
+                None,
+                Some(object_id),
+                None,
+                None,
+                Some("g".to_string()),
+            ),
+            Some(ParentSpanInfo::ProjectName { project_name }) => {
+                let proj_id = self
+                    .ensure_project_id(&token, &org_id, org_name.as_deref(), &project_name)
+                    .await?;
+                (
                     new_span_id.clone(),
                     new_span_id.clone(),
                     None,
-                    project_id.clone(),
-                    None,
-                ),
-                Some(ParentSpanInfo::Experiment { object_id }) => (
-                    new_span_id.clone(),
-                    new_span_id.clone(),
+                    Some(proj_id),
                     None,
                     None,
-                    Some(object_id),
-                ),
-                Some(ParentSpanInfo::ProjectLogs { object_id }) => (
-                    new_span_id.clone(),
-                    new_span_id.clone(),
-                    None,
-                    Some(object_id),
-                    None,
-                ),
-                Some(ParentSpanInfo::ProjectName { project_name }) => {
-                    let proj_id = self
-                        .ensure_project_id(&token, &org_id, org_name.as_deref(), &project_name)
-                        .await?;
-                    (
+                    Some("g".to_string()),
+                )
+            }
+            Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
+                new_span_id.clone(),
+                new_span_id.clone(),
+                None,
+                None,
+                None,
+                Some(object_id),
+                Some("x".to_string()),
+            ),
+            Some(ParentSpanInfo::FullSpan {
+                object_type,
+                object_id,
+                span_id: parent_span_id,
+                root_span_id: parent_root_span_id,
+            }) => {
+                let span_parents = vec![parent_span_id];
+                match SpanObjectType::try_from(object_type) {
+                    Ok(SpanObjectType::Experiment) => (
                         new_span_id.clone(),
+                        parent_root_span_id,
+                        Some(span_parents),
+                        None,
+                        Some(object_id),
+                        None,
+                        None,
+                    ),
+                    Ok(SpanObjectType::ProjectLogs) => (
                         new_span_id.clone(),
+                        parent_root_span_id,
+                        Some(span_parents),
+                        Some(object_id),
                         None,
-                        Some(proj_id),
                         None,
-                    )
+                        Some("g".to_string()),
+                    ),
+                    Ok(SpanObjectType::PlaygroundLogs) => (
+                        new_span_id.clone(),
+                        parent_root_span_id,
+                        Some(span_parents),
+                        None,
+                        None,
+                        Some(object_id),
+                        Some("x".to_string()),
+                    ),
+                    Err(()) => (
+                        new_span_id.clone(),
+                        parent_root_span_id,
+                        Some(span_parents),
+                        Some(object_id),
+                        None,
+                        None,
+                        Some("g".to_string()),
+                    ),
                 }
-                Some(ParentSpanInfo::PlaygroundLogs { object_id: _ }) => {
-                    (new_span_id.clone(), new_span_id.clone(), None, None, None)
-                }
-                Some(ParentSpanInfo::FullSpan {
-                    object_type,
-                    object_id,
-                    span_id: parent_span_id,
-                    root_span_id: parent_root_span_id,
-                }) => {
-                    let span_parents = vec![parent_span_id];
-                    match object_type {
-                        1 => (
-                            new_span_id.clone(),
-                            parent_root_span_id,
-                            Some(span_parents),
-                            None,
-                            Some(object_id),
-                        ),
-                        2 => (
-                            new_span_id.clone(),
-                            parent_root_span_id,
-                            Some(span_parents),
-                            Some(object_id),
-                            None,
-                        ),
-                        3 => (
-                            new_span_id.clone(),
-                            parent_root_span_id,
-                            Some(span_parents),
-                            None,
-                            None,
-                        ),
-                        _ => (
-                            new_span_id.clone(),
-                            parent_root_span_id,
-                            Some(span_parents),
-                            Some(object_id),
-                            None,
-                        ),
-                    }
-                }
-            };
+            }
+        };
 
         let final_project_id = computed_project_id.or(project_id);
         let log_id = if experiment_id.is_some() {
             None
         } else {
-            Some("g".to_string())
+            log_id
         };
 
         let row = Logs3Row {
@@ -298,6 +337,7 @@ impl WorkerState {
             span_id: span_id.clone(),
             root_span_id: root_span_id.clone(),
             span_parents,
+            prompt_session_id,
             project_id: final_project_id.clone(),
             experiment_id,
             log_id,
