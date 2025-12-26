@@ -53,6 +53,8 @@ pub struct Logs3Request {
 #[derive(Debug, Clone, Serialize)]
 pub struct Logs3Row {
     pub id: String,
+    #[serde(rename = "_is_merge", skip_serializing_if = "Option::is_none")]
+    pub is_merge: Option<bool>,
     pub span_id: String,
     pub root_span_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,6 +87,9 @@ pub struct Logs3Row {
 
 #[derive(Debug, Clone)]
 pub struct SpanPayload {
+    pub row_id: String,
+    pub span_id: String,
+    pub is_merge: bool,
     pub org_id: String,
     pub org_name: Option<String>,
     pub project_name: Option<String>,
@@ -234,5 +239,75 @@ impl Usage {
             prompt_tokens_details: prompt_details,
             completion_tokens_details: completion_details,
         })
+    }
+}
+
+pub fn usage_metrics_to_map(usage: UsageMetrics) -> HashMap<String, f64> {
+    let mut metrics = HashMap::new();
+    insert_metric(&mut metrics, "prompt_tokens", usage.prompt_tokens);
+    insert_metric(&mut metrics, "completion_tokens", usage.completion_tokens);
+    insert_metric(&mut metrics, "tokens", usage.total_tokens);
+    insert_metric(&mut metrics, "reasoning_tokens", usage.reasoning_tokens);
+    insert_metric(
+        &mut metrics,
+        "completion_reasoning_tokens",
+        usage.completion_reasoning_tokens,
+    );
+    insert_metric(
+        &mut metrics,
+        "prompt_cached_tokens",
+        usage.prompt_cached_tokens,
+    );
+    insert_metric(
+        &mut metrics,
+        "prompt_cache_creation_tokens",
+        usage.prompt_cache_creation_tokens,
+    );
+
+    if let Some(details) = usage.prompt_tokens_details {
+        insert_metric(&mut metrics, "prompt_audio_tokens", details.audio_tokens);
+        if usage.prompt_cached_tokens.is_none() {
+            insert_metric(&mut metrics, "prompt_cached_tokens", details.cached_tokens);
+        }
+        if usage.prompt_cache_creation_tokens.is_none() {
+            insert_metric(
+                &mut metrics,
+                "prompt_cache_creation_tokens",
+                details.cache_creation_tokens,
+            );
+        }
+    }
+
+    if let Some(details) = usage.completion_tokens_details {
+        insert_metric(
+            &mut metrics,
+            "completion_audio_tokens",
+            details.audio_tokens,
+        );
+        if usage.completion_reasoning_tokens.is_none() {
+            insert_metric(
+                &mut metrics,
+                "completion_reasoning_tokens",
+                details.reasoning_tokens,
+            );
+        }
+        insert_metric(
+            &mut metrics,
+            "completion_accepted_prediction_tokens",
+            details.accepted_prediction_tokens,
+        );
+        insert_metric(
+            &mut metrics,
+            "completion_rejected_prediction_tokens",
+            details.rejected_prediction_tokens,
+        );
+    }
+
+    metrics
+}
+
+fn insert_metric(metrics: &mut HashMap<String, f64>, key: &str, value: Option<u32>) {
+    if let Some(value) = value {
+        metrics.insert(key.to_string(), value as f64);
     }
 }

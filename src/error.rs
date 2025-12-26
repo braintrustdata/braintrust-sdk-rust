@@ -10,6 +10,8 @@ pub enum BraintrustError {
     ChannelClosed,
     #[error("background task failed: {0}")]
     Background(String),
+    #[error("stream aggregation error: {0}")]
+    StreamAggregation(String),
 }
 
 pub type Result<T> = std::result::Result<T, BraintrustError>;

@@ -1,5 +1,6 @@
 use braintrust_sdk_rust::{
     extract_anthropic_usage, extract_openai_usage, BraintrustClient, BraintrustClientConfig,
+    SpanLog,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -31,11 +32,15 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
         .org_name("org-name")
         .project_name("demo-project")
         .build();
-    span.set_name("integration-span").await;
-    span.log_input(Value::String("input".into())).await;
-    span.log_output(Value::String("output".into())).await;
-    span.finish().await.expect("finish");
-    client.flush().await.expect("flush");
+    span.log(SpanLog {
+        name: Some("integration-span".into()),
+        input: Some(Value::String("input".into())),
+        output: Some(Value::String("output".into())),
+        ..Default::default()
+    })
+    .await;
+    span.flush().await.expect("flush");
+    client.flush().await.expect("client flush");
 
     let logs_requests: Vec<_> = server
         .received_requests()

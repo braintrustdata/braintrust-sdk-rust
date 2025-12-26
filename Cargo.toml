@@ -13,6 +13,7 @@ categories = ["api-bindings", "asynchronous", "development-tools"]
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -30,4 +31,3 @@ wiremock = "0.5.22"
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
-

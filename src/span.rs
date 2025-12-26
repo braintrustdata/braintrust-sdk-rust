@@ -4,9 +4,21 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::error::Result;
-use crate::types::{ParentSpanInfo, SpanPayload, UsageMetrics};
+use crate::types::{ParentSpanInfo, SpanPayload};
+
+/// Event data to log to a span. All fields are optional.
+/// Multiple calls to `log()` will merge data.
+#[derive(Clone, Default)]
+pub struct SpanLog {
+    pub name: Option<String>,
+    pub input: Option<Value>,
+    pub output: Option<Value>,
+    pub metadata: Option<Map<String, Value>>,
+    pub metrics: Option<HashMap<String, f64>>,
+}
 
 #[async_trait]
 pub(crate) trait SpanSubmitter: Send + Sync {
@@ -62,6 +74,9 @@ impl SpanBuilder {
     pub fn build(self) -> SpanHandle {
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        // Generate both IDs ONCE at span creation - reused for all flushes
+        let row_id = Uuid::new_v4().to_string();
+        let span_id = Uuid::new_v4().to_string();
         let start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
@@ -72,6 +87,9 @@ impl SpanBuilder {
             token: self.token,
             parent_info: self.parent_info,
             inner: Arc::new(Mutex::new(SpanData {
+                row_id,
+                span_id,
+                has_flushed: false,
                 org_id: self.org_id,
                 org_name: self.org_name,
                 project_name: self.project_name,
@@ -91,104 +109,36 @@ pub struct SpanHandle {
 }
 
 impl SpanHandle {
-    pub async fn set_name(&self, name: impl Into<String>) {
-        self.inner.lock().await.name = Some(name.into());
-    }
-
-    pub async fn set_project_name(&self, name: impl Into<String>) {
-        self.inner.lock().await.project_name = Some(name.into());
-    }
-
-    pub async fn log_input(&self, value: Value) {
-        self.inner.lock().await.input = Some(value);
-    }
-
-    pub async fn log_output(&self, value: Value) {
-        self.inner.lock().await.output = Some(value);
-    }
-
-    pub async fn log_metadata(&self, metadata: Map<String, Value>) {
+    /// Log event data to this span. All fields are optional.
+    /// Multiple calls will merge data (later values overwrite earlier ones).
+    pub async fn log(&self, event: SpanLog) {
         let mut inner = self.inner.lock().await;
-        for (key, value) in metadata {
-            inner.metadata.insert(key, value);
+
+        if let Some(name) = event.name {
+            inner.name = Some(name);
+        }
+        if let Some(input) = event.input {
+            inner.input = Some(input);
+        }
+        if let Some(output) = event.output {
+            inner.output = Some(output);
+        }
+        if let Some(metadata) = event.metadata {
+            for (key, value) in metadata {
+                inner.metadata.insert(key, value);
+            }
+        }
+        if let Some(metrics) = event.metrics {
+            for (key, value) in metrics {
+                inner.metrics.insert(key, value);
+            }
         }
     }
 
-    pub async fn log_metrics(&self, metrics: HashMap<String, f64>) {
-        let mut inner = self.inner.lock().await;
-        for (key, value) in metrics {
-            inner.metrics.insert(key, value);
-        }
-    }
-
-    pub async fn log_usage(&self, usage: UsageMetrics) {
-        let mut metrics = HashMap::new();
-        insert_metric(&mut metrics, "prompt_tokens", usage.prompt_tokens);
-        insert_metric(&mut metrics, "completion_tokens", usage.completion_tokens);
-        // Use "tokens" to match legacy proxy - this is what the UI expects
-        insert_metric(&mut metrics, "tokens", usage.total_tokens);
-        insert_metric(&mut metrics, "reasoning_tokens", usage.reasoning_tokens);
-        insert_metric(
-            &mut metrics,
-            "completion_reasoning_tokens",
-            usage.completion_reasoning_tokens,
-        );
-        insert_metric(
-            &mut metrics,
-            "prompt_cached_tokens",
-            usage.prompt_cached_tokens,
-        );
-        insert_metric(
-            &mut metrics,
-            "prompt_cache_creation_tokens",
-            usage.prompt_cache_creation_tokens,
-        );
-
-        if let Some(details) = usage.prompt_tokens_details {
-            insert_metric(&mut metrics, "prompt_audio_tokens", details.audio_tokens);
-            if usage.prompt_cached_tokens.is_none() {
-                insert_metric(&mut metrics, "prompt_cached_tokens", details.cached_tokens);
-            }
-            if usage.prompt_cache_creation_tokens.is_none() {
-                insert_metric(
-                    &mut metrics,
-                    "prompt_cache_creation_tokens",
-                    details.cache_creation_tokens,
-                );
-            }
-        }
-
-        if let Some(details) = usage.completion_tokens_details {
-            insert_metric(
-                &mut metrics,
-                "completion_audio_tokens",
-                details.audio_tokens,
-            );
-            if usage.completion_reasoning_tokens.is_none() {
-                insert_metric(
-                    &mut metrics,
-                    "completion_reasoning_tokens",
-                    details.reasoning_tokens,
-                );
-            }
-            insert_metric(
-                &mut metrics,
-                "completion_accepted_prediction_tokens",
-                details.accepted_prediction_tokens,
-            );
-            insert_metric(
-                &mut metrics,
-                "completion_rejected_prediction_tokens",
-                details.rejected_prediction_tokens,
-            );
-        }
-
-        if !metrics.is_empty() {
-            self.log_metrics(metrics).await;
-        }
-    }
-
-    pub async fn finish(&self) -> Result<()> {
+    /// Flush span data to Braintrust. Can be called multiple times - last writer wins.
+    /// Each call updates the same span (same row_id and span_id).
+    /// First flush sends with is_merge=false (replace), subsequent flushes send is_merge=true (merge).
+    pub async fn flush(&self) -> Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         // Capture end time and add start/end to metrics
@@ -197,7 +147,7 @@ impl SpanHandle {
             .map(|d| d.as_secs_f64())
             .ok();
 
-        {
+        let payload: SpanPayload = {
             let mut inner = self.inner.lock().await;
             if let Some(start) = inner.start_time {
                 inner.metrics.insert("start".to_string(), start);
@@ -205,23 +155,27 @@ impl SpanHandle {
             if let Some(end) = end_time {
                 inner.metrics.insert("end".to_string(), end);
             }
-        }
 
-        let payload: SpanPayload = self.inner.lock().await.clone().into();
+            // Create payload from current state (captures has_flushed for is_merge)
+            let payload: SpanPayload = inner.clone().into();
+
+            // Mark as flushed for subsequent calls
+            inner.has_flushed = true;
+
+            payload
+        };
+
         self.submitter
             .submit(self.token.clone(), payload, self.parent_info.clone())
             .await
     }
 }
 
-fn insert_metric(metrics: &mut HashMap<String, f64>, key: &str, value: Option<u32>) {
-    if let Some(value) = value {
-        metrics.insert(key.to_string(), value as f64);
-    }
-}
-
 #[derive(Clone, Default)]
 struct SpanData {
+    row_id: String,
+    span_id: String,
+    has_flushed: bool,
     org_id: String,
     org_name: Option<String>,
     project_name: Option<String>,
@@ -242,6 +196,9 @@ impl From<SpanData> for SpanPayload {
         span_attributes.insert("type".to_string(), Value::String("llm".to_string()));
 
         Self {
+            row_id: data.row_id,
+            span_id: data.span_id,
+            is_merge: data.has_flushed, // First flush = false (replace), subsequent = true (merge)
             org_id: data.org_id,
             org_name: data.org_name,
             project_name: data.project_name,
@@ -258,16 +215,20 @@ impl From<SpanData> for SpanPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
     use crate::test_utils::{build_test_span, mock_span_builder};
+    use crate::types::{usage_metrics_to_map, UsageMetrics};
+    use serde_json::json;
 
     #[tokio::test]
     async fn span_logs_input_and_output() {
         let (span, collector) = build_test_span();
-        span.log_input(json!({"input": "hello"})).await;
-        span.log_output(json!({"output": "world"})).await;
-        span.finish().await.expect("finish");
+        span.log(SpanLog {
+            input: Some(json!({"input": "hello"})),
+            output: Some(json!({"output": "world"})),
+            ..Default::default()
+        })
+        .await;
+        span.flush().await.expect("flush");
 
         let spans = collector.spans();
         assert_eq!(spans.len(), 1);
@@ -279,17 +240,19 @@ mod tests {
     #[tokio::test]
     async fn span_logs_metadata_and_metrics() {
         let (span, collector) = build_test_span();
-        span.log_metadata([("foo".to_string(), json!("bar"))].into_iter().collect())
-            .await;
-        span.log_usage(UsageMetrics {
-            prompt_tokens: Some(10),
-            completion_tokens: Some(5),
-            total_tokens: Some(15),
-            reasoning_tokens: None,
+        span.log(SpanLog {
+            metadata: Some([("foo".to_string(), json!("bar"))].into_iter().collect()),
+            metrics: Some(usage_metrics_to_map(UsageMetrics {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                total_tokens: Some(15),
+                reasoning_tokens: None,
+                ..Default::default()
+            })),
             ..Default::default()
         })
         .await;
-        span.finish().await.expect("finish");
+        span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
         let metadata = captured.payload.metadata.unwrap();
@@ -309,8 +272,12 @@ mod tests {
                 object_id: "proj-id".into(),
             })
             .build();
-        span.log_input(json!("data")).await;
-        span.finish().await.expect("finish");
+        span.log(SpanLog {
+            input: Some(json!("data")),
+            ..Default::default()
+        })
+        .await;
+        span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
         assert_eq!(
