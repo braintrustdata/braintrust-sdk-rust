@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tracing::warn;
 use url::Url;
-use uuid::Uuid;
 
 use crate::error::{BraintrustError, Result};
 use crate::span::SpanSubmitter;
@@ -87,27 +87,27 @@ impl BraintrustClient {
         crate::span::SpanBuilder::new(submitter, token, org_id)
     }
 
+    /// Submit a span payload for logging (fire-and-forget).
+    ///
+    /// Returns immediately after queuing. HTTP submission happens in the background.
+    /// Errors are logged as warnings but not propagated to callers.
     pub async fn submit_payload(
         &self,
         token: String,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
         let cmd = LogCommand::Submit(Box::new(SubmitCommand {
             token,
             payload,
             parent_info,
-            response: tx,
         }));
         self.inner
             .sender
             .send(cmd)
             .await
             .map_err(|_| BraintrustError::ChannelClosed)?;
-        rx.await
-            .map_err(|_| BraintrustError::ChannelClosed)?
-            .map_err(|e| BraintrustError::Background(e.to_string()))
+        Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -144,7 +144,6 @@ struct SubmitCommand {
     token: String,
     payload: SpanPayload,
     parent_info: Option<ParentSpanInfo>,
-    response: oneshot::Sender<std::result::Result<(), anyhow::Error>>,
 }
 
 async fn run_worker(base_url: Url, mut receiver: mpsc::Receiver<LogCommand>) {
@@ -152,10 +151,13 @@ async fn run_worker(base_url: Url, mut receiver: mpsc::Receiver<LogCommand>) {
     while let Some(cmd) = receiver.recv().await {
         match cmd {
             LogCommand::Submit(submit) => {
-                let result = state
+                // Fire-and-forget: log errors but don't propagate
+                if let Err(e) = state
                     .submit_payload(submit.token, submit.payload, submit.parent_info)
-                    .await;
-                let _ = submit.response.send(result);
+                    .await
+                {
+                    warn!(error = %e, "failed to submit span to Braintrust");
+                }
             }
             LogCommand::Flush(response) => {
                 let _ = response.send(Ok(()));
@@ -190,6 +192,9 @@ impl WorkerState {
         parent_info: Option<ParentSpanInfo>,
     ) -> std::result::Result<(), anyhow::Error> {
         let SpanPayload {
+            row_id,
+            span_id,
+            is_merge,
             org_id,
             org_name,
             project_name,
@@ -215,11 +220,10 @@ impl WorkerState {
             .join("logs3")
             .map_err(|e| anyhow::anyhow!("invalid logs url: {e}"))?;
 
-        let row_id = Uuid::new_v4().to_string();
-        let new_span_id = Uuid::new_v4().to_string();
+        // row_id and span_id come from payload - generated once at span creation, reused on every flush
 
         let (
-            span_id,
+            final_span_id,
             root_span_id,
             span_parents,
             computed_project_id,
@@ -228,8 +232,8 @@ impl WorkerState {
             log_id,
         ) = match parent_info {
             None => (
-                new_span_id.clone(),
-                new_span_id.clone(),
+                span_id.clone(),
+                span_id.clone(),
                 None,
                 project_id.clone(),
                 None,
@@ -237,8 +241,8 @@ impl WorkerState {
                 Some("g".to_string()),
             ),
             Some(ParentSpanInfo::Experiment { object_id }) => (
-                new_span_id.clone(),
-                new_span_id.clone(),
+                span_id.clone(),
+                span_id.clone(),
                 None,
                 None,
                 Some(object_id),
@@ -246,8 +250,8 @@ impl WorkerState {
                 None,
             ),
             Some(ParentSpanInfo::ProjectLogs { object_id }) => (
-                new_span_id.clone(),
-                new_span_id.clone(),
+                span_id.clone(),
+                span_id.clone(),
                 None,
                 Some(object_id),
                 None,
@@ -259,8 +263,8 @@ impl WorkerState {
                     .ensure_project_id(&token, &org_id, org_name.as_deref(), &project_name)
                     .await?;
                 (
-                    new_span_id.clone(),
-                    new_span_id.clone(),
+                    span_id.clone(),
+                    span_id.clone(),
                     None,
                     Some(proj_id),
                     None,
@@ -269,8 +273,8 @@ impl WorkerState {
                 )
             }
             Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
-                new_span_id.clone(),
-                new_span_id.clone(),
+                span_id.clone(),
+                span_id.clone(),
                 None,
                 None,
                 None,
@@ -286,7 +290,7 @@ impl WorkerState {
                 let span_parents = vec![parent_span_id];
                 match SpanObjectType::try_from(object_type) {
                     Ok(SpanObjectType::Experiment) => (
-                        new_span_id.clone(),
+                        span_id.clone(),
                         parent_root_span_id,
                         Some(span_parents),
                         None,
@@ -295,7 +299,7 @@ impl WorkerState {
                         None,
                     ),
                     Ok(SpanObjectType::ProjectLogs) => (
-                        new_span_id.clone(),
+                        span_id.clone(),
                         parent_root_span_id,
                         Some(span_parents),
                         Some(object_id),
@@ -304,7 +308,7 @@ impl WorkerState {
                         Some("g".to_string()),
                     ),
                     Ok(SpanObjectType::PlaygroundLogs) => (
-                        new_span_id.clone(),
+                        span_id.clone(),
                         parent_root_span_id,
                         Some(span_parents),
                         None,
@@ -313,7 +317,7 @@ impl WorkerState {
                         Some("x".to_string()),
                     ),
                     Err(()) => (
-                        new_span_id.clone(),
+                        span_id.clone(),
                         parent_root_span_id,
                         Some(span_parents),
                         Some(object_id),
@@ -334,7 +338,8 @@ impl WorkerState {
 
         let row = Logs3Row {
             id: row_id,
-            span_id: span_id.clone(),
+            is_merge: if is_merge { Some(true) } else { None },
+            span_id: final_span_id.clone(),
             root_span_id: root_span_id.clone(),
             span_parents,
             prompt_session_id,
@@ -356,11 +361,15 @@ impl WorkerState {
             api_version: LOGS_API_VERSION,
         };
 
+        let json_bytes = serde_json::to_vec(&request)
+            .map_err(|e| anyhow::anyhow!("JSON serialization failed: {e}"))?;
+
         let response = self
             .client
             .post(logs_url)
             .bearer_auth(token)
-            .json(&request)
+            .header("content-type", "application/json")
+            .body(json_bytes)
             .send()
             .await?;
 
@@ -439,6 +448,7 @@ impl WorkerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::span::SpanLog;
     use serde_json::Value;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -477,9 +487,13 @@ mod tests {
                 .org_name("org-name")
                 .project_name("demo-project")
                 .build();
-            span.log_input(Value::String("hello".into())).await;
-            span.finish().await.expect("finish");
-            client.flush().await.expect("flush");
+            span.log(SpanLog {
+                input: Some(Value::String("hello".into())),
+                ..Default::default()
+            })
+            .await;
+            span.flush().await.expect("flush");
+            client.flush().await.expect("client flush");
         }
 
         let register_calls = server
@@ -518,9 +532,13 @@ mod tests {
             .span_builder("token", "org-id")
             .project_name("demo-project")
             .build();
-        span.log_input(Value::String("input".into())).await;
-        span.finish().await.expect("finish");
-        client.flush().await.expect("flush");
+        span.log(SpanLog {
+            input: Some(Value::String("input".into())),
+            ..Default::default()
+        })
+        .await;
+        span.flush().await.expect("flush");
+        client.flush().await.expect("client flush");
 
         let logs_request = server
             .received_requests()

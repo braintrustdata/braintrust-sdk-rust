@@ -1,6 +1,5 @@
-use braintrust_sdk_rust::{BraintrustClient, BraintrustClientConfig};
-use serde_json::json;
-use serde_json::Value;
+use braintrust_sdk_rust::{BraintrustClient, BraintrustClientConfig, SpanLog};
+use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -29,9 +28,13 @@ async fn submits_with_bearer_token() {
         .span_builder("secret-token", "org")
         .project_name("demo")
         .build();
-    span.log_input(Value::String("input".into())).await;
-    span.finish().await.expect("finish");
-    client.flush().await.expect("flush");
+    span.log(SpanLog {
+        input: Some(Value::String("input".into())),
+        ..Default::default()
+    })
+    .await;
+    span.flush().await.expect("flush");
+    client.flush().await.expect("client flush");
 
     let logs_calls = server
         .received_requests()
@@ -44,7 +47,9 @@ async fn submits_with_bearer_token() {
 }
 
 #[tokio::test]
-async fn project_registration_failure_bubbles_up() {
+async fn flush_is_fire_and_forget() {
+    // flush() should succeed even when project registration would fail.
+    // Errors are logged but not propagated (resilient design).
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -60,6 +65,8 @@ async fn project_registration_failure_bubbles_up() {
         .project_name("demo")
         .build();
 
-    let result = span.finish().await;
-    assert!(result.is_err());
+    // flush() queues the data and returns immediately.
+    // The actual HTTP submission (which fails) happens in the background.
+    let result = span.flush().await;
+    assert!(result.is_ok(), "flush() should be fire-and-forget");
 }

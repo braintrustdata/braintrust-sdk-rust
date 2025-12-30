@@ -14,7 +14,7 @@ braintrust-sdk-rust = "0.1"
 ## Usage
 
 ```rust
-use braintrust_sdk_rust::{BraintrustClient, BraintrustClientConfig};
+use braintrust_sdk_rust::{BraintrustClient, BraintrustClientConfig, SpanLog};
 use serde_json::json;
 
 #[tokio::main]
@@ -30,12 +30,15 @@ async fn main() -> anyhow::Result<()> {
         .project_name("my-project")
         .build();
 
-    // Log input/output
-    span.log_input(json!({"prompt": "Hello, world!"})).await;
-    span.log_output(json!({"response": "Hi there!"})).await;
+    // Log input/output using span.log()
+    span.log(SpanLog {
+        input: Some(json!({"prompt": "Hello, world!"})),
+        output: Some(json!({"response": "Hi there!"})),
+        ..Default::default()
+    }).await;
 
-    // Finish the span and flush
-    span.finish().await?;
+    // Flush the span data to Braintrust
+    span.flush().await?;
     client.flush().await?;
 
     Ok(())
@@ -85,4 +88,3 @@ This project is licensed under either of:
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
-
