@@ -2,13 +2,15 @@
 
 Rust SDK for [Braintrust](https://braintrust.dev) logging and tracing.
 
+> **Early Development Notice**: This SDK is in early development (alpha). Expect backwards-incompatible changes between releases until we reach 1.0.
+
 ## Installation
 
 Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-braintrust-sdk-rust = "0.1"
+braintrust-sdk-rust = "0.1.0-alpha.1"
 ```
 
 ## Usage
@@ -82,9 +84,4 @@ let usage = extract_anthropic_usage(&anthropic_response);
 
 ## License
 
-This project is licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+This project is licensed under the [Apache License, Version 2.0](LICENSE).

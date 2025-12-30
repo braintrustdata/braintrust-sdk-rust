@@ -1,12 +1,12 @@
 [package]
 name = "braintrust-sdk-rust"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
 rust-version = "1.86.0"
 authors = ["Braintrust Team <team@braintrust.dev>"]
 description = "Rust SDK for Braintrust logging and tracing"
 repository = "https://github.com/braintrustdata/braintrust-sdk-rust"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 keywords = ["braintrust", "logging", "tracing", "observability"]
 categories = ["api-bindings", "asynchronous", "development-tools"]
 
