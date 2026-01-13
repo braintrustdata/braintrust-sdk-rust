@@ -11,7 +11,10 @@ pub use error::{BraintrustError, Result};
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
 pub use logger::{BraintrustClient, BraintrustClientConfig};
 pub use span::{SpanBuilder, SpanHandle, SpanLog};
-pub use stream::{wrap_stream_with_span, BraintrustStream, FinalizedStream};
+pub use stream::{
+    wrap_stream_with_span, BraintrustStream, ChatMessage, FinalizedStream, FunctionCall,
+    OutputChoice, StreamMetadata, ToolCall,
+};
 pub use types::{
-    CompletionTokensDetails, ParentSpanInfo, PromptTokensDetails, Usage, UsageMetrics,
+    CompletionTokensDetails, ParentSpanInfo, PromptTokensDetails, SpanType, Usage, UsageMetrics,
 };

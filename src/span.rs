@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::types::{ParentSpanInfo, SpanPayload};
+use crate::types::{ParentSpanInfo, SpanAttributes, SpanPayload, SpanType};
 
 /// Event data to log to a span. All fields are optional.
 /// Multiple calls to `log()` will merge data.
@@ -38,6 +38,8 @@ pub struct SpanBuilder<S: SpanSubmitter> {
     org_name: Option<String>,
     project_name: Option<String>,
     parent_info: Option<ParentSpanInfo>,
+    span_type: SpanType,
+    purpose: Option<String>,
 }
 
 impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
@@ -49,6 +51,8 @@ impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
             org_name: self.org_name.clone(),
             project_name: self.project_name.clone(),
             parent_info: self.parent_info.clone(),
+            span_type: self.span_type,
+            purpose: self.purpose.clone(),
         }
     }
 }
@@ -67,6 +71,8 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
             org_name: None,
             project_name: None,
             parent_info: None,
+            span_type: SpanType::default(),
+            purpose: None,
         }
     }
 
@@ -82,6 +88,16 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
 
     pub fn parent_info(mut self, parent: ParentSpanInfo) -> Self {
         self.parent_info = Some(parent);
+        self
+    }
+
+    pub fn span_type(mut self, span_type: SpanType) -> Self {
+        self.span_type = span_type;
+        self
+    }
+
+    pub fn purpose(mut self, purpose: impl Into<String>) -> Self {
+        self.purpose = Some(purpose.into());
         self
     }
 
@@ -108,6 +124,8 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
                 org_name: self.org_name,
                 project_name: self.project_name,
                 start_time,
+                span_type: self.span_type,
+                purpose: self.purpose,
                 ..Default::default()
             })),
         }
@@ -206,6 +224,8 @@ struct SpanData {
     org_name: Option<String>,
     project_name: Option<String>,
     name: Option<String>,
+    span_type: SpanType,
+    purpose: Option<String>,
     input: Option<Value>,
     output: Option<Value>,
     metadata: Map<String, Value>,
@@ -215,11 +235,17 @@ struct SpanData {
 
 impl From<SpanData> for SpanPayload {
     fn from(data: SpanData) -> Self {
-        let mut span_attributes = Map::new();
-        if let Some(name) = data.name {
-            span_attributes.insert("name".to_string(), Value::String(name));
-        }
-        span_attributes.insert("type".to_string(), Value::String("llm".to_string()));
+        let span_attributes = SpanAttributes {
+            name: data.name,
+            span_type: Some(data.span_type),
+            purpose: data.purpose,
+            extra: HashMap::new(),
+        };
+
+        // Only include span_attributes if it has meaningful content
+        let has_attributes = span_attributes.name.is_some()
+            || span_attributes.span_type.is_some()
+            || span_attributes.purpose.is_some();
 
         Self {
             row_id: data.row_id,
@@ -228,12 +254,11 @@ impl From<SpanData> for SpanPayload {
             org_id: data.org_id,
             org_name: data.org_name,
             project_name: data.project_name,
-            name: None,
             input: data.input,
             output: data.output,
             metadata: (!data.metadata.is_empty()).then_some(data.metadata),
             metrics: (!data.metrics.is_empty()).then_some(data.metrics),
-            span_attributes: (!span_attributes.is_empty()).then_some(span_attributes),
+            span_attributes: has_attributes.then_some(span_attributes),
         }
     }
 }

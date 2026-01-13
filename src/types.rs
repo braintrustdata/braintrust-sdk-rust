@@ -33,6 +33,39 @@ impl fmt::Display for SpanObjectType {
     }
 }
 
+/// The type of span.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanType {
+    #[default]
+    Llm,
+    Score,
+    Function,
+    Eval,
+    Task,
+    Tool,
+    Automation,
+    Facet,
+    Preprocessor,
+}
+
+/// Span attributes with typed known fields and passthrough for extras.
+///
+/// Uses `#[serde(flatten)]` to serialize/deserialize unknown fields into the
+/// `extra` map, matching the TS SDK's `.passthrough()` behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct SpanAttributes {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub span_type: Option<SpanType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// Catch-all for additional fields (passthrough behavior).
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
+}
+
 /// The destination for a log row. Each variant represents a mutually exclusive
 /// target: an experiment, project logs, or playground logs.
 ///
@@ -106,24 +139,23 @@ pub(crate) struct Logs3Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<HashMap<String, f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub span_attributes: Option<Map<String, Value>>,
+    pub span_attributes: Option<SpanAttributes>,
     pub created: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
-pub struct SpanPayload {
+pub(crate) struct SpanPayload {
     pub row_id: String,
     pub span_id: String,
     pub is_merge: bool,
     pub org_id: String,
     pub org_name: Option<String>,
     pub project_name: Option<String>,
-    pub name: Option<String>,
     pub input: Option<Value>,
     pub output: Option<Value>,
     pub metadata: Option<Map<String, Value>>,
     pub metrics: Option<HashMap<String, f64>>,
-    pub span_attributes: Option<Map<String, Value>>,
+    pub span_attributes: Option<SpanAttributes>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -519,5 +551,99 @@ mod tests {
 
         let result: Result<ParentSpanInfo, _> = serde_json::from_value(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn span_type_serializes_as_snake_case() {
+        assert_eq!(serde_json::to_value(SpanType::Llm).unwrap(), json!("llm"));
+        assert_eq!(
+            serde_json::to_value(SpanType::Score).unwrap(),
+            json!("score")
+        );
+        assert_eq!(
+            serde_json::to_value(SpanType::Function).unwrap(),
+            json!("function")
+        );
+        assert_eq!(
+            serde_json::to_value(SpanType::Automation).unwrap(),
+            json!("automation")
+        );
+        assert_eq!(
+            serde_json::to_value(SpanType::Facet).unwrap(),
+            json!("facet")
+        );
+        assert_eq!(
+            serde_json::to_value(SpanType::Preprocessor).unwrap(),
+            json!("preprocessor")
+        );
+    }
+
+    #[test]
+    fn span_type_deserializes_from_snake_case() {
+        let llm: SpanType = serde_json::from_value(json!("llm")).unwrap();
+        assert_eq!(llm, SpanType::Llm);
+
+        let tool: SpanType = serde_json::from_value(json!("tool")).unwrap();
+        assert_eq!(tool, SpanType::Tool);
+
+        let automation: SpanType = serde_json::from_value(json!("automation")).unwrap();
+        assert_eq!(automation, SpanType::Automation);
+
+        let facet: SpanType = serde_json::from_value(json!("facet")).unwrap();
+        assert_eq!(facet, SpanType::Facet);
+
+        let preprocessor: SpanType = serde_json::from_value(json!("preprocessor")).unwrap();
+        assert_eq!(preprocessor, SpanType::Preprocessor);
+    }
+
+    #[test]
+    fn span_attributes_serializes_flat_with_extras() {
+        let attrs = SpanAttributes {
+            name: Some("my-span".to_string()),
+            span_type: Some(SpanType::Llm),
+            purpose: None,
+            extra: [("custom_field".to_string(), json!(42))]
+                .into_iter()
+                .collect(),
+        };
+
+        let json = serde_json::to_value(&attrs).unwrap();
+
+        // All fields should be at top level (flat, not nested "extra")
+        assert_eq!(json.get("name").unwrap(), "my-span");
+        assert_eq!(json.get("type").unwrap(), "llm");
+        assert_eq!(json.get("custom_field").unwrap(), 42);
+        // No "extra" key in output
+        assert!(json.get("extra").is_none());
+        // purpose is None so should be omitted
+        assert!(json.get("purpose").is_none());
+    }
+
+    #[test]
+    fn span_attributes_deserializes_with_passthrough() {
+        let json = json!({
+            "name": "test-span",
+            "type": "score",
+            "purpose": "scorer",
+            "exec_counter": 5,
+            "unknown_field": "hello"
+        });
+
+        let attrs: SpanAttributes = serde_json::from_value(json).unwrap();
+
+        assert_eq!(attrs.name, Some("test-span".to_string()));
+        assert_eq!(attrs.span_type, Some(SpanType::Score));
+        assert_eq!(attrs.purpose, Some("scorer".to_string()));
+        // Unknown fields captured in extra
+        assert_eq!(attrs.extra.get("exec_counter").unwrap(), &json!(5));
+        assert_eq!(attrs.extra.get("unknown_field").unwrap(), &json!("hello"));
+    }
+
+    #[test]
+    fn span_attributes_empty_serializes_to_empty_object() {
+        let attrs = SpanAttributes::default();
+        let json = serde_json::to_value(&attrs).unwrap();
+
+        assert_eq!(json, json!({}));
     }
 }
