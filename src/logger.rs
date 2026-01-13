@@ -83,8 +83,8 @@ impl BraintrustClient {
         &self,
         token: impl Into<String>,
         org_id: impl Into<String>,
-    ) -> crate::span::SpanBuilder {
-        let submitter: Arc<dyn crate::span::SpanSubmitter> = Arc::new(self.clone());
+    ) -> crate::span::SpanBuilder<Self> {
+        let submitter = Arc::new(self.clone());
         crate::span::SpanBuilder::new(submitter, token, org_id)
     }
 
@@ -94,12 +94,12 @@ impl BraintrustClient {
     /// Errors are logged as warnings but not propagated to callers.
     pub async fn submit_payload(
         &self,
-        token: String,
+        token: impl Into<String>,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> Result<()> {
         let cmd = LogCommand::Submit(Box::new(SubmitCommand {
-            token,
+            token: token.into(),
             payload,
             parent_info,
         }));
@@ -128,7 +128,7 @@ impl BraintrustClient {
 impl SpanSubmitter for BraintrustClient {
     async fn submit(
         &self,
-        token: String,
+        token: impl Into<String> + Send,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> Result<()> {
@@ -151,12 +151,14 @@ async fn run_worker(base_url: Url, mut receiver: mpsc::Receiver<LogCommand>) {
     let mut state = WorkerState::new(base_url);
     while let Some(cmd) = receiver.recv().await {
         match cmd {
-            LogCommand::Submit(submit) => {
+            LogCommand::Submit(cmd) => {
+                let SubmitCommand {
+                    token,
+                    payload,
+                    parent_info,
+                } = *cmd;
                 // Fire-and-forget: log errors but don't propagate
-                if let Err(e) = state
-                    .submit_payload(submit.token, submit.payload, submit.parent_info)
-                    .await
-                {
+                if let Err(e) = state.submit_payload(&token, payload, parent_info).await {
                     warn!(error = %e, "failed to submit span to Braintrust");
                 }
             }
@@ -188,7 +190,7 @@ impl WorkerState {
 
     async fn submit_payload(
         &mut self,
-        token: String,
+        token: &str,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> std::result::Result<(), anyhow::Error> {
@@ -209,7 +211,7 @@ impl WorkerState {
 
         let project_id = if let Some(ref project_name) = project_name {
             Some(
-                self.ensure_project_id(&token, &org_id, org_name.as_deref(), project_name)
+                self.ensure_project_id(token, &org_id, org_name.as_deref(), project_name)
                     .await?,
             )
         } else {
@@ -245,7 +247,7 @@ impl WorkerState {
             ),
             Some(ParentSpanInfo::ProjectName { project_name }) => {
                 let proj_id = self
-                    .ensure_project_id(&token, &org_id, org_name.as_deref(), &project_name)
+                    .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name)
                     .await?;
                 (span_id.clone(), None, LogDestination::project_logs(proj_id))
             }

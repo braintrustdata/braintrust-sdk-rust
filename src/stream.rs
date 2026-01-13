@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
-use crate::span::{SpanHandle, SpanLog};
+use crate::span::{SpanHandle, SpanLog, SpanSubmitter};
 use crate::types::{usage_metrics_to_map, UsageMetrics};
 
 /// Aggregated result from a streaming response.
@@ -220,13 +220,16 @@ impl BraintrustStream {
 /// # Type Parameters
 /// - `S`: The stream type yielding `Result<Value, E>`
 /// - `E`: The error type (allows use with any error type)
-pub fn wrap_stream_with_span<S, E>(
+/// - `Sub`: The span submitter type
+#[allow(private_bounds)]
+pub fn wrap_stream_with_span<S, E, Sub>(
     stream: S,
-    span: SpanHandle,
+    span: SpanHandle<Sub>,
 ) -> Pin<Box<dyn Stream<Item = std::result::Result<Value, E>> + Send>>
 where
     S: Stream<Item = std::result::Result<Value, E>> + Send + Unpin + 'static,
     E: Send + 'static,
+    Sub: SpanSubmitter + 'static,
 {
     use futures::StreamExt;
 
@@ -301,16 +304,17 @@ fn value_has_content(value: &Value) -> bool {
 }
 
 /// A wrapper stream that logs aggregated output when the stream is exhausted.
-struct SpanCompleteWrapper<S> {
+struct SpanCompleteWrapper<S, Sub: SpanSubmitter> {
     inner: S,
-    span: Option<SpanHandle>,
+    span: Option<SpanHandle<Sub>>,
     aggregator: Option<Arc<Mutex<BraintrustStream>>>,
 }
 
-impl<S, E> Stream for SpanCompleteWrapper<S>
+impl<S, E, Sub> Stream for SpanCompleteWrapper<S, Sub>
 where
     S: Stream<Item = std::result::Result<Value, E>> + Unpin,
     E: Send + 'static,
+    Sub: SpanSubmitter + 'static,
 {
     type Item = std::result::Result<Value, E>;
 
