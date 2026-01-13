@@ -24,15 +24,15 @@ pub struct SpanLog {
 pub(crate) trait SpanSubmitter: Send + Sync {
     async fn submit(
         &self,
-        token: String,
+        token: impl Into<String> + Send,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> Result<()>;
 }
 
-#[derive(Clone)]
-pub struct SpanBuilder {
-    submitter: Arc<dyn SpanSubmitter>,
+#[allow(private_bounds)]
+pub struct SpanBuilder<S: SpanSubmitter> {
+    submitter: Arc<S>,
     token: String,
     org_id: String,
     org_name: Option<String>,
@@ -40,9 +40,23 @@ pub struct SpanBuilder {
     parent_info: Option<ParentSpanInfo>,
 }
 
-impl SpanBuilder {
+impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
+    fn clone(&self) -> Self {
+        Self {
+            submitter: Arc::clone(&self.submitter),
+            token: self.token.clone(),
+            org_id: self.org_id.clone(),
+            org_name: self.org_name.clone(),
+            project_name: self.project_name.clone(),
+            parent_info: self.parent_info.clone(),
+        }
+    }
+}
+
+#[allow(private_bounds)]
+impl<S: SpanSubmitter> SpanBuilder<S> {
     pub(crate) fn new(
-        submitter: Arc<dyn SpanSubmitter>,
+        submitter: Arc<S>,
         token: impl Into<String>,
         org_id: impl Into<String>,
     ) -> Self {
@@ -71,7 +85,7 @@ impl SpanBuilder {
         self
     }
 
-    pub fn build(self) -> SpanHandle {
+    pub fn build(self) -> SpanHandle<S> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         // Generate both IDs ONCE at span creation - reused for all flushes
@@ -100,15 +114,27 @@ impl SpanBuilder {
     }
 }
 
-#[derive(Clone)]
-pub struct SpanHandle {
-    submitter: Arc<dyn SpanSubmitter>,
+#[allow(private_bounds)]
+pub struct SpanHandle<S: SpanSubmitter> {
+    submitter: Arc<S>,
     token: String,
     parent_info: Option<ParentSpanInfo>,
     inner: Arc<Mutex<SpanData>>,
 }
 
-impl SpanHandle {
+impl<S: SpanSubmitter> Clone for SpanHandle<S> {
+    fn clone(&self) -> Self {
+        Self {
+            submitter: Arc::clone(&self.submitter),
+            token: self.token.clone(),
+            parent_info: self.parent_info.clone(),
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+#[allow(private_bounds)]
+impl<S: SpanSubmitter> SpanHandle<S> {
     /// Log event data to this span. All fields are optional.
     /// Multiple calls will merge data (later values overwrite earlier ones).
     pub async fn log(&self, event: SpanLog) {
