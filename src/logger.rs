@@ -13,7 +13,8 @@ use url::Url;
 use crate::error::{BraintrustError, Result};
 use crate::span::SpanSubmitter;
 use crate::types::{
-    Logs3Request, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload, LOGS_API_VERSION,
+    LogDestination, Logs3Request, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload,
+    LOGS_API_VERSION,
 };
 
 const DEFAULT_QUEUE_SIZE: usize = 256;
@@ -222,64 +223,36 @@ impl WorkerState {
 
         // row_id and span_id come from payload - generated once at span creation, reused on every flush
 
-        let (
-            final_span_id,
-            root_span_id,
-            span_parents,
-            computed_project_id,
-            experiment_id,
-            prompt_session_id,
-            log_id,
-        ) = match parent_info {
-            None => (
-                span_id.clone(),
-                span_id.clone(),
-                None,
-                project_id.clone(),
-                None,
-                None,
-                Some("g".to_string()),
-            ),
-            Some(ParentSpanInfo::Experiment { object_id }) => (
-                span_id.clone(),
-                span_id.clone(),
-                None,
-                None,
-                Some(object_id),
-                None,
-                None,
-            ),
+        // Determine destination and span hierarchy based on parent info
+        let (root_span_id, span_parents, destination) = match parent_info {
+            None => {
+                // No parent - use project_id if available, otherwise fail
+                let dest = match project_id {
+                    Some(pid) => LogDestination::project_logs(pid),
+                    None => {
+                        anyhow::bail!("no destination: either parent_info or project_name required")
+                    }
+                };
+                (span_id.clone(), None, dest)
+            }
+            Some(ParentSpanInfo::Experiment { object_id }) => {
+                (span_id.clone(), None, LogDestination::experiment(object_id))
+            }
             Some(ParentSpanInfo::ProjectLogs { object_id }) => (
                 span_id.clone(),
-                span_id.clone(),
                 None,
-                Some(object_id),
-                None,
-                None,
-                Some("g".to_string()),
+                LogDestination::project_logs(object_id),
             ),
             Some(ParentSpanInfo::ProjectName { project_name }) => {
                 let proj_id = self
                     .ensure_project_id(&token, &org_id, org_name.as_deref(), &project_name)
                     .await?;
-                (
-                    span_id.clone(),
-                    span_id.clone(),
-                    None,
-                    Some(proj_id),
-                    None,
-                    None,
-                    Some("g".to_string()),
-                )
+                (span_id.clone(), None, LogDestination::project_logs(proj_id))
             }
             Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
                 span_id.clone(),
-                span_id.clone(),
                 None,
-                None,
-                None,
-                Some(object_id),
-                Some("x".to_string()),
+                LogDestination::playground_logs(object_id),
             ),
             Some(ParentSpanInfo::FullSpan {
                 object_type,
@@ -287,73 +260,31 @@ impl WorkerState {
                 span_id: parent_span_id,
                 root_span_id: parent_root_span_id,
             }) => {
-                let span_parents = vec![parent_span_id];
-                match SpanObjectType::try_from(object_type) {
-                    Ok(SpanObjectType::Experiment) => (
-                        span_id.clone(),
-                        parent_root_span_id,
-                        Some(span_parents),
-                        None,
-                        Some(object_id),
-                        None,
-                        None,
-                    ),
-                    Ok(SpanObjectType::ProjectLogs) => (
-                        span_id.clone(),
-                        parent_root_span_id,
-                        Some(span_parents),
-                        Some(object_id),
-                        None,
-                        None,
-                        Some("g".to_string()),
-                    ),
-                    Ok(SpanObjectType::PlaygroundLogs) => (
-                        span_id.clone(),
-                        parent_root_span_id,
-                        Some(span_parents),
-                        None,
-                        None,
-                        Some(object_id),
-                        Some("x".to_string()),
-                    ),
-                    Err(()) => (
-                        span_id.clone(),
-                        parent_root_span_id,
-                        Some(span_parents),
-                        Some(object_id),
-                        None,
-                        None,
-                        Some("g".to_string()),
-                    ),
-                }
+                let span_parents = Some(vec![parent_span_id]);
+                let dest = match object_type {
+                    SpanObjectType::Experiment => LogDestination::experiment(object_id),
+                    SpanObjectType::ProjectLogs => LogDestination::project_logs(object_id),
+                    SpanObjectType::PlaygroundLogs => LogDestination::playground_logs(object_id),
+                };
+                (parent_root_span_id, span_parents, dest)
             }
-        };
-
-        let final_project_id = computed_project_id.or(project_id);
-        let log_id = if experiment_id.is_some() {
-            None
-        } else {
-            log_id
         };
 
         let row = Logs3Row {
             id: row_id,
             is_merge: if is_merge { Some(true) } else { None },
-            span_id: final_span_id.clone(),
-            root_span_id: root_span_id.clone(),
+            span_id,
+            root_span_id,
             span_parents,
-            prompt_session_id,
-            project_id: final_project_id.clone(),
-            experiment_id,
-            log_id,
-            org_id: Some(org_id.clone()),
-            org_name: org_name.clone(),
+            destination,
+            org_id,
+            org_name,
             input,
             output,
             metadata,
             metrics,
             span_attributes,
-            created: Some(Utc::now()),
+            created: Utc::now(),
         };
 
         let request = Logs3Request {
