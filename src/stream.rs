@@ -348,6 +348,7 @@ where
         inner: Box::pin(logged_stream),
         span: Some(span_for_complete),
         aggregator: Some(aggregator_for_complete),
+        finalize_state: FinalizeState::Idle,
     })
 }
 
@@ -378,11 +379,62 @@ fn value_has_content(value: &Value) -> bool {
     false
 }
 
+/// State for stream finalization.
+enum FinalizeState {
+    /// Not yet finalizing
+    Idle,
+    /// Finalizing in progress
+    Finalizing(Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
+    /// Finalization complete
+    Done,
+}
+
 /// A wrapper stream that logs aggregated output when the stream is exhausted.
 struct SpanCompleteWrapper<S, Sub: SpanSubmitter> {
     inner: S,
     span: Option<SpanHandle<Sub>>,
     aggregator: Option<Arc<Mutex<BraintrustStream>>>,
+    finalize_state: FinalizeState,
+}
+
+/// Finalize the stream by logging and flushing the span.
+async fn finalize_span<Sub: SpanSubmitter>(
+    span: SpanHandle<Sub>,
+    aggregator: Arc<Mutex<BraintrustStream>>,
+) {
+    let mut agg = aggregator.lock().await;
+    if !agg.is_empty() {
+        match agg.final_value() {
+            Ok(finalized) => {
+                // Build metrics from usage
+                let metrics = finalized
+                    .usage
+                    .as_ref()
+                    .map(|u| usage_metrics_to_map(u.clone()));
+
+                // Convert StreamMetadata to Option<Map>
+                let metadata = finalized.metadata.to_map();
+
+                // Serialize typed output to Value for SpanLog
+                let output = serde_json::to_value(&finalized.output).ok();
+
+                span.log(SpanLog {
+                    output,
+                    metadata,
+                    metrics,
+                    ..Default::default()
+                })
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to finalize stream: {}", e);
+            }
+        }
+    }
+    // Flush span with aggregated output
+    if let Err(e) = span.flush().await {
+        tracing::warn!("Failed to flush span: {}", e);
+    }
 }
 
 impl<S, E, Sub> Stream for SpanCompleteWrapper<S, Sub>
@@ -394,48 +446,46 @@ where
     type Item = std::result::Result<Value, E>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
+        // SAFETY: We never move the inner stream or finalize future after pinning
+        let this = unsafe { self.get_unchecked_mut() };
+
+        // First, check if we're in the middle of finalizing
+        match &mut this.finalize_state {
+            FinalizeState::Idle => {
+                // Not finalizing yet, poll the inner stream
+            }
+            FinalizeState::Finalizing(fut) => {
+                // Poll the finalization future
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        // Finalization complete
+                        this.finalize_state = FinalizeState::Done;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => {
+                        // Still finalizing
+                        return Poll::Pending;
+                    }
+                }
+            }
+            FinalizeState::Done => {
+                return Poll::Ready(None);
+            }
+        }
+
+        // Poll the inner stream
         let result = Pin::new(&mut this.inner).poll_next(cx);
 
-        // If stream is done, spawn task to finalize and log
+        // If stream is done, start finalization
         if matches!(result, Poll::Ready(None)) {
             if let (Some(span), Some(aggregator)) = (this.span.take(), this.aggregator.take()) {
-                tokio::spawn(async move {
-                    let mut agg = aggregator.lock().await;
-                    if !agg.is_empty() {
-                        match agg.final_value() {
-                            Ok(finalized) => {
-                                // Build metrics from usage
-                                let metrics = finalized
-                                    .usage
-                                    .as_ref()
-                                    .map(|u| usage_metrics_to_map(u.clone()));
+                // Create the finalization future
+                let fut = Box::pin(finalize_span(span, aggregator));
+                this.finalize_state = FinalizeState::Finalizing(fut);
 
-                                // Convert StreamMetadata to Option<Map>
-                                let metadata = finalized.metadata.to_map();
-
-                                // Serialize typed output to Value for SpanLog
-                                let output = serde_json::to_value(&finalized.output).ok();
-
-                                span.log(SpanLog {
-                                    output,
-                                    metadata,
-                                    metrics,
-                                    ..Default::default()
-                                })
-                                .await;
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to finalize stream: {}", e);
-                            }
-                        }
-                    }
-                    // Flush span with aggregated output - can be called multiple times,
-                    // last writer wins. Gateway may also call flush() after stream completes.
-                    if let Err(e) = span.flush().await {
-                        tracing::warn!("Failed to flush span: {}", e);
-                    }
-                });
+                // Poll it immediately by recursing
+                // SAFETY: self is still valid and pinned
+                return unsafe { Pin::new_unchecked(this) }.poll_next(cx);
             }
         }
 
