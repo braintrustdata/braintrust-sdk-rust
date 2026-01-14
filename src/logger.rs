@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -92,7 +93,7 @@ impl BraintrustClient {
     ///
     /// Returns immediately after queuing. HTTP submission happens in the background.
     /// Errors are logged as warnings but not propagated to callers.
-    pub async fn submit_payload(
+    pub(crate) async fn submit_payload(
         &self,
         token: impl Into<String>,
         payload: SpanPayload,
@@ -145,6 +146,28 @@ struct SubmitCommand {
     token: String,
     payload: SpanPayload,
     parent_info: Option<ParentSpanInfo>,
+}
+
+/// Request body for project registration.
+#[derive(Serialize)]
+struct ProjectRegisterRequest<'a> {
+    project_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org_name: Option<&'a str>,
+}
+
+/// Response from project registration.
+#[derive(Deserialize)]
+struct ProjectRegisterResponse {
+    project: ProjectInfo,
+}
+
+/// Project info in registration response.
+#[derive(Deserialize)]
+struct ProjectInfo {
+    id: String,
 }
 
 async fn run_worker(base_url: Url, mut receiver: mpsc::Receiver<LogCommand>) {
@@ -201,7 +224,6 @@ impl WorkerState {
             org_id,
             org_name,
             project_name,
-            name: _,
             input,
             output,
             metadata,
@@ -330,23 +352,11 @@ impl WorkerState {
             return Ok(project_id.clone());
         }
 
-        let mut body = serde_json::Map::new();
-        body.insert(
-            "project_name".to_string(),
-            serde_json::Value::String(project_name.to_string()),
-        );
-        if !org_id.is_empty() {
-            body.insert(
-                "org_id".to_string(),
-                serde_json::Value::String(org_id.to_string()),
-            );
-        }
-        if let Some(name) = org_name {
-            body.insert(
-                "org_name".to_string(),
-                serde_json::Value::String(name.to_string()),
-            );
-        }
+        let request = ProjectRegisterRequest {
+            project_name,
+            org_id: (!org_id.is_empty()).then_some(org_id),
+            org_name,
+        };
 
         let url = self
             .base_url
@@ -356,7 +366,7 @@ impl WorkerState {
             .client
             .post(url)
             .bearer_auth(token)
-            .json(&body)
+            .json(&request)
             .send()
             .await?;
         let status = response.status();
@@ -365,16 +375,14 @@ impl WorkerState {
             anyhow::bail!("register project failed: [{status}] {text}");
         }
 
-        let json = response.json::<serde_json::Value>().await?;
-        let project_id = json
-            .get("project")
-            .and_then(|v| v.get("id"))
-            .and_then(|v| v.as_str())
-            .context("project registration missing project.id")?
-            .to_string();
+        let register_response: ProjectRegisterResponse = response
+            .json()
+            .await
+            .context("failed to parse project registration response")?;
 
-        self.project_cache.insert(cache_key, project_id.clone());
-        Ok(project_id)
+        self.project_cache
+            .insert(cache_key, register_response.project.id.clone());
+        Ok(register_response.project.id)
     }
 }
 

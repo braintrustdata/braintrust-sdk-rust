@@ -5,6 +5,7 @@
 //!
 //! It also provides `wrap_stream_with_span` for wrapping streams with span logging.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,21 +15,87 @@ use std::time::Instant;
 use anyhow::Result;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::span::{SpanHandle, SpanLog, SpanSubmitter};
 use crate::types::{usage_metrics_to_map, UsageMetrics};
 
+/// A tool call in a chat message.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String, // Always "function"
+    pub function: FunctionCall,
+}
+
+/// Function details in a tool call.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// A chat message in the output.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ChatMessage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// A choice in the output array (matches OpenAI response format).
+#[derive(Clone, Debug, Serialize)]
+pub struct OutputChoice {
+    pub index: usize,
+    pub message: ChatMessage,
+    pub logprobs: Option<()>, // Always None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+/// Stream metadata with typed known fields and passthrough for extras.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct StreamMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Catch-all for additional fields (passthrough behavior).
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
+}
+
+impl StreamMetadata {
+    /// Returns true if the metadata has no content.
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.extra.is_empty()
+    }
+
+    /// Convert to a serde_json Map for logging.
+    pub fn to_map(&self) -> Option<serde_json::Map<String, Value>> {
+        if self.is_empty() {
+            return None;
+        }
+        // Serialize to Value and extract the Map
+        match serde_json::to_value(self) {
+            Ok(Value::Object(map)) => Some(map),
+            _ => None,
+        }
+    }
+}
+
 /// Aggregated result from a streaming response.
 #[derive(Clone)]
 pub struct FinalizedStream {
-    /// The output value (messages only)
-    pub output: Value,
+    /// The output choices (matches OpenAI response format)
+    pub output: Vec<OutputChoice>,
     /// Usage metrics extracted from the stream
     pub usage: Option<UsageMetrics>,
-    /// Metadata (model, finish_reason)
-    pub metadata: Map<String, Value>,
+    /// Metadata (model and any extras)
+    pub metadata: StreamMetadata,
 }
 
 /// A stream aggregator that collects streaming chunks and produces a final value.
@@ -55,10 +122,19 @@ struct StreamChunk {
     usage: Option<StreamUsage>,
 }
 
+/// Delta from a streaming chunk (typed for role/content).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct StreamDelta {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct StreamChoice {
     #[serde(default)]
-    delta: Option<Value>,
+    delta: Option<StreamDelta>,
     #[serde(default)]
     finish_reason: Option<String>,
 }
@@ -114,7 +190,6 @@ impl BraintrustStream {
     }
 
     fn aggregate(&self) -> Result<FinalizedStream> {
-        let mut metadata = Map::new();
         let mut usage: Option<UsageMetrics> = None;
         let mut model: Option<String> = None;
         let mut finish_reason: Option<String> = None;
@@ -168,41 +243,41 @@ impl BraintrustStream {
 
                 // Extract content from delta
                 if let Some(ref delta) = choice.delta {
-                    if let Some(obj) = delta.as_object() {
-                        // Extract role (take first)
-                        if role.is_none() {
-                            if let Some(r) = obj.get("role").and_then(Value::as_str) {
-                                role = Some(r.to_string());
-                            }
-                        }
+                    // Extract role (take first)
+                    if role.is_none() {
+                        role = delta.role.clone();
+                    }
 
-                        // Append content
-                        if let Some(content) = obj.get("content").and_then(Value::as_str) {
-                            aggregated_content.push_str(content);
-                        }
+                    // Append content
+                    if let Some(ref content) = delta.content {
+                        aggregated_content.push_str(content);
                     }
                 }
             }
         }
 
-        // Build metadata
-        if let Some(m) = model {
-            metadata.insert("model".to_string(), Value::String(m));
-        }
-        if let Some(fr) = finish_reason {
-            metadata.insert("finish_reason".to_string(), Value::String(fr));
-        }
+        // Build metadata (finish_reason moved to OutputChoice)
+        let metadata = StreamMetadata {
+            model,
+            extra: HashMap::new(),
+        };
 
-        // Build output as array directly
-        let mut message = Map::new();
-        message.insert(
-            "role".to_string(),
-            Value::String(role.unwrap_or_else(|| "assistant".to_string())),
-        );
-        message.insert("content".to_string(), Value::String(aggregated_content));
+        // Build typed output (matches OpenAI response format)
+        let message = ChatMessage {
+            role: Some(role.unwrap_or_else(|| "assistant".to_string())),
+            content: Some(aggregated_content),
+            tool_calls: None, // TODO: implement tool call aggregation
+        };
+
+        let choice = OutputChoice {
+            index: 0,
+            message,
+            logprobs: None,
+            finish_reason,
+        };
 
         Ok(FinalizedStream {
-            output: Value::Array(vec![Value::Object(message)]),
+            output: vec![choice],
             usage,
             metadata,
         })
@@ -336,15 +411,14 @@ where
                                     .as_ref()
                                     .map(|u| usage_metrics_to_map(u.clone()));
 
-                                // Convert metadata Map to Option<Map>
-                                let metadata = if finalized.metadata.is_empty() {
-                                    None
-                                } else {
-                                    Some(finalized.metadata.clone())
-                                };
+                                // Convert StreamMetadata to Option<Map>
+                                let metadata = finalized.metadata.to_map();
+
+                                // Serialize typed output to Value for SpanLog
+                                let output = serde_json::to_value(&finalized.output).ok();
 
                                 span.log(SpanLog {
-                                    output: Some(finalized.output.clone()),
+                                    output,
                                     metadata,
                                     metrics,
                                     ..Default::default()
@@ -414,32 +488,17 @@ mod tests {
 
         let finalized = stream.final_value().expect("should finalize");
 
-        // Check output is array of messages
-        let messages = finalized.output.as_array().expect("messages array");
-        assert_eq!(messages.len(), 1);
+        // Check output is array of choices
+        assert_eq!(finalized.output.len(), 1);
 
-        let message = messages[0].as_object().expect("message object");
-        assert_eq!(
-            message.get("role").and_then(Value::as_str),
-            Some("assistant")
-        );
-        assert_eq!(
-            message.get("content").and_then(Value::as_str),
-            Some("Hello world!")
-        );
+        let choice = &finalized.output[0];
+        assert_eq!(choice.index, 0);
+        assert_eq!(choice.message.role.as_deref(), Some("assistant"));
+        assert_eq!(choice.message.content.as_deref(), Some("Hello world!"));
+        assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
 
         // Check metadata
-        assert_eq!(
-            finalized.metadata.get("model").and_then(Value::as_str),
-            Some("gpt-4")
-        );
-        assert_eq!(
-            finalized
-                .metadata
-                .get("finish_reason")
-                .and_then(Value::as_str),
-            Some("stop")
-        );
+        assert_eq!(finalized.metadata.model.as_deref(), Some("gpt-4"));
     }
 
     #[test]
@@ -508,13 +567,7 @@ mod tests {
         // First call computes - extract content and drop borrow
         let first_content = {
             let first = stream.final_value().expect("should finalize");
-            first
-                .output
-                .as_array()
-                .and_then(|m| m.first())
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string())
+            first.output.first().and_then(|c| c.message.content.clone())
         };
 
         // Second call returns cached
@@ -522,11 +575,8 @@ mod tests {
             let second = stream.final_value().expect("should finalize");
             second
                 .output
-                .as_array()
-                .and_then(|m| m.first())
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string())
+                .first()
+                .and_then(|c| c.message.content.clone())
         };
 
         assert_eq!(first_content, second_content);
