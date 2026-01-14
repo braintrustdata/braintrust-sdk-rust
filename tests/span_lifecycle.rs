@@ -1,6 +1,5 @@
 use braintrust_sdk_rust::{
-    extract_anthropic_usage, extract_openai_usage, BraintrustClient, BraintrustClientConfig,
-    SpanLog,
+    extract_anthropic_usage, extract_openai_usage, BraintrustClient, SpanLog,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -25,10 +24,16 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
         .mount(&server)
         .await;
 
-    let client = BraintrustClient::new(BraintrustClientConfig::new(server.uri())).expect("client");
+    let client = BraintrustClient::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build()
+        .await
+        .expect("client");
 
     let span = client
-        .span_builder("token", "org-id")
+        .span_builder_with_credentials("token", "org-id")
         .org_name("org-name")
         .project_name("demo-project")
         .build();

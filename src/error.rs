@@ -6,6 +6,10 @@ pub enum BraintrustError {
     InvalidConfig(String),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("network error: {0}")]
+    Network(String),
+    #[error("API error ({status}): {message}")]
+    Api { status: u16, message: String },
     #[error("internal channel closed")]
     ChannelClosed,
     #[error("background task failed: {0}")]
