@@ -1,5 +1,6 @@
 mod error;
 mod extractors;
+mod json_merge;
 mod logger;
 mod logs3;
 mod span;

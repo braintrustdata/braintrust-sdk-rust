@@ -133,6 +133,42 @@ impl LogDestination {
             log_id: "x".to_string(),
         }
     }
+
+    /// Get the project_id if this is a ProjectLogs destination.
+    pub fn project_id(&self) -> Option<&str> {
+        match self {
+            Self::ProjectLogs { project_id, .. } => Some(project_id),
+            _ => None,
+        }
+    }
+
+    /// Get the experiment_id if this is an Experiment destination.
+    pub fn experiment_id(&self) -> Option<&str> {
+        match self {
+            Self::Experiment { experiment_id } => Some(experiment_id),
+            _ => None,
+        }
+    }
+
+    /// Get the log_id if present (ProjectLogs or PlaygroundLogs).
+    pub fn log_id(&self) -> Option<&str> {
+        match self {
+            Self::ProjectLogs { log_id, .. } => Some(log_id),
+            Self::PlaygroundLogs { log_id, .. } => Some(log_id),
+            Self::Experiment { .. } => None,
+        }
+    }
+
+    /// Get the prompt_session_id if this is a PlaygroundLogs destination.
+    #[allow(dead_code)]
+    pub fn prompt_session_id(&self) -> Option<&str> {
+        match self {
+            Self::PlaygroundLogs {
+                prompt_session_id, ..
+            } => Some(prompt_session_id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

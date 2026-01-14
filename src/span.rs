@@ -205,6 +205,9 @@ pub(crate) trait SpanSubmitter: Send + Sync {
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> Result<()>;
+
+    /// Trigger a non-blocking background flush.
+    async fn trigger_flush(&self) -> Result<()>;
 }
 
 #[allow(private_bounds)]
@@ -406,6 +409,12 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         self.submitter
             .submit(self.token.clone(), payload, self.parent_info.clone())
             .await
+    }
+
+    /// Trigger a non-blocking background flush.
+    /// Useful for streaming writes to get partial updates visible immediately.
+    pub async fn trigger_flush(&self) -> Result<()> {
+        self.submitter.trigger_flush().await
     }
 }
 
