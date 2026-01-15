@@ -1,4 +1,5 @@
 mod error;
+mod experiment;
 mod extractors;
 mod logger;
 mod span;
@@ -8,6 +9,12 @@ pub(crate) mod test_utils;
 mod types;
 
 pub use error::{BraintrustError, Result};
+pub use experiment::{
+    BaseExperimentInfo, Experiment, ExperimentBuilder, ExperimentBuilderError, ExperimentLog,
+    ExperimentLogBuilder, ExperimentLogBuilderError, ExperimentSpanBuilder, ExperimentSummary,
+    ExportedExperiment, Feedback, FeedbackBuilder, FeedbackBuilderError, GitMetadataCollect,
+    GitMetadataField, GitMetadataSettings, MetricSummary, ProjectMetadata, RepoInfo, ScoreSummary,
+};
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
 pub use logger::{BraintrustClient, BraintrustClientBuilder, LoginState, OrgInfo};
 pub use span::{SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanLogBuilderError};
