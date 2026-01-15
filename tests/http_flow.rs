@@ -1,4 +1,4 @@
-use braintrust_sdk_rust::{BraintrustClient, BraintrustClientConfig, SpanLog};
+use braintrust_sdk_rust::{BraintrustClient, SpanLog};
 use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -22,10 +22,16 @@ async fn submits_with_bearer_token() {
         .mount(&server)
         .await;
 
-    let client = BraintrustClient::new(BraintrustClientConfig::new(server.uri())).expect("client");
+    let client = BraintrustClient::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build()
+        .await
+        .expect("client");
 
     let span = client
-        .span_builder("secret-token", "org")
+        .span_builder_with_credentials("secret-token", "org")
         .project_name("demo")
         .build();
     span.log(SpanLog {
@@ -58,10 +64,16 @@ async fn flush_is_fire_and_forget() {
         .mount(&server)
         .await;
 
-    let client = BraintrustClient::new(BraintrustClientConfig::new(server.uri())).expect("client");
+    let client = BraintrustClient::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build()
+        .await
+        .expect("client");
 
     let span = client
-        .span_builder("secret-token", "org")
+        .span_builder_with_credentials("secret-token", "org")
         .project_name("demo")
         .build();
 

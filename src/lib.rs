@@ -9,7 +9,7 @@ mod types;
 
 pub use error::{BraintrustError, Result};
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
-pub use logger::{BraintrustClient, BraintrustClientConfig};
+pub use logger::{BraintrustClient, BraintrustClientBuilder, LoginState, OrgInfo};
 pub use span::{SpanBuilder, SpanHandle, SpanLog};
 pub use stream::{
     wrap_stream_with_span, BraintrustStream, ChatMessage, FinalizedStream, FunctionCall,
