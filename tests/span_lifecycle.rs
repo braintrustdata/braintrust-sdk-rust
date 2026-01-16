@@ -37,12 +37,14 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
         .org_name("org-name")
         .project_name("demo-project")
         .build();
-    span.log(SpanLog {
-        name: Some("integration-span".into()),
-        input: Some(Value::String("input".into())),
-        output: Some(Value::String("output".into())),
-        ..Default::default()
-    })
+    span.log(
+        SpanLog::builder()
+            .name("integration-span")
+            .input(Value::String("input".into()))
+            .output(Value::String("output".into()))
+            .build()
+            .expect("build"),
+    )
     .await;
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");
@@ -76,10 +78,10 @@ fn usage_extractors_return_expected_metrics() {
             "reasoning_tokens": 2
         }
     }));
-    assert_eq!(openai_usage.prompt_tokens, Some(10));
-    assert_eq!(openai_usage.completion_tokens, Some(5));
-    assert_eq!(openai_usage.total_tokens, Some(15));
-    assert_eq!(openai_usage.reasoning_tokens, Some(2));
+    assert_eq!(openai_usage.prompt_tokens(), Some(10));
+    assert_eq!(openai_usage.completion_tokens(), Some(5));
+    assert_eq!(openai_usage.total_tokens(), Some(15));
+    assert_eq!(openai_usage.reasoning_tokens(), Some(2));
 
     let anthropic_usage = extract_anthropic_usage(&json!({
         "usage": {
@@ -87,7 +89,7 @@ fn usage_extractors_return_expected_metrics() {
             "output_tokens": 7
         }
     }));
-    assert_eq!(anthropic_usage.prompt_tokens, Some(3));
-    assert_eq!(anthropic_usage.completion_tokens, Some(7));
-    assert_eq!(anthropic_usage.total_tokens, Some(10));
+    assert_eq!(anthropic_usage.prompt_tokens(), Some(3));
+    assert_eq!(anthropic_usage.completion_tokens(), Some(7));
+    assert_eq!(anthropic_usage.total_tokens(), Some(10));
 }
