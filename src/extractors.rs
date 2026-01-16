@@ -36,7 +36,7 @@ pub fn extract_openai_usage(value: &Value) -> UsageMetrics {
             .or_else(|| {
                 prompt_details
                     .as_ref()
-                    .and_then(|details| details.cached_tokens)
+                    .and_then(|details| details.cached_tokens())
             });
         let prompt_cache_creation_tokens = usage
             .get("prompt_cache_creation_tokens")
@@ -45,7 +45,7 @@ pub fn extract_openai_usage(value: &Value) -> UsageMetrics {
             .or_else(|| {
                 prompt_details
                     .as_ref()
-                    .and_then(|details| details.cache_creation_tokens)
+                    .and_then(|details| details.cache_creation_tokens())
             });
         let reasoning_tokens = usage
             .get("reasoning_tokens")
@@ -54,20 +54,36 @@ pub fn extract_openai_usage(value: &Value) -> UsageMetrics {
             .or_else(|| {
                 completion_details
                     .as_ref()
-                    .and_then(|details| details.reasoning_tokens)
+                    .and_then(|details| details.reasoning_tokens())
             });
 
-        UsageMetrics {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            reasoning_tokens,
-            prompt_cached_tokens,
-            prompt_cache_creation_tokens,
-            completion_reasoning_tokens: reasoning_tokens,
-            prompt_tokens_details: prompt_details,
-            completion_tokens_details: completion_details,
+        let mut metrics = UsageMetrics::new();
+        if let Some(v) = prompt_tokens {
+            metrics.set_prompt_tokens(v);
         }
+        if let Some(v) = completion_tokens {
+            metrics.set_completion_tokens(v);
+        }
+        if let Some(v) = total_tokens {
+            metrics.set_total_tokens(v);
+        }
+        if let Some(v) = reasoning_tokens {
+            metrics.set_reasoning_tokens(v);
+            metrics.set_completion_reasoning_tokens(v);
+        }
+        if let Some(v) = prompt_cached_tokens {
+            metrics.set_prompt_cached_tokens(v);
+        }
+        if let Some(v) = prompt_cache_creation_tokens {
+            metrics.set_prompt_cache_creation_tokens(v);
+        }
+        if let Some(details) = prompt_details {
+            metrics.set_prompt_tokens_details(details);
+        }
+        if let Some(details) = completion_details {
+            metrics.set_completion_tokens_details(details);
+        }
+        metrics
     } else {
         UsageMetrics::default()
     }
@@ -107,46 +123,65 @@ pub fn extract_anthropic_usage(value: &Value) -> UsageMetrics {
 
         let prompt_tokens_details =
             if prompt_cached_tokens.is_some() || prompt_cache_creation_tokens.is_some() {
-                Some(PromptTokensDetails {
-                    cached_tokens: prompt_cached_tokens,
-                    cache_creation_tokens: prompt_cache_creation_tokens,
-                    audio_tokens: None,
-                })
+                Some(PromptTokensDetails::new(
+                    None,
+                    prompt_cached_tokens,
+                    prompt_cache_creation_tokens,
+                ))
             } else {
                 None
             };
 
-        UsageMetrics {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            reasoning_tokens: usage
-                .get("reasoning_tokens")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
-            prompt_cached_tokens,
-            prompt_cache_creation_tokens,
-            completion_reasoning_tokens: usage
-                .get("reasoning_tokens")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
-            prompt_tokens_details,
-            completion_tokens_details: usage
-                .get("output_tokens_details")
-                .and_then(Value::as_object)
-                .map(|details| CompletionTokensDetails {
-                    reasoning_tokens: details
-                        .get("reasoning_tokens")
-                        .and_then(Value::as_u64)
-                        .map(|v| v as u32),
-                    audio_tokens: details
+        let reasoning_tokens = usage
+            .get("reasoning_tokens")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
+
+        let completion_tokens_details = usage
+            .get("output_tokens_details")
+            .and_then(Value::as_object)
+            .map(|details| {
+                CompletionTokensDetails::new(
+                    details
                         .get("audio_tokens")
                         .and_then(Value::as_u64)
                         .map(|v| v as u32),
-                    accepted_prediction_tokens: None,
-                    rejected_prediction_tokens: None,
-                }),
+                    details
+                        .get("reasoning_tokens")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32),
+                    None,
+                    None,
+                )
+            });
+
+        let mut metrics = UsageMetrics::new();
+        if let Some(v) = prompt_tokens {
+            metrics.set_prompt_tokens(v);
         }
+        if let Some(v) = completion_tokens {
+            metrics.set_completion_tokens(v);
+        }
+        if let Some(v) = total_tokens {
+            metrics.set_total_tokens(v);
+        }
+        if let Some(v) = reasoning_tokens {
+            metrics.set_reasoning_tokens(v);
+            metrics.set_completion_reasoning_tokens(v);
+        }
+        if let Some(v) = prompt_cached_tokens {
+            metrics.set_prompt_cached_tokens(v);
+        }
+        if let Some(v) = prompt_cache_creation_tokens {
+            metrics.set_prompt_cache_creation_tokens(v);
+        }
+        if let Some(details) = prompt_tokens_details {
+            metrics.set_prompt_tokens_details(details);
+        }
+        if let Some(details) = completion_tokens_details {
+            metrics.set_completion_tokens_details(details);
+        }
+        metrics
     } else {
         UsageMetrics::default()
     }
@@ -159,20 +194,22 @@ fn parse_prompt_tokens_details(
     keys.iter()
         .find_map(|key| usage.get(*key))
         .and_then(Value::as_object)
-        .map(|details| PromptTokensDetails {
-            audio_tokens: details
-                .get("audio_tokens")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
-            cached_tokens: details
-                .get("cached_tokens")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
-            cache_creation_tokens: details
-                .get("cache_creation_tokens")
-                .or_else(|| details.get("cache_creation_input_tokens"))
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
+        .map(|details| {
+            PromptTokensDetails::new(
+                details
+                    .get("audio_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+                details
+                    .get("cached_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+                details
+                    .get("cache_creation_tokens")
+                    .or_else(|| details.get("cache_creation_input_tokens"))
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+            )
         })
 }
 
@@ -183,23 +220,25 @@ fn parse_completion_tokens_details(
     keys.iter()
         .find_map(|key| usage.get(*key))
         .and_then(Value::as_object)
-        .map(|details| CompletionTokensDetails {
-            reasoning_tokens: details
-                .get("reasoning_tokens")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
-            accepted_prediction_tokens: details
-                .get("accepted_prediction_tokens")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
-            rejected_prediction_tokens: details
-                .get("rejected_prediction_tokens")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
-            audio_tokens: details
-                .get("audio_tokens")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
+        .map(|details| {
+            CompletionTokensDetails::new(
+                details
+                    .get("audio_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+                details
+                    .get("reasoning_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+                details
+                    .get("accepted_prediction_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+                details
+                    .get("rejected_prediction_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+            )
         })
 }
 
@@ -230,23 +269,23 @@ mod tests {
         });
 
         let metrics = extract_openai_usage(&value);
-        assert_eq!(metrics.prompt_tokens, Some(100));
-        assert_eq!(metrics.completion_tokens, Some(200));
-        assert_eq!(metrics.total_tokens, Some(300));
-        assert_eq!(metrics.prompt_cached_tokens, Some(80));
-        assert_eq!(metrics.prompt_cache_creation_tokens, Some(10));
-        assert_eq!(metrics.completion_reasoning_tokens, Some(40));
-        let prompt_details = metrics.prompt_tokens_details.expect("prompt details");
-        assert_eq!(prompt_details.audio_tokens, Some(5));
-        assert_eq!(prompt_details.cached_tokens, Some(80));
-        assert_eq!(prompt_details.cache_creation_tokens, Some(10));
+        assert_eq!(metrics.prompt_tokens(), Some(100));
+        assert_eq!(metrics.completion_tokens(), Some(200));
+        assert_eq!(metrics.total_tokens(), Some(300));
+        assert_eq!(metrics.prompt_cached_tokens(), Some(80));
+        assert_eq!(metrics.prompt_cache_creation_tokens(), Some(10));
+        assert_eq!(metrics.completion_reasoning_tokens(), Some(40));
+        let prompt_details = metrics.prompt_tokens_details().expect("prompt details");
+        assert_eq!(prompt_details.audio_tokens(), Some(5));
+        assert_eq!(prompt_details.cached_tokens(), Some(80));
+        assert_eq!(prompt_details.cache_creation_tokens(), Some(10));
         let completion_details = metrics
-            .completion_tokens_details
+            .completion_tokens_details()
             .expect("completion details");
-        assert_eq!(completion_details.reasoning_tokens, Some(40));
-        assert_eq!(completion_details.accepted_prediction_tokens, Some(7));
-        assert_eq!(completion_details.rejected_prediction_tokens, Some(3));
-        assert_eq!(completion_details.audio_tokens, Some(2));
+        assert_eq!(completion_details.reasoning_tokens(), Some(40));
+        assert_eq!(completion_details.accepted_prediction_tokens(), Some(7));
+        assert_eq!(completion_details.rejected_prediction_tokens(), Some(3));
+        assert_eq!(completion_details.audio_tokens(), Some(2));
     }
 
     #[test]
@@ -262,14 +301,14 @@ mod tests {
         });
 
         let metrics = extract_anthropic_usage(&value);
-        assert_eq!(metrics.prompt_tokens, Some(50));
-        assert_eq!(metrics.completion_tokens, Some(25));
-        assert_eq!(metrics.total_tokens, Some(75));
-        assert_eq!(metrics.prompt_cached_tokens, Some(30));
-        assert_eq!(metrics.prompt_cache_creation_tokens, Some(5));
-        assert_eq!(metrics.completion_reasoning_tokens, Some(12));
-        let prompt_details = metrics.prompt_tokens_details.expect("prompt details");
-        assert_eq!(prompt_details.cached_tokens, Some(30));
-        assert_eq!(prompt_details.cache_creation_tokens, Some(5));
+        assert_eq!(metrics.prompt_tokens(), Some(50));
+        assert_eq!(metrics.completion_tokens(), Some(25));
+        assert_eq!(metrics.total_tokens(), Some(75));
+        assert_eq!(metrics.prompt_cached_tokens(), Some(30));
+        assert_eq!(metrics.prompt_cache_creation_tokens(), Some(5));
+        assert_eq!(metrics.completion_reasoning_tokens(), Some(12));
+        let prompt_details = metrics.prompt_tokens_details().expect("prompt details");
+        assert_eq!(prompt_details.cached_tokens(), Some(30));
+        assert_eq!(prompt_details.cache_creation_tokens(), Some(5));
     }
 }

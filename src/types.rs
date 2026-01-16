@@ -135,9 +135,19 @@ pub(crate) struct Logs3Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scores: Option<HashMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Map<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<HashMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_attributes: Option<SpanAttributes>,
     pub created: DateTime<Utc>,
@@ -153,8 +163,13 @@ pub(crate) struct SpanPayload {
     pub project_name: Option<String>,
     pub input: Option<Value>,
     pub output: Option<Value>,
+    pub expected: Option<Value>,
+    pub error: Option<Value>,
+    pub scores: Option<HashMap<String, f64>>,
     pub metadata: Option<Map<String, Value>>,
     pub metrics: Option<HashMap<String, f64>>,
+    pub tags: Option<Vec<String>>,
+    pub context: Option<Value>,
     pub span_attributes: Option<SpanAttributes>,
 }
 
@@ -181,31 +196,177 @@ pub enum ParentSpanInfo {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PromptTokensDetails {
-    pub audio_tokens: Option<u32>,
-    pub cached_tokens: Option<u32>,
-    pub cache_creation_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audio_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cached_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_creation_tokens: Option<u32>,
+}
+
+impl PromptTokensDetails {
+    pub(crate) fn new(
+        audio_tokens: Option<u32>,
+        cached_tokens: Option<u32>,
+        cache_creation_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            audio_tokens,
+            cached_tokens,
+            cache_creation_tokens,
+        }
+    }
+
+    pub fn audio_tokens(&self) -> Option<u32> {
+        self.audio_tokens
+    }
+
+    pub fn cached_tokens(&self) -> Option<u32> {
+        self.cached_tokens
+    }
+
+    pub fn cache_creation_tokens(&self) -> Option<u32> {
+        self.cache_creation_tokens
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CompletionTokensDetails {
-    pub audio_tokens: Option<u32>,
-    pub reasoning_tokens: Option<u32>,
-    pub accepted_prediction_tokens: Option<u32>,
-    pub rejected_prediction_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audio_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_prediction_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rejected_prediction_tokens: Option<u32>,
+}
+
+impl CompletionTokensDetails {
+    pub(crate) fn new(
+        audio_tokens: Option<u32>,
+        reasoning_tokens: Option<u32>,
+        accepted_prediction_tokens: Option<u32>,
+        rejected_prediction_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            audio_tokens,
+            reasoning_tokens,
+            accepted_prediction_tokens,
+            rejected_prediction_tokens,
+        }
+    }
+
+    pub fn audio_tokens(&self) -> Option<u32> {
+        self.audio_tokens
+    }
+
+    pub fn reasoning_tokens(&self) -> Option<u32> {
+        self.reasoning_tokens
+    }
+
+    pub fn accepted_prediction_tokens(&self) -> Option<u32> {
+        self.accepted_prediction_tokens
+    }
+
+    pub fn rejected_prediction_tokens(&self) -> Option<u32> {
+        self.rejected_prediction_tokens
+    }
 }
 
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct UsageMetrics {
-    pub prompt_tokens: Option<u32>,
-    pub completion_tokens: Option<u32>,
-    pub total_tokens: Option<u32>,
-    pub reasoning_tokens: Option<u32>,
-    pub prompt_cached_tokens: Option<u32>,
-    pub prompt_cache_creation_tokens: Option<u32>,
-    pub completion_reasoning_tokens: Option<u32>,
-    pub prompt_tokens_details: Option<PromptTokensDetails>,
-    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    pub(crate) prompt_tokens: Option<u32>,
+    pub(crate) completion_tokens: Option<u32>,
+    pub(crate) total_tokens: Option<u32>,
+    pub(crate) reasoning_tokens: Option<u32>,
+    pub(crate) prompt_cached_tokens: Option<u32>,
+    pub(crate) prompt_cache_creation_tokens: Option<u32>,
+    pub(crate) completion_reasoning_tokens: Option<u32>,
+    pub(crate) prompt_tokens_details: Option<PromptTokensDetails>,
+    pub(crate) completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+impl UsageMetrics {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn set_prompt_tokens(&mut self, value: u32) {
+        self.prompt_tokens = Some(value);
+    }
+
+    pub(crate) fn set_completion_tokens(&mut self, value: u32) {
+        self.completion_tokens = Some(value);
+    }
+
+    pub(crate) fn set_total_tokens(&mut self, value: u32) {
+        self.total_tokens = Some(value);
+    }
+
+    pub(crate) fn set_reasoning_tokens(&mut self, value: u32) {
+        self.reasoning_tokens = Some(value);
+    }
+
+    pub(crate) fn set_prompt_cached_tokens(&mut self, value: u32) {
+        self.prompt_cached_tokens = Some(value);
+    }
+
+    pub(crate) fn set_prompt_cache_creation_tokens(&mut self, value: u32) {
+        self.prompt_cache_creation_tokens = Some(value);
+    }
+
+    pub(crate) fn set_completion_reasoning_tokens(&mut self, value: u32) {
+        self.completion_reasoning_tokens = Some(value);
+    }
+
+    pub(crate) fn set_prompt_tokens_details(&mut self, value: PromptTokensDetails) {
+        self.prompt_tokens_details = Some(value);
+    }
+
+    pub(crate) fn set_completion_tokens_details(&mut self, value: CompletionTokensDetails) {
+        self.completion_tokens_details = Some(value);
+    }
+
+    pub fn prompt_tokens(&self) -> Option<u32> {
+        self.prompt_tokens
+    }
+
+    pub fn completion_tokens(&self) -> Option<u32> {
+        self.completion_tokens
+    }
+
+    pub fn total_tokens(&self) -> Option<u32> {
+        self.total_tokens
+    }
+
+    pub fn reasoning_tokens(&self) -> Option<u32> {
+        self.reasoning_tokens
+    }
+
+    pub fn prompt_cached_tokens(&self) -> Option<u32> {
+        self.prompt_cached_tokens
+    }
+
+    pub fn prompt_cache_creation_tokens(&self) -> Option<u32> {
+        self.prompt_cache_creation_tokens
+    }
+
+    pub fn completion_reasoning_tokens(&self) -> Option<u32> {
+        self.completion_reasoning_tokens
+    }
+
+    pub fn prompt_tokens_details(&self) -> Option<&PromptTokensDetails> {
+        self.prompt_tokens_details.as_ref()
+    }
+
+    pub fn completion_tokens_details(&self) -> Option<&CompletionTokensDetails> {
+        self.completion_tokens_details.as_ref()
+    }
 }
 
 /// Usage statistics that can deserialize from both OpenAI and Anthropic formats.
@@ -214,54 +375,55 @@ pub struct UsageMetrics {
 /// `input_tokens`/`output_tokens`. The serde aliases allow this struct to
 /// deserialize from either format automatically.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct Usage {
     #[serde(default, alias = "input_tokens")]
-    pub prompt_tokens: u32,
+    prompt_tokens: u32,
     #[serde(default, alias = "output_tokens")]
-    pub completion_tokens: u32,
+    completion_tokens: u32,
     #[serde(default)]
-    pub total_tokens: u32,
+    total_tokens: u32,
     #[serde(default)]
-    pub reasoning_tokens: Option<u32>,
+    reasoning_tokens: Option<u32>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         alias = "cache_read_input_tokens"
     )]
-    pub prompt_cached_tokens: Option<u32>,
+    prompt_cached_tokens: Option<u32>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         alias = "cache_creation_input_tokens"
     )]
-    pub prompt_cache_creation_tokens: Option<u32>,
+    prompt_cache_creation_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion_reasoning_tokens: Option<u32>,
+    completion_reasoning_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 impl Usage {
     /// Create a Usage from UsageMetrics, returning None if no metrics are present.
     pub fn from_metrics(metrics: UsageMetrics) -> Option<Self> {
-        let has_metrics = metrics.prompt_tokens.is_some()
-            || metrics.completion_tokens.is_some()
-            || metrics.total_tokens.is_some()
-            || metrics.reasoning_tokens.is_some()
-            || metrics.prompt_cached_tokens.is_some()
-            || metrics.prompt_cache_creation_tokens.is_some()
-            || metrics.completion_reasoning_tokens.is_some();
+        let has_metrics = metrics.prompt_tokens().is_some()
+            || metrics.completion_tokens().is_some()
+            || metrics.total_tokens().is_some()
+            || metrics.reasoning_tokens().is_some()
+            || metrics.prompt_cached_tokens().is_some()
+            || metrics.prompt_cache_creation_tokens().is_some()
+            || metrics.completion_reasoning_tokens().is_some();
 
         if !has_metrics {
             return None;
         }
 
-        let prompt = metrics.prompt_tokens.unwrap_or_default();
-        let completion = metrics.completion_tokens.unwrap_or_default();
+        let prompt = metrics.prompt_tokens().unwrap_or_default();
+        let completion = metrics.completion_tokens().unwrap_or_default();
         let total = metrics
-            .total_tokens
+            .total_tokens()
             .or_else(|| {
                 if prompt != 0 || completion != 0 {
                     Some(prompt + completion)
@@ -270,93 +432,133 @@ impl Usage {
                 }
             })
             .unwrap_or_default();
-        let prompt_details = metrics.prompt_tokens_details.clone();
-        let completion_details = metrics.completion_tokens_details.clone();
+        let prompt_details = metrics.prompt_tokens_details().cloned();
+        let completion_details = metrics.completion_tokens_details().cloned();
 
         Some(Self {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: total,
-            reasoning_tokens: metrics.reasoning_tokens,
-            prompt_cached_tokens: metrics.prompt_cached_tokens.or_else(|| {
+            reasoning_tokens: metrics.reasoning_tokens(),
+            prompt_cached_tokens: metrics.prompt_cached_tokens().or_else(|| {
                 prompt_details
                     .as_ref()
-                    .and_then(|details| details.cached_tokens)
+                    .and_then(|details| details.cached_tokens())
             }),
-            prompt_cache_creation_tokens: metrics.prompt_cache_creation_tokens.or_else(|| {
+            prompt_cache_creation_tokens: metrics.prompt_cache_creation_tokens().or_else(|| {
                 prompt_details
                     .as_ref()
-                    .and_then(|details| details.cache_creation_tokens)
+                    .and_then(|details| details.cache_creation_tokens())
             }),
-            completion_reasoning_tokens: metrics.completion_reasoning_tokens.or_else(|| {
+            completion_reasoning_tokens: metrics.completion_reasoning_tokens().or_else(|| {
                 completion_details
                     .as_ref()
-                    .and_then(|details| details.reasoning_tokens)
+                    .and_then(|details| details.reasoning_tokens())
             }),
             prompt_tokens_details: prompt_details,
             completion_tokens_details: completion_details,
         })
     }
+
+    pub fn prompt_tokens(&self) -> u32 {
+        self.prompt_tokens
+    }
+
+    pub fn completion_tokens(&self) -> u32 {
+        self.completion_tokens
+    }
+
+    pub fn total_tokens(&self) -> u32 {
+        self.total_tokens
+    }
+
+    pub fn reasoning_tokens(&self) -> Option<u32> {
+        self.reasoning_tokens
+    }
+
+    pub fn prompt_cached_tokens(&self) -> Option<u32> {
+        self.prompt_cached_tokens
+    }
+
+    pub fn prompt_cache_creation_tokens(&self) -> Option<u32> {
+        self.prompt_cache_creation_tokens
+    }
+
+    pub fn completion_reasoning_tokens(&self) -> Option<u32> {
+        self.completion_reasoning_tokens
+    }
+
+    pub fn prompt_tokens_details(&self) -> Option<&PromptTokensDetails> {
+        self.prompt_tokens_details.as_ref()
+    }
+
+    pub fn completion_tokens_details(&self) -> Option<&CompletionTokensDetails> {
+        self.completion_tokens_details.as_ref()
+    }
 }
 
 pub fn usage_metrics_to_map(usage: UsageMetrics) -> HashMap<String, f64> {
     let mut metrics = HashMap::new();
-    insert_metric(&mut metrics, "prompt_tokens", usage.prompt_tokens);
-    insert_metric(&mut metrics, "completion_tokens", usage.completion_tokens);
-    insert_metric(&mut metrics, "tokens", usage.total_tokens);
-    insert_metric(&mut metrics, "reasoning_tokens", usage.reasoning_tokens);
+    insert_metric(&mut metrics, "prompt_tokens", usage.prompt_tokens());
+    insert_metric(&mut metrics, "completion_tokens", usage.completion_tokens());
+    insert_metric(&mut metrics, "tokens", usage.total_tokens());
+    insert_metric(&mut metrics, "reasoning_tokens", usage.reasoning_tokens());
     insert_metric(
         &mut metrics,
         "completion_reasoning_tokens",
-        usage.completion_reasoning_tokens,
+        usage.completion_reasoning_tokens(),
     );
     insert_metric(
         &mut metrics,
         "prompt_cached_tokens",
-        usage.prompt_cached_tokens,
+        usage.prompt_cached_tokens(),
     );
     insert_metric(
         &mut metrics,
         "prompt_cache_creation_tokens",
-        usage.prompt_cache_creation_tokens,
+        usage.prompt_cache_creation_tokens(),
     );
 
-    if let Some(details) = usage.prompt_tokens_details {
-        insert_metric(&mut metrics, "prompt_audio_tokens", details.audio_tokens);
-        if usage.prompt_cached_tokens.is_none() {
-            insert_metric(&mut metrics, "prompt_cached_tokens", details.cached_tokens);
+    if let Some(details) = usage.prompt_tokens_details() {
+        insert_metric(&mut metrics, "prompt_audio_tokens", details.audio_tokens());
+        if usage.prompt_cached_tokens().is_none() {
+            insert_metric(
+                &mut metrics,
+                "prompt_cached_tokens",
+                details.cached_tokens(),
+            );
         }
-        if usage.prompt_cache_creation_tokens.is_none() {
+        if usage.prompt_cache_creation_tokens().is_none() {
             insert_metric(
                 &mut metrics,
                 "prompt_cache_creation_tokens",
-                details.cache_creation_tokens,
+                details.cache_creation_tokens(),
             );
         }
     }
 
-    if let Some(details) = usage.completion_tokens_details {
+    if let Some(details) = usage.completion_tokens_details() {
         insert_metric(
             &mut metrics,
             "completion_audio_tokens",
-            details.audio_tokens,
+            details.audio_tokens(),
         );
-        if usage.completion_reasoning_tokens.is_none() {
+        if usage.completion_reasoning_tokens().is_none() {
             insert_metric(
                 &mut metrics,
                 "completion_reasoning_tokens",
-                details.reasoning_tokens,
+                details.reasoning_tokens(),
             );
         }
         insert_metric(
             &mut metrics,
             "completion_accepted_prediction_tokens",
-            details.accepted_prediction_tokens,
+            details.accepted_prediction_tokens(),
         );
         insert_metric(
             &mut metrics,
             "completion_rejected_prediction_tokens",
-            details.rejected_prediction_tokens,
+            details.rejected_prediction_tokens(),
         );
     }
 
@@ -465,8 +667,13 @@ mod tests {
             org_name: None,
             input: None,
             output: None,
+            expected: None,
+            error: None,
+            scores: None,
             metadata: None,
             metrics: None,
+            tags: None,
+            context: None,
             span_attributes: None,
             created: Utc::now(),
         };
