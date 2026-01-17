@@ -1,3 +1,4 @@
+mod dataset;
 mod error;
 mod experiment;
 mod extractors;
@@ -8,12 +9,17 @@ mod stream;
 pub(crate) mod test_utils;
 mod types;
 
+pub use dataset::{
+    Dataset, DatasetBuilder, DatasetBuilderError, DatasetInsert, DatasetInsertBuilder,
+    DatasetInsertBuilderError, DatasetIterator, DatasetRecord, DatasetSummary,
+};
 pub use error::{BraintrustError, Result};
 pub use experiment::{
-    BaseExperimentInfo, Experiment, ExperimentBuilder, ExperimentBuilderError, ExperimentLog,
-    ExperimentLogBuilder, ExperimentLogBuilderError, ExperimentSpanBuilder, ExperimentSummary,
-    ExportedExperiment, Feedback, FeedbackBuilder, FeedbackBuilderError, GitMetadataCollect,
-    GitMetadataField, GitMetadataSettings, MetricSummary, ProjectMetadata, RepoInfo, ScoreSummary,
+    BaseExperimentInfo, Experiment, ExperimentBuilder, ExperimentBuilderError, ExperimentIterator,
+    ExperimentLog, ExperimentLogBuilder, ExperimentLogBuilderError, ExperimentRecord,
+    ExperimentSpanBuilder, ExperimentSummary, ExportedExperiment, Feedback, FeedbackBuilder,
+    FeedbackBuilderError, GitMetadataCollect, GitMetadataField, GitMetadataSettings, MetricSummary,
+    ProjectMetadata, ReadonlyExperiment, RepoInfo, ScoreSummary,
 };
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
 pub use logger::{BraintrustClient, BraintrustClientBuilder, LoginState, OrgInfo};

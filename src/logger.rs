@@ -11,6 +11,10 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use url::Url;
 
+use crate::dataset::{
+    BTQLQuery, BTQLResponse, DatasetBuilder, DatasetFetcher, DatasetRegisterRequest,
+    DatasetRegisterResponse, DatasetRegistrar, DatasetSummarizer, DatasetSummaryResponse,
+};
 use crate::error::{BraintrustError, Result};
 use crate::experiment::{
     BaseExperimentFetcher, BaseExperimentInfo, BaseExperimentRequest, BaseExperimentResponse,
@@ -304,23 +308,11 @@ impl BraintrustClient {
     pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder<Self>> {
         let state = self.wait_for_login_state().await?;
         let mut builder =
-            crate::span::SpanBuilder::new(Arc::new(self.clone()), &state.api_key, &state.org_id);
+            crate::span::SpanBuilder::new(Arc::new(self.clone()), &state.api_key, &state.org_name);
         if let Some(ref project) = self.inner.default_project {
             builder = builder.project_name(project);
         }
         Ok(builder)
-    }
-
-    /// Create a span builder with explicit token and org_id.
-    ///
-    /// Use this if you already have the org_id and don't want to use the login state.
-    pub fn span_builder_with_credentials(
-        &self,
-        token: impl Into<String>,
-        org_id: impl Into<String>,
-    ) -> crate::span::SpanBuilder<Self> {
-        let submitter = Arc::new(self.clone());
-        crate::span::SpanBuilder::new(submitter, token, org_id)
     }
 
     /// Perform login synchronously.
@@ -443,27 +435,72 @@ impl BraintrustClient {
         }
     }
 
-    /// Create an experiment builder with explicit credentials.
+    /// Create an experiment builder using the logged-in state and default project.
     ///
-    /// Note: This will be deprecated in favor of `experiment_builder()` once
-    /// the login-flow branch lands and credentials are stored in the client.
+    /// This waits for login to complete if it hasn't already.
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// use braintrust_sdk_rust::BraintrustClient;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = BraintrustClient::builder()
+    ///     .api_key("sk-...")
+    ///     .default_project("my-project")
+    ///     .build()
+    ///     .await?;
+    ///
     /// let experiment = client
-    ///     .experiment_builder_with_credentials(&api_key, &org_id)
-    ///     .project_name("my-project")
+    ///     .experiment_builder()
+    ///     .await?
     ///     .experiment_name("baseline")
     ///     .build()?;
+    /// # Ok(())
+    /// # }
     /// ```
-    pub fn experiment_builder_with_credentials(
-        &self,
-        token: impl Into<String>,
-        org_id: impl Into<String>,
-    ) -> ExperimentBuilder<Self> {
-        let submitter = Arc::new(self.clone());
-        ExperimentBuilder::new(submitter, token, org_id)
+    pub async fn experiment_builder(&self) -> Result<ExperimentBuilder<Self>> {
+        let state = self.wait_for_login_state().await?;
+        let mut builder =
+            ExperimentBuilder::new(Arc::new(self.clone()), &state.api_key, &state.org_name);
+        if let Some(ref project) = self.inner.default_project {
+            builder = builder.project_name(project);
+        }
+        Ok(builder)
+    }
+
+    /// Create a dataset builder using the logged-in state and default project.
+    ///
+    /// This waits for login to complete if it hasn't already.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use braintrust_sdk_rust::BraintrustClient;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = BraintrustClient::builder()
+    ///     .api_key("sk-...")
+    ///     .default_project("my-project")
+    ///     .build()
+    ///     .await?;
+    ///
+    /// let dataset = client
+    ///     .dataset_builder()
+    ///     .await?
+    ///     .dataset_name("test-cases")
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn dataset_builder(&self) -> Result<DatasetBuilder<Self>> {
+        let state = self.wait_for_login_state().await?;
+        let mut builder =
+            DatasetBuilder::new(Arc::new(self.clone()), &state.api_key, &state.org_name);
+        if let Some(ref project) = self.inner.default_project {
+            builder = builder.project_name(project);
+        }
+        Ok(builder)
     }
 
     /// Submit a span payload for logging (fire-and-forget).
@@ -590,6 +627,74 @@ impl ExperimentComparisonFetcher for BraintrustClient {
     }
 }
 
+#[async_trait]
+impl DatasetRegistrar for BraintrustClient {
+    async fn register_dataset(
+        &self,
+        token: &str,
+        request: DatasetRegisterRequest,
+    ) -> Result<DatasetRegisterResponse> {
+        let (tx, rx) = oneshot::channel();
+        let cmd = LogCommand::RegisterDataset(Box::new(RegisterDatasetCommand {
+            token: token.to_string(),
+            request,
+            response: tx,
+        }));
+        self.inner
+            .sender
+            .send(cmd)
+            .await
+            .map_err(|_| BraintrustError::ChannelClosed)?;
+        rx.await
+            .map_err(|_| BraintrustError::ChannelClosed)?
+            .map_err(|e| BraintrustError::Background(e.to_string()))
+    }
+}
+
+#[async_trait]
+impl DatasetFetcher for BraintrustClient {
+    async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse> {
+        let (tx, rx) = oneshot::channel();
+        let cmd = LogCommand::FetchDatasetRecords(Box::new(FetchDatasetRecordsCommand {
+            token: token.to_string(),
+            query,
+            response: tx,
+        }));
+        self.inner
+            .sender
+            .send(cmd)
+            .await
+            .map_err(|_| BraintrustError::ChannelClosed)?;
+        rx.await
+            .map_err(|_| BraintrustError::ChannelClosed)?
+            .map_err(|e| BraintrustError::Background(e.to_string()))
+    }
+}
+
+#[async_trait]
+impl DatasetSummarizer for BraintrustClient {
+    async fn fetch_dataset_summary(
+        &self,
+        token: &str,
+        dataset_id: &str,
+    ) -> Result<DatasetSummaryResponse> {
+        let (tx, rx) = oneshot::channel();
+        let cmd = LogCommand::FetchDatasetSummary(Box::new(FetchDatasetSummaryCommand {
+            token: token.to_string(),
+            dataset_id: dataset_id.to_string(),
+            response: tx,
+        }));
+        self.inner
+            .sender
+            .send(cmd)
+            .await
+            .map_err(|_| BraintrustError::ChannelClosed)?;
+        rx.await
+            .map_err(|_| BraintrustError::ChannelClosed)?
+            .map_err(|e| BraintrustError::Background(e.to_string()))
+    }
+}
+
 enum LogCommand {
     Submit(Box<SubmitCommand>),
     Flush(oneshot::Sender<std::result::Result<(), anyhow::Error>>),
@@ -599,6 +704,12 @@ enum LogCommand {
     FetchBaseExperiment(Box<FetchBaseExperimentCommand>),
     /// Fetch experiment comparison data.
     FetchExperimentComparison(Box<FetchExperimentComparisonCommand>),
+    /// Register a dataset.
+    RegisterDataset(Box<RegisterDatasetCommand>),
+    /// Fetch dataset records via BTQL.
+    FetchDatasetRecords(Box<FetchDatasetRecordsCommand>),
+    /// Fetch dataset summary.
+    FetchDatasetSummary(Box<FetchDatasetSummaryCommand>),
 }
 
 struct RegisterExperimentCommand {
@@ -618,6 +729,24 @@ struct FetchExperimentComparisonCommand {
     experiment_id: String,
     base_experiment_id: Option<String>,
     response: oneshot::Sender<std::result::Result<ExperimentComparisonResponse, anyhow::Error>>,
+}
+
+struct RegisterDatasetCommand {
+    token: String,
+    request: DatasetRegisterRequest,
+    response: oneshot::Sender<std::result::Result<DatasetRegisterResponse, anyhow::Error>>,
+}
+
+struct FetchDatasetRecordsCommand {
+    token: String,
+    query: BTQLQuery,
+    response: oneshot::Sender<std::result::Result<BTQLResponse, anyhow::Error>>,
+}
+
+struct FetchDatasetSummaryCommand {
+    token: String,
+    dataset_id: String,
+    response: oneshot::Sender<std::result::Result<DatasetSummaryResponse, anyhow::Error>>,
 }
 
 struct SubmitCommand {
@@ -698,6 +827,33 @@ async fn run_worker(api_url: Url, app_url: Url, mut receiver: mpsc::Receiver<Log
                         base_experiment_id.as_deref(),
                     )
                     .await;
+                let _ = response.send(result);
+            }
+            LogCommand::RegisterDataset(cmd) => {
+                let RegisterDatasetCommand {
+                    token,
+                    request,
+                    response,
+                } = *cmd;
+                let result = state.register_dataset(&token, request).await;
+                let _ = response.send(result);
+            }
+            LogCommand::FetchDatasetRecords(cmd) => {
+                let FetchDatasetRecordsCommand {
+                    token,
+                    query,
+                    response,
+                } = *cmd;
+                let result = state.fetch_dataset_records(&token, query).await;
+                let _ = response.send(result);
+            }
+            LogCommand::FetchDatasetSummary(cmd) => {
+                let FetchDatasetSummaryCommand {
+                    token,
+                    dataset_id,
+                    response,
+                } = *cmd;
+                let result = state.fetch_dataset_summary(&token, &dataset_id).await;
                 let _ = response.send(result);
             }
         }
@@ -799,6 +955,9 @@ impl WorkerState {
                 None,
                 LogDestination::playground_logs(object_id),
             ),
+            Some(ParentSpanInfo::Dataset { object_id }) => {
+                (span_id.clone(), None, LogDestination::dataset(object_id))
+            }
             Some(ParentSpanInfo::FullSpan {
                 object_type,
                 object_id,
@@ -918,7 +1077,7 @@ impl WorkerState {
         request: ExperimentRegisterRequest,
     ) -> std::result::Result<ExperimentRegisterResponse, anyhow::Error> {
         let url = self
-            .base_url
+            .api_url
             .join("api/experiment/register")
             .map_err(|e| anyhow::anyhow!("invalid experiment register url: {e}"))?;
 
@@ -951,7 +1110,7 @@ impl WorkerState {
         experiment_id: &str,
     ) -> std::result::Result<Option<BaseExperimentInfo>, anyhow::Error> {
         let url = self
-            .base_url
+            .api_url
             .join("api/base_experiment/get_id")
             .map_err(|e| anyhow::anyhow!("invalid base experiment url: {e}"))?;
 
@@ -998,7 +1157,7 @@ impl WorkerState {
         base_experiment_id: Option<&str>,
     ) -> std::result::Result<ExperimentComparisonResponse, anyhow::Error> {
         let mut url = self
-            .base_url
+            .api_url
             .join("experiment-comparison2")
             .map_err(|e| anyhow::anyhow!("invalid experiment comparison url: {e}"))?;
 
@@ -1024,6 +1183,101 @@ impl WorkerState {
             .context("failed to parse experiment comparison response")?;
 
         Ok(comparison)
+    }
+
+    /// Register a dataset with the Braintrust API.
+    async fn register_dataset(
+        &self,
+        token: &str,
+        request: DatasetRegisterRequest,
+    ) -> std::result::Result<DatasetRegisterResponse, anyhow::Error> {
+        let url = self
+            .api_url
+            .join("api/dataset/register")
+            .map_err(|e| anyhow::anyhow!("invalid dataset register url: {e}"))?;
+
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .json(&request)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("register dataset failed: [{status}] {text}");
+        }
+
+        let register_response: DatasetRegisterResponse = response
+            .json()
+            .await
+            .context("failed to parse dataset registration response")?;
+
+        Ok(register_response)
+    }
+
+    /// Fetch dataset records via BTQL query.
+    async fn fetch_dataset_records(
+        &self,
+        token: &str,
+        query: BTQLQuery,
+    ) -> std::result::Result<BTQLResponse, anyhow::Error> {
+        let url = self
+            .api_url
+            .join("btql")
+            .map_err(|e| anyhow::anyhow!("invalid btql url: {e}"))?;
+
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .json(&query)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("btql query failed: [{status}] {text}");
+        }
+
+        let btql_response: BTQLResponse = response
+            .json()
+            .await
+            .context("failed to parse btql response")?;
+
+        Ok(btql_response)
+    }
+
+    /// Fetch dataset summary.
+    async fn fetch_dataset_summary(
+        &self,
+        token: &str,
+        dataset_id: &str,
+    ) -> std::result::Result<DatasetSummaryResponse, anyhow::Error> {
+        let mut url = self
+            .api_url
+            .join("dataset-summary")
+            .map_err(|e| anyhow::anyhow!("invalid dataset summary url: {e}"))?;
+
+        url.query_pairs_mut().append_pair("dataset_id", dataset_id);
+
+        let response = self.client.get(url).bearer_auth(token).send().await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("fetch dataset summary failed: [{status}] {text}");
+        }
+
+        let summary: DatasetSummaryResponse = response
+            .json()
+            .await
+            .context("failed to parse dataset summary response")?;
+
+        Ok(summary)
     }
 }
 
@@ -1426,7 +1680,7 @@ mod tests {
         span.flush().await.expect("flush");
         client.flush().await.expect("client flush");
 
-        // Verify the logs request was made with the correct org_id
+        // Verify the logs request was made with the correct org_name
         let logs_request = server
             .received_requests()
             .await
@@ -1438,65 +1692,8 @@ mod tests {
         let rows = body.get("rows").and_then(|r| r.as_array()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].get("org_id").and_then(|v| v.as_str()),
-            Some("org-123")
-        );
-    }
-
-    #[tokio::test]
-    async fn span_builder_with_credentials_bypasses_login() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/api/project/register"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "project": { "id": "proj-id" }
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/logs3"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-            .mount(&server)
-            .await;
-
-        // Create client without any login mock - background login will fail
-        let client = BraintrustClient::builder()
-            .api_key("test-api-key")
-            .app_url(server.uri())
-            .api_url(server.uri())
-            .build()
-            .await
-            .expect("client");
-
-        // Use span_builder_with_credentials to bypass login
-        let span = client
-            .span_builder_with_credentials("explicit-token", "explicit-org-id")
-            .project_name("demo-project")
-            .build();
-
-        span.log(SpanLog {
-            input: Some(Value::String("test".into())),
-            ..Default::default()
-        })
-        .await;
-        span.flush().await.expect("flush");
-        client.flush().await.expect("client flush");
-
-        // Verify the logs request was made with the explicit org_id
-        let logs_request = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|request| request.url.path() == "/logs3")
-            .expect("logs request present");
-        let body: Value = serde_json::from_slice(&logs_request.body).expect("json");
-        let rows = body.get("rows").and_then(|r| r.as_array()).unwrap();
-        assert_eq!(
-            rows[0].get("org_id").and_then(|v| v.as_str()),
-            Some("explicit-org-id")
+            rows[0].get("org_name").and_then(|v| v.as_str()),
+            Some("Test Org")
         );
     }
 

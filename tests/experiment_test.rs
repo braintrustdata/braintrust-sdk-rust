@@ -3,9 +3,24 @@ use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+// Helper to create a mock login response
+fn mock_login_response(orgs: &[(&str, &str)]) -> ResponseTemplate {
+    let org_info: Vec<_> = orgs
+        .iter()
+        .map(|(id, name)| json!({ "id": id, "name": name }))
+        .collect();
+    ResponseTemplate::new(200).set_body_json(json!({ "org_info": org_info }))
+}
+
 #[tokio::test]
 async fn experiment_log_flushes_to_logs_endpoint() {
     let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
+        .mount(&server)
+        .await;
 
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
@@ -27,12 +42,15 @@ async fn experiment_log_flushes_to_logs_endpoint() {
         .api_key("token")
         .app_url(server.uri())
         .api_url(server.uri())
+        .blocking_login(true)
         .build()
         .await
         .expect("client");
 
     let experiment = client
-        .experiment_builder_with_credentials("token", "org-id")
+        .experiment_builder()
+        .await
+        .unwrap()
         .project_name("test-project")
         .experiment_name("test-experiment")
         .build()
@@ -73,15 +91,27 @@ async fn experiment_log_flushes_to_logs_endpoint() {
 
 #[tokio::test]
 async fn experiment_builder_requires_project_name() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
+        .mount(&server)
+        .await;
+
     let client = BraintrustClient::builder()
         .api_key("token")
-        .api_url("https://api.braintrust.dev")
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .blocking_login(true)
         .build()
         .await
         .expect("client");
 
     let result = client
-        .experiment_builder_with_credentials("token", "org-id")
+        .experiment_builder()
+        .await
+        .unwrap()
         .experiment_name("test-experiment")
         .build();
 
@@ -91,6 +121,12 @@ async fn experiment_builder_requires_project_name() {
 #[tokio::test]
 async fn experiment_log_feedback_sends_merge_event() {
     let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
+        .mount(&server)
+        .await;
 
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
@@ -112,12 +148,15 @@ async fn experiment_log_feedback_sends_merge_event() {
         .api_key("token")
         .app_url(server.uri())
         .api_url(server.uri())
+        .blocking_login(true)
         .build()
         .await
         .expect("client");
 
     let experiment = client
-        .experiment_builder_with_credentials("token", "org-id")
+        .experiment_builder()
+        .await
+        .unwrap()
         .project_name("test-project")
         .build()
         .expect("build experiment");
@@ -161,6 +200,12 @@ async fn experiment_log_feedback_sends_merge_event() {
 #[tokio::test]
 async fn experiment_summarize_returns_summary() {
     let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
+        .mount(&server)
+        .await;
 
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
@@ -207,12 +252,15 @@ async fn experiment_summarize_returns_summary() {
         .api_key("token")
         .app_url(server.uri())
         .api_url(server.uri())
+        .blocking_login(true)
         .build()
         .await
         .expect("client");
 
     let experiment = client
-        .experiment_builder_with_credentials("token", "org-id")
+        .experiment_builder()
+        .await
+        .unwrap()
         .project_name("test-project")
         .experiment_name("my-experiment")
         .build()

@@ -402,6 +402,57 @@ impl ExperimentSummary {
         self.metrics = Some(metrics);
     }
 
+    /// Create an ExperimentSummary from a comparison API response.
+    pub(crate) fn from_comparison(response: ExperimentComparisonResponse) -> Self {
+        let mut summary = Self {
+            project_name: String::new(),
+            experiment_name: String::new(),
+            project_id: None,
+            experiment_id: None,
+            project_url: None,
+            experiment_url: None,
+            comparison_experiment_name: response.base_experiment_name,
+            scores: HashMap::new(),
+            metrics: None,
+        };
+
+        // Convert comparison scores to ScoreSummary
+        for (key, data) in response.scores {
+            let mut score_summary = ScoreSummary::new(key.clone(), data.score);
+            if let Some(diff) = data.diff {
+                score_summary.set_diff(diff);
+            }
+            if let Some(improvements) = data.improvements {
+                score_summary.set_improvements(improvements);
+            }
+            if let Some(regressions) = data.regressions {
+                score_summary.set_regressions(regressions);
+            }
+            summary.scores.insert(key, score_summary);
+        }
+
+        // Convert comparison metrics to MetricSummary
+        let metrics: HashMap<String, MetricSummary> = response
+            .metrics
+            .into_iter()
+            .map(|(key, data)| {
+                let mut metric_summary = MetricSummary::new(key.clone(), data.metric);
+                if let Some(unit) = data.unit {
+                    metric_summary.set_unit(unit);
+                }
+                if let Some(diff) = data.diff {
+                    metric_summary.set_diff(diff);
+                }
+                (key, metric_summary)
+            })
+            .collect();
+        if !metrics.is_empty() {
+            summary.metrics = Some(metrics);
+        }
+
+        summary
+    }
+
     /// Get the project name.
     pub fn project_name(&self) -> &str {
         &self.project_name
@@ -540,6 +591,11 @@ impl MetricSummary {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn set_unit(&mut self, unit: String) {
+        self.unit = Some(unit);
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn set_diff(&mut self, diff: f64) {
         self.diff = Some(diff);
     }
@@ -593,7 +649,7 @@ impl MetricSummary {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ExperimentRegisterRequest {
     pub project_name: String,
-    pub org_id: String,
+    pub org_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experiment_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -830,8 +886,7 @@ impl std::error::Error for ExperimentBuilderError {}
 pub struct ExperimentBuilder<S: SpanSubmitter> {
     submitter: Arc<S>,
     token: String,
-    org_id: String,
-    org_name: Option<String>,
+    org_name: String,
     project_name: Option<String>,
     experiment_name: Option<String>,
     description: Option<String>,
@@ -849,7 +904,6 @@ impl<S: SpanSubmitter> Clone for ExperimentBuilder<S> {
         Self {
             submitter: Arc::clone(&self.submitter),
             token: self.token.clone(),
-            org_id: self.org_id.clone(),
             org_name: self.org_name.clone(),
             project_name: self.project_name.clone(),
             experiment_name: self.experiment_name.clone(),
@@ -870,13 +924,12 @@ impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
     pub(crate) fn new(
         submitter: Arc<S>,
         token: impl Into<String>,
-        org_id: impl Into<String>,
+        org_name: impl Into<String>,
     ) -> Self {
         Self {
             submitter,
             token: token.into(),
-            org_id: org_id.into(),
-            org_name: None,
+            org_name: org_name.into(),
             project_name: None,
             experiment_name: None,
             description: None,
@@ -887,12 +940,6 @@ impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
             repo_info: None,
             git_metadata_settings: None,
         }
-    }
-
-    /// Set the organization name.
-    pub fn org_name(mut self, org_name: impl Into<String>) -> Self {
-        self.org_name = Some(org_name.into());
-        self
     }
 
     /// Set the project name (required).
@@ -974,7 +1021,6 @@ impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
         Ok(Experiment {
             submitter: self.submitter,
             token: self.token,
-            org_id: self.org_id,
             org_name: self.org_name,
             project_name,
             experiment_name: self.experiment_name,
@@ -1011,8 +1057,7 @@ struct ExperimentMetadata {
 pub struct Experiment<S: SpanSubmitter> {
     submitter: Arc<S>,
     token: String,
-    org_id: String,
-    org_name: Option<String>,
+    org_name: String,
     project_name: String,
     experiment_name: Option<String>,
     description: Option<String>,
@@ -1035,7 +1080,6 @@ impl<S: SpanSubmitter> Clone for Experiment<S> {
         Self {
             submitter: Arc::clone(&self.submitter),
             token: self.token.clone(),
-            org_id: self.org_id.clone(),
             org_name: self.org_name.clone(),
             project_name: self.project_name.clone(),
             experiment_name: self.experiment_name.clone(),
@@ -1162,8 +1206,8 @@ impl<
             row_id: id.to_string(),
             span_id: id.to_string(), // Use same ID for merge
             is_merge: true,
-            org_id: self.org_id.clone(),
-            org_name: self.org_name.clone(),
+            org_id: String::new(),
+            org_name: Some(self.org_name.clone()),
             project_name: None,
             input: None,
             output: None,
@@ -1344,8 +1388,8 @@ impl<
             row_id: id.to_string(),
             span_id: id.to_string(),
             is_merge: true,
-            org_id: self.org_id.clone(),
-            org_name: self.org_name.clone(),
+            org_id: String::new(),
+            org_name: Some(self.org_name.clone()),
             project_name: None,
             input: event.input,
             output: event.output,
@@ -1397,7 +1441,7 @@ impl<
             .get_or_init(|| async {
                 let request = ExperimentRegisterRequest {
                     project_name: self.project_name.clone(),
-                    org_id: self.org_id.clone(),
+                    org_name: self.org_name.clone(),
                     experiment_name: self.experiment_name.clone(),
                     description: self.description.clone(),
                     base_experiment: self.base_experiment.clone(),
@@ -1447,19 +1491,14 @@ impl<
 
         // Note: When using ParentSpanInfo::Experiment, we don't need project_name
         // because the destination is determined by the experiment_id.
-        let mut builder = SpanBuilder::new(
+        let span = SpanBuilder::new(
             Arc::clone(&self.submitter),
             self.token.clone(),
-            self.org_id.clone(),
+            self.org_name.clone(),
         )
         .parent_info(parent_info)
-        .span_type(SpanType::Eval);
-
-        if let Some(org_name) = &self.org_name {
-            builder = builder.org_name(org_name.clone());
-        }
-
-        let span = builder.build();
+        .span_type(SpanType::Eval)
+        .build();
 
         // If we have a custom start time, we'd need to set it
         // For now, the span uses its own creation time
@@ -1513,19 +1552,14 @@ impl<'a, S: SpanSubmitter + 'static> ExperimentSpanBuilder<'a, S> {
 
         // Note: When using ParentSpanInfo::Experiment, we don't need project_name
         // because the destination is determined by the experiment_id.
-        let mut builder = SpanBuilder::new(
+        SpanBuilder::new(
             Arc::clone(&self.experiment.submitter),
             self.experiment.token.clone(),
-            self.experiment.org_id.clone(),
+            self.experiment.org_name.clone(),
         )
         .parent_info(parent_info)
-        .span_type(self.span_type);
-
-        if let Some(org_name) = &self.experiment.org_name {
-            builder = builder.org_name(org_name.clone());
-        }
-
-        builder.build()
+        .span_type(self.span_type)
+        .build()
     }
 }
 
@@ -1562,6 +1596,238 @@ pub(crate) trait ExperimentComparisonFetcher: Send + Sync {
         experiment_id: &str,
         base_experiment_id: Option<&str>,
     ) -> Result<ExperimentComparisonResponse>;
+}
+
+// ============================================================================
+// ReadonlyExperiment - Read-only access to existing experiments
+// ============================================================================
+
+use crate::dataset::{BTQLQuery, BTQLQueryInner, DatasetFetcher, DatasetRecord};
+use std::collections::VecDeque;
+
+/// A record from an experiment (read-only).
+#[derive(Debug, Clone)]
+pub struct ExperimentRecord {
+    /// Unique identifier for this record.
+    pub id: String,
+    /// The input data.
+    pub input: Option<Value>,
+    /// The output data.
+    pub output: Option<Value>,
+    /// The expected output.
+    pub expected: Option<Value>,
+    /// Error information if any.
+    pub error: Option<Value>,
+    /// Scores associated with this record.
+    pub scores: Option<HashMap<String, Value>>,
+    /// Additional metadata.
+    pub metadata: Option<Map<String, Value>>,
+    /// Tags for categorization.
+    pub tags: Option<Vec<String>>,
+}
+
+impl ExperimentRecord {
+    /// Convert this experiment record to a dataset record.
+    ///
+    /// This allows using experiment data as a dataset for evaluation.
+    pub fn into_dataset_record(self) -> DatasetRecord {
+        DatasetRecord {
+            id: self.id,
+            input: self.input,
+            expected: self.expected.or(self.output), // Use expected if available, fallback to output
+            metadata: self.metadata,
+            tags: self.tags,
+            xact_id: None,
+            created: None,
+        }
+    }
+}
+
+/// A read-only view of an existing experiment.
+///
+/// Use this to fetch records from a completed experiment, useful for:
+/// - Comparing against baseline experiments
+/// - Using experiment results as dataset for new evaluations
+/// - Analyzing historical experiment data
+#[allow(private_bounds)]
+pub struct ReadonlyExperiment<S: DatasetFetcher + ExperimentComparisonFetcher> {
+    fetcher: Arc<S>,
+    token: String,
+    experiment_id: String,
+    #[allow(dead_code)]
+    experiment_name: Option<String>,
+    #[allow(dead_code)]
+    project_name: Option<String>,
+}
+
+impl<S: DatasetFetcher + ExperimentComparisonFetcher> fmt::Debug for ReadonlyExperiment<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadonlyExperiment")
+            .field("experiment_id", &self.experiment_id)
+            .field("experiment_name", &self.experiment_name)
+            .field("project_name", &self.project_name)
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(private_bounds)]
+impl<S: DatasetFetcher + ExperimentComparisonFetcher> ReadonlyExperiment<S> {
+    /// Create a new ReadonlyExperiment.
+    pub fn new(
+        fetcher: Arc<S>,
+        token: impl Into<String>,
+        experiment_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            fetcher,
+            token: token.into(),
+            experiment_id: experiment_id.into(),
+            experiment_name: None,
+            project_name: None,
+        }
+    }
+
+    /// Get the experiment ID.
+    pub fn experiment_id(&self) -> &str {
+        &self.experiment_id
+    }
+
+    /// Fetch records from this experiment with pagination.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch_size` - Number of records to fetch per batch (default: 100)
+    pub async fn fetch(&self, batch_size: Option<usize>) -> ExperimentIterator<S> {
+        ExperimentIterator::new(
+            Arc::clone(&self.fetcher),
+            self.token.clone(),
+            self.experiment_id.clone(),
+            batch_size.unwrap_or(100),
+        )
+    }
+
+    /// Get the experiment summary.
+    pub async fn summarize(&self) -> Result<ExperimentSummary> {
+        let response = self
+            .fetcher
+            .fetch_experiment_comparison(&self.token, &self.experiment_id, None)
+            .await?;
+
+        Ok(ExperimentSummary::from_comparison(response))
+    }
+
+    /// Fetch all records and convert to dataset records.
+    ///
+    /// This is useful for using experiment results as input for new evaluations.
+    pub async fn as_dataset(&self) -> Vec<DatasetRecord> {
+        let iter = self.fetch(Some(100)).await;
+        iter.collect()
+            .await
+            .into_iter()
+            .map(|r| r.into_dataset_record())
+            .collect()
+    }
+}
+
+/// Iterator for fetching experiment records with pagination.
+#[allow(private_bounds)]
+pub struct ExperimentIterator<S: DatasetFetcher> {
+    fetcher: Arc<S>,
+    token: String,
+    experiment_id: String,
+    batch_size: usize,
+    cursor: Option<String>,
+    buffer: VecDeque<ExperimentRecord>,
+    done: bool,
+}
+
+#[allow(private_bounds)]
+impl<S: DatasetFetcher> ExperimentIterator<S> {
+    fn new(fetcher: Arc<S>, token: String, experiment_id: String, batch_size: usize) -> Self {
+        Self {
+            fetcher,
+            token,
+            experiment_id,
+            batch_size,
+            cursor: None,
+            buffer: VecDeque::new(),
+            done: false,
+        }
+    }
+
+    /// Get the next record, fetching more from the API if needed.
+    pub async fn next(&mut self) -> Option<ExperimentRecord> {
+        // Return from buffer if available
+        if let Some(record) = self.buffer.pop_front() {
+            return Some(record);
+        }
+
+        // If we're done, return None
+        if self.done {
+            return None;
+        }
+
+        // Fetch next batch
+        self.fetch_next_batch().await;
+
+        // Return first item from newly fetched batch
+        self.buffer.pop_front()
+    }
+
+    async fn fetch_next_batch(&mut self) {
+        // Note: BTQL queries for experiments use the same endpoint as datasets
+        // but with experiment() reference
+        let query = BTQLQuery {
+            query: BTQLQueryInner {
+                from: format!("experiment('{}')", self.experiment_id),
+                limit: Some(self.batch_size),
+                cursor: self.cursor.clone(),
+            },
+        };
+
+        match self.fetcher.fetch_dataset_records(&self.token, query).await {
+            Ok(response) => {
+                // Parse records from response
+                for record in response.data {
+                    self.buffer.push_back(Self::convert_dataset_record(record));
+                }
+
+                // Update cursor
+                self.cursor = response.cursor;
+
+                // Mark done if no more data
+                if self.buffer.is_empty() || self.cursor.is_none() {
+                    self.done = true;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to fetch experiment records: {}", e);
+                self.done = true;
+            }
+        }
+    }
+
+    fn convert_dataset_record(record: DatasetRecord) -> ExperimentRecord {
+        ExperimentRecord {
+            id: record.id,
+            input: record.input,
+            output: None, // DatasetRecord doesn't have output
+            expected: record.expected,
+            error: None,  // DatasetRecord doesn't have error
+            scores: None, // DatasetRecord doesn't have scores
+            metadata: record.metadata,
+            tags: record.tags,
+        }
+    }
+
+    /// Collect all remaining records into a vector.
+    pub async fn collect(mut self) -> Vec<ExperimentRecord> {
+        let mut records = Vec::new();
+        while let Some(record) = self.next().await {
+            records.push(record);
+        }
+        records
+    }
 }
 
 // ============================================================================

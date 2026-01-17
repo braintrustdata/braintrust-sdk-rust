@@ -3,9 +3,24 @@ use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+// Helper to create a mock login response
+fn mock_login_response(orgs: &[(&str, &str)]) -> ResponseTemplate {
+    let org_info: Vec<_> = orgs
+        .iter()
+        .map(|(id, name)| json!({ "id": id, "name": name }))
+        .collect();
+    ResponseTemplate::new(200).set_body_json(json!({ "org_info": org_info }))
+}
+
 #[tokio::test]
 async fn submits_with_bearer_token() {
     let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
+        .mount(&server)
+        .await;
 
     Mock::given(method("POST"))
         .and(path("/api/project/register"))
@@ -26,12 +41,15 @@ async fn submits_with_bearer_token() {
         .api_key("test-key")
         .api_url(server.uri())
         .app_url(server.uri())
+        .blocking_login(true)
         .build()
         .await
         .expect("client");
 
     let span = client
-        .span_builder_with_credentials("secret-token", "org")
+        .span_builder()
+        .await
+        .unwrap()
         .project_name("demo")
         .build();
     span.log(
@@ -61,6 +79,12 @@ async fn flush_is_fire_and_forget() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
         .and(path("/api/project/register"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
@@ -70,12 +94,15 @@ async fn flush_is_fire_and_forget() {
         .api_key("test-key")
         .api_url(server.uri())
         .app_url(server.uri())
+        .blocking_login(true)
         .build()
         .await
         .expect("client");
 
     let span = client
-        .span_builder_with_credentials("secret-token", "org")
+        .span_builder()
+        .await
+        .unwrap()
         .project_name("demo")
         .build();
 
