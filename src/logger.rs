@@ -177,7 +177,7 @@ impl BraintrustClientBuilder {
             .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
 
         let (sender, receiver) = mpsc::channel(self.queue_size.max(32));
-        let worker = tokio::spawn(run_worker(api_url.clone(), receiver));
+        let worker = tokio::spawn(run_worker(api_url.clone(), app_url.clone(), receiver));
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
@@ -520,8 +520,8 @@ struct ProjectInfo {
     id: String,
 }
 
-async fn run_worker(base_url: Url, mut receiver: mpsc::Receiver<LogCommand>) {
-    let mut state = WorkerState::new(base_url);
+async fn run_worker(api_url: Url, app_url: Url, mut receiver: mpsc::Receiver<LogCommand>) {
+    let mut state = WorkerState::new(api_url, app_url);
     while let Some(cmd) = receiver.recv().await {
         match cmd {
             LogCommand::Submit(cmd) => {
@@ -543,19 +543,23 @@ async fn run_worker(base_url: Url, mut receiver: mpsc::Receiver<LogCommand>) {
 }
 
 struct WorkerState {
-    base_url: Url,
+    /// URL for data plane requests (e.g., /logs3)
+    api_url: Url,
+    /// URL for control plane requests (e.g., /api/project/register)
+    app_url: Url,
     client: reqwest::Client,
     project_cache: HashMap<String, String>,
 }
 
 impl WorkerState {
-    fn new(base_url: Url) -> Self {
+    fn new(api_url: Url, app_url: Url) -> Self {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("reqwest client");
         Self {
-            base_url,
+            api_url,
+            app_url,
             client,
             project_cache: HashMap::new(),
         }
@@ -591,7 +595,7 @@ impl WorkerState {
         };
 
         let logs_url = self
-            .base_url
+            .api_url
             .join("logs3")
             .map_err(|e| anyhow::anyhow!("invalid logs url: {e}"))?;
 
@@ -709,7 +713,7 @@ impl WorkerState {
         };
 
         let url = self
-            .base_url
+            .app_url
             .join("api/project/register")
             .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
         let response = self
@@ -1202,6 +1206,92 @@ mod tests {
         assert_eq!(
             rows[0].get("org_id").and_then(|v| v.as_str()),
             Some("explicit-org-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn separate_urls_for_data_and_control_plane() {
+        // Use two separate mock servers to verify requests go to the correct URLs
+        let api_server = MockServer::start().await; // Data plane: /logs3
+        let app_server = MockServer::start().await; // Control plane: /api/project/register, /api/apikey/login
+
+        // Mount login mock on app_server
+        Mock::given(method("POST"))
+            .and(path("/api/apikey/login"))
+            .respond_with(mock_login_response(&[("org-id", "Test Org")]))
+            .mount(&app_server)
+            .await;
+
+        // Mount project registration on app_server (control plane)
+        Mock::given(method("POST"))
+            .and(path("/api/project/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "project": { "id": "proj-id" }
+            })))
+            .expect(1)
+            .mount(&app_server)
+            .await;
+
+        // Mount logs endpoint on api_server (data plane)
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&api_server)
+            .await;
+
+        let client = BraintrustClient::builder()
+            .api_key("test-api-key")
+            .app_url(app_server.uri()) // Control plane
+            .api_url(api_server.uri()) // Data plane
+            .blocking_login(true)
+            .build()
+            .await
+            .expect("client");
+
+        let span = client
+            .span_builder()
+            .await
+            .expect("span_builder")
+            .project_name("test-project")
+            .build();
+
+        span.log(SpanLog {
+            input: Some(Value::String("test".into())),
+            ..Default::default()
+        })
+        .await;
+        span.flush().await.expect("flush");
+        client.flush().await.expect("client flush");
+
+        // Verify api_server received the /logs3 request
+        let api_requests = api_server.received_requests().await.unwrap();
+        assert_eq!(api_requests.len(), 1);
+        assert_eq!(api_requests[0].url.path(), "/logs3");
+
+        // Verify app_server received the /api/project/register request (and login)
+        let app_requests = app_server.received_requests().await.unwrap();
+        let register_requests: Vec<_> = app_requests
+            .iter()
+            .filter(|r| r.url.path() == "/api/project/register")
+            .collect();
+        assert_eq!(register_requests.len(), 1);
+
+        // Verify app_server did NOT receive /logs3
+        let logs_on_app: Vec<_> = app_requests
+            .iter()
+            .filter(|r| r.url.path() == "/logs3")
+            .collect();
+        assert!(logs_on_app.is_empty(), "/logs3 should not go to app_server");
+
+        // Verify api_server did NOT receive /api/project/register
+        let register_on_api: Vec<_> = api_requests
+            .iter()
+            .filter(|r| r.url.path() == "/api/project/register")
+            .collect();
+        assert!(
+            register_on_api.is_empty(),
+            "/api/project/register should not go to api_server"
         );
     }
 }
