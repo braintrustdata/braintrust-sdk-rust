@@ -586,14 +586,8 @@ mod tests {
             SpanObjectType::try_from(3),
             Ok(SpanObjectType::PlaygroundLogs)
         );
-        assert_eq!(
-            SpanObjectType::try_from(0),
-            Err(InvalidSpanObjectType(0))
-        );
-        assert_eq!(
-            SpanObjectType::try_from(99),
-            Err(InvalidSpanObjectType(99))
-        );
+        assert_eq!(SpanObjectType::try_from(0), Err(InvalidSpanObjectType(0)));
+        assert_eq!(SpanObjectType::try_from(99), Err(InvalidSpanObjectType(99)));
     }
 
     #[test]
