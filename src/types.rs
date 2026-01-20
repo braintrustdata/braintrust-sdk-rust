@@ -33,6 +33,31 @@ impl fmt::Display for SpanObjectType {
     }
 }
 
+/// Error returned when an invalid u8 value is converted to SpanObjectType.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSpanObjectType(pub u8);
+
+impl fmt::Display for InvalidSpanObjectType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid SpanObjectType value: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidSpanObjectType {}
+
+impl TryFrom<u8> for SpanObjectType {
+    type Error = InvalidSpanObjectType;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(SpanObjectType::Experiment),
+            2 => Ok(SpanObjectType::ProjectLogs),
+            3 => Ok(SpanObjectType::PlaygroundLogs),
+            _ => Err(InvalidSpanObjectType(value)),
+        }
+    }
+}
+
 /// The type of span.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -484,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_span_info_full_span_uses_typed_object_type() {
+    fn parent_span_info_full_span_serializes_object_type_as_u8() {
         let parent = ParentSpanInfo::FullSpan {
             object_type: SpanObjectType::Experiment,
             object_id: "exp-123".to_string(),
@@ -495,13 +520,13 @@ mod tests {
         let json = serde_json::to_value(&parent).unwrap();
         let obj = json.get("FullSpan").unwrap();
 
-        // SpanObjectType should serialize as u8 for wire compatibility
+        // SpanObjectType serializes as u8 for wire compatibility
         assert_eq!(obj.get("object_type").unwrap(), 1);
     }
 
     #[test]
     fn parent_span_info_deserializes_with_typed_object_type() {
-        // SpanObjectType deserializes from integer (wire format)
+        // Deserializes from integer (wire format) into SpanObjectType
         let json = json!({
             "FullSpan": {
                 "object_type": 1,
@@ -551,6 +576,18 @@ mod tests {
 
         let result: Result<ParentSpanInfo, _> = serde_json::from_value(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn span_object_type_try_from_u8() {
+        assert_eq!(SpanObjectType::try_from(1), Ok(SpanObjectType::Experiment));
+        assert_eq!(SpanObjectType::try_from(2), Ok(SpanObjectType::ProjectLogs));
+        assert_eq!(
+            SpanObjectType::try_from(3),
+            Ok(SpanObjectType::PlaygroundLogs)
+        );
+        assert_eq!(SpanObjectType::try_from(0), Err(InvalidSpanObjectType(0)));
+        assert_eq!(SpanObjectType::try_from(99), Err(InvalidSpanObjectType(99)));
     }
 
     #[test]
