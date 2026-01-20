@@ -12,6 +12,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::error::{BraintrustError, Result};
+use crate::prompt::{PromptBuilder, PromptFetchRequest, PromptFetchResponse, PromptFetcher};
 use crate::span::SpanSubmitter;
 use crate::types::{
     LogDestination, Logs3Request, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload,
@@ -438,6 +439,30 @@ impl BraintrustClient {
         }
     }
 
+    /// Create a prompt builder with explicit credentials.
+    ///
+    /// Note: This will be deprecated in favor of `prompt_builder()` once
+    /// the login-flow branch lands and credentials are stored in the client.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let prompt = client
+    ///     .prompt_builder_with_credentials(&api_key, &org_id)
+    ///     .project_name("my-project")
+    ///     .slug("greeting-prompt")
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn prompt_builder_with_credentials(
+        &self,
+        token: impl Into<String>,
+        org_id: impl Into<String>,
+    ) -> PromptBuilder<Self> {
+        let fetcher = Arc::new(self.clone());
+        PromptBuilder::new(fetcher, token, org_id)
+    }
+
     /// Submit a span payload for logging (fire-and-forget).
     ///
     /// Returns immediately after queuing. HTTP submission happens in the background.
@@ -487,9 +512,40 @@ impl SpanSubmitter for BraintrustClient {
     }
 }
 
+#[async_trait]
+impl PromptFetcher for BraintrustClient {
+    async fn fetch_prompt(
+        &self,
+        token: &str,
+        request: PromptFetchRequest,
+    ) -> Result<PromptFetchResponse> {
+        let (tx, rx) = oneshot::channel();
+        let cmd = LogCommand::FetchPrompt(Box::new(FetchPromptCommand {
+            token: token.to_string(),
+            request,
+            response: tx,
+        }));
+        self.inner
+            .sender
+            .send(cmd)
+            .await
+            .map_err(|_| BraintrustError::ChannelClosed)?;
+        rx.await
+            .map_err(|_| BraintrustError::ChannelClosed)?
+            .map_err(|e| BraintrustError::Background(e.to_string()))
+    }
+}
+
 enum LogCommand {
     Submit(Box<SubmitCommand>),
     Flush(oneshot::Sender<std::result::Result<(), anyhow::Error>>),
+    FetchPrompt(Box<FetchPromptCommand>),
+}
+
+struct FetchPromptCommand {
+    token: String,
+    request: PromptFetchRequest,
+    response: oneshot::Sender<std::result::Result<PromptFetchResponse, anyhow::Error>>,
 }
 
 struct SubmitCommand {
@@ -537,6 +593,15 @@ async fn run_worker(api_url: Url, app_url: Url, mut receiver: mpsc::Receiver<Log
             }
             LogCommand::Flush(response) => {
                 let _ = response.send(Ok(()));
+            }
+            LogCommand::FetchPrompt(cmd) => {
+                let FetchPromptCommand {
+                    token,
+                    request,
+                    response,
+                } = *cmd;
+                let result = state.fetch_prompt(&token, request).await;
+                let _ = response.send(result);
             }
         }
     }
@@ -737,6 +802,53 @@ impl WorkerState {
         self.project_cache
             .insert(cache_key, register_response.project.id.clone());
         Ok(register_response.project.id)
+    }
+
+    /// Fetch a prompt from the API.
+    async fn fetch_prompt(
+        &self,
+        token: &str,
+        request: PromptFetchRequest,
+    ) -> std::result::Result<PromptFetchResponse, anyhow::Error> {
+        // Build URL with query parameters
+        let mut url = self
+            .base_url
+            .join("v1/prompt")
+            .map_err(|e| anyhow::anyhow!("invalid prompt url: {e}"))?;
+
+        // Add query parameters
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("slug", &request.slug);
+
+            if let Some(project_id) = &request.project_id {
+                pairs.append_pair("project_id", project_id);
+            }
+            if let Some(project_name) = &request.project_name {
+                pairs.append_pair("project_name", project_name);
+            }
+            if let Some(version) = &request.version {
+                pairs.append_pair("version", version);
+            }
+            if let Some(environment) = &request.environment {
+                pairs.append_pair("environment", environment);
+            }
+        }
+
+        let response = self.client.get(url).bearer_auth(token).send().await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("fetch prompt failed: [{status}] {text}");
+        }
+
+        let prompt_response: PromptFetchResponse = response
+            .json()
+            .await
+            .context("failed to parse prompt response")?;
+
+        Ok(prompt_response)
     }
 }
 
