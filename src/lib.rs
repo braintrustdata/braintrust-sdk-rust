@@ -16,6 +16,6 @@ pub use stream::{
     OutputChoice, StreamMetadata, ToolCall,
 };
 pub use types::{
-    CompletionTokensDetails, ParentSpanInfo, PromptTokensDetails, SpanObjectType, SpanType, Usage,
-    UsageMetrics,
+    CompletionTokensDetails, InvalidSpanObjectType, ParentSpanInfo, PromptTokensDetails,
+    SpanObjectType, SpanType, Usage, UsageMetrics,
 };

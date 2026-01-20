@@ -33,15 +33,27 @@ impl fmt::Display for SpanObjectType {
     }
 }
 
+/// Error returned when an invalid u8 value is converted to SpanObjectType.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSpanObjectType(pub u8);
+
+impl fmt::Display for InvalidSpanObjectType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid SpanObjectType value: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidSpanObjectType {}
+
 impl TryFrom<u8> for SpanObjectType {
-    type Error = ();
+    type Error = InvalidSpanObjectType;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(SpanObjectType::Experiment),
             2 => Ok(SpanObjectType::ProjectLogs),
             3 => Ok(SpanObjectType::PlaygroundLogs),
-            _ => Err(()),
+            _ => Err(InvalidSpanObjectType(value)),
         }
     }
 }
@@ -574,8 +586,14 @@ mod tests {
             SpanObjectType::try_from(3),
             Ok(SpanObjectType::PlaygroundLogs)
         );
-        assert!(SpanObjectType::try_from(0).is_err());
-        assert!(SpanObjectType::try_from(99).is_err());
+        assert_eq!(
+            SpanObjectType::try_from(0),
+            Err(InvalidSpanObjectType(0))
+        );
+        assert_eq!(
+            SpanObjectType::try_from(99),
+            Err(InvalidSpanObjectType(99))
+        );
     }
 
     #[test]
