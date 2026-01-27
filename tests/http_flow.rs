@@ -34,10 +34,12 @@ async fn submits_with_bearer_token() {
         .span_builder_with_credentials("secret-token", "org")
         .project_name("demo")
         .build();
-    span.log(SpanLog {
-        input: Some(Value::String("input".into())),
-        ..Default::default()
-    })
+    span.log(
+        SpanLog::builder()
+            .input(Value::String("input".into()))
+            .build()
+            .expect("build"),
+    )
     .await;
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");

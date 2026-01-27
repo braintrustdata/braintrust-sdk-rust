@@ -580,8 +580,13 @@ impl WorkerState {
             project_name,
             input,
             output,
+            expected,
+            error,
+            scores,
             metadata,
             metrics,
+            tags,
+            context,
             span_attributes,
         } = payload;
 
@@ -659,8 +664,13 @@ impl WorkerState {
             org_name,
             input,
             output,
+            expected,
+            error,
+            scores,
             metadata,
             metrics,
+            tags,
+            context,
             span_attributes,
             created: Utc::now(),
         };
@@ -839,10 +849,12 @@ mod tests {
                 .expect("span_builder")
                 .project_name("demo-project")
                 .build();
-            span.log(SpanLog {
-                input: Some(Value::String("hello".into())),
-                ..Default::default()
-            })
+            span.log(
+                SpanLog::builder()
+                    .input(Value::String("hello".into()))
+                    .build()
+                    .expect("build"),
+            )
             .await;
             span.flush().await.expect("flush");
             client.flush().await.expect("client flush");
@@ -898,10 +910,12 @@ mod tests {
             .expect("span_builder")
             .project_name("demo-project")
             .build();
-        span.log(SpanLog {
-            input: Some(Value::String("input".into())),
-            ..Default::default()
-        })
+        span.log(
+            SpanLog::builder()
+                .input(Value::String("input".into()))
+                .build()
+                .expect("build"),
+        )
         .await;
         span.flush().await.expect("flush");
         client.flush().await.expect("client flush");

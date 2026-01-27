@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,15 +10,191 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanPayload, SpanType};
 
+/// Error type for SpanLog builder validation.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum SpanLogBuilderError {
+    /// A score value was outside the valid range (0.0 to 1.0).
+    ScoreOutOfRange { key: String, value: f64 },
+    /// A tag was empty or invalid.
+    InvalidTag { index: usize, reason: String },
+    /// A metric key was empty.
+    EmptyMetricKey,
+    /// A score key was empty.
+    EmptyScoreKey,
+}
+
+impl fmt::Display for SpanLogBuilderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ScoreOutOfRange { key, value } => {
+                write!(
+                    f,
+                    "score '{}' has value {} which is outside the valid range [0.0, 1.0]",
+                    key, value
+                )
+            }
+            Self::InvalidTag { index, reason } => {
+                write!(f, "tag at index {} is invalid: {}", index, reason)
+            }
+            Self::EmptyMetricKey => write!(f, "metric key cannot be empty"),
+            Self::EmptyScoreKey => write!(f, "score key cannot be empty"),
+        }
+    }
+}
+
+impl std::error::Error for SpanLogBuilderError {}
+
 /// Event data to log to a span. All fields are optional.
 /// Multiple calls to `log()` will merge data.
+///
+/// Use `SpanLog::builder()` to construct instances.
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct SpanLog {
-    pub name: Option<String>,
-    pub input: Option<Value>,
-    pub output: Option<Value>,
-    pub metadata: Option<Map<String, Value>>,
-    pub metrics: Option<HashMap<String, f64>>,
+    pub(crate) name: Option<String>,
+    pub(crate) input: Option<Value>,
+    pub(crate) output: Option<Value>,
+    /// Expected output for comparison (used in evaluations).
+    pub(crate) expected: Option<Value>,
+    /// Error that occurred during execution.
+    pub(crate) error: Option<Value>,
+    /// Score values (0-1 range recommended) for evaluation.
+    pub(crate) scores: Option<HashMap<String, f64>>,
+    pub(crate) metadata: Option<Map<String, Value>>,
+    pub(crate) metrics: Option<HashMap<String, f64>>,
+    /// Tags for categorization.
+    pub(crate) tags: Option<Vec<String>>,
+    /// Arbitrary context data.
+    pub(crate) context: Option<Value>,
+}
+
+impl SpanLog {
+    /// Create a new SpanLog builder.
+    pub fn builder() -> SpanLogBuilder {
+        SpanLogBuilder::new()
+    }
+}
+
+/// Builder for SpanLog.
+#[derive(Clone, Default)]
+pub struct SpanLogBuilder {
+    inner: SpanLog,
+}
+
+impl SpanLogBuilder {
+    /// Create a new SpanLogBuilder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the span name.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.inner.name = Some(name.into());
+        self
+    }
+
+    /// Set the input data.
+    pub fn input(mut self, input: impl Into<Value>) -> Self {
+        self.inner.input = Some(input.into());
+        self
+    }
+
+    /// Set the output data.
+    pub fn output(mut self, output: impl Into<Value>) -> Self {
+        self.inner.output = Some(output.into());
+        self
+    }
+
+    /// Set the expected output for comparison (used in evaluations).
+    pub fn expected(mut self, expected: impl Into<Value>) -> Self {
+        self.inner.expected = Some(expected.into());
+        self
+    }
+
+    /// Set the error that occurred during execution.
+    pub fn error(mut self, error: impl Into<Value>) -> Self {
+        self.inner.error = Some(error.into());
+        self
+    }
+
+    /// Set multiple scores at once.
+    pub fn scores(mut self, scores: HashMap<String, f64>) -> Self {
+        self.inner.scores = Some(scores);
+        self
+    }
+
+    /// Add a single score (0-1 range recommended).
+    pub fn score(mut self, key: impl Into<String>, value: f64) -> Self {
+        self.inner
+            .scores
+            .get_or_insert_with(HashMap::new)
+            .insert(key.into(), value);
+        self
+    }
+
+    /// Set the metadata map.
+    pub fn metadata(mut self, metadata: Map<String, Value>) -> Self {
+        self.inner.metadata = Some(metadata);
+        self
+    }
+
+    /// Add a single metadata entry.
+    pub fn metadata_entry(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.inner
+            .metadata
+            .get_or_insert_with(Map::new)
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// Set the metrics map.
+    pub fn metrics(mut self, metrics: HashMap<String, f64>) -> Self {
+        self.inner.metrics = Some(metrics);
+        self
+    }
+
+    /// Add a single metric.
+    pub fn metric(mut self, key: impl Into<String>, value: f64) -> Self {
+        self.inner
+            .metrics
+            .get_or_insert_with(HashMap::new)
+            .insert(key.into(), value);
+        self
+    }
+
+    /// Set multiple tags at once.
+    pub fn tags(mut self, tags: Vec<String>) -> Self {
+        self.inner.tags = Some(tags);
+        self
+    }
+
+    /// Add a single tag for categorization.
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.inner
+            .tags
+            .get_or_insert_with(Vec::new)
+            .push(tag.into());
+        self
+    }
+
+    /// Set arbitrary context data.
+    pub fn context(mut self, context: impl Into<Value>) -> Self {
+        self.inner.context = Some(context.into());
+        self
+    }
+
+    /// Build the SpanLog.
+    ///
+    /// Currently this always succeeds, but returns a `Result` to allow
+    /// for future validation (e.g., score range checking) without breaking changes.
+    pub fn build(self) -> std::result::Result<SpanLog, SpanLogBuilderError> {
+        // Future validation can be added here, e.g.:
+        // - Validate scores are in 0-1 range
+        // - Validate tags are non-empty
+        // - Validate metric/score keys are non-empty
+        Ok(self.inner)
+    }
 }
 
 #[async_trait]
@@ -167,6 +344,17 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         if let Some(output) = event.output {
             inner.output = Some(output);
         }
+        if let Some(expected) = event.expected {
+            inner.expected = Some(expected);
+        }
+        if let Some(error) = event.error {
+            inner.error = Some(error);
+        }
+        if let Some(scores) = event.scores {
+            for (key, value) in scores {
+                inner.scores.insert(key, value);
+            }
+        }
         if let Some(metadata) = event.metadata {
             for (key, value) in metadata {
                 inner.metadata.insert(key, value);
@@ -176,6 +364,12 @@ impl<S: SpanSubmitter> SpanHandle<S> {
             for (key, value) in metrics {
                 inner.metrics.insert(key, value);
             }
+        }
+        if let Some(tags) = event.tags {
+            inner.tags.extend(tags);
+        }
+        if let Some(context) = event.context {
+            inner.context = Some(context);
         }
     }
 
@@ -228,8 +422,13 @@ struct SpanData {
     purpose: Option<String>,
     input: Option<Value>,
     output: Option<Value>,
+    expected: Option<Value>,
+    error: Option<Value>,
+    scores: HashMap<String, f64>,
     metadata: Map<String, Value>,
     metrics: HashMap<String, f64>,
+    tags: Vec<String>,
+    context: Option<Value>,
     start_time: Option<f64>,
 }
 
@@ -256,8 +455,13 @@ impl From<SpanData> for SpanPayload {
             project_name: data.project_name,
             input: data.input,
             output: data.output,
+            expected: data.expected,
+            error: data.error,
+            scores: (!data.scores.is_empty()).then_some(data.scores),
             metadata: (!data.metadata.is_empty()).then_some(data.metadata),
             metrics: (!data.metrics.is_empty()).then_some(data.metrics),
+            tags: (!data.tags.is_empty()).then_some(data.tags),
+            context: data.context,
             span_attributes: has_attributes.then_some(span_attributes),
         }
     }
@@ -273,11 +477,13 @@ mod tests {
     #[tokio::test]
     async fn span_logs_input_and_output() {
         let (span, collector) = build_test_span();
-        span.log(SpanLog {
-            input: Some(json!({"input": "hello"})),
-            output: Some(json!({"output": "world"})),
-            ..Default::default()
-        })
+        span.log(
+            SpanLog::builder()
+                .input(json!({"input": "hello"}))
+                .output(json!({"output": "world"}))
+                .build()
+                .expect("build"),
+        )
         .await;
         span.flush().await.expect("flush");
 
@@ -291,17 +497,19 @@ mod tests {
     #[tokio::test]
     async fn span_logs_metadata_and_metrics() {
         let (span, collector) = build_test_span();
-        span.log(SpanLog {
-            metadata: Some([("foo".to_string(), json!("bar"))].into_iter().collect()),
-            metrics: Some(usage_metrics_to_map(UsageMetrics {
-                prompt_tokens: Some(10),
-                completion_tokens: Some(5),
-                total_tokens: Some(15),
-                reasoning_tokens: None,
-                ..Default::default()
-            })),
-            ..Default::default()
-        })
+        span.log(
+            SpanLog::builder()
+                .metadata([("foo".to_string(), json!("bar"))].into_iter().collect())
+                .metrics(usage_metrics_to_map(UsageMetrics {
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(5),
+                    total_tokens: Some(15),
+                    reasoning_tokens: None,
+                    ..Default::default()
+                }))
+                .build()
+                .expect("build"),
+        )
         .await;
         span.flush().await.expect("flush");
 
@@ -323,10 +531,12 @@ mod tests {
                 object_id: "proj-id".into(),
             })
             .build();
-        span.log(SpanLog {
-            input: Some(json!("data")),
-            ..Default::default()
-        })
+        span.log(
+            SpanLog::builder()
+                .input(json!("data"))
+                .build()
+                .expect("build"),
+        )
         .await;
         span.flush().await.expect("flush");
 
@@ -339,5 +549,58 @@ mod tests {
             captured.parent,
             Some(ParentSpanInfo::ProjectLogs { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn span_logs_scores_expected_and_tags() {
+        let (span, collector) = build_test_span();
+        span.log(
+            SpanLog::builder()
+                .output(json!({"answer": "Paris"}))
+                .expected(json!({"answer": "Paris"}))
+                .scores(
+                    [
+                        ("accuracy".to_string(), 1.0),
+                        ("relevance".to_string(), 0.95),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+                .tags(vec!["geography".to_string(), "qa".to_string()])
+                .context(json!({"source": "test"}))
+                .build()
+                .expect("build"),
+        )
+        .await;
+        span.flush().await.expect("flush");
+
+        let captured = collector.spans().into_iter().next().unwrap();
+        assert_eq!(captured.payload.expected, Some(json!({"answer": "Paris"})));
+        let scores = captured.payload.scores.unwrap();
+        assert_eq!(scores.get("accuracy").copied(), Some(1.0));
+        assert_eq!(scores.get("relevance").copied(), Some(0.95));
+        let tags = captured.payload.tags.unwrap();
+        assert!(tags.contains(&"geography".to_string()));
+        assert!(tags.contains(&"qa".to_string()));
+        assert_eq!(captured.payload.context, Some(json!({"source": "test"})));
+    }
+
+    #[tokio::test]
+    async fn span_logs_error() {
+        let (span, collector) = build_test_span();
+        span.log(
+            SpanLog::builder()
+                .error(json!({"message": "Something went wrong", "code": 500}))
+                .build()
+                .expect("build"),
+        )
+        .await;
+        span.flush().await.expect("flush");
+
+        let captured = collector.spans().into_iter().next().unwrap();
+        assert_eq!(
+            captured.payload.error,
+            Some(json!({"message": "Something went wrong", "code": 500}))
+        );
     }
 }

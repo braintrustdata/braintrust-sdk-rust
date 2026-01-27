@@ -32,12 +32,14 @@ async fn main() -> anyhow::Result<()> {
         .project_name("my-project")
         .build();
 
-    // Log input/output using span.log()
-    span.log(SpanLog {
-        input: Some(json!({"prompt": "Hello, world!"})),
-        output: Some(json!({"response": "Hi there!"})),
-        ..Default::default()
-    }).await;
+    // Log input/output using span.log() with the builder pattern
+    span.log(
+        SpanLog::builder()
+            .input(json!({"prompt": "Hello, world!"}))
+            .output(json!({"response": "Hi there!"}))
+            .build()
+            .expect("Failed to build SpanLog")
+    ).await;
 
     // Flush the span data to Braintrust
     span.flush().await?;
