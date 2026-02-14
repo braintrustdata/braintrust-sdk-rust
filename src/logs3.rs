@@ -206,7 +206,7 @@ impl Logs3BatchUploader {
                 continue;
             }
             let payload = construct_logs3_payload(&chunk);
-            let payload_bytes = payload.as_bytes().len();
+            let payload_bytes = payload.len();
 
             if limits.can_use_overflow && payload_bytes > limits.max_request_size {
                 let overflow_result = self.submit_overflow(&chunk, payload, payload_bytes).await?;
@@ -429,7 +429,7 @@ impl RowPayload {
         let row_json = serde_json::to_string(row).map_err(|e| {
             BraintrustError::InvalidConfig(format!("failed to serialize logs3 row: {e}"))
         })?;
-        let row_bytes = row_json.as_bytes().len();
+        let row_bytes = row_json.len();
         let mut object_ids = Map::new();
         for key in OBJECT_ID_KEYS {
             if let Some(value) = row.get(key) {
