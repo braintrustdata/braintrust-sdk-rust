@@ -10,7 +10,10 @@ mod types;
 
 pub use error::{BraintrustError, Result};
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
-pub use logger::{BraintrustClient, BraintrustClientBuilder, LoginState, OrgInfo};
+pub use logger::{
+    BraintrustClient, BraintrustClientBuilder, LoginState, OrgInfo, DEFAULT_API_URL,
+    DEFAULT_APP_URL,
+};
 pub use logs3::{Logs3BatchUploader, Logs3UploadResult};
 pub use span::{SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanLogBuilderError};
 pub use stream::{

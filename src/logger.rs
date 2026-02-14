@@ -21,6 +21,8 @@ use crate::types::{
 const DEFAULT_QUEUE_SIZE: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
+pub const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
 
 /// Organization info returned from login.
 #[derive(Debug, Clone, Deserialize)]
@@ -86,8 +88,8 @@ impl BraintrustClientBuilder {
     ///
     /// Supported environment variables:
     /// - `BRAINTRUST_API_KEY`: API key for authentication (required)
-    /// - `BRAINTRUST_APP_URL`: Braintrust app URL (default: `https://www.braintrust.dev`)
-    /// - `BRAINTRUST_API_URL`: API endpoint URL (default: `https://api.braintrust.dev`)
+    /// - `BRAINTRUST_APP_URL`: Braintrust app URL (default: `https://www.braintrust.dev`; see [`DEFAULT_APP_URL`])
+    /// - `BRAINTRUST_API_URL`: API endpoint URL (default: `https://api.braintrust.dev`; see [`DEFAULT_API_URL`])
     /// - `BRAINTRUST_ORG_NAME`: Organization name (default: first org from login)
     /// - `BRAINTRUST_DEFAULT_PROJECT`: Default project name
     pub fn new() -> Self {
@@ -159,12 +161,8 @@ impl BraintrustClientBuilder {
             )
         })?;
 
-        let app_url_str = self
-            .app_url
-            .unwrap_or_else(|| "https://www.braintrust.dev".into());
-        let api_url_str = self
-            .api_url
-            .unwrap_or_else(|| "https://api.braintrust.dev".into());
+        let app_url_str = self.app_url.unwrap_or_else(|| DEFAULT_APP_URL.into());
+        let api_url_str = self.api_url.unwrap_or_else(|| DEFAULT_API_URL.into());
 
         let app_url = Url::parse(&app_url_str)
             .map_err(|e| BraintrustError::InvalidConfig(format!("invalid app_url: {}", e)))?;
