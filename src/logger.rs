@@ -88,8 +88,8 @@ impl BraintrustClientBuilder {
     ///
     /// Supported environment variables:
     /// - `BRAINTRUST_API_KEY`: API key for authentication (required)
-    /// - `BRAINTRUST_APP_URL`: Braintrust app URL (default: `DEFAULT_APP_URL`)
-    /// - `BRAINTRUST_API_URL`: API endpoint URL (default: `DEFAULT_API_URL`)
+    /// - `BRAINTRUST_APP_URL`: Braintrust app URL (default: `https://www.braintrust.dev`; see [`DEFAULT_APP_URL`])
+    /// - `BRAINTRUST_API_URL`: API endpoint URL (default: `https://api.braintrust.dev`; see [`DEFAULT_API_URL`])
     /// - `BRAINTRUST_ORG_NAME`: Organization name (default: first org from login)
     /// - `BRAINTRUST_DEFAULT_PROJECT`: Default project name
     pub fn new() -> Self {
