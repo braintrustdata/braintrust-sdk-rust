@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use backoff::backoff::Backoff;
+use backoff::ExponentialBackoffBuilder;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{multipart, Client, Url};
 use serde::{Deserialize, Serialize};
@@ -214,34 +216,27 @@ impl Logs3BatchUploader {
                 continue;
             }
 
-            let mut chunk_done = false;
-            for attempt in 0..MAX_ATTEMPTS {
-                result.requests_sent += 1;
-                match self.post_logs3_raw(&payload).await {
-                    Ok(()) => {
-                        result.rows_uploaded += chunk.len();
-                        result.bytes_processed += payload_bytes;
-                        chunk_done = true;
-                        break;
-                    }
-                    Err(BraintrustError::Api { status, .. }) if status == 413 => {
-                        if limits.can_use_overflow {
-                            let overflow_result = self
-                                .submit_overflow(&chunk, payload.clone(), payload_bytes)
-                                .await?;
-                            result.rows_uploaded += overflow_result.rows_uploaded;
-                            result.bytes_processed += overflow_result.bytes_processed;
-                            result.requests_sent += overflow_result.requests_sent;
-                            chunk_done = true;
-                            break;
-                        }
-                        if chunk.len() > 1 {
-                            let mid = chunk.len() / 2;
-                            pending.push(chunk[mid..].to_vec());
-                            pending.push(chunk[..mid].to_vec());
-                            chunk_done = true;
-                            break;
-                        }
+            let (post_result, post_attempts) =
+                run_with_backoff(|| self.post_logs3_raw(&payload)).await;
+            result.requests_sent += post_attempts;
+            match post_result {
+                Ok(()) => {
+                    result.rows_uploaded += chunk.len();
+                    result.bytes_processed += payload_bytes;
+                }
+                Err(BraintrustError::Api { status, .. }) if status == 413 => {
+                    if limits.can_use_overflow {
+                        let overflow_result = self
+                            .submit_overflow(&chunk, payload.clone(), payload_bytes)
+                            .await?;
+                        result.rows_uploaded += overflow_result.rows_uploaded;
+                        result.bytes_processed += overflow_result.bytes_processed;
+                        result.requests_sent += overflow_result.requests_sent;
+                    } else if chunk.len() > 1 {
+                        let mid = chunk.len() / 2;
+                        pending.push(chunk[mid..].to_vec());
+                        pending.push(chunk[..mid].to_vec());
+                    } else {
                         return Err(BraintrustError::Api {
                             status,
                             message:
@@ -249,17 +244,8 @@ impl Logs3BatchUploader {
                                     .to_string(),
                         });
                     }
-                    Err(err) if should_retry(&err) && attempt + 1 < MAX_ATTEMPTS => {
-                        sleep(backoff_delay(attempt)).await;
-                    }
-                    Err(err) => return Err(err),
                 }
-            }
-
-            if !chunk_done {
-                return Err(BraintrustError::InvalidConfig(
-                    "unexpected retry exhaustion in logs3 uploader".to_string(),
-                ));
+                Err(err) => return Err(err),
             }
         }
 
@@ -277,56 +263,15 @@ impl Logs3BatchUploader {
             .map(|item| item.overflow_meta.clone())
             .collect();
         let mut requests_sent = 0usize;
-        let upload = {
-            let mut last_error: Option<BraintrustError> = None;
-            let mut upload = None;
-            for attempt in 0..MAX_ATTEMPTS {
-                requests_sent += 1;
-                match self
-                    .request_overflow_upload(&overflow_rows, payload_bytes)
-                    .await
-                {
-                    Ok(response) => {
-                        upload = Some(response);
-                        break;
-                    }
-                    Err(err) if should_retry(&err) && attempt + 1 < MAX_ATTEMPTS => {
-                        last_error = Some(err);
-                        sleep(backoff_delay(attempt)).await;
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-            upload.ok_or_else(|| {
-                last_error.unwrap_or_else(|| {
-                    BraintrustError::InvalidConfig("missing overflow upload response".to_string())
-                })
-            })?
-        };
+        let (upload_result, upload_attempts) =
+            run_with_backoff(|| self.request_overflow_upload(&overflow_rows, payload_bytes)).await;
+        requests_sent += upload_attempts;
+        let upload = upload_result?;
 
-        {
-            let mut last_error: Option<BraintrustError> = None;
-            let mut uploaded = false;
-            for attempt in 0..MAX_ATTEMPTS {
-                requests_sent += 1;
-                match self.upload_overflow_payload(&upload, &payload).await {
-                    Ok(()) => {
-                        uploaded = true;
-                        break;
-                    }
-                    Err(err) if should_retry(&err) && attempt + 1 < MAX_ATTEMPTS => {
-                        last_error = Some(err);
-                        sleep(backoff_delay(attempt)).await;
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-            if !uploaded {
-                return Err(last_error.unwrap_or_else(|| {
-                    BraintrustError::InvalidConfig("logs3 overflow upload failed".to_string())
-                }));
-            }
-        }
+        let (upload_payload_result, upload_payload_attempts) =
+            run_with_backoff(|| self.upload_overflow_payload(&upload, &payload)).await;
+        requests_sent += upload_payload_attempts;
+        upload_payload_result?;
 
         let overflow_reference = json!({
             "rows": {
@@ -336,26 +281,16 @@ impl Logs3BatchUploader {
             "api_version": LOGS_API_VERSION,
         })
         .to_string();
-        for attempt in 0..MAX_ATTEMPTS {
-            requests_sent += 1;
-            match self.post_logs3_raw(&overflow_reference).await {
-                Ok(()) => {
-                    return Ok(Logs3UploadResult {
-                        rows_uploaded: items.len(),
-                        bytes_processed: payload_bytes,
-                        requests_sent,
-                    });
-                }
-                Err(err) if should_retry(&err) && attempt + 1 < MAX_ATTEMPTS => {
-                    sleep(backoff_delay(attempt)).await;
-                }
-                Err(err) => return Err(err),
-            }
-        }
+        let (post_result, post_attempts) =
+            run_with_backoff(|| self.post_logs3_raw(&overflow_reference)).await;
+        requests_sent += post_attempts;
+        post_result?;
 
-        Err(BraintrustError::InvalidConfig(
-            "unexpected retry exhaustion for overflow logs3 post".to_string(),
-        ))
+        Ok(Logs3UploadResult {
+            rows_uploaded: items.len(),
+            bytes_processed: payload_bytes,
+            requests_sent,
+        })
     }
 
     async fn request_overflow_upload(
@@ -582,8 +517,33 @@ fn should_retry(err: &BraintrustError) -> bool {
     }
 }
 
-fn backoff_delay(attempt: usize) -> Duration {
-    let factor = 2u64.saturating_pow(attempt as u32);
-    let millis = (BASE_BACKOFF_MS.saturating_mul(factor)).min(MAX_BACKOFF_MS);
-    Duration::from_millis(millis.max(BASE_BACKOFF_MS))
+async fn run_with_backoff<T, F, Fut>(mut operation: F) -> (Result<T>, usize)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempts = 0usize;
+    let mut backoff = ExponentialBackoffBuilder::new()
+        .with_initial_interval(Duration::from_millis(BASE_BACKOFF_MS))
+        .with_multiplier(2.0)
+        .with_randomization_factor(0.2)
+        .with_max_interval(Duration::from_millis(MAX_BACKOFF_MS))
+        .with_max_elapsed_time(None)
+        .build();
+
+    loop {
+        attempts += 1;
+        match operation().await {
+            Ok(value) => return (Ok(value), attempts),
+            Err(err) => {
+                if !should_retry(&err) || attempts >= MAX_ATTEMPTS {
+                    return (Err(err), attempts);
+                }
+                match backoff.next_backoff() {
+                    Some(delay) => sleep(delay).await,
+                    None => return (Err(err), attempts),
+                }
+            }
+        }
+    }
 }
