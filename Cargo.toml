@@ -12,11 +12,14 @@ categories = ["api-bindings", "asynchronous", "development-tools"]
 
 [dependencies]
 anyhow = "1"
+bon = "3"
+arc-swap = "1"
 async-trait = "0.1"
 backoff = { version = "0.4", features = ["tokio"] }
 bytes = "1"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
+crossbeam = "0.8"
 indexmap = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

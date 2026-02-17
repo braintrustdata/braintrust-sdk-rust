@@ -92,15 +92,18 @@ pub(crate) struct SpanAttributes {
 }
 
 /// The destination for a log row. Each variant represents a mutually exclusive
-/// target: an experiment, project logs, or playground logs.
+/// target: an experiment, project logs, dataset, or playground logs.
 ///
 /// NOTE: The `untagged` attribute is only safe if the field sets are also
-/// mutually exclusive.
+/// mutually exclusive. Variants are tried in order, so more specific ones
+/// (with unique fields) must come before broader ones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum LogDestination {
     /// Log to an experiment (for evaluation runs).
     Experiment { experiment_id: String },
+    /// Log to a dataset.
+    Dataset { dataset_id: String, log_id: String },
     /// Log to project logs (general observability).
     ProjectLogs { project_id: String, log_id: String },
     /// Log to playground logs (interactive sessions).
@@ -115,6 +118,14 @@ impl LogDestination {
     pub fn experiment(experiment_id: impl Into<String>) -> Self {
         Self::Experiment {
             experiment_id: experiment_id.into(),
+        }
+    }
+
+    /// Create a new dataset destination.
+    pub fn dataset(dataset_id: impl Into<String>) -> Self {
+        Self::Dataset {
+            dataset_id: dataset_id.into(),
+            log_id: "g".to_string(),
         }
     }
 
@@ -150,9 +161,18 @@ impl LogDestination {
         }
     }
 
-    /// Get the log_id if present (ProjectLogs or PlaygroundLogs).
+    /// Get the dataset_id if this is a Dataset destination.
+    pub fn dataset_id(&self) -> Option<&str> {
+        match self {
+            Self::Dataset { dataset_id, .. } => Some(dataset_id),
+            _ => None,
+        }
+    }
+
+    /// Get the log_id if present (Dataset, ProjectLogs, or PlaygroundLogs).
     pub fn log_id(&self) -> Option<&str> {
         match self {
+            Self::Dataset { log_id, .. } => Some(log_id),
             Self::ProjectLogs { log_id, .. } => Some(log_id),
             Self::PlaygroundLogs { log_id, .. } => Some(log_id),
             Self::Experiment { .. } => None,
@@ -176,6 +196,54 @@ pub(crate) struct Logs3Request {
     pub rows: Vec<Logs3Row>,
     pub api_version: u8,
 }
+
+/// Response from POST logs3/overflow — provides a signed URL to upload the payload.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Logs3OverflowUpload {
+    pub method: String,
+    pub signed_url: String,
+    pub headers: Option<HashMap<String, String>>,
+    pub fields: Option<HashMap<String, String>>,
+    pub key: String,
+}
+
+/// A single row's overflow metadata, sent when requesting the overflow upload URL.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Logs3OverflowInputRow {
+    /// Key identifying fields extracted from the row (experiment_id, dataset_id, etc.)
+    pub object_ids: serde_json::Map<String, Value>,
+    pub input_row: Logs3OverflowInputRowMeta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Logs3OverflowInputRowMeta {
+    pub byte_size: usize,
+}
+
+/// Reference sent to POST logs3 after a successful overflow upload.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Logs3OverflowRequest {
+    pub rows: Logs3OverflowReference,
+    pub api_version: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Logs3OverflowReference {
+    #[serde(rename = "type")]
+    pub reference_type: &'static str,
+    pub key: String,
+}
+
+/// The object ID keys that identify a row's destination, used for overflow metadata.
+/// Matches the TypeScript SDK's OBJECT_ID_KEYS.
+pub(crate) const OBJECT_ID_KEYS: &[&str] = &[
+    "experiment_id",
+    "dataset_id",
+    "prompt_session_id",
+    "project_id",
+    "log_id",
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Logs3Row {

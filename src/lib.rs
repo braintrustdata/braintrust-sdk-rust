@@ -1,6 +1,7 @@
 mod error;
 mod extractors;
 mod json_merge;
+mod log_queue;
 mod logger;
 mod logs3;
 mod span;
@@ -11,6 +12,7 @@ mod types;
 
 pub use error::{BraintrustError, Result};
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
+pub use log_queue::LogQueueConfig;
 pub use logger::{
     BraintrustClient, BraintrustClientBuilder, LoginState, OrgInfo, DEFAULT_API_URL,
     DEFAULT_APP_URL,

@@ -1,37 +1,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use indexmap::map::Entry;
-use indexmap::IndexMap;
-
-use anyhow::Context;
 use async_trait::async_trait;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use serde_json::Map;
-use tokio::sync::{mpsc, oneshot, Notify, RwLock};
-use tokio::task::JoinHandle;
-use tracing::warn;
+use serde::Deserialize;
+use tokio::sync::Notify;
 use url::Url;
 
 use crate::error::{BraintrustError, Result};
-use crate::json_merge::deep_merge;
+use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::SpanSubmitter;
-use crate::types::{
-    LogDestination, Logs3Request, Logs3Row, ParentSpanInfo, SpanAttributes, SpanObjectType,
-    SpanPayload, LOGS_API_VERSION,
-};
+use crate::types::{ParentSpanInfo, SpanPayload};
 
-const DEFAULT_QUEUE_SIZE: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_QUEUE_SIZE: usize = 256;
 pub const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
 pub const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
-const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-const DEFAULT_BATCH_MAX_ITEMS: usize = 100;
-const DEFAULT_BATCH_MAX_BYTES: usize = 6 * 1024 * 1024; // 6 MB
-const DEFAULT_MAX_RETRIES: usize = 3;
-const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Organization info returned from login.
 #[derive(Debug, Clone, Deserialize)]
@@ -42,48 +26,6 @@ pub struct OrgInfo {
     pub api_url: Option<String>,
 }
 
-/// Composite key for row merging (mirrors TS generateMergedRowKey).
-/// Rows with the same key are merged when `_is_merge: true`.
-#[derive(Hash, Eq, PartialEq, Clone, Debug)]
-struct RowKey {
-    org_id: String,
-    project_id: Option<String>,
-    experiment_id: Option<String>,
-    dataset_id: Option<String>,
-    prompt_session_id: Option<String>,
-    log_id: Option<String>,
-    row_id: String,
-}
-
-impl RowKey {
-    fn from_row(row: &Logs3Row) -> Self {
-        Self {
-            org_id: row.org_id.clone(),
-            project_id: row.destination.project_id().map(|s| s.to_string()),
-            experiment_id: row.destination.experiment_id().map(|s| s.to_string()),
-            // TODO: Populate dataset_id once Dataset destination is added to LogDestination
-            dataset_id: None,
-            prompt_session_id: row.destination.prompt_session_id().map(|s| s.to_string()),
-            log_id: row.destination.log_id().map(|s| s.to_string()),
-            row_id: row.id.clone(),
-        }
-    }
-}
-
-/// A pending row awaiting batch submission.
-struct PendingRow {
-    row: Logs3Row,
-}
-
-/// Configuration passed to the background worker.
-#[derive(Default)]
-struct WorkerConfig {
-    flush_interval: Option<Duration>,
-    batch_max_items: Option<usize>,
-    batch_max_bytes: Option<usize>,
-    queue_max_size: Option<usize>,
-}
-
 /// Response from the login endpoint.
 #[derive(Debug, Deserialize)]
 struct LoginResponse {
@@ -91,12 +33,90 @@ struct LoginResponse {
 }
 
 /// Logged-in state containing API key and org info.
-#[derive(Debug, Clone)]
+/// Handles internal synchronization for the transition from not-logged-in to logged-in.
+#[derive(Clone)]
 pub struct LoginState {
-    pub api_key: String,
-    pub org_id: String,
-    pub org_name: String,
-    pub api_url: Option<String>,
+    inner: Arc<std::sync::OnceLock<LoginStateInner>>,
+}
+
+#[derive(Debug, Clone)]
+struct LoginStateInner {
+    api_key: String,
+    org_id: String,
+    org_name: String,
+    api_url: String,
+    app_url: String,
+}
+
+impl LoginState {
+    /// Create a new empty login state.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Set the login state (can only be called once).
+    pub fn set(
+        &self,
+        api_key: String,
+        org_id: String,
+        org_name: String,
+        api_url: String,
+        app_url: String,
+    ) -> std::result::Result<(), ()> {
+        self.inner
+            .set(LoginStateInner {
+                api_key,
+                org_id,
+                org_name,
+                api_url,
+                app_url,
+            })
+            .map_err(|_| ())
+    }
+
+    /// Check if logged in.
+    pub fn is_logged_in(&self) -> bool {
+        self.inner.get().is_some()
+    }
+
+    /// Get the API key if logged in.
+    pub fn api_key(&self) -> Option<String> {
+        self.inner.get().map(|s| s.api_key.clone())
+    }
+
+    /// Get the org ID if logged in.
+    pub fn org_id(&self) -> Option<String> {
+        self.inner.get().map(|s| s.org_id.clone())
+    }
+
+    /// Get the org name if logged in.
+    pub fn org_name(&self) -> Option<String> {
+        self.inner.get().map(|s| s.org_name.clone())
+    }
+
+    /// Get the API URL if logged in.
+    pub fn api_url(&self) -> Option<String> {
+        self.inner.get().map(|s| s.api_url.clone())
+    }
+
+    /// Get the app URL if logged in.
+    pub fn app_url(&self) -> Option<String> {
+        self.inner.get().map(|s| s.app_url.clone())
+    }
+}
+
+impl std::fmt::Debug for LoginState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner.get() {
+            Some(inner) => f.debug_struct("LoginState").field("inner", inner).finish(),
+            None => f
+                .debug_struct("LoginState")
+                .field("inner", &"<not logged in>")
+                .finish(),
+        }
+    }
 }
 
 /// Builder for creating a BraintrustClient with configuration.
@@ -265,29 +285,31 @@ impl BraintrustClientBuilder {
             .build()
             .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
 
-        // Build worker config from client config
-        let worker_config = WorkerConfig {
-            flush_interval: self.flush_interval,
-            batch_max_items: self.batch_max_items,
-            batch_max_bytes: self.batch_max_bytes,
-            queue_max_size: self.queue_max_size,
-        };
+        // Create login state (initially empty, populated by login)
+        let login_state = LoginState::new();
 
-        let (sender, receiver) = mpsc::channel(self.queue_size.max(32));
-        let worker = tokio::spawn(run_worker(
-            api_url.clone(),
+        // Build log queue config
+        let log_config = LogQueueConfig::builder()
+            .maybe_batch_max_items(self.batch_max_items)
+            .maybe_batch_max_bytes(self.batch_max_bytes)
+            .maybe_queue_max_size(self.queue_max_size)
+            .build();
+
+        // LogQueue owns the background worker
+        let queue = LogQueue::new(
+            log_config,
+            login_state.clone(),
+            http_client.clone(),
             app_url.clone(),
-            receiver,
-            worker_config,
-        ));
+            self.queue_size,
+        );
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
                 api_url,
                 app_url,
-                sender,
-                worker,
-                login_state: RwLock::new(None),
+                queue,
+                login_state,
                 login_notify: Notify::new(),
                 http_client,
                 default_project: self.default_project,
@@ -322,10 +344,8 @@ struct ClientInner {
     #[allow(dead_code)]
     api_url: Url,
     app_url: Url,
-    sender: mpsc::Sender<LogCommand>,
-    #[allow(dead_code)]
-    worker: JoinHandle<()>,
-    login_state: RwLock<Option<LoginState>>,
+    queue: LogQueue,
+    login_state: LoginState,
     login_notify: Notify,
     http_client: reqwest::Client,
     default_project: Option<String>,
@@ -363,7 +383,7 @@ impl BraintrustClient {
 
     /// Check if the client is logged in.
     pub async fn is_logged_in(&self) -> bool {
-        self.inner.login_state.read().await.is_some()
+        self.inner.login_state.is_logged_in()
     }
 
     /// Wait for login to complete (useful if using background login).
@@ -373,9 +393,9 @@ impl BraintrustClient {
         self.wait_for_login_state().await
     }
 
-    /// Get the current login state, if logged in.
-    pub async fn login_state(&self) -> Option<LoginState> {
-        self.inner.login_state.read().await.clone()
+    /// Get the current login state.
+    pub async fn login_state(&self) -> LoginState {
+        self.inner.login_state.clone()
     }
 
     /// Create a span builder using the logged-in state and default project.
@@ -400,8 +420,13 @@ impl BraintrustClient {
     /// ```
     pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder<Self>> {
         let state = self.wait_for_login_state().await?;
-        let mut builder =
-            crate::span::SpanBuilder::new(Arc::new(self.clone()), &state.api_key, &state.org_id);
+        let api_key = state
+            .api_key()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        let org_id = state
+            .org_id()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        let mut builder = crate::span::SpanBuilder::new(Arc::new(self.clone()), &api_key, &org_id);
         if let Some(ref project) = self.inner.default_project {
             builder = builder.project_name(project);
         }
@@ -416,6 +441,18 @@ impl BraintrustClient {
         token: impl Into<String>,
         org_id: impl Into<String>,
     ) -> crate::span::SpanBuilder<Self> {
+        let token = token.into();
+        let org_id = org_id.into();
+
+        // Populate login state with explicit credentials
+        let _ = self.inner.login_state.set(
+            token.clone(),
+            org_id.clone(),
+            String::new(), // org_name unknown
+            self.inner.api_url.to_string(),
+            self.inner.app_url.to_string(),
+        );
+
         let submitter = Arc::new(self.clone());
         crate::span::SpanBuilder::new(submitter, token, org_id)
     }
@@ -470,14 +507,18 @@ impl BraintrustClient {
             })?
         };
 
-        let state = LoginState {
-            api_key: api_key.to_string(),
-            org_id: org.id,
-            org_name: org.name,
-            api_url: org.api_url,
-        };
+        self.inner
+            .login_state
+            .set(
+                api_key.to_string(),
+                org.id,
+                org.name,
+                org.api_url
+                    .unwrap_or_else(|| self.inner.api_url.to_string()),
+                self.inner.app_url.to_string(),
+            )
+            .map_err(|_| BraintrustError::InvalidConfig("Login state already set".to_string()))?;
 
-        *self.inner.login_state.write().await = Some(state);
         self.inner.login_notify.notify_waiters();
         Ok(())
     }
@@ -509,28 +550,29 @@ impl BraintrustClient {
     /// Wait for login state to be available.
     async fn wait_for_login_state(&self) -> Result<LoginState> {
         // Check if already logged in
-        if let Some(state) = self.inner.login_state.read().await.clone() {
-            return Ok(state);
+        if self.inner.login_state.is_logged_in() {
+            return Ok(self.inner.login_state.clone());
         }
 
         // Get notification future BEFORE checking state to avoid race condition
         let notified = self.inner.login_notify.notified();
 
         // Check state again (may have been set between our first check and now)
-        if let Some(state) = self.inner.login_state.read().await.clone() {
-            return Ok(state);
+        if self.inner.login_state.is_logged_in() {
+            return Ok(self.inner.login_state.clone());
         }
 
         // Wait for notification or timeout
         tokio::select! {
             _ = notified => {
-                // Login completed - state is guaranteed to be set since
-                // notify_waiters() is only called after setting state
-                self.inner.login_state.read().await.clone().ok_or_else(|| {
-                    BraintrustError::InvalidConfig(
+                // Login completed - return the login state
+                if self.inner.login_state.is_logged_in() {
+                    Ok(self.inner.login_state.clone())
+                } else {
+                    Err(BraintrustError::InvalidConfig(
                         "Login notification received but state not set".into(),
-                    )
-                })
+                    ))
+                }
             }
             _ = tokio::time::sleep(LOGIN_TIMEOUT) => {
                 Err(BraintrustError::InvalidConfig(
@@ -550,40 +592,18 @@ impl BraintrustClient {
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> Result<()> {
-        let cmd = LogCommand::Submit(Box::new(SubmitCommand {
-            token: token.into(),
-            payload,
-            parent_info,
-        }));
-        self.inner
-            .sender
-            .send(cmd)
-            .await
-            .map_err(|_| BraintrustError::ChannelClosed)?;
-        Ok(())
+        self.inner.queue.submit(token, payload, parent_info).await
     }
 
     /// Flush all pending log events.
     pub async fn flush(&self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.inner
-            .sender
-            .send(LogCommand::Flush(tx))
-            .await
-            .map_err(|_| BraintrustError::ChannelClosed)?;
-        rx.await
-            .map_err(|_| BraintrustError::ChannelClosed)?
-            .map_err(|e| BraintrustError::Background(e.to_string()))
+        self.inner.queue.flush_all().await
     }
 
     /// Trigger a non-blocking background flush.
     /// Does not wait for completion - useful for streaming writes.
     pub async fn trigger_flush(&self) -> Result<()> {
-        self.inner
-            .sender
-            .send(LogCommand::TriggerFlush)
-            .await
-            .map_err(|_| BraintrustError::ChannelClosed)
+        self.inner.queue.trigger_flush_command().await
     }
 }
 
@@ -603,619 +623,11 @@ impl SpanSubmitter for BraintrustClient {
     }
 }
 
-enum LogCommand {
-    Submit(Box<SubmitCommand>),
-    Flush(oneshot::Sender<std::result::Result<(), anyhow::Error>>),
-    TriggerFlush,
-}
-
-struct SubmitCommand {
-    token: String,
-    payload: SpanPayload,
-    parent_info: Option<ParentSpanInfo>,
-}
-
-/// Request body for project registration.
-#[derive(Serialize)]
-struct ProjectRegisterRequest<'a> {
-    project_name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_name: Option<&'a str>,
-}
-
-/// Response from project registration.
-#[derive(Deserialize)]
-struct ProjectRegisterResponse {
-    project: ProjectInfo,
-}
-
-/// Project info in registration response.
-#[derive(Deserialize)]
-struct ProjectInfo {
-    id: String,
-}
-
-async fn run_worker(
-    api_url: Url,
-    app_url: Url,
-    mut receiver: mpsc::Receiver<LogCommand>,
-    config: WorkerConfig,
-) {
-    let mut state = WorkerState::new(api_url, app_url, config);
-    let mut flush_interval = tokio::time::interval(state.flush_interval);
-
-    loop {
-        tokio::select! {
-            cmd = receiver.recv() => {
-                match cmd {
-                    Some(LogCommand::Submit(cmd)) => {
-                        let SubmitCommand {
-                            token,
-                            payload,
-                            parent_info,
-                        } = *cmd;
-                        // Queue row for batch submission (fire-and-forget)
-                        if let Err(e) = state.prepare_and_queue_row(&token, payload, parent_info).await {
-                            warn!(error = %e, "failed to queue span");
-                        }
-                    }
-                    Some(LogCommand::Flush(response)) => {
-                        // Flush all pending rows and respond
-                        let result = state.flush_pending().await;
-                        let _ = response.send(result);
-                    }
-                    Some(LogCommand::TriggerFlush) => {
-                        // Non-blocking flush (fire-and-forget)
-                        if let Err(e) = state.flush_pending().await {
-                            warn!(error = %e, "background flush failed");
-                        }
-                    }
-                    None => {
-                        // Channel closed - flush remaining and exit
-                        if let Err(e) = state.flush_pending().await {
-                            warn!(error = %e, "final flush failed");
-                        }
-                        break;
-                    }
-                }
-            }
-            _ = flush_interval.tick() => {
-                // Periodic flush per spec (default: 1 second)
-                if !state.pending.is_empty() {
-                    if let Err(e) = state.flush_pending().await {
-                        warn!(error = %e, "periodic flush failed");
-                    }
-                }
-            }
-        }
-    }
-}
-
-struct WorkerState {
-    /// URL for data plane requests (e.g., /logs3)
-    api_url: Url,
-    /// URL for control plane requests (e.g., /api/project/register)
-    app_url: Url,
-    client: reqwest::Client,
-    project_cache: IndexMap<String, String>,
-    /// Pending rows awaiting batch submission, keyed for merging.
-    /// Uses IndexMap to maintain insertion order for FIFO queue behavior.
-    pending: IndexMap<RowKey, PendingRow>,
-    /// Token associated with pending rows (all rows share the same token).
-    pending_token: Option<String>,
-    /// Interval between periodic flushes.
-    flush_interval: Duration,
-    /// Maximum items per HTTP batch.
-    batch_max_items: usize,
-    /// Maximum bytes per HTTP batch.
-    batch_max_bytes: usize,
-    /// Maximum queue size (None = unlimited).
-    queue_max_size: Option<usize>,
-    /// Count of dropped events (for logging).
-    dropped_count: usize,
-}
-
-impl WorkerState {
-    fn new(api_url: Url, app_url: Url, config: WorkerConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("reqwest client");
-
-        // Use config values, falling back to environment variables, then defaults.
-        let flush_interval = config.flush_interval.unwrap_or(DEFAULT_FLUSH_INTERVAL);
-
-        let batch_max_items = config.batch_max_items.unwrap_or_else(|| {
-            std::env::var("BRAINTRUST_DEFAULT_BATCH_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_BATCH_MAX_ITEMS)
-        });
-
-        let batch_max_bytes = config.batch_max_bytes.unwrap_or_else(|| {
-            std::env::var("BRAINTRUST_MAX_REQUEST_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_BATCH_MAX_BYTES)
-        });
-
-        let queue_max_size = config.queue_max_size.or_else(|| {
-            std::env::var("BRAINTRUST_QUEUE_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        });
-
-        Self {
-            api_url,
-            app_url,
-            client,
-            project_cache: IndexMap::new(),
-            pending: IndexMap::new(),
-            pending_token: None,
-            flush_interval,
-            batch_max_items,
-            batch_max_bytes,
-            queue_max_size,
-            dropped_count: 0,
-        }
-    }
-
-    /// Prepare a row from payload and queue it for batch submission.
-    async fn prepare_and_queue_row(
-        &mut self,
-        token: &str,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) -> std::result::Result<(), anyhow::Error> {
-        let SpanPayload {
-            row_id,
-            span_id,
-            is_merge,
-            org_id,
-            org_name,
-            project_name,
-            input,
-            output,
-            expected,
-            error,
-            scores,
-            metadata,
-            metrics,
-            tags,
-            context,
-            span_attributes,
-        } = payload;
-
-        let project_id = if let Some(ref project_name) = project_name {
-            Some(
-                self.ensure_project_id(token, &org_id, org_name.as_deref(), project_name)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        // Determine destination and span hierarchy based on parent info
-        let (root_span_id, span_parents, destination) = match parent_info {
-            None => {
-                // No parent - use project_id if available, otherwise fail
-                let dest = match project_id {
-                    Some(pid) => LogDestination::project_logs(pid),
-                    None => {
-                        anyhow::bail!("no destination: either parent_info or project_name required")
-                    }
-                };
-                (span_id.clone(), None, dest)
-            }
-            Some(ParentSpanInfo::Experiment { object_id }) => {
-                (span_id.clone(), None, LogDestination::experiment(object_id))
-            }
-            Some(ParentSpanInfo::ProjectLogs { object_id }) => (
-                span_id.clone(),
-                None,
-                LogDestination::project_logs(object_id),
-            ),
-            Some(ParentSpanInfo::ProjectName { project_name }) => {
-                let proj_id = self
-                    .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name)
-                    .await?;
-                (span_id.clone(), None, LogDestination::project_logs(proj_id))
-            }
-            Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
-                span_id.clone(),
-                None,
-                LogDestination::playground_logs(object_id),
-            ),
-            Some(ParentSpanInfo::FullSpan {
-                object_type,
-                object_id,
-                span_id: parent_span_id,
-                root_span_id: parent_root_span_id,
-            }) => {
-                let span_parents = Some(vec![parent_span_id]);
-                let dest = match object_type {
-                    SpanObjectType::Experiment => LogDestination::experiment(object_id),
-                    SpanObjectType::ProjectLogs => LogDestination::project_logs(object_id),
-                    SpanObjectType::PlaygroundLogs => LogDestination::playground_logs(object_id),
-                };
-                (parent_root_span_id, span_parents, dest)
-            }
-        };
-
-        let row = Logs3Row {
-            id: row_id,
-            is_merge: if is_merge { Some(true) } else { None },
-            span_id,
-            root_span_id,
-            span_parents,
-            destination,
-            org_id,
-            org_name,
-            input,
-            output,
-            expected,
-            error,
-            scores,
-            metadata,
-            metrics,
-            tags,
-            context,
-            span_attributes,
-            created: Utc::now(),
-        };
-
-        // Queue the row for merging and batch submission
-        self.merge_row(row);
-        self.pending_token = Some(token.to_string());
-        self.enforce_queue_limit();
-
-        Ok(())
-    }
-
-    /// Merge a row into pending queue (or replace if not a merge operation).
-    fn merge_row(&mut self, new_row: Logs3Row) {
-        let key = RowKey::from_row(&new_row);
-
-        match self.pending.entry(key) {
-            Entry::Occupied(mut entry) => {
-                if new_row.is_merge.unwrap_or(false) {
-                    // Deep merge into existing row
-                    let pending = entry.get_mut();
-                    merge_into(&mut pending.row, new_row);
-                } else {
-                    // Replace entirely
-                    entry.insert(PendingRow { row: new_row });
-                }
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(PendingRow { row: new_row });
-            }
-        }
-    }
-
-    /// Enforce queue size limit by dropping oldest entries (FIFO).
-    fn enforce_queue_limit(&mut self) {
-        if let Some(max_size) = self.queue_max_size {
-            while self.pending.len() > max_size {
-                // Drop oldest entry (IndexMap maintains insertion order)
-                if let Some(key) = self.pending.keys().next().cloned() {
-                    self.pending.shift_remove(&key);
-                    self.dropped_count += 1;
-                    warn!(
-                        "Queue full, dropping oldest event (total dropped: {})",
-                        self.dropped_count
-                    );
-                }
-            }
-        }
-    }
-
-    /// Flush all pending rows in batches.
-    async fn flush_pending(&mut self) -> std::result::Result<(), anyhow::Error> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-
-        let token = match self.pending_token.take() {
-            Some(t) => t,
-            None => return Ok(()),
-        };
-
-        let rows: Vec<Logs3Row> = self
-            .pending
-            .drain(..)
-            .map(|(_, pending)| pending.row)
-            .collect();
-
-        // Batch and serialize in one pass to avoid double serialization
-        for batch in self.batch_and_serialize_rows(rows) {
-            if let Err(e) = self.send_batch_bytes(&token, batch).await {
-                warn!(error = %e, "batch send failed");
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Split rows into batches and serialize them, respecting size limits.
-    /// This combines batching and serialization to avoid double JSON encoding.
-    fn batch_and_serialize_rows(&self, rows: Vec<Logs3Row>) -> Vec<Vec<u8>> {
-        let mut batches = Vec::new();
-        let mut current_batch = Vec::new();
-        let mut current_size = 0;
-
-        for row in rows {
-            // Estimate size using to_vec (will be actual serialization)
-            let row_json = match serde_json::to_vec(&row) {
-                Ok(json) => json,
-                Err(e) => {
-                    warn!(error = %e, "failed to serialize row, skipping");
-                    continue;
-                }
-            };
-            let row_size = row_json.len();
-
-            if current_batch.len() >= self.batch_max_items
-                || (current_size + row_size > self.batch_max_bytes && !current_batch.is_empty())
-            {
-                // Serialize current batch and start new one
-                if let Ok(batch_bytes) = self.serialize_batch(&current_batch) {
-                    batches.push(batch_bytes);
-                }
-                current_batch.clear();
-                current_size = 0;
-            }
-
-            current_size += row_size;
-            current_batch.push(row);
-        }
-
-        if !current_batch.is_empty() {
-            if let Ok(batch_bytes) = self.serialize_batch(&current_batch) {
-                batches.push(batch_bytes);
-            }
-        }
-
-        batches
-    }
-
-    /// Serialize a batch of rows into the Logs3Request format.
-    fn serialize_batch(&self, rows: &[Logs3Row]) -> std::result::Result<Vec<u8>, anyhow::Error> {
-        let request = Logs3Request {
-            rows: rows.to_vec(),
-            api_version: LOGS_API_VERSION,
-        };
-        serde_json::to_vec(&request).map_err(|e| anyhow::anyhow!("JSON serialization failed: {e}"))
-    }
-
-    /// Send pre-serialized batch bytes with retry logic.
-    async fn send_batch_bytes(
-        &self,
-        token: &str,
-        json_bytes: Vec<u8>,
-    ) -> std::result::Result<(), anyhow::Error> {
-        let logs_url = self
-            .api_url
-            .join("logs3")
-            .map_err(|e| anyhow::anyhow!("invalid logs url: {e}"))?;
-
-        // Retry with exponential backoff per spec
-        let mut delay = INITIAL_RETRY_DELAY;
-
-        for attempt in 0..DEFAULT_MAX_RETRIES {
-            let response = self
-                .client
-                .post(logs_url.clone())
-                .bearer_auth(token)
-                .header("content-type", "application/json")
-                .body(json_bytes.clone())
-                .send()
-                .await;
-
-            match response {
-                Ok(resp) if resp.status().is_success() => {
-                    return Ok(());
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<unavailable>".to_string());
-
-                    // Check if retryable per spec:
-                    // - 5xx server errors: retryable
-                    // - 429 rate limit: retryable
-                    // - 4xx client errors (except 429): NOT retryable
-                    let is_retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status.is_server_error();
-
-                    if is_retryable && attempt < DEFAULT_MAX_RETRIES - 1 {
-                        warn!(
-                            status = %status,
-                            attempt, "batch send failed with retryable error, retrying"
-                        );
-                        tokio::time::sleep(delay).await;
-                        delay *= 2;
-                        continue;
-                    }
-
-                    anyhow::bail!("batch send failed: [{}] {}", status, body);
-                }
-                Err(e) => {
-                    // Network error - retryable
-                    if attempt < DEFAULT_MAX_RETRIES - 1 {
-                        warn!(error = %e, attempt, "batch send network error, retrying");
-                        tokio::time::sleep(delay).await;
-                        delay *= 2;
-                        continue;
-                    }
-                    return Err(e.into());
-                }
-            }
-        }
-
-        unreachable!("retry loop should always return or continue")
-    }
-
-    async fn ensure_project_id(
-        &mut self,
-        token: &str,
-        org_id: &str,
-        org_name: Option<&str>,
-        project_name: &str,
-    ) -> std::result::Result<String, anyhow::Error> {
-        let cache_key = format!("{org_id}:{project_name}");
-        if let Some(project_id) = self.project_cache.get(&cache_key) {
-            return Ok(project_id.clone());
-        }
-
-        let request = ProjectRegisterRequest {
-            project_name,
-            org_id: (!org_id.is_empty()).then_some(org_id),
-            org_name,
-        };
-
-        let url = self
-            .app_url
-            .join("api/project/register")
-            .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("register project failed: [{status}] {text}");
-        }
-
-        let register_response: ProjectRegisterResponse = response
-            .json()
-            .await
-            .context("failed to parse project registration response")?;
-
-        self.project_cache
-            .insert(cache_key, register_response.project.id.clone());
-        Ok(register_response.project.id)
-    }
-}
-
 /// Deep merge source row into target row.
 /// Matches the behavior of TS SDK's mergeRowBatch and Brainstore's WAL merge logic.
 /// - JSON fields (input, output, expected, error): deep merged recursively
 /// - Map fields (metadata, metrics): keys merged, last write wins for conflicts
 /// - Identity fields (created, span_id, root_span_id, span_parents): preserved from target
-fn merge_into(target: &mut Logs3Row, source: Logs3Row) {
-    // Deep merge JSON fields (input, output, expected, error)
-    if let Some(source_input) = source.input {
-        match &mut target.input {
-            Some(target_input) => deep_merge(target_input, &source_input),
-            None => target.input = Some(source_input),
-        }
-    }
-    if let Some(source_output) = source.output {
-        match &mut target.output {
-            Some(target_output) => deep_merge(target_output, &source_output),
-            None => target.output = Some(source_output),
-        }
-    }
-    if let Some(source_expected) = source.expected {
-        match &mut target.expected {
-            Some(target_expected) => deep_merge(target_expected, &source_expected),
-            None => target.expected = Some(source_expected),
-        }
-    }
-    if let Some(source_error) = source.error {
-        match &mut target.error {
-            Some(target_error) => deep_merge(target_error, &source_error),
-            None => target.error = Some(source_error),
-        }
-    }
-
-    // Deep merge context (JSON field)
-    if let Some(source_context) = source.context {
-        match &mut target.context {
-            Some(target_context) => deep_merge(target_context, &source_context),
-            None => target.context = Some(source_context),
-        }
-    }
-
-    // Merge scores map (last write wins for conflicts)
-    if let Some(source_scores) = source.scores {
-        let target_scores = target
-            .scores
-            .get_or_insert_with(std::collections::HashMap::new);
-        for (k, v) in source_scores {
-            target_scores.insert(k, v);
-        }
-    }
-
-    // Deep merge metadata map (last write wins for conflicts)
-    if let Some(source_meta) = source.metadata {
-        let target_meta = target.metadata.get_or_insert_with(Map::new);
-        for (k, v) in source_meta {
-            target_meta.insert(k, v);
-        }
-    }
-
-    // Deep merge metrics map (last write wins for conflicts)
-    if let Some(source_metrics) = source.metrics {
-        let target_metrics = target
-            .metrics
-            .get_or_insert_with(std::collections::HashMap::new);
-        for (k, v) in source_metrics {
-            target_metrics.insert(k, v);
-        }
-    }
-
-    // Merge tags (deduplicate by converting to set and back)
-    if let Some(source_tags) = source.tags {
-        match &mut target.tags {
-            Some(target_tags) => {
-                // Add new tags, avoiding duplicates
-                for tag in source_tags {
-                    if !target_tags.contains(&tag) {
-                        target_tags.push(tag);
-                    }
-                }
-            }
-            None => target.tags = Some(source_tags),
-        }
-    }
-
-    // Deep merge span_attributes
-    if let Some(source_attrs) = source.span_attributes {
-        let target_attrs = target
-            .span_attributes
-            .get_or_insert_with(SpanAttributes::default);
-        if source_attrs.name.is_some() {
-            target_attrs.name = source_attrs.name;
-        }
-        if source_attrs.span_type.is_some() {
-            target_attrs.span_type = source_attrs.span_type;
-        }
-        if source_attrs.purpose.is_some() {
-            target_attrs.purpose = source_attrs.purpose;
-        }
-        for (k, v) in source_attrs.extra {
-            target_attrs.extra.insert(k, v);
-        }
-    }
-
-    // Merge org_name if source has it
-    if source.org_name.is_some() {
-        target.org_name = source.org_name;
-    }
-
-    // Note: Identity fields (created, span_id, root_span_id, span_parents) are NOT merged.
-    // These are auto-generated attributes that should be preserved from the first row.
-}
 
 #[cfg(test)]
 mod tests {
@@ -1420,11 +832,11 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await.expect("should be logged in");
-
-        assert_eq!(login_state.org_id, "org-1");
-        assert_eq!(login_state.org_name, "First Org");
-        assert_eq!(login_state.api_key, "test-api-key");
+        let login_state = client.login_state().await;
+        assert!(login_state.is_logged_in(), "should be logged in");
+        assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
+        assert_eq!(login_state.org_name().as_deref(), Some("First Org"));
+        assert_eq!(login_state.api_key().as_deref(), Some("test-api-key"));
     }
 
     #[tokio::test]
@@ -1450,10 +862,10 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await.expect("should be logged in");
-
-        assert_eq!(login_state.org_id, "org-2");
-        assert_eq!(login_state.org_name, "Second Org");
+        let login_state = client.login_state().await;
+        assert!(login_state.is_logged_in(), "should be logged in");
+        assert_eq!(login_state.org_id().as_deref(), Some("org-2"));
+        assert_eq!(login_state.org_name().as_deref(), Some("Second Org"));
     }
 
     #[tokio::test]
@@ -1567,7 +979,7 @@ mod tests {
 
         // Wait for background login to complete
         let login_state = client.wait_for_login().await.expect("login should succeed");
-        assert_eq!(login_state.org_id, "org-1");
+        assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
         assert!(client.is_logged_in().await);
     }
 
@@ -1713,6 +1125,13 @@ mod tests {
             .mount(&app_server)
             .await;
 
+        // Mount version endpoint on api_server (data plane) - for lazy version fetch
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+
         // Mount logs endpoint on api_server (data plane)
         Mock::given(method("POST"))
             .and(path("/logs3"))
@@ -1745,10 +1164,13 @@ mod tests {
         span.flush().await.expect("flush");
         client.flush().await.expect("client flush");
 
-        // Verify api_server received the /logs3 request
+        // Verify api_server received the /logs3 request (and optionally /version for lazy fetch)
         let api_requests = api_server.received_requests().await.unwrap();
-        assert_eq!(api_requests.len(), 1);
-        assert_eq!(api_requests[0].url.path(), "/logs3");
+        let logs3_requests: Vec<_> = api_requests
+            .iter()
+            .filter(|r| r.url.path() == "/logs3")
+            .collect();
+        assert_eq!(logs3_requests.len(), 1);
 
         // Verify app_server received the /api/project/register request (and login)
         let app_requests = app_server.received_requests().await.unwrap();
@@ -1774,243 +1196,5 @@ mod tests {
             register_on_api.is_empty(),
             "/api/project/register should not go to api_server"
         );
-    }
-
-    #[test]
-    fn row_key_from_experiment_row() {
-        let row = Logs3Row {
-            id: "row-1".to_string(),
-            is_merge: None,
-            span_id: "span-1".to_string(),
-            root_span_id: "root-1".to_string(),
-            span_parents: None,
-            destination: LogDestination::experiment("exp-123"),
-            org_id: "org-1".to_string(),
-            org_name: None,
-            input: None,
-            output: None,
-            expected: None,
-            error: None,
-            scores: None,
-            metadata: None,
-            metrics: None,
-            tags: None,
-            context: None,
-            span_attributes: None,
-            created: Utc::now(),
-        };
-
-        let key = RowKey::from_row(&row);
-        assert_eq!(key.org_id, "org-1");
-        assert_eq!(key.experiment_id, Some("exp-123".to_string()));
-        assert_eq!(key.project_id, None);
-        assert_eq!(key.dataset_id, None);
-        assert_eq!(key.prompt_session_id, None);
-        assert_eq!(key.log_id, None);
-        assert_eq!(key.row_id, "row-1");
-    }
-
-    #[test]
-    fn row_key_from_project_logs_row() {
-        let row = Logs3Row {
-            id: "row-2".to_string(),
-            is_merge: None,
-            span_id: "span-2".to_string(),
-            root_span_id: "root-2".to_string(),
-            span_parents: None,
-            destination: LogDestination::project_logs("proj-456"),
-            org_id: "org-2".to_string(),
-            org_name: None,
-            input: None,
-            output: None,
-            expected: None,
-            error: None,
-            scores: None,
-            metadata: None,
-            metrics: None,
-            tags: None,
-            context: None,
-            span_attributes: None,
-            created: Utc::now(),
-        };
-
-        let key = RowKey::from_row(&row);
-        assert_eq!(key.org_id, "org-2");
-        assert_eq!(key.experiment_id, None);
-        assert_eq!(key.project_id, Some("proj-456".to_string()));
-        assert_eq!(key.dataset_id, None);
-        assert_eq!(key.prompt_session_id, None);
-        assert_eq!(key.log_id, Some("g".to_string()));
-        assert_eq!(key.row_id, "row-2");
-    }
-
-    #[test]
-    fn merge_into_overwrites_scalar_fields() {
-        let mut target = Logs3Row {
-            id: "row-1".to_string(),
-            is_merge: None,
-            span_id: "span-1".to_string(),
-            root_span_id: "root-1".to_string(),
-            span_parents: None,
-            destination: LogDestination::experiment("exp-123"),
-            org_id: "org-1".to_string(),
-            org_name: None,
-            input: Some(serde_json::json!("old-input")),
-            output: None,
-            expected: None,
-            error: None,
-            scores: None,
-            metadata: None,
-            metrics: None,
-            tags: None,
-            context: None,
-            span_attributes: None,
-            created: Utc::now(),
-        };
-
-        let source = Logs3Row {
-            id: "row-1".to_string(),
-            is_merge: Some(true),
-            span_id: "span-1".to_string(),
-            root_span_id: "root-1".to_string(),
-            span_parents: None,
-            destination: LogDestination::experiment("exp-123"),
-            org_id: "org-1".to_string(),
-            org_name: Some("new-org-name".to_string()),
-            input: Some(serde_json::json!("new-input")),
-            output: Some(serde_json::json!("new-output")),
-            expected: None,
-            error: None,
-            scores: None,
-            metadata: None,
-            metrics: None,
-            tags: None,
-            context: None,
-            span_attributes: None,
-            created: Utc::now(),
-        };
-
-        merge_into(&mut target, source);
-
-        assert_eq!(target.input, Some(serde_json::json!("new-input")));
-        assert_eq!(target.output, Some(serde_json::json!("new-output")));
-        assert_eq!(target.org_name, Some("new-org-name".to_string()));
-    }
-
-    #[test]
-    fn merge_into_deep_merges_metadata() {
-        let mut target = Logs3Row {
-            id: "row-1".to_string(),
-            is_merge: None,
-            span_id: "span-1".to_string(),
-            root_span_id: "root-1".to_string(),
-            span_parents: None,
-            destination: LogDestination::experiment("exp-123"),
-            org_id: "org-1".to_string(),
-            org_name: None,
-            input: None,
-            output: None,
-            expected: None,
-            error: None,
-            scores: None,
-            metadata: Some(
-                [("key1".to_string(), serde_json::json!("value1"))]
-                    .into_iter()
-                    .collect(),
-            ),
-            metrics: Some([("metric1".to_string(), 1.0)].into_iter().collect()),
-            tags: None,
-            context: None,
-            span_attributes: None,
-            created: Utc::now(),
-        };
-
-        let source = Logs3Row {
-            id: "row-1".to_string(),
-            is_merge: Some(true),
-            span_id: "span-1".to_string(),
-            root_span_id: "root-1".to_string(),
-            span_parents: None,
-            destination: LogDestination::experiment("exp-123"),
-            org_id: "org-1".to_string(),
-            org_name: None,
-            input: None,
-            output: None,
-            expected: None,
-            error: None,
-            scores: None,
-            metadata: Some(
-                [("key2".to_string(), serde_json::json!("value2"))]
-                    .into_iter()
-                    .collect(),
-            ),
-            metrics: Some([("metric2".to_string(), 2.0)].into_iter().collect()),
-            tags: None,
-            context: None,
-            span_attributes: None,
-            created: Utc::now(),
-        };
-
-        merge_into(&mut target, source);
-
-        let metadata = target.metadata.unwrap();
-        assert_eq!(metadata.get("key1").unwrap(), "value1");
-        assert_eq!(metadata.get("key2").unwrap(), "value2");
-
-        let metrics = target.metrics.unwrap();
-        assert_eq!(metrics.get("metric1").copied(), Some(1.0));
-        assert_eq!(metrics.get("metric2").copied(), Some(2.0));
-    }
-
-    #[test]
-    fn batching_respects_item_limit() {
-        let state = WorkerState::new(
-            Url::parse("https://api.braintrust.dev").expect("valid url"),
-            Url::parse("https://www.braintrust.dev").expect("valid url"),
-            WorkerConfig::default(),
-        );
-
-        // Create more rows than batch limit
-        let rows: Vec<Logs3Row> = (0..250)
-            .map(|i| Logs3Row {
-                id: format!("row-{}", i),
-                is_merge: None,
-                span_id: format!("span-{}", i),
-                root_span_id: format!("root-{}", i),
-                span_parents: None,
-                destination: LogDestination::experiment("exp-123"),
-                org_id: "org-1".to_string(),
-                org_name: None,
-                input: None,
-                output: None,
-                expected: None,
-                error: None,
-                scores: None,
-                metadata: None,
-                metrics: None,
-                tags: None,
-                context: None,
-                span_attributes: None,
-                created: Utc::now(),
-            })
-            .collect();
-
-        let batches = state.batch_and_serialize_rows(rows);
-
-        // Should create 3 batches: 100, 100, 50
-        assert_eq!(batches.len(), 3);
-
-        // Verify batches are non-empty and serialized correctly
-        for batch_bytes in &batches {
-            assert!(!batch_bytes.is_empty(), "batch should not be empty");
-            // Verify it's valid JSON
-            let value: Value =
-                serde_json::from_slice(batch_bytes).expect("batch should be valid JSON");
-            assert!(value.get("rows").is_some(), "batch should have rows field");
-            assert!(
-                value.get("api_version").is_some(),
-                "batch should have api_version field"
-            );
-        }
     }
 }
