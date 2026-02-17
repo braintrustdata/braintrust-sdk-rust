@@ -6,6 +6,38 @@ use crate::types::{
 use serde_json::Value;
 use tracing::warn;
 
+/// Generic batching function - matches TypeScript SDK's batchItems().
+///
+/// Splits `items` into batches respecting `max_items` and `max_bytes` limits.
+/// `byte_size` is called once per item to determine its size.
+pub(crate) fn batch_items<T>(
+    items: Vec<T>,
+    max_items: usize,
+    max_bytes: usize,
+    byte_size: impl Fn(&T) -> usize,
+) -> Vec<Vec<T>> {
+    let max_items = max_items.max(1);
+    let max_bytes = max_bytes.max(1);
+    let mut output = Vec::new();
+    let mut batch: Vec<T> = Vec::new();
+    let mut batch_bytes = 0usize;
+
+    for item in items {
+        let item_size = byte_size(&item);
+        if !batch.is_empty() && (batch.len() >= max_items || batch_bytes + item_size > max_bytes) {
+            output.push(batch);
+            batch = Vec::new();
+            batch_bytes = 0;
+        }
+        batch_bytes += item_size;
+        batch.push(item);
+    }
+    if !batch.is_empty() {
+        output.push(batch);
+    }
+    output
+}
+
 /// A serialized batch with per-row overflow metadata.
 pub(crate) struct SerializedBatch {
     /// The full batch serialized as a Logs3Request JSON payload.
@@ -99,6 +131,7 @@ fn build_overflow_row(row: &Logs3Row, byte_size: usize) -> Logs3OverflowInputRow
 
     Logs3OverflowInputRow {
         object_ids,
+        is_delete: None,
         input_row: Logs3OverflowInputRowMeta { byte_size },
     }
 }

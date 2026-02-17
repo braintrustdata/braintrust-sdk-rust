@@ -48,6 +48,12 @@ struct LoginStateInner {
     app_url: String,
 }
 
+impl Default for LoginState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoginState {
     /// Create a new empty login state.
     pub fn new() -> Self {
@@ -57,6 +63,7 @@ impl LoginState {
     }
 
     /// Set the login state (can only be called once).
+    /// Returns true if set successfully, false if already set.
     pub fn set(
         &self,
         api_key: String,
@@ -64,7 +71,7 @@ impl LoginState {
         org_name: String,
         api_url: String,
         app_url: String,
-    ) -> std::result::Result<(), ()> {
+    ) -> bool {
         self.inner
             .set(LoginStateInner {
                 api_key,
@@ -73,7 +80,7 @@ impl LoginState {
                 api_url,
                 app_url,
             })
-            .map_err(|_| ())
+            .is_ok()
     }
 
     /// Check if logged in.
@@ -507,17 +514,19 @@ impl BraintrustClient {
             })?
         };
 
-        self.inner
-            .login_state
-            .set(
-                api_key.to_string(),
-                org.id,
-                org.name,
-                org.api_url
-                    .unwrap_or_else(|| self.inner.api_url.to_string()),
-                self.inner.app_url.to_string(),
-            )
-            .map_err(|_| BraintrustError::InvalidConfig("Login state already set".to_string()))?;
+        let did_set = self.inner.login_state.set(
+            api_key.to_string(),
+            org.id,
+            org.name,
+            org.api_url
+                .unwrap_or_else(|| self.inner.api_url.to_string()),
+            self.inner.app_url.to_string(),
+        );
+        if !did_set {
+            return Err(BraintrustError::InvalidConfig(
+                "Login state already set".to_string(),
+            ));
+        }
 
         self.inner.login_notify.notify_waiters();
         Ok(())

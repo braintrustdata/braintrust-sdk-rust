@@ -21,6 +21,7 @@ pub fn deep_merge(into: &mut Value, from: &Value) {
     deep_merge_helper(into, from, None, true);
 }
 
+#[allow(dead_code)]
 pub fn deep_merge_maps(into: &mut Map<String, Value>, from: &Map<String, Value>) {
     deep_merge_maps_helper(into, from, None, true);
 }
@@ -31,6 +32,7 @@ pub fn deep_merge_maps(into: &mut Map<String, Value>, from: &Map<String, Value>)
 // E.g. if the `stop_deep_merge_paths` set contains the path ["a", "b", "c"], then if you are
 // merging the following objects: into={"a": {"b": {"c": {"d": 1}}}}, from={"a": {"b": {"c": {"e":
 // 2}}}}, then the resulting object will be {"a": {"b": {"c": {"e": 2}}}}.
+#[allow(dead_code)]
 pub fn deep_merge_with_stop_paths(
     into: &mut Value,
     from: &Value,
@@ -47,6 +49,7 @@ pub fn deep_merge_with_stop_paths(
     );
 }
 
+#[allow(dead_code)]
 pub fn deep_merge_maps_with_stop_paths(
     into: &mut Map<String, Value>,
     from: &Map<String, Value>,

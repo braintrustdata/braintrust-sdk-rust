@@ -227,10 +227,17 @@ impl LogQueue {
 
     /// Get the cached (max_request_size, can_use_overflow) from GET /version.
     /// Fetches lazily on first call and caches the result.
-    async fn get_version_info(&self, api_url: &Url, token: &str) -> (usize, bool) {
+    async fn get_version_info(
+        &self,
+        api_url: &Url,
+        token: &str,
+        org_name: Option<&str>,
+    ) -> (usize, bool) {
         *self
             .version_info
-            .get_or_init(|| async { fetch_version_info(&self.client, api_url, token).await })
+            .get_or_init(|| async {
+                fetch_version_info(&self.client, api_url, token, org_name).await
+            })
             .await
     }
 
@@ -253,6 +260,7 @@ impl LogQueue {
                 return;
             }
         };
+        let org_name = self.login_state.org_name();
 
         let api_url = match Url::parse(&api_url_str) {
             Ok(url) => url,
@@ -262,7 +270,9 @@ impl LogQueue {
             }
         };
 
-        let (max_request_size, can_use_overflow) = self.get_version_info(&api_url, &api_key).await;
+        let (max_request_size, can_use_overflow) = self
+            .get_version_info(&api_url, &api_key, org_name.as_deref())
+            .await;
 
         // Chunk size matches TypeScript SDK: max(1, min(batchMaxItems, flushChunkSize))
         let chunk_size = std::cmp::max(
@@ -310,6 +320,7 @@ impl LogQueue {
                         &self.client,
                         &api_url,
                         &api_key,
+                        org_name.as_deref(),
                         batch,
                         &self.config,
                         max_request_size,
@@ -341,6 +352,7 @@ impl LogQueue {
     }
 
     /// Get the approximate number of items in the queue.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.channel.load().1.len()
     }
@@ -351,6 +363,7 @@ impl LogQueue {
     }
 
     /// Get the total number of dropped items.
+    #[allow(dead_code)]
     pub fn dropped_count(&self) -> usize {
         self.dropped_count.load(Ordering::Relaxed)
     }
@@ -381,6 +394,7 @@ impl LogQueue {
     }
 
     /// Shutdown: flush all pending data then drop.
+    #[allow(dead_code)]
     pub async fn shutdown(&self) {
         let _ = self.flush_all().await;
     }

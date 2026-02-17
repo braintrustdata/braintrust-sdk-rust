@@ -1,30 +1,22 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoffBuilder;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest::{multipart, Client, Url};
-use serde::{Deserialize, Serialize};
+use reqwest::{Client, Url};
 use serde_json::{json, Map, Value};
 use tokio::time::sleep;
 
+use super::batching::batch_items;
+use super::http::{request_overflow_upload, upload_overflow_payload};
 use crate::error::{BraintrustError, Result};
+use crate::types::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, OBJECT_ID_KEYS};
 
-const DEFAULT_MAX_REQUEST_SIZE: usize = 6 * 1024 * 1024;
 const LOGS_API_VERSION: u8 = 2;
 const LOGS3_OVERFLOW_REFERENCE_TYPE: &str = "logs3_overflow";
 const MAX_ATTEMPTS: usize = 5;
 const BASE_BACKOFF_MS: u64 = 300;
 const MAX_BACKOFF_MS: u64 = 8_000;
-const OBJECT_ID_KEYS: [&str; 6] = [
-    "experiment_id",
-    "dataset_id",
-    "prompt_session_id",
-    "project_id",
-    "log_id",
-    "function_data",
-];
+const DEFAULT_MAX_REQUEST_SIZE: usize = 6 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct Logs3UploadResult {
@@ -54,42 +46,6 @@ struct RowPayload {
     row_json: String,
     row_bytes: usize,
     overflow_meta: Logs3OverflowInputRow,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct Logs3OverflowInputRow {
-    object_ids: Map<String, Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    is_delete: Option<bool>,
-    input_row: OverflowInputRowInfo,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OverflowInputRowInfo {
-    byte_size: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct VersionInfo {
-    #[serde(default)]
-    logs3_payload_max_bytes: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-enum OverflowMethod {
-    Put,
-    Post,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Logs3OverflowUpload {
-    method: OverflowMethod,
-    signed_url: String,
-    headers: Option<HashMap<String, String>>,
-    fields: Option<HashMap<String, String>>,
-    key: String,
 }
 
 impl Logs3BatchUploader {
@@ -136,7 +92,9 @@ impl Logs3BatchUploader {
 
         let batch_limit_rows = batch_max_num_items.max(1);
         let batch_limit_bytes = (limits.max_request_size / 2).max(1);
-        let batches = batch_items(&row_payloads, batch_limit_rows, batch_limit_bytes);
+        let batches = batch_items(row_payloads, batch_limit_rows, batch_limit_bytes, |item| {
+            item.row_bytes
+        });
 
         let mut result = Logs3UploadResult::default();
         for batch in batches {
@@ -158,22 +116,22 @@ impl Logs3BatchUploader {
     }
 
     async fn fetch_payload_limits(&self) -> PayloadLimits {
-        let mut server_limit: Option<usize> = None;
-        if let Ok(url) = self.api_url.join("version") {
-            let mut request = self.client.get(url).bearer_auth(&self.api_key);
-            if let Some(org_name) = &self.org_name {
-                request = request.header("x-bt-org-name", org_name);
-            }
-            if let Ok(response) = request.send().await {
-                if response.status().is_success() {
-                    if let Ok(version) = response.json::<VersionInfo>().await {
-                        server_limit = version.logs3_payload_max_bytes.filter(|v| *v > 0);
-                    }
-                }
-            }
-        }
+        let (server_max, can_use_overflow) = super::http::fetch_version_info(
+            &self.client,
+            &self.api_url,
+            &self.api_key,
+            self.org_name.as_deref(),
+        )
+        .await;
 
-        let can_use_overflow = server_limit.is_some();
+        // fetch_version_info returns can_use_overflow=true only if the server
+        // responded with a positive logs3_payload_max_bytes
+        let server_limit = if can_use_overflow {
+            Some(server_max)
+        } else {
+            None
+        };
+
         let mut max_request_size = DEFAULT_MAX_REQUEST_SIZE;
         if let Some(override_bytes) = self.max_request_size_override {
             max_request_size = if let Some(server_limit) = server_limit {
@@ -181,8 +139,8 @@ impl Logs3BatchUploader {
             } else {
                 override_bytes
             };
-        } else if let Some(server_limit) = server_limit {
-            max_request_size = server_limit;
+        } else if let Some(limit) = server_limit {
+            max_request_size = limit;
         }
         PayloadLimits {
             max_request_size: max_request_size.max(1),
@@ -263,15 +221,15 @@ impl Logs3BatchUploader {
             .map(|item| item.overflow_meta.clone())
             .collect();
         let mut requests_sent = 0usize;
-        let (upload_result, upload_attempts) =
-            run_with_backoff(|| self.request_overflow_upload(&overflow_rows, payload_bytes)).await;
-        requests_sent += upload_attempts;
-        let upload = upload_result?;
 
-        let (upload_payload_result, upload_payload_attempts) =
-            run_with_backoff(|| self.upload_overflow_payload(&upload, &payload)).await;
-        requests_sent += upload_payload_attempts;
-        upload_payload_result?;
+        let payload_bytes_vec = payload.as_bytes().to_vec();
+
+        let upload = self
+            .request_overflow_with_retry(&overflow_rows, &payload_bytes_vec, &mut requests_sent)
+            .await?;
+
+        self.upload_payload_with_retry(&upload, &payload_bytes_vec, &mut requests_sent)
+            .await?;
 
         let overflow_reference = json!({
             "rows": {
@@ -293,111 +251,79 @@ impl Logs3BatchUploader {
         })
     }
 
-    async fn request_overflow_upload(
+    async fn request_overflow_with_retry(
         &self,
-        rows: &[Logs3OverflowInputRow],
-        payload_bytes: usize,
-    ) -> Result<Logs3OverflowUpload> {
-        let url = self
-            .api_url
-            .join("logs3/overflow")
-            .map_err(|e| BraintrustError::InvalidConfig(format!("invalid overflow URL: {e}")))?;
-
-        let request_body = json!({
-            "content_type": "application/json",
-            "size_bytes": payload_bytes,
-            "rows": rows,
-        });
-        let mut request = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&request_body);
-        if let Some(org_name) = &self.org_name {
-            request = request.header("x-bt-org-name", org_name);
+        overflow_rows: &[Logs3OverflowInputRow],
+        payload_bytes: &[u8],
+        requests_sent: &mut usize,
+    ) -> Result<crate::types::Logs3OverflowUpload> {
+        let mut attempts = 0usize;
+        let mut backoff = new_backoff();
+        loop {
+            attempts += 1;
+            let result = request_overflow_upload(
+                &self.client,
+                &self.api_url,
+                &self.api_key,
+                payload_bytes,
+                overflow_rows,
+            )
+            .await;
+            match result {
+                Ok(upload) => {
+                    *requests_sent += attempts;
+                    return Ok(upload);
+                }
+                Err(e) => {
+                    let bt_err = BraintrustError::Network(e.to_string());
+                    if !should_retry(&bt_err) || attempts >= MAX_ATTEMPTS {
+                        *requests_sent += attempts;
+                        return Err(bt_err);
+                    }
+                    match backoff.next_backoff() {
+                        Some(delay) => sleep(delay).await,
+                        None => {
+                            *requests_sent += attempts;
+                            return Err(bt_err);
+                        }
+                    }
+                }
+            }
         }
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api { status, message });
-        }
-        response
-            .json::<Logs3OverflowUpload>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("failed to parse logs3 overflow response: {e}"),
-            })
     }
 
-    async fn upload_overflow_payload(
+    async fn upload_payload_with_retry(
         &self,
-        upload: &Logs3OverflowUpload,
-        payload: &str,
+        upload: &crate::types::Logs3OverflowUpload,
+        payload_bytes: &[u8],
+        requests_sent: &mut usize,
     ) -> Result<()> {
-        let signed_url = Url::parse(&upload.signed_url).map_err(|e| {
-            BraintrustError::InvalidConfig(format!("invalid logs3 overflow signed URL: {e}"))
-        })?;
-        match upload.method {
-            OverflowMethod::Post => {
-                let fields = upload.fields.clone().ok_or_else(|| {
-                    BraintrustError::InvalidConfig(
-                        "logs3 overflow POST upload missing form fields".to_string(),
-                    )
-                })?;
-                let content_type = fields
-                    .get("Content-Type")
-                    .cloned()
-                    .unwrap_or_else(|| "application/json".to_string());
-                let mut form = multipart::Form::new();
-                for (key, value) in &fields {
-                    form = form.text(key.clone(), value.clone());
+        let mut attempts = 0usize;
+        let mut backoff = new_backoff();
+        loop {
+            attempts += 1;
+            let result = upload_overflow_payload(&self.client, upload, payload_bytes).await;
+            match result {
+                Ok(()) => {
+                    *requests_sent += attempts;
+                    return Ok(());
                 }
-                let file_part = multipart::Part::text(payload.to_string())
-                    .mime_str(&content_type)
-                    .map_err(|e| {
-                        BraintrustError::InvalidConfig(format!(
-                            "invalid overflow content-type '{content_type}': {e}"
-                        ))
-                    })?;
-                form = form.part("file", file_part);
-
-                let mut request = self.client.post(signed_url).multipart(form);
-                let mut headers = header_map_from_pairs(upload.headers.as_ref())?;
-                headers.remove("content-type");
-                if !headers.is_empty() {
-                    request = request.headers(headers);
-                }
-                let response = request.send().await?;
-                if !response.status().is_success() {
-                    let status = response.status().as_u16();
-                    let message = response.text().await.unwrap_or_default();
-                    return Err(BraintrustError::Api { status, message });
-                }
-            }
-            OverflowMethod::Put => {
-                let mut headers = header_map_from_pairs(upload.headers.as_ref())?;
-                if upload.signed_url.contains("blob.core.windows.net")
-                    && !headers.contains_key("x-ms-blob-type")
-                {
-                    headers.insert("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
-                }
-
-                let mut request = self.client.put(signed_url).body(payload.to_string());
-                if !headers.is_empty() {
-                    request = request.headers(headers);
-                }
-                let response = request.send().await?;
-                if !response.status().is_success() {
-                    let status = response.status().as_u16();
-                    let message = response.text().await.unwrap_or_default();
-                    return Err(BraintrustError::Api { status, message });
+                Err(e) => {
+                    let bt_err = BraintrustError::Network(e.to_string());
+                    if !should_retry(&bt_err) || attempts >= MAX_ATTEMPTS {
+                        *requests_sent += attempts;
+                        return Err(bt_err);
+                    }
+                    match backoff.next_backoff() {
+                        Some(delay) => sleep(delay).await,
+                        None => {
+                            *requests_sent += attempts;
+                            return Err(bt_err);
+                        }
+                    }
                 }
             }
         }
-        Ok(())
     }
 
     async fn post_logs3_raw(&self, payload: &str) -> Result<()> {
@@ -430,9 +356,9 @@ impl RowPayload {
             BraintrustError::InvalidConfig(format!("failed to serialize logs3 row: {e}"))
         })?;
         let row_bytes = row_json.len();
-        let mut object_ids = Map::new();
+        let mut object_ids = serde_json::Map::new();
         for key in OBJECT_ID_KEYS {
-            if let Some(value) = row.get(key) {
+            if let Some(value) = row.get(*key) {
                 object_ids.insert(key.to_string(), value.clone());
             }
         }
@@ -443,7 +369,7 @@ impl RowPayload {
             overflow_meta: Logs3OverflowInputRow {
                 object_ids,
                 is_delete,
-                input_row: OverflowInputRowInfo {
+                input_row: Logs3OverflowInputRowMeta {
                     byte_size: row_bytes,
                 },
             },
@@ -460,52 +386,6 @@ fn construct_logs3_payload(items: &[RowPayload]) -> String {
     format!("{{\"rows\":[{rows}],\"api_version\":{LOGS_API_VERSION}}}")
 }
 
-fn batch_items(
-    items: &[RowPayload],
-    batch_max_num_items: usize,
-    batch_max_num_bytes: usize,
-) -> Vec<Vec<RowPayload>> {
-    let max_items = batch_max_num_items.max(1);
-    let max_bytes = batch_max_num_bytes.max(1);
-    let mut output: Vec<Vec<RowPayload>> = Vec::new();
-    let mut batch: Vec<RowPayload> = Vec::new();
-    let mut batch_len = 0usize;
-
-    for item in items {
-        if !batch.is_empty()
-            && (batch.len() >= max_items || batch_len + item.row_bytes >= max_bytes)
-        {
-            output.push(batch);
-            batch = Vec::new();
-            batch_len = 0;
-        }
-        batch_len += item.row_bytes;
-        batch.push(item.clone());
-    }
-    if !batch.is_empty() {
-        output.push(batch);
-    }
-    output
-}
-
-fn header_map_from_pairs(headers: Option<&HashMap<String, String>>) -> Result<HeaderMap> {
-    let mut out = HeaderMap::new();
-    if let Some(headers) = headers {
-        for (key, value) in headers {
-            let name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid HTTP header name '{key}': {e}"))
-            })?;
-            let header_value = HeaderValue::from_str(value).map_err(|e| {
-                BraintrustError::InvalidConfig(format!(
-                    "invalid HTTP header value for '{key}': {e}"
-                ))
-            })?;
-            out.insert(name, header_value);
-        }
-    }
-    Ok(out)
-}
-
 fn should_retry(err: &BraintrustError) -> bool {
     match err {
         BraintrustError::Http(http_err) => http_err.is_timeout() || http_err.is_connect(),
@@ -517,19 +397,23 @@ fn should_retry(err: &BraintrustError) -> bool {
     }
 }
 
+fn new_backoff() -> backoff::ExponentialBackoff {
+    ExponentialBackoffBuilder::new()
+        .with_initial_interval(Duration::from_millis(BASE_BACKOFF_MS))
+        .with_multiplier(2.0)
+        .with_randomization_factor(0.2)
+        .with_max_interval(Duration::from_millis(MAX_BACKOFF_MS))
+        .with_max_elapsed_time(None)
+        .build()
+}
+
 async fn run_with_backoff<T, F, Fut>(mut operation: F) -> (Result<T>, usize)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
     let mut attempts = 0usize;
-    let mut backoff = ExponentialBackoffBuilder::new()
-        .with_initial_interval(Duration::from_millis(BASE_BACKOFF_MS))
-        .with_multiplier(2.0)
-        .with_randomization_factor(0.2)
-        .with_max_interval(Duration::from_millis(MAX_BACKOFF_MS))
-        .with_max_elapsed_time(None)
-        .build();
+    let mut backoff = new_backoff();
 
     loop {
         attempts += 1;

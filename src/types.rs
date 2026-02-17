@@ -122,6 +122,7 @@ impl LogDestination {
     }
 
     /// Create a new dataset destination.
+    #[allow(dead_code)]
     pub fn dataset(dataset_id: impl Into<String>) -> Self {
         Self::Dataset {
             dataset_id: dataset_id.into(),
@@ -213,6 +214,8 @@ pub(crate) struct Logs3OverflowUpload {
 pub(crate) struct Logs3OverflowInputRow {
     /// Key identifying fields extracted from the row (experiment_id, dataset_id, etc.)
     pub object_ids: serde_json::Map<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_delete: Option<bool>,
     pub input_row: Logs3OverflowInputRowMeta,
 }
 
@@ -243,6 +246,7 @@ pub(crate) const OBJECT_ID_KEYS: &[&str] = &[
     "prompt_session_id",
     "project_id",
     "log_id",
+    "function_data",
 ];
 
 #[derive(Debug, Clone, Serialize)]

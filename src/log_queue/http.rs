@@ -33,6 +33,7 @@ pub(crate) async fn fetch_version_info(
     client: &reqwest::Client,
     api_url: &Url,
     token: &str,
+    org_name: Option<&str>,
 ) -> (usize, bool) {
     let version_url = match api_url.join("version") {
         Ok(url) => url,
@@ -42,7 +43,11 @@ pub(crate) async fn fetch_version_info(
         }
     };
 
-    let response = client.get(version_url).bearer_auth(token).send().await;
+    let mut request = client.get(version_url).bearer_auth(token);
+    if let Some(org) = org_name {
+        request = request.header("x-bt-org-name", org);
+    }
+    let response = request.send().await;
 
     match response {
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
@@ -83,10 +88,12 @@ pub(crate) async fn fetch_version_info(
 /// - `config.num_retries()` is the number of *retries* (not total attempts)
 /// - Total attempts = num_retries + 1
 /// - Retry delay starts at 1 second, doubles each attempt: `1s * 2^attempt`
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_batch_with_retry(
     client: &reqwest::Client,
     api_url: &Url,
     token: &str,
+    org_name: Option<&str>,
     batch: SerializedBatch,
     config: &LogQueueConfig,
     max_request_size: usize,
@@ -171,14 +178,15 @@ pub(crate) async fn send_batch_with_retry(
             let overflow_bytes = serde_json::to_vec(&overflow_ref)
                 .map_err(|e| anyhow::anyhow!("failed to serialize overflow ref: {e}"))?;
 
-            match client
+            let mut overflow_req = client
                 .post(logs_url.clone())
                 .bearer_auth(token)
                 .header("content-type", "application/json")
-                .body(overflow_bytes)
-                .send()
-                .await
-            {
+                .body(overflow_bytes);
+            if let Some(org) = org_name {
+                overflow_req = overflow_req.header("x-bt-org-name", org);
+            }
+            match overflow_req.send().await {
                 Ok(resp) if resp.status().is_success() => return Ok(()),
                 Ok(resp) => {
                     let status = resp.status();
@@ -209,14 +217,15 @@ pub(crate) async fn send_batch_with_retry(
             }
         } else {
             // Normal path: POST directly to logs3
-            match client
+            let mut normal_req = client
                 .post(logs_url.clone())
                 .bearer_auth(token)
                 .header("content-type", "application/json")
-                .body(json_bytes.clone())
-                .send()
-                .await
-            {
+                .body(json_bytes.clone());
+            if let Some(org) = org_name {
+                normal_req = normal_req.header("x-bt-org-name", org);
+            }
+            match normal_req.send().await {
                 Ok(resp) if resp.status().is_success() => return Ok(()),
                 Ok(resp) => {
                     let status = resp.status();
@@ -254,7 +263,7 @@ pub(crate) async fn send_batch_with_retry(
 }
 
 /// Request an overflow upload URL from the server.
-async fn request_overflow_upload(
+pub(crate) async fn request_overflow_upload(
     client: &reqwest::Client,
     api_url: &Url,
     token: &str,
@@ -294,7 +303,7 @@ async fn request_overflow_upload(
 }
 
 /// Upload the payload to the signed URL provided by the overflow response.
-async fn upload_overflow_payload(
+pub(crate) async fn upload_overflow_payload(
     client: &reqwest::Client,
     upload: &Logs3OverflowUpload,
     payload: &[u8],
@@ -354,39 +363,12 @@ async fn upload_overflow_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log_queue::batching::batch_and_serialize_rows;
     use crate::log_queue::config::LogQueueConfig;
-    use crate::types::{LogDestination, Logs3Row};
-    use chrono::Utc;
 
     fn make_batch(data: &[u8]) -> SerializedBatch {
         SerializedBatch {
             data: data.to_vec(),
             overflow_rows: vec![],
-        }
-    }
-
-    fn make_row(id: &str) -> Logs3Row {
-        Logs3Row {
-            id: id.to_string(),
-            is_merge: None,
-            span_id: id.to_string(),
-            root_span_id: id.to_string(),
-            span_parents: None,
-            destination: LogDestination::experiment("exp-123"),
-            org_id: "org".to_string(),
-            org_name: None,
-            input: None,
-            output: None,
-            expected: None,
-            error: None,
-            scores: None,
-            metadata: None,
-            metrics: None,
-            tags: None,
-            context: None,
-            span_attributes: None,
-            created: Utc::now(),
         }
     }
 
@@ -443,6 +425,7 @@ mod tests {
             &client,
             &api_url,
             "token",
+            None,
             make_batch(b"{}"),
             &config,
             usize::MAX,
@@ -478,6 +461,7 @@ mod tests {
             &client,
             &api_url,
             "token",
+            None,
             make_batch(b"{}"),
             &config,
             usize::MAX,
@@ -512,6 +496,7 @@ mod tests {
             &client,
             &api_url,
             "token",
+            None,
             make_batch(b"{}"),
             &config,
             usize::MAX,
@@ -540,6 +525,7 @@ mod tests {
             &client,
             &api_url,
             "token",
+            None,
             make_batch(b"{}"),
             &config,
             usize::MAX,
@@ -569,6 +555,7 @@ mod tests {
             &client,
             &api_url,
             "token",
+            None,
             make_batch(b"{}"),
             &config,
             usize::MAX,
@@ -603,6 +590,7 @@ mod tests {
             &client,
             &api_url,
             "token",
+            None,
             make_batch(b"{}"),
             &config,
             usize::MAX,
