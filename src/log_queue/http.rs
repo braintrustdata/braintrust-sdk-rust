@@ -2,7 +2,7 @@ use super::batching::SerializedBatch;
 use super::config::LogQueueConfig;
 use crate::types::{Logs3OverflowReference, Logs3OverflowRequest, Logs3OverflowUpload};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use url::Url;
 
@@ -18,7 +18,8 @@ pub(crate) fn save_payload_debug(
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let filename = dir.join(format!("{}-{}.json", prefix, timestamp));
+        let unique_id = uuid::Uuid::new_v4();
+        let filename = dir.join(format!("{}-{}-{}.json", prefix, timestamp, unique_id));
         std::fs::write(&filename, data)?;
         tracing::debug!("Saved payload to {}", filename.display());
     }
@@ -88,6 +89,10 @@ pub(crate) async fn fetch_version_info(
 /// - `config.num_retries()` is the number of *retries* (not total attempts)
 /// - Total attempts = num_retries + 1
 /// - Retry delay starts at 1 second, doubles each attempt: `1s * 2^attempt`
+///
+/// Note: the TypeScript SDK retries on all errors including 4xx. This implementation
+/// intentionally diverges: only 429 and 5xx are retried since retrying on 400 Bad
+/// Request (malformed payload) cannot succeed and wastes time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_batch_with_retry(
     client: &reqwest::Client,
@@ -103,7 +108,7 @@ pub(crate) async fn send_batch_with_retry(
     let overflow_rows = batch.overflow_rows;
 
     // Save to debug directories if configured
-    save_payload_debug(&json_bytes, config.all_publish_payloads_dir(), "all")?;
+    save_payload_debug(&json_bytes, config.all_publish_payloads_dir(), "all").ok();
 
     let logs_url = api_url
         .join("logs3")
@@ -146,7 +151,8 @@ pub(crate) async fn send_batch_with_retry(
                                     &json_bytes,
                                     config.failed_publish_payloads_dir(),
                                     "failed",
-                                )?;
+                                )
+                                .ok();
                                 return Err(e);
                             }
                         }
@@ -160,7 +166,8 @@ pub(crate) async fn send_batch_with_retry(
                             &json_bytes,
                             config.failed_publish_payloads_dir(),
                             "failed",
-                        )?;
+                        )
+                        .ok();
                         return Err(e);
                     }
                 }
@@ -186,20 +193,27 @@ pub(crate) async fn send_batch_with_retry(
             if let Some(org) = org_name {
                 overflow_req = overflow_req.header("x-bt-org-name", org);
             }
+            let req_start = Instant::now();
             match overflow_req.send().await {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::debug!(
+                        bytes = json_bytes.len(),
+                        elapsed_ms = req_start.elapsed().as_millis(),
+                        "overflow batch sent"
+                    );
+                    return Ok(());
+                }
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
-                    if attempt < config.num_retries() {
+                    let is_retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error();
+                    if is_retryable && attempt < config.num_retries() {
                         warn!(status = %status, attempt, "overflow ref send failed, retrying");
                         continue;
                     }
-                    save_payload_debug(
-                        &json_bytes,
-                        config.failed_publish_payloads_dir(),
-                        "failed",
-                    )?;
+                    save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
+                        .ok();
                     anyhow::bail!("overflow ref send failed: [{status}] {body}");
                 }
                 Err(e) => {
@@ -207,11 +221,8 @@ pub(crate) async fn send_batch_with_retry(
                         warn!(error = %e, attempt, "overflow ref send network error, retrying");
                         continue;
                     }
-                    save_payload_debug(
-                        &json_bytes,
-                        config.failed_publish_payloads_dir(),
-                        "failed",
-                    )?;
+                    save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
+                        .ok();
                     return Err(e.into());
                 }
             }
@@ -225,8 +236,16 @@ pub(crate) async fn send_batch_with_retry(
             if let Some(org) = org_name {
                 normal_req = normal_req.header("x-bt-org-name", org);
             }
+            let req_start = Instant::now();
             match normal_req.send().await {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::debug!(
+                        bytes = json_bytes.len(),
+                        elapsed_ms = req_start.elapsed().as_millis(),
+                        "batch sent"
+                    );
+                    return Ok(());
+                }
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
@@ -236,11 +255,8 @@ pub(crate) async fn send_batch_with_retry(
                         warn!(status = %status, attempt, "batch send failed with retryable error, retrying");
                         continue;
                     }
-                    save_payload_debug(
-                        &json_bytes,
-                        config.failed_publish_payloads_dir(),
-                        "failed",
-                    )?;
+                    save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
+                        .ok();
                     anyhow::bail!("batch send failed: [{status}] {body}");
                 }
                 Err(e) => {
@@ -248,11 +264,8 @@ pub(crate) async fn send_batch_with_retry(
                         warn!(error = %e, attempt, "batch send network error, retrying");
                         continue;
                     }
-                    save_payload_debug(
-                        &json_bytes,
-                        config.failed_publish_payloads_dir(),
-                        "failed",
-                    )?;
+                    save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
+                        .ok();
                     return Err(e.into());
                 }
             }
@@ -347,6 +360,14 @@ pub(crate) async fn upload_overflow_payload(
             for (key, value) in headers {
                 req = req.header(key, value);
             }
+        }
+        // Azure Blob Storage requires `x-ms-blob-type: BlockBlob` on SAS-URL PUT
+        // requests; without it the server returns 400. The TypeScript SDK uses the
+        // same hostname-based check (`addAzureBlobHeaders`). A more robust signal
+        // would be an `upload_type` field in the server's overflow response, but
+        // that is a server-side change outside this SDK's scope for now.
+        if upload.signed_url.contains("blob.core.windows.net") {
+            req = req.header("x-ms-blob-type", "BlockBlob");
         }
         req.send().await
     };

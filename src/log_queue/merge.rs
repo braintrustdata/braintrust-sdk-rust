@@ -3,7 +3,29 @@ use crate::types::{Logs3Row, SpanAttributes};
 use serde_json::Map;
 use std::collections::HashMap;
 
-/// Merge source row into target row (matches logger.rs merge_into).
+/// Merge source row into target row.
+///
+/// Mirrors the TypeScript SDK's `mergeDicts` (via `mergeDictsWithPathsHelper`):
+/// - JSON object fields (`input`, `output`, `expected`, `error`, `context`) are deep-merged.
+/// - Map fields (`scores`, `metadata`, `metrics`) are merged key-by-key.
+/// - `tags` is a set-union (TypeScript's SET_UNION_FIELDS = {"tags"}).
+/// - Identity fields (`id`, `span_id`, `root_span_id`, `span_parents`, `created`,
+///   `destination`, `org_id`) are preserved from the target without modification.
+///   (These correspond to TypeScript's MERGE_ROW_SKIP_FIELDS.)
+/// - TypeScript also skips `_parent_id`, an internal span-cache field that does not
+///   appear in the Rust wire format, so no special handling is needed here.
+///
+/// TODO: support `_merge_paths` (TS SDK's `MERGE_PATHS_FIELD`).
+/// The TypeScript SDK's `merge_row_batch.ts` lists `_merge_paths` as a skip field
+/// with a matching TODO. Once the TS SDK wires it end-to-end, Rust should follow suit.
+///
+/// Note: `target.is_merge` is intentionally not modified here.  The TypeScript SDK's
+/// `mergeRowBatch` deletes `_is_merge` from the merged result when the existing row
+/// didn't originally have it (`preserveNoMerge` logic).  In this SDK, `is_merge` is
+/// always `Some(true)` or `None` — never `Some(false)` — so the effective behavior is
+/// identical: if target had `None` it keeps `None`; if it had `Some(true)` it keeps
+/// `Some(true)`.  Any future code that explicitly sets `is_merge = Some(false)` would
+/// need to re-evaluate this logic to stay aligned with TypeScript.
 pub(crate) fn merge_row_into(target: &mut Logs3Row, source: Logs3Row) {
     // Deep merge JSON fields
     if let Some(source_input) = source.input {
@@ -71,15 +93,22 @@ pub(crate) fn merge_row_into(target: &mut Logs3Row, source: Logs3Row) {
         }
     }
 
-    // Overwrite scalar fields
-    if let Some(name) = source
-        .span_attributes
-        .as_ref()
-        .and_then(|a| a.name.as_ref())
-    {
-        target
+    // Merge span_attributes fields
+    if let Some(source_attrs) = source.span_attributes {
+        let target_attrs = target
             .span_attributes
-            .get_or_insert_with(SpanAttributes::default)
-            .name = Some(name.clone());
+            .get_or_insert_with(SpanAttributes::default);
+        if let Some(name) = source_attrs.name {
+            target_attrs.name = Some(name);
+        }
+        if let Some(span_type) = source_attrs.span_type {
+            target_attrs.span_type = Some(span_type);
+        }
+        if let Some(purpose) = source_attrs.purpose {
+            target_attrs.purpose = Some(purpose);
+        }
+        for (k, v) in source_attrs.extra {
+            target_attrs.extra.insert(k, v);
+        }
     }
 }

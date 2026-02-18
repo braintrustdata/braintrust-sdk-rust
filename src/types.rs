@@ -91,6 +91,13 @@ pub(crate) struct SpanAttributes {
     pub extra: HashMap<String, Value>,
 }
 
+/// The `log_id` used for regular (non-playground) log destinations (experiments, project
+/// logs, datasets). Matches the TypeScript SDK's `GLOBAL_ID`.
+pub(crate) const GLOBAL_LOG_ID: &str = "g";
+
+/// The `log_id` used for playground log destinations.
+pub(crate) const PLAYGROUND_LOG_ID: &str = "x";
+
 /// The destination for a log row. Each variant represents a mutually exclusive
 /// target: an experiment, project logs, dataset, or playground logs.
 ///
@@ -126,7 +133,7 @@ impl LogDestination {
     pub fn dataset(dataset_id: impl Into<String>) -> Self {
         Self::Dataset {
             dataset_id: dataset_id.into(),
-            log_id: "g".to_string(),
+            log_id: GLOBAL_LOG_ID.to_string(),
         }
     }
 
@@ -134,7 +141,7 @@ impl LogDestination {
     pub fn project_logs(project_id: impl Into<String>) -> Self {
         Self::ProjectLogs {
             project_id: project_id.into(),
-            log_id: "g".to_string(),
+            log_id: GLOBAL_LOG_ID.to_string(),
         }
     }
 
@@ -142,7 +149,7 @@ impl LogDestination {
     pub fn playground_logs(prompt_session_id: impl Into<String>) -> Self {
         Self::PlaygroundLogs {
             prompt_session_id: prompt_session_id.into(),
-            log_id: "x".to_string(),
+            log_id: PLAYGROUND_LOG_ID.to_string(),
         }
     }
 
@@ -192,12 +199,6 @@ impl LogDestination {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Logs3Request {
-    pub rows: Vec<Logs3Row>,
-    pub api_version: u8,
-}
-
 /// Response from POST logs3/overflow — provides a signed URL to upload the payload.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -240,6 +241,10 @@ pub(crate) struct Logs3OverflowReference {
 
 /// The object ID keys that identify a row's destination, used for overflow metadata.
 /// Matches the TypeScript SDK's OBJECT_ID_KEYS.
+///
+/// Note: `function_data` is included to match the TypeScript SDK's key set, but is not
+/// yet a field on `Logs3Row`. It will be populated once a `FunctionLogs` destination
+/// type is added in a future release.
 pub(crate) const OBJECT_ID_KEYS: &[&str] = &[
     "experiment_id",
     "dataset_id",
@@ -284,6 +289,19 @@ pub(crate) struct Logs3Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_attributes: Option<SpanAttributes>,
     pub created: DateTime<Utc>,
+    /// Transaction ID assigned by the server for ordering purposes.
+    /// Matches TS SDK's `_xact_id` / `TRANSACTION_ID_FIELD`. Clients may omit
+    /// this; it is surfaced here for pass-through scenarios.
+    #[serde(rename = "_xact_id", skip_serializing_if = "Option::is_none")]
+    pub xact_id: Option<String>,
+    /// When `true`, marks this row for deletion on the server.
+    /// Matches TS SDK's `_object_delete` / `OBJECT_DELETE_FIELD`.
+    #[serde(rename = "_object_delete", skip_serializing_if = "Option::is_none")]
+    pub object_delete: Option<bool>,
+    /// Source that produced this row. Matches TS SDK's `_audit_source`.
+    /// The Rust SDK always sets this to `"api"` for rows it creates.
+    #[serde(rename = "_audit_source", skip_serializing_if = "Option::is_none")]
+    pub audit_source: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +322,9 @@ pub(crate) struct SpanPayload {
     pub tags: Option<Vec<String>>,
     pub context: Option<Value>,
     pub span_attributes: Option<SpanAttributes>,
+    /// When `true`, marks this row for deletion on the server.
+    /// Matches TS SDK's `_object_delete` / `OBJECT_DELETE_FIELD`.
+    pub object_delete: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +339,9 @@ pub enum ParentSpanInfo {
         project_name: String,
     },
     PlaygroundLogs {
+        object_id: String,
+    },
+    Dataset {
         object_id: String,
     },
     FullSpan {
@@ -809,6 +833,9 @@ mod tests {
             context: None,
             span_attributes: None,
             created: Utc::now(),
+            xact_id: None,
+            object_delete: None,
+            audit_source: None,
         };
 
         let json = serde_json::to_value(&row).unwrap();

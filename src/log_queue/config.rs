@@ -5,7 +5,11 @@ const DEFAULT_QUEUE_MAX_SIZE: usize = 15000;
 const DEFAULT_QUEUE_DROP_LOGGING_PERIOD_SECS: u64 = 60;
 const DEFAULT_BATCH_MAX_ITEMS: usize = 100;
 pub(crate) const DEFAULT_BATCH_MAX_BYTES: usize = 3 * 1024 * 1024; // 3MB (half of BRAINTRUST_MAX_REQUEST_SIZE)
-const DEFAULT_NUM_RETRIES: usize = 3;
+
+// 2 retries = 3 total attempts, matching the TypeScript SDK's default numTries = 3.
+// When BRAINTRUST_NUM_RETRIES=N is set, both SDKs produce N+1 total attempts
+// (TypeScript does `numTries = env + 1`; Rust loops `0..=num_retries`).
+const DEFAULT_NUM_RETRIES: usize = 2;
 const DEFAULT_FLUSH_CHUNK_SIZE: usize = 25;
 
 fn default_queue_max_size() -> usize {
@@ -47,19 +51,26 @@ fn default_num_retries() -> usize {
 }
 
 fn default_flush_chunk_size() -> usize {
-    std::env::var("BRAINTRUST_LOG_FLUSH_CHUNK_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_FLUSH_CHUNK_SIZE)
+    if let Ok(s) = std::env::var("BRAINTRUST_LOG_FLUSH_CHUNK_SIZE") {
+        if let Ok(v) = s.parse::<usize>() {
+            if v > 0 {
+                return v;
+            }
+            tracing::warn!(
+                value = v,
+                "BRAINTRUST_LOG_FLUSH_CHUNK_SIZE must be > 0, using default ({})",
+                DEFAULT_FLUSH_CHUNK_SIZE
+            );
+        }
+    }
+    DEFAULT_FLUSH_CHUNK_SIZE
 }
 
 fn default_sync_flush() -> bool {
-    std::env::var("BRAINTRUST_SYNC_FLUSH")
-        .ok()
-        .and_then(|s| s.parse::<u8>().ok())
-        .map(|v| v != 0)
-        .unwrap_or(false)
+    matches!(
+        std::env::var("BRAINTRUST_SYNC_FLUSH").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
 }
 
 fn default_failed_publish_payloads_dir() -> Option<PathBuf> {
@@ -105,7 +116,9 @@ pub struct LogQueueConfig {
     #[builder(default = default_batch_max_bytes())]
     batch_max_bytes: usize,
 
-    /// Retry count (BRAINTRUST_NUM_RETRIES, default: 3)
+    /// Retry count (BRAINTRUST_NUM_RETRIES, default: 2 retries = 3 total attempts).
+    /// When the env var is set to N, both this SDK and the TypeScript SDK produce N+1 total
+    /// attempts (TypeScript does `numTries = env + 1`; Rust loops `0..=num_retries`).
     #[builder(default = default_num_retries())]
     num_retries: usize,
 
@@ -124,6 +137,13 @@ pub struct LogQueueConfig {
 
     /// Debug: save all payloads (BRAINTRUST_ALL_PUBLISH_PAYLOADS_DIR)
     all_publish_payloads_dir: Option<PathBuf>,
+
+    /// When true, the queue drops new items once it reaches `queue_max_size`.
+    /// Defaults to false (unbounded), matching the TypeScript SDK's default behavior where
+    /// data loss via queue overflow is opt-in. Set to true to apply a hard cap and protect
+    /// against runaway memory growth in high-throughput scenarios.
+    #[builder(default = false)]
+    enforce_queue_size_limit: bool,
 }
 
 impl Default for LogQueueConfig {
@@ -172,6 +192,10 @@ impl LogQueueConfig {
             .clone()
             .or_else(default_all_publish_payloads_dir)
     }
+
+    pub fn enforce_queue_size_limit(&self) -> bool {
+        self.enforce_queue_size_limit
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +210,15 @@ mod tests {
         assert_eq!(config.batch_max_bytes(), DEFAULT_BATCH_MAX_BYTES);
         assert_eq!(config.num_retries(), DEFAULT_NUM_RETRIES);
         assert!(!config.sync_flush());
+        assert!(!config.enforce_queue_size_limit()); // unbounded by default (matches TS SDK)
+    }
+
+    #[test]
+    fn test_enforce_queue_size_limit_can_be_enabled() {
+        let config = LogQueueConfig::builder()
+            .enforce_queue_size_limit(true)
+            .build();
+        assert!(config.enforce_queue_size_limit());
     }
 
     #[test]
@@ -201,6 +234,26 @@ mod tests {
         assert_eq!(config.batch_max_items(), 50);
         assert_eq!(config.num_retries(), 5);
         assert!(config.sync_flush());
+    }
+
+    #[test]
+    fn test_sync_flush_env_var_accepts_truthy_strings() {
+        for truthy in &["1", "true", "yes"] {
+            unsafe { std::env::set_var("BRAINTRUST_SYNC_FLUSH", truthy) };
+            assert!(
+                default_sync_flush(),
+                "BRAINTRUST_SYNC_FLUSH={truthy} should enable sync flush"
+            );
+        }
+        for falsy in &["0", "false", "no", ""] {
+            unsafe { std::env::set_var("BRAINTRUST_SYNC_FLUSH", falsy) };
+            assert!(
+                !default_sync_flush(),
+                "BRAINTRUST_SYNC_FLUSH={falsy} should not enable sync flush"
+            );
+        }
+        unsafe { std::env::remove_var("BRAINTRUST_SYNC_FLUSH") };
+        assert!(!default_sync_flush(), "unset should not enable sync flush");
     }
 
     #[test]

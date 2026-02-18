@@ -2,20 +2,21 @@ use anyhow::Context;
 use chrono::Utc;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use url::Url;
 
-use crate::logger::LoginState;
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 
-use super::queue::LogQueue;
-
-pub(super) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+use super::queue::LogQueueCore;
 
 /// Configuration for the background worker.
 pub(super) struct WorkerConfig {
     pub(super) app_url: Url,
+    /// HTTP client for project registration requests.
+    /// Should be the same client used by `LogQueueCore` so both share a connection pool.
+    pub(super) client: reqwest::Client,
 }
 
 /// Commands sent through the worker channel.
@@ -54,12 +55,11 @@ struct ProjectInfo {
 }
 
 pub(super) async fn run_worker(
-    login_state: LoginState,
     mut receiver: mpsc::Receiver<LogCommand>,
     config: WorkerConfig,
-    queue: LogQueue,
+    core: Arc<LogQueueCore>,
 ) {
-    let mut state = WorkerState::new(login_state, config, queue);
+    let mut state = WorkerState::new(config, core);
 
     loop {
         match receiver.recv().await {
@@ -96,26 +96,21 @@ pub(super) async fn run_worker(
     }
 }
 
-/// Internal worker state - implementation detail of LogQueue.
+/// Internal worker state — implementation detail of LogQueue.
 struct WorkerState {
     app_url: Url,
     client: reqwest::Client,
     project_cache: IndexMap<String, String>,
-    queue: LogQueue,
+    core: Arc<LogQueueCore>,
 }
 
 impl WorkerState {
-    fn new(_login_state: LoginState, config: WorkerConfig, queue: LogQueue) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("reqwest client");
-
+    fn new(config: WorkerConfig, core: Arc<LogQueueCore>) -> Self {
         Self {
             app_url: config.app_url,
-            client,
+            client: config.client,
             project_cache: IndexMap::new(),
-            queue,
+            core,
         }
     }
 
@@ -143,6 +138,7 @@ impl WorkerState {
             tags,
             context,
             span_attributes,
+            object_delete,
         } = payload;
 
         let project_id = if let Some(ref project_name) = project_name {
@@ -183,6 +179,9 @@ impl WorkerState {
                 None,
                 LogDestination::playground_logs(object_id),
             ),
+            Some(ParentSpanInfo::Dataset { object_id }) => {
+                (span_id.clone(), None, LogDestination::dataset(object_id))
+            }
             Some(ParentSpanInfo::FullSpan {
                 object_type,
                 object_id,
@@ -219,15 +218,18 @@ impl WorkerState {
             context,
             span_attributes,
             created: Utc::now(),
+            xact_id: None,
+            object_delete,
+            audit_source: Some("api".to_string()),
         };
 
-        self.queue.push(row);
+        self.core.push(row);
 
         Ok(())
     }
 
     async fn flush_pending(&mut self) -> std::result::Result<(), anyhow::Error> {
-        self.queue
+        self.core
             .flush()
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))

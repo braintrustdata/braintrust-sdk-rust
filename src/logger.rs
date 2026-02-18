@@ -11,7 +11,9 @@ use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::SpanSubmitter;
 use crate::types::{ParentSpanInfo, SpanPayload};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// 30s covers both quick API calls (login, project registration) and slower batch log uploads.
+// The TypeScript SDK applies no explicit timeout.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_QUEUE_SIZE: usize = 256;
 pub const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
@@ -159,8 +161,6 @@ pub struct BraintrustClientBuilder {
     default_project: Option<String>,
     queue_size: usize,
     blocking_login: bool,
-    /// Interval between periodic background flushes.
-    pub flush_interval: Option<Duration>,
     /// Maximum items per HTTP batch.
     pub batch_max_items: Option<usize>,
     /// Maximum bytes per HTTP batch.
@@ -187,7 +187,6 @@ impl BraintrustClientBuilder {
             default_project: std::env::var("BRAINTRUST_DEFAULT_PROJECT").ok(),
             queue_size: DEFAULT_QUEUE_SIZE,
             blocking_login: false,
-            flush_interval: None,
             batch_max_items: None,
             batch_max_bytes: None,
             queue_max_size: None,
@@ -197,13 +196,6 @@ impl BraintrustClientBuilder {
     /// Set the API key (overrides `BRAINTRUST_API_KEY` env var).
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
-        self
-    }
-
-    /// Set the interval between periodic background flushes.
-    /// Default: 1 second.
-    pub fn with_flush_interval(mut self, interval: Duration) -> Self {
-        self.flush_interval = Some(interval);
         self
     }
 
@@ -221,8 +213,9 @@ impl BraintrustClientBuilder {
         self
     }
 
-    /// Set the maximum queue capacity. When full, oldest events are dropped (FIFO).
-    /// Default: unlimited (or `BRAINTRUST_QUEUE_SIZE` env var).
+    /// Set the maximum queue capacity.
+    /// When full, the newest arriving events are dropped.
+    /// Default: 15,000 (or `BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE` env var).
     pub fn with_queue_max_size(mut self, max_size: usize) -> Self {
         self.queue_max_size = Some(max_size);
         self
@@ -536,20 +529,35 @@ impl BraintrustClient {
     fn start_background_login(&self, api_key: String, org_name: Option<String>) {
         let client = self.clone();
         tokio::spawn(async move {
-            // Retry with exponential backoff
+            // Retry with exponential backoff up to a fixed maximum number of attempts.
+            const MAX_ATTEMPTS: u32 = 10;
             let mut delay = Duration::from_millis(100);
             let max_delay = Duration::from_secs(5);
 
-            loop {
+            for attempt in 1..=MAX_ATTEMPTS {
                 match client.perform_login(&api_key, org_name.as_deref()).await {
                     Ok(()) => {
                         tracing::debug!("Background login completed successfully");
-                        break;
+                        return;
                     }
-                    Err(e) => {
-                        tracing::warn!("Background login failed: {}, retrying in {:?}", e, delay);
+                    Err(e) if attempt < MAX_ATTEMPTS => {
+                        tracing::warn!(
+                            attempt,
+                            max = MAX_ATTEMPTS,
+                            "Background login failed: {}, retrying in {:?}",
+                            e,
+                            delay
+                        );
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(max_delay);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Background login failed after {} attempts: {}. \
+                             Spans will not be uploaded until the client is re-created.",
+                            MAX_ATTEMPTS,
+                            e
+                        );
                     }
                 }
             }
@@ -613,6 +621,42 @@ impl BraintrustClient {
     /// Does not wait for completion - useful for streaming writes.
     pub async fn trigger_flush(&self) -> Result<()> {
         self.inner.queue.trigger_flush_command().await
+    }
+}
+
+impl Drop for BraintrustClient {
+    fn drop(&mut self) {
+        // Only flush on the last client reference and when the client is logged in.
+        // `strong_count == 1` means no other `BraintrustClient` clones are alive.
+        if Arc::strong_count(&self.inner) != 1 || !self.inner.login_state.is_logged_in() {
+            return;
+        }
+
+        // Flush via flush_all(), which routes through the background worker's mpsc channel.
+        // This ensures any Submit commands still sitting in the worker's backlog are processed
+        // before the flush begins — resolving the race in LogQueue::Drop where is_empty() only
+        // inspects the lock-free crossbeam queue, not the worker channel.
+        // After this flush completes, LogQueue::Drop will find an empty queue and exit early.
+        //
+        // block_in_place panics on current-thread runtimes (e.g. #[tokio::test] default).
+        // In that case we skip the flush here; LogQueue::Drop provides a best-effort fallback
+        // for the lock-free queue, and tests should always call flush() explicitly.
+        let inner = self.inner.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        let _ = inner.queue.flush_all().await;
+                    });
+                });
+            }
+        } else {
+            // No async runtime available — spin up a temporary one.
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let _ = inner.queue.flush_all().await;
+            });
+        }
     }
 }
 

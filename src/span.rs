@@ -472,6 +472,7 @@ impl From<SpanData> for SpanPayload {
             tags: (!data.tags.is_empty()).then_some(data.tags),
             context: data.context,
             span_attributes: has_attributes.then_some(span_attributes),
+            object_delete: None,
         }
     }
 }

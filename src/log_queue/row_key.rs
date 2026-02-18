@@ -55,6 +55,9 @@ mod tests {
             context: None,
             span_attributes: None,
             created: Utc::now(),
+            xact_id: None,
+            object_delete: None,
+            audit_source: None,
         };
 
         let key = RowKey::from_row(&row);
