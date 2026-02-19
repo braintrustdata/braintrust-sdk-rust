@@ -681,7 +681,6 @@ impl SpanSubmitter for BraintrustClient {
 /// - JSON fields (input, output, expected, error): deep merged recursively
 /// - Map fields (metadata, metrics): keys merged, last write wins for conflicts
 /// - Identity fields (created, span_id, root_span_id, span_parents): preserved from target
-
 #[cfg(test)]
 mod tests {
     use super::*;
