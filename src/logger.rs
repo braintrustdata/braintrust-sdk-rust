@@ -6,6 +6,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -587,6 +588,19 @@ impl WorkerState {
             context,
             span_attributes,
         } = payload;
+        let mut event_fields = MutableSpanEvent {
+            input,
+            output,
+            expected,
+            error,
+            scores,
+            metadata,
+            metrics,
+            tags,
+            context,
+            span_attributes,
+            extra: HashMap::new(),
+        };
 
         let project_id = if let Some(ref project_name) = project_name {
             Some(
@@ -605,7 +619,7 @@ impl WorkerState {
         // row_id and span_id come from payload - generated once at span creation, reused on every flush
 
         // Determine destination and span hierarchy based on parent info
-        let (root_span_id, span_parents, destination) = match parent_info {
+        let (root_span_id, span_parents, destination, propagated_event) = match parent_info {
             None => {
                 // No parent - use project_id if available, otherwise fail
                 let dest = match project_id {
@@ -614,32 +628,43 @@ impl WorkerState {
                         anyhow::bail!("no destination: either parent_info or project_name required")
                     }
                 };
-                (span_id.clone(), None, dest)
+                (span_id.clone(), None, dest, None)
             }
-            Some(ParentSpanInfo::Experiment { object_id }) => {
-                (span_id.clone(), None, LogDestination::experiment(object_id))
-            }
+            Some(ParentSpanInfo::Experiment { object_id }) => (
+                span_id.clone(),
+                None,
+                LogDestination::experiment(object_id),
+                None,
+            ),
             Some(ParentSpanInfo::ProjectLogs { object_id }) => (
                 span_id.clone(),
                 None,
                 LogDestination::project_logs(object_id),
+                None,
             ),
             Some(ParentSpanInfo::ProjectName { project_name }) => {
                 let proj_id = self
                     .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name)
                     .await?;
-                (span_id.clone(), None, LogDestination::project_logs(proj_id))
+                (
+                    span_id.clone(),
+                    None,
+                    LogDestination::project_logs(proj_id),
+                    None,
+                )
             }
             Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
                 span_id.clone(),
                 None,
                 LogDestination::playground_logs(object_id),
+                None,
             ),
             Some(ParentSpanInfo::FullSpan {
                 object_type,
                 object_id,
                 span_id: parent_span_id,
                 root_span_id: parent_root_span_id,
+                propagated_event,
             }) => {
                 let span_parents = Some(vec![parent_span_id]);
                 let dest = match object_type {
@@ -647,9 +672,26 @@ impl WorkerState {
                     SpanObjectType::ProjectLogs => LogDestination::project_logs(object_id),
                     SpanObjectType::PlaygroundLogs => LogDestination::playground_logs(object_id),
                 };
-                (parent_root_span_id, span_parents, dest)
+                (parent_root_span_id, span_parents, dest, propagated_event)
             }
         };
+        if let Some(propagated_event) = propagated_event {
+            apply_propagated_event(&propagated_event, &mut event_fields);
+        }
+
+        let MutableSpanEvent {
+            input,
+            output,
+            expected,
+            error,
+            scores,
+            metadata,
+            metrics,
+            tags,
+            context,
+            span_attributes,
+            extra,
+        } = event_fields;
 
         let row = Logs3Row {
             id: row_id,
@@ -670,6 +712,7 @@ impl WorkerState {
             tags,
             context,
             span_attributes,
+            extra,
             created: Utc::now(),
         };
 
@@ -748,11 +791,156 @@ impl WorkerState {
     }
 }
 
+#[derive(Debug, Default)]
+struct MutableSpanEvent {
+    input: Option<Value>,
+    output: Option<Value>,
+    expected: Option<Value>,
+    error: Option<Value>,
+    scores: Option<HashMap<String, f64>>,
+    metadata: Option<Map<String, Value>>,
+    metrics: Option<HashMap<String, f64>>,
+    tags: Option<Vec<String>>,
+    context: Option<Value>,
+    span_attributes: Option<crate::types::SpanAttributes>,
+    extra: HashMap<String, Value>,
+}
+
+#[derive(Serialize)]
+struct SerializableSpanEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scores: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span_attributes: Option<Value>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+impl MutableSpanEvent {
+    fn to_event_map(&self) -> Map<String, Value> {
+        let serialized = SerializableSpanEvent {
+            input: self.input.clone(),
+            output: self.output.clone(),
+            expected: self.expected.clone(),
+            error: self.error.clone(),
+            scores: self.scores.as_ref().map(numeric_map_to_value),
+            metadata: self.metadata.clone(),
+            metrics: self.metrics.as_ref().map(numeric_map_to_value),
+            tags: self.tags.clone(),
+            context: self.context.clone(),
+            span_attributes: self
+                .span_attributes
+                .clone()
+                .and_then(|value| serde_json::to_value(value).ok()),
+            extra: self.extra.clone(),
+        };
+        serde_json::to_value(serialized)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default()
+    }
+
+    fn apply_merged_event_map(&mut self, mut event: Map<String, Value>) {
+        self.input = event.remove("input");
+        self.output = event.remove("output");
+        self.expected = event.remove("expected");
+        self.error = event.remove("error");
+        self.scores = event.remove("scores").and_then(parse_numeric_map);
+        self.metadata = event.remove("metadata").and_then(|value| match value {
+            Value::Object(map) => Some(map),
+            _ => None,
+        });
+        self.metrics = event.remove("metrics").and_then(parse_numeric_map);
+        self.tags = event.remove("tags").and_then(parse_string_array);
+        self.context = event.remove("context");
+        self.span_attributes = event
+            .remove("span_attributes")
+            .and_then(|value| serde_json::from_value(value).ok());
+        self.extra = HashMap::from_iter(event);
+    }
+}
+
+fn numeric_map_to_value(map: &HashMap<String, f64>) -> Value {
+    Value::Object(Map::from_iter(
+        map.iter()
+            .map(|(key, value)| (key.clone(), Value::from(*value))),
+    ))
+}
+
+fn apply_propagated_event(
+    propagated_event: &Map<String, Value>,
+    event_fields: &mut MutableSpanEvent,
+) {
+    let mut event = event_fields.to_event_map();
+    merge_event_maps(&mut event, propagated_event);
+    event_fields.apply_merged_event_map(event);
+}
+
+fn merge_event_maps(merge_into: &mut Map<String, Value>, merge_from: &Map<String, Value>) {
+    for (key, merge_from_value) in merge_from {
+        match (merge_into.get_mut(key), merge_from_value) {
+            (Some(Value::Object(merge_into_object)), Value::Object(merge_from_object)) => {
+                merge_event_maps(merge_into_object, merge_from_object);
+            }
+            (Some(Value::Array(merge_into_array)), Value::Array(merge_from_array))
+                if key == "tags" =>
+            {
+                for item in merge_from_array {
+                    if !merge_into_array.iter().any(|existing| existing == item) {
+                        merge_into_array.push(item.clone());
+                    }
+                }
+            }
+            _ => {
+                merge_into.insert(key.clone(), merge_from_value.clone());
+            }
+        }
+    }
+}
+
+fn parse_numeric_map(value: Value) -> Option<HashMap<String, f64>> {
+    match value {
+        Value::Object(map) => Some(HashMap::from_iter(
+            map.into_iter()
+                .filter_map(|(key, value)| value.as_f64().map(|number| (key, number))),
+        )),
+        _ => None,
+    }
+}
+
+fn parse_string_array(value: Value) -> Option<Vec<String>> {
+    match value {
+        Value::Array(values) => Some(
+            values
+                .into_iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::span::SpanLog;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -927,6 +1115,64 @@ mod tests {
             .expect("logs request present");
         let body: Value = serde_json::from_slice(&logs_request.body).expect("json");
         assert!(body.get("rows").is_some());
+    }
+
+    #[test]
+    fn apply_propagated_event_merges_fields_and_extra() {
+        let propagated_event = Map::from_iter([
+            ("metrics".to_string(), json!({ "foo": 0.1 })),
+            (
+                "span_attributes".to_string(),
+                json!({ "purpose": "scorer", "source": "propagated" }),
+            ),
+            (
+                "_async_scoring_control".to_string(),
+                json!({ "kind": "state_override", "state": { "status": "disabled" } }),
+            ),
+        ]);
+
+        let mut event_fields = MutableSpanEvent {
+            metrics: Some(HashMap::from_iter([("start".to_string(), 1.0)])),
+            span_attributes: Some(crate::types::SpanAttributes {
+                name: Some("child".to_string()),
+                span_type: Some(crate::types::SpanType::Facet),
+                purpose: None,
+                extra: HashMap::new(),
+            }),
+            ..Default::default()
+        };
+
+        apply_propagated_event(&propagated_event, &mut event_fields);
+
+        assert_eq!(
+            event_fields
+                .metrics
+                .as_ref()
+                .and_then(|m| m.get("start").copied()),
+            Some(1.0)
+        );
+        assert_eq!(
+            event_fields
+                .metrics
+                .as_ref()
+                .and_then(|m| m.get("foo").copied()),
+            Some(0.1)
+        );
+        assert_eq!(
+            event_fields
+                .span_attributes
+                .as_ref()
+                .and_then(|attrs| attrs.purpose.as_deref()),
+            Some("scorer")
+        );
+        assert_eq!(
+            event_fields
+                .span_attributes
+                .as_ref()
+                .and_then(|attrs| attrs.extra.get("source")),
+            Some(&json!("propagated"))
+        );
+        assert!(event_fields.extra.contains_key("_async_scoring_control"));
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -376,21 +377,16 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     /// Flush span data to Braintrust. Can be called multiple times - last writer wins.
     /// Each call updates the same span (same row_id and span_id).
     /// First flush sends with is_merge=false (replace), subsequent flushes send is_merge=true (merge).
+    ///
+    /// This does not mark the span as completed. Call [`SpanHandle::end`] to set
+    /// the `end` metric before final flush.
     pub async fn flush(&self) -> Result<()> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        // Capture end time and add start/end to metrics
-        let end_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .ok();
-
         let payload: SpanPayload = {
             let mut inner = self.inner.lock().await;
             if let Some(start) = inner.start_time {
-                inner.metrics.insert("start".to_string(), start);
+                inner.metrics.entry("start".to_string()).or_insert(start);
             }
-            if let Some(end) = end_time {
+            if let Some(end) = inner.end_time {
                 inner.metrics.insert("end".to_string(), end);
             }
 
@@ -406,6 +402,27 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         self.submitter
             .submit(self.token.clone(), payload, self.parent_info.clone())
             .await
+    }
+
+    /// Mark the span as ended with the current timestamp.
+    ///
+    /// Calling `end()` multiple times is idempotent: once an end time is set,
+    /// subsequent calls return the same value without overwriting it.
+    pub async fn end(&self) -> f64 {
+        self.end_with_time(epoch_secs()).await
+    }
+
+    /// Mark the span as ended with an explicit timestamp (seconds since Unix epoch).
+    ///
+    /// Calling this multiple times is idempotent: once an end time is set,
+    /// subsequent calls return the previously-set value.
+    pub async fn end_with_time(&self, end_time: f64) -> f64 {
+        let mut inner = self.inner.lock().await;
+        if let Some(existing) = inner.end_time {
+            return existing;
+        }
+        inner.end_time = Some(end_time);
+        end_time
     }
 }
 
@@ -430,6 +447,7 @@ struct SpanData {
     tags: Vec<String>,
     context: Option<Value>,
     start_time: Option<f64>,
+    end_time: Option<f64>,
 }
 
 impl From<SpanData> for SpanPayload {
@@ -465,6 +483,13 @@ impl From<SpanData> for SpanPayload {
             span_attributes: has_attributes.then_some(span_attributes),
         }
     }
+}
+
+fn epoch_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -602,5 +627,43 @@ mod tests {
             captured.payload.error,
             Some(json!({"message": "Something went wrong", "code": 500}))
         );
+    }
+
+    #[tokio::test]
+    async fn flush_does_not_set_end_metric() {
+        let (span, collector) = build_test_span();
+        span.log(
+            SpanLog::builder()
+                .input(json!({"input": "hello"}))
+                .build()
+                .expect("build"),
+        )
+        .await;
+        span.flush().await.expect("flush");
+
+        let captured = collector.spans().into_iter().next().unwrap();
+        let metrics = captured.payload.metrics.unwrap_or_default();
+        assert!(metrics.contains_key("start"));
+        assert!(!metrics.contains_key("end"));
+    }
+
+    #[tokio::test]
+    async fn end_sets_end_metric_on_flush() {
+        let (span, collector) = build_test_span();
+        span.end_with_time(123.0).await;
+        span.flush().await.expect("flush");
+
+        let captured = collector.spans().into_iter().next().unwrap();
+        let metrics = captured.payload.metrics.unwrap_or_default();
+        assert_eq!(metrics.get("end").copied(), Some(123.0));
+    }
+
+    #[tokio::test]
+    async fn end_is_idempotent() {
+        let (span, _collector) = build_test_span();
+        let first = span.end_with_time(123.0).await;
+        let second = span.end_with_time(456.0).await;
+        assert_eq!(first, 123.0);
+        assert_eq!(second, 123.0);
     }
 }

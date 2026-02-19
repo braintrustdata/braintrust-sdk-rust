@@ -940,6 +940,7 @@ async fn finalize_span<Sub: SpanSubmitter>(
             }
         }
     }
+    span.end().await;
     // Flush span with aggregated output
     if let Err(e) = span.flush().await {
         tracing::warn!("Failed to flush span: {}", e);

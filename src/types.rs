@@ -175,6 +175,8 @@ pub(crate) struct Logs3Row {
     pub context: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_attributes: Option<SpanAttributes>,
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
     pub created: DateTime<Utc>,
 }
 
@@ -217,6 +219,8 @@ pub enum ParentSpanInfo {
         object_id: String,
         span_id: String,
         root_span_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        propagated_event: Option<Map<String, Value>>,
     },
 }
 
@@ -700,6 +704,7 @@ mod tests {
             tags: None,
             context: None,
             span_attributes: None,
+            extra: HashMap::new(),
             created: Utc::now(),
         };
 
@@ -722,6 +727,7 @@ mod tests {
             object_id: "exp-123".to_string(),
             span_id: "span-1".to_string(),
             root_span_id: "root-1".to_string(),
+            propagated_event: None,
         };
 
         let json = serde_json::to_value(&parent).unwrap();
@@ -751,6 +757,27 @@ mod tests {
             }
             _ => panic!("Expected FullSpan variant"),
         }
+    }
+
+    #[test]
+    fn parent_span_info_serializes_propagated_event() {
+        let parent = ParentSpanInfo::FullSpan {
+            object_type: SpanObjectType::ProjectLogs,
+            object_id: "proj-123".to_string(),
+            span_id: "span-1".to_string(),
+            root_span_id: "root-1".to_string(),
+            propagated_event: Some(Map::from_iter([(
+                "metrics".to_string(),
+                json!({ "foo": 0.1 }),
+            )])),
+        };
+
+        let json = serde_json::to_value(&parent).unwrap();
+        let obj = json.get("FullSpan").unwrap();
+        assert_eq!(
+            obj.get("propagated_event").unwrap(),
+            &json!({ "metrics": { "foo": 0.1 } })
+        );
     }
 
     #[test]
