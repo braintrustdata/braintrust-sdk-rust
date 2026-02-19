@@ -8,10 +8,10 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::Stream;
@@ -103,6 +103,12 @@ impl fmt::Display for FinalizedStreamBuilderError {
 }
 
 impl std::error::Error for FinalizedStreamBuilderError {}
+
+/// Number of chunks between periodic flushes during streaming.
+const STREAMING_FLUSH_CHUNK_INTERVAL: usize = 10;
+
+/// Maximum time between periodic flushes during streaming.
+const STREAMING_FLUSH_TIME_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A tool call in a chat message.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -707,6 +713,17 @@ impl BraintrustStream {
         self.raw_chunks.is_empty()
     }
 
+    /// Get current partial aggregated value without finalizing.
+    /// Used for streaming periodic updates.
+    pub fn current_value(&self) -> Result<FinalizedStream> {
+        self.aggregate()
+    }
+
+    /// Get the number of chunks collected so far.
+    pub fn chunk_count(&self) -> usize {
+        self.raw_chunks.len()
+    }
+
     fn aggregate(&self) -> Result<FinalizedStream> {
         let mut usage: Option<UsageMetrics> = None;
         let mut model: Option<String> = None;
@@ -796,6 +813,7 @@ impl BraintrustStream {
 /// but also:
 /// - Records time-to-first-token on first meaningful content
 /// - Accumulates chunks for aggregation
+/// - Periodically flushes partial updates for real-time dashboard visibility
 /// - On stream completion, logs the aggregated output/usage/metadata via `span.log()`
 ///
 /// # Type Parameters
@@ -820,10 +838,16 @@ where
     let span_for_complete = span.clone();
     let aggregator_for_complete = Arc::clone(&aggregator);
 
+    // State for periodic flushing
+    let chunk_count = Arc::new(AtomicUsize::new(0));
+    let last_flush = Arc::new(Mutex::new(Instant::now()));
+
     let logged_stream = stream.then(move |result| {
         let span = span.clone();
         let ttft_recorded = ttft_recorded.clone();
         let aggregator = aggregator.clone();
+        let chunk_count = chunk_count.clone();
+        let last_flush = last_flush.clone();
         async move {
             if let Ok(ref value) = result {
                 // Skip keep-alive markers
@@ -838,8 +862,40 @@ where
                             span.log(log).await;
                         }
                     }
+
                     // Accumulate chunk for final aggregation
                     aggregator.lock().await.push(value.clone());
+
+                    // Check if we should do a periodic flush
+                    let count = chunk_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let elapsed = {
+                        let guard = last_flush.lock().await;
+                        guard.elapsed()
+                    };
+
+                    // Flush every N chunks OR every T seconds (whichever comes first)
+                    let should_flush = count % STREAMING_FLUSH_CHUNK_INTERVAL == 0
+                        || elapsed > STREAMING_FLUSH_TIME_INTERVAL;
+
+                    if should_flush {
+                        // Log partial output for dashboard visibility
+                        let agg = aggregator.lock().await;
+                        if let Ok(partial) = agg.current_value() {
+                            // Serialize typed output to Value
+                            if let Ok(output) = serde_json::to_value(&partial.output) {
+                                span.log(SpanLog {
+                                    output: Some(output),
+                                    ..Default::default()
+                                })
+                                .await;
+                            }
+                        }
+                        drop(agg);
+
+                        // Non-blocking flush for real-time updates
+                        let _ = span.trigger_flush().await;
+                        *last_flush.lock().await = Instant::now();
+                    }
                 }
             }
             result

@@ -1,26 +1,21 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use async_trait::async_trait;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, Notify, RwLock};
-use tokio::task::JoinHandle;
-use tracing::warn;
+use serde::Deserialize;
+use tokio::sync::Notify;
 use url::Url;
 
 use crate::error::{BraintrustError, Result};
+use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::SpanSubmitter;
-use crate::types::{
-    LogDestination, Logs3Request, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload,
-    LOGS_API_VERSION,
-};
+use crate::types::{ParentSpanInfo, SpanPayload};
 
-const DEFAULT_QUEUE_SIZE: usize = 256;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// 30s covers both quick API calls (login, project registration) and slower batch log uploads.
+// The TypeScript SDK applies no explicit timeout.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_QUEUE_SIZE: usize = 256;
 pub const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
 pub const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
 
@@ -40,12 +35,97 @@ struct LoginResponse {
 }
 
 /// Logged-in state containing API key and org info.
-#[derive(Debug, Clone)]
+/// Handles internal synchronization for the transition from not-logged-in to logged-in.
+#[derive(Clone)]
 pub struct LoginState {
-    pub api_key: String,
-    pub org_id: String,
-    pub org_name: String,
-    pub api_url: Option<String>,
+    inner: Arc<std::sync::OnceLock<LoginStateInner>>,
+}
+
+#[derive(Debug, Clone)]
+struct LoginStateInner {
+    api_key: String,
+    org_id: String,
+    org_name: String,
+    api_url: String,
+    app_url: String,
+}
+
+impl Default for LoginState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoginState {
+    /// Create a new empty login state.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Set the login state (can only be called once).
+    /// Returns true if set successfully, false if already set.
+    pub fn set(
+        &self,
+        api_key: String,
+        org_id: String,
+        org_name: String,
+        api_url: String,
+        app_url: String,
+    ) -> bool {
+        self.inner
+            .set(LoginStateInner {
+                api_key,
+                org_id,
+                org_name,
+                api_url,
+                app_url,
+            })
+            .is_ok()
+    }
+
+    /// Check if logged in.
+    pub fn is_logged_in(&self) -> bool {
+        self.inner.get().is_some()
+    }
+
+    /// Get the API key if logged in.
+    pub fn api_key(&self) -> Option<String> {
+        self.inner.get().map(|s| s.api_key.clone())
+    }
+
+    /// Get the org ID if logged in.
+    pub fn org_id(&self) -> Option<String> {
+        self.inner.get().map(|s| s.org_id.clone())
+    }
+
+    /// Get the org name if logged in.
+    pub fn org_name(&self) -> Option<String> {
+        self.inner.get().map(|s| s.org_name.clone())
+    }
+
+    /// Get the API URL if logged in.
+    pub fn api_url(&self) -> Option<String> {
+        self.inner.get().map(|s| s.api_url.clone())
+    }
+
+    /// Get the app URL if logged in.
+    pub fn app_url(&self) -> Option<String> {
+        self.inner.get().map(|s| s.app_url.clone())
+    }
+}
+
+impl std::fmt::Debug for LoginState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner.get() {
+            Some(inner) => f.debug_struct("LoginState").field("inner", inner).finish(),
+            None => f
+                .debug_struct("LoginState")
+                .field("inner", &"<not logged in>")
+                .finish(),
+        }
+    }
 }
 
 /// Builder for creating a BraintrustClient with configuration.
@@ -81,6 +161,12 @@ pub struct BraintrustClientBuilder {
     default_project: Option<String>,
     queue_size: usize,
     blocking_login: bool,
+    /// Maximum items per HTTP batch.
+    pub batch_max_items: Option<usize>,
+    /// Maximum bytes per HTTP batch.
+    pub batch_max_bytes: Option<usize>,
+    /// Maximum queue capacity (None = unlimited).
+    pub queue_max_size: Option<usize>,
 }
 
 impl BraintrustClientBuilder {
@@ -101,12 +187,37 @@ impl BraintrustClientBuilder {
             default_project: std::env::var("BRAINTRUST_DEFAULT_PROJECT").ok(),
             queue_size: DEFAULT_QUEUE_SIZE,
             blocking_login: false,
+            batch_max_items: None,
+            batch_max_bytes: None,
+            queue_max_size: None,
         }
     }
 
     /// Set the API key (overrides `BRAINTRUST_API_KEY` env var).
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Set the maximum number of items per HTTP batch.
+    /// Default: 100 (or `BRAINTRUST_DEFAULT_BATCH_SIZE` env var).
+    pub fn with_batch_max_items(mut self, max_items: usize) -> Self {
+        self.batch_max_items = Some(max_items);
+        self
+    }
+
+    /// Set the maximum bytes per HTTP batch.
+    /// Default: 6 MB (or `BRAINTRUST_MAX_REQUEST_SIZE` env var).
+    pub fn with_batch_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.batch_max_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Set the maximum queue capacity.
+    /// When full, the newest arriving events are dropped.
+    /// Default: 15,000 (or `BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE` env var).
+    pub fn with_queue_max_size(mut self, max_size: usize) -> Self {
+        self.queue_max_size = Some(max_size);
         self
     }
 
@@ -174,16 +285,31 @@ impl BraintrustClientBuilder {
             .build()
             .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
 
-        let (sender, receiver) = mpsc::channel(self.queue_size.max(32));
-        let worker = tokio::spawn(run_worker(api_url.clone(), app_url.clone(), receiver));
+        // Create login state (initially empty, populated by login)
+        let login_state = LoginState::new();
+
+        // Build log queue config
+        let log_config = LogQueueConfig::builder()
+            .maybe_batch_max_items(self.batch_max_items)
+            .maybe_batch_max_bytes(self.batch_max_bytes)
+            .maybe_queue_max_size(self.queue_max_size)
+            .build();
+
+        // LogQueue owns the background worker
+        let queue = LogQueue::new(
+            log_config,
+            login_state.clone(),
+            http_client.clone(),
+            app_url.clone(),
+            self.queue_size,
+        );
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
                 api_url,
                 app_url,
-                sender,
-                worker,
-                login_state: RwLock::new(None),
+                queue,
+                login_state,
                 login_notify: Notify::new(),
                 http_client,
                 default_project: self.default_project,
@@ -218,10 +344,8 @@ struct ClientInner {
     #[allow(dead_code)]
     api_url: Url,
     app_url: Url,
-    sender: mpsc::Sender<LogCommand>,
-    #[allow(dead_code)]
-    worker: JoinHandle<()>,
-    login_state: RwLock<Option<LoginState>>,
+    queue: LogQueue,
+    login_state: LoginState,
     login_notify: Notify,
     http_client: reqwest::Client,
     default_project: Option<String>,
@@ -259,7 +383,7 @@ impl BraintrustClient {
 
     /// Check if the client is logged in.
     pub async fn is_logged_in(&self) -> bool {
-        self.inner.login_state.read().await.is_some()
+        self.inner.login_state.is_logged_in()
     }
 
     /// Wait for login to complete (useful if using background login).
@@ -269,9 +393,9 @@ impl BraintrustClient {
         self.wait_for_login_state().await
     }
 
-    /// Get the current login state, if logged in.
-    pub async fn login_state(&self) -> Option<LoginState> {
-        self.inner.login_state.read().await.clone()
+    /// Get the current login state.
+    pub async fn login_state(&self) -> LoginState {
+        self.inner.login_state.clone()
     }
 
     /// Create a span builder using the logged-in state and default project.
@@ -296,8 +420,13 @@ impl BraintrustClient {
     /// ```
     pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder<Self>> {
         let state = self.wait_for_login_state().await?;
-        let mut builder =
-            crate::span::SpanBuilder::new(Arc::new(self.clone()), &state.api_key, &state.org_id);
+        let api_key = state
+            .api_key()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        let org_id = state
+            .org_id()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        let mut builder = crate::span::SpanBuilder::new(Arc::new(self.clone()), &api_key, &org_id);
         if let Some(ref project) = self.inner.default_project {
             builder = builder.project_name(project);
         }
@@ -312,6 +441,18 @@ impl BraintrustClient {
         token: impl Into<String>,
         org_id: impl Into<String>,
     ) -> crate::span::SpanBuilder<Self> {
+        let token = token.into();
+        let org_id = org_id.into();
+
+        // Populate login state with explicit credentials
+        let _ = self.inner.login_state.set(
+            token.clone(),
+            org_id.clone(),
+            String::new(), // org_name unknown
+            self.inner.api_url.to_string(),
+            self.inner.app_url.to_string(),
+        );
+
         let submitter = Arc::new(self.clone());
         crate::span::SpanBuilder::new(submitter, token, org_id)
     }
@@ -366,14 +507,20 @@ impl BraintrustClient {
             })?
         };
 
-        let state = LoginState {
-            api_key: api_key.to_string(),
-            org_id: org.id,
-            org_name: org.name,
-            api_url: org.api_url,
-        };
+        let did_set = self.inner.login_state.set(
+            api_key.to_string(),
+            org.id,
+            org.name,
+            org.api_url
+                .unwrap_or_else(|| self.inner.api_url.to_string()),
+            self.inner.app_url.to_string(),
+        );
+        if !did_set {
+            return Err(BraintrustError::InvalidConfig(
+                "Login state already set".to_string(),
+            ));
+        }
 
-        *self.inner.login_state.write().await = Some(state);
         self.inner.login_notify.notify_waiters();
         Ok(())
     }
@@ -382,20 +529,35 @@ impl BraintrustClient {
     fn start_background_login(&self, api_key: String, org_name: Option<String>) {
         let client = self.clone();
         tokio::spawn(async move {
-            // Retry with exponential backoff
+            // Retry with exponential backoff up to a fixed maximum number of attempts.
+            const MAX_ATTEMPTS: u32 = 10;
             let mut delay = Duration::from_millis(100);
             let max_delay = Duration::from_secs(5);
 
-            loop {
+            for attempt in 1..=MAX_ATTEMPTS {
                 match client.perform_login(&api_key, org_name.as_deref()).await {
                     Ok(()) => {
                         tracing::debug!("Background login completed successfully");
-                        break;
+                        return;
                     }
-                    Err(e) => {
-                        tracing::warn!("Background login failed: {}, retrying in {:?}", e, delay);
+                    Err(e) if attempt < MAX_ATTEMPTS => {
+                        tracing::warn!(
+                            attempt,
+                            max = MAX_ATTEMPTS,
+                            "Background login failed: {}, retrying in {:?}",
+                            e,
+                            delay
+                        );
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(max_delay);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Background login failed after {} attempts: {}. \
+                             Spans will not be uploaded until the client is re-created.",
+                            MAX_ATTEMPTS,
+                            e
+                        );
                     }
                 }
             }
@@ -405,28 +567,29 @@ impl BraintrustClient {
     /// Wait for login state to be available.
     async fn wait_for_login_state(&self) -> Result<LoginState> {
         // Check if already logged in
-        if let Some(state) = self.inner.login_state.read().await.clone() {
-            return Ok(state);
+        if self.inner.login_state.is_logged_in() {
+            return Ok(self.inner.login_state.clone());
         }
 
         // Get notification future BEFORE checking state to avoid race condition
         let notified = self.inner.login_notify.notified();
 
         // Check state again (may have been set between our first check and now)
-        if let Some(state) = self.inner.login_state.read().await.clone() {
-            return Ok(state);
+        if self.inner.login_state.is_logged_in() {
+            return Ok(self.inner.login_state.clone());
         }
 
         // Wait for notification or timeout
         tokio::select! {
             _ = notified => {
-                // Login completed - state is guaranteed to be set since
-                // notify_waiters() is only called after setting state
-                self.inner.login_state.read().await.clone().ok_or_else(|| {
-                    BraintrustError::InvalidConfig(
+                // Login completed - return the login state
+                if self.inner.login_state.is_logged_in() {
+                    Ok(self.inner.login_state.clone())
+                } else {
+                    Err(BraintrustError::InvalidConfig(
                         "Login notification received but state not set".into(),
-                    )
-                })
+                    ))
+                }
             }
             _ = tokio::time::sleep(LOGIN_TIMEOUT) => {
                 Err(BraintrustError::InvalidConfig(
@@ -446,30 +609,54 @@ impl BraintrustClient {
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> Result<()> {
-        let cmd = LogCommand::Submit(Box::new(SubmitCommand {
-            token: token.into(),
-            payload,
-            parent_info,
-        }));
-        self.inner
-            .sender
-            .send(cmd)
-            .await
-            .map_err(|_| BraintrustError::ChannelClosed)?;
-        Ok(())
+        self.inner.queue.submit(token, payload, parent_info).await
     }
 
     /// Flush all pending log events.
     pub async fn flush(&self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.inner
-            .sender
-            .send(LogCommand::Flush(tx))
-            .await
-            .map_err(|_| BraintrustError::ChannelClosed)?;
-        rx.await
-            .map_err(|_| BraintrustError::ChannelClosed)?
-            .map_err(|e| BraintrustError::Background(e.to_string()))
+        self.inner.queue.flush_all().await
+    }
+
+    /// Trigger a non-blocking background flush.
+    /// Does not wait for completion - useful for streaming writes.
+    pub async fn trigger_flush(&self) -> Result<()> {
+        self.inner.queue.trigger_flush_command().await
+    }
+}
+
+impl Drop for BraintrustClient {
+    fn drop(&mut self) {
+        // Only flush on the last client reference and when the client is logged in.
+        // `strong_count == 1` means no other `BraintrustClient` clones are alive.
+        if Arc::strong_count(&self.inner) != 1 || !self.inner.login_state.is_logged_in() {
+            return;
+        }
+
+        // Flush via flush_all(), which routes through the background worker's mpsc channel.
+        // This ensures any Submit commands still sitting in the worker's backlog are processed
+        // before the flush begins — resolving the race in LogQueue::Drop where is_empty() only
+        // inspects the lock-free crossbeam queue, not the worker channel.
+        // After this flush completes, LogQueue::Drop will find an empty queue and exit early.
+        //
+        // block_in_place panics on current-thread runtimes (e.g. #[tokio::test] default).
+        // In that case we skip the flush here; LogQueue::Drop provides a best-effort fallback
+        // for the lock-free queue, and tests should always call flush() explicitly.
+        let inner = self.inner.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        let _ = inner.queue.flush_all().await;
+                    });
+                });
+            }
+        } else {
+            // No async runtime available — spin up a temporary one.
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let _ = inner.queue.flush_all().await;
+            });
+        }
     }
 }
 
@@ -483,271 +670,17 @@ impl SpanSubmitter for BraintrustClient {
     ) -> Result<()> {
         self.submit_payload(token, payload, parent_info).await
     }
-}
 
-enum LogCommand {
-    Submit(Box<SubmitCommand>),
-    Flush(oneshot::Sender<std::result::Result<(), anyhow::Error>>),
-}
-
-struct SubmitCommand {
-    token: String,
-    payload: SpanPayload,
-    parent_info: Option<ParentSpanInfo>,
-}
-
-/// Request body for project registration.
-#[derive(Serialize)]
-struct ProjectRegisterRequest<'a> {
-    project_name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_name: Option<&'a str>,
-}
-
-/// Response from project registration.
-#[derive(Deserialize)]
-struct ProjectRegisterResponse {
-    project: ProjectInfo,
-}
-
-/// Project info in registration response.
-#[derive(Deserialize)]
-struct ProjectInfo {
-    id: String,
-}
-
-async fn run_worker(api_url: Url, app_url: Url, mut receiver: mpsc::Receiver<LogCommand>) {
-    let mut state = WorkerState::new(api_url, app_url);
-    while let Some(cmd) = receiver.recv().await {
-        match cmd {
-            LogCommand::Submit(cmd) => {
-                let SubmitCommand {
-                    token,
-                    payload,
-                    parent_info,
-                } = *cmd;
-                // Fire-and-forget: log errors but don't propagate
-                if let Err(e) = state.submit_payload(&token, payload, parent_info).await {
-                    warn!(error = %e, "failed to submit span to Braintrust");
-                }
-            }
-            LogCommand::Flush(response) => {
-                let _ = response.send(Ok(()));
-            }
-        }
+    async fn trigger_flush(&self) -> Result<()> {
+        self.trigger_flush().await
     }
 }
 
-struct WorkerState {
-    /// URL for data plane requests (e.g., /logs3)
-    api_url: Url,
-    /// URL for control plane requests (e.g., /api/project/register)
-    app_url: Url,
-    client: reqwest::Client,
-    project_cache: HashMap<String, String>,
-}
-
-impl WorkerState {
-    fn new(api_url: Url, app_url: Url) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("reqwest client");
-        Self {
-            api_url,
-            app_url,
-            client,
-            project_cache: HashMap::new(),
-        }
-    }
-
-    async fn submit_payload(
-        &mut self,
-        token: &str,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) -> std::result::Result<(), anyhow::Error> {
-        let SpanPayload {
-            row_id,
-            span_id,
-            is_merge,
-            org_id,
-            org_name,
-            project_name,
-            input,
-            output,
-            expected,
-            error,
-            scores,
-            metadata,
-            metrics,
-            tags,
-            context,
-            span_attributes,
-        } = payload;
-
-        let project_id = if let Some(ref project_name) = project_name {
-            Some(
-                self.ensure_project_id(token, &org_id, org_name.as_deref(), project_name)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        let logs_url = self
-            .api_url
-            .join("logs3")
-            .map_err(|e| anyhow::anyhow!("invalid logs url: {e}"))?;
-
-        // row_id and span_id come from payload - generated once at span creation, reused on every flush
-
-        // Determine destination and span hierarchy based on parent info
-        let (root_span_id, span_parents, destination) = match parent_info {
-            None => {
-                // No parent - use project_id if available, otherwise fail
-                let dest = match project_id {
-                    Some(pid) => LogDestination::project_logs(pid),
-                    None => {
-                        anyhow::bail!("no destination: either parent_info or project_name required")
-                    }
-                };
-                (span_id.clone(), None, dest)
-            }
-            Some(ParentSpanInfo::Experiment { object_id }) => {
-                (span_id.clone(), None, LogDestination::experiment(object_id))
-            }
-            Some(ParentSpanInfo::ProjectLogs { object_id }) => (
-                span_id.clone(),
-                None,
-                LogDestination::project_logs(object_id),
-            ),
-            Some(ParentSpanInfo::ProjectName { project_name }) => {
-                let proj_id = self
-                    .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name)
-                    .await?;
-                (span_id.clone(), None, LogDestination::project_logs(proj_id))
-            }
-            Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
-                span_id.clone(),
-                None,
-                LogDestination::playground_logs(object_id),
-            ),
-            Some(ParentSpanInfo::FullSpan {
-                object_type,
-                object_id,
-                span_id: parent_span_id,
-                root_span_id: parent_root_span_id,
-            }) => {
-                let span_parents = Some(vec![parent_span_id]);
-                let dest = match object_type {
-                    SpanObjectType::Experiment => LogDestination::experiment(object_id),
-                    SpanObjectType::ProjectLogs => LogDestination::project_logs(object_id),
-                    SpanObjectType::PlaygroundLogs => LogDestination::playground_logs(object_id),
-                };
-                (parent_root_span_id, span_parents, dest)
-            }
-        };
-
-        let row = Logs3Row {
-            id: row_id,
-            is_merge: if is_merge { Some(true) } else { None },
-            span_id,
-            root_span_id,
-            span_parents,
-            destination,
-            org_id,
-            org_name,
-            input,
-            output,
-            expected,
-            error,
-            scores,
-            metadata,
-            metrics,
-            tags,
-            context,
-            span_attributes,
-            created: Utc::now(),
-        };
-
-        let request = Logs3Request {
-            rows: vec![row],
-            api_version: LOGS_API_VERSION,
-        };
-
-        let json_bytes = serde_json::to_vec(&request)
-            .map_err(|e| anyhow::anyhow!("JSON serialization failed: {e}"))?;
-
-        let response = self
-            .client
-            .post(logs_url)
-            .bearer_auth(token)
-            .header("content-type", "application/json")
-            .body(json_bytes)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unavailable>".to_string());
-            tracing::warn!("failed to submit span: [{status}] {body}");
-        }
-
-        Ok(())
-    }
-
-    async fn ensure_project_id(
-        &mut self,
-        token: &str,
-        org_id: &str,
-        org_name: Option<&str>,
-        project_name: &str,
-    ) -> std::result::Result<String, anyhow::Error> {
-        let cache_key = format!("{org_id}:{project_name}");
-        if let Some(project_id) = self.project_cache.get(&cache_key) {
-            return Ok(project_id.clone());
-        }
-
-        let request = ProjectRegisterRequest {
-            project_name,
-            org_id: (!org_id.is_empty()).then_some(org_id),
-            org_name,
-        };
-
-        let url = self
-            .app_url
-            .join("api/project/register")
-            .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("register project failed: [{status}] {text}");
-        }
-
-        let register_response: ProjectRegisterResponse = response
-            .json()
-            .await
-            .context("failed to parse project registration response")?;
-
-        self.project_cache
-            .insert(cache_key, register_response.project.id.clone());
-        Ok(register_response.project.id)
-    }
-}
-
+/// Deep merge source row into target row.
+/// Matches the behavior of TS SDK's mergeRowBatch and Brainstore's WAL merge logic.
+/// - JSON fields (input, output, expected, error): deep merged recursively
+/// - Map fields (metadata, metrics): keys merged, last write wins for conflicts
+/// - Identity fields (created, span_id, root_span_id, span_parents): preserved from target
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -951,11 +884,11 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await.expect("should be logged in");
-
-        assert_eq!(login_state.org_id, "org-1");
-        assert_eq!(login_state.org_name, "First Org");
-        assert_eq!(login_state.api_key, "test-api-key");
+        let login_state = client.login_state().await;
+        assert!(login_state.is_logged_in(), "should be logged in");
+        assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
+        assert_eq!(login_state.org_name().as_deref(), Some("First Org"));
+        assert_eq!(login_state.api_key().as_deref(), Some("test-api-key"));
     }
 
     #[tokio::test]
@@ -981,10 +914,10 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await.expect("should be logged in");
-
-        assert_eq!(login_state.org_id, "org-2");
-        assert_eq!(login_state.org_name, "Second Org");
+        let login_state = client.login_state().await;
+        assert!(login_state.is_logged_in(), "should be logged in");
+        assert_eq!(login_state.org_id().as_deref(), Some("org-2"));
+        assert_eq!(login_state.org_name().as_deref(), Some("Second Org"));
     }
 
     #[tokio::test]
@@ -1098,7 +1031,7 @@ mod tests {
 
         // Wait for background login to complete
         let login_state = client.wait_for_login().await.expect("login should succeed");
-        assert_eq!(login_state.org_id, "org-1");
+        assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
         assert!(client.is_logged_in().await);
     }
 
@@ -1244,6 +1177,13 @@ mod tests {
             .mount(&app_server)
             .await;
 
+        // Mount version endpoint on api_server (data plane) - for lazy version fetch
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+
         // Mount logs endpoint on api_server (data plane)
         Mock::given(method("POST"))
             .and(path("/logs3"))
@@ -1276,10 +1216,13 @@ mod tests {
         span.flush().await.expect("flush");
         client.flush().await.expect("client flush");
 
-        // Verify api_server received the /logs3 request
+        // Verify api_server received the /logs3 request (and optionally /version for lazy fetch)
         let api_requests = api_server.received_requests().await.unwrap();
-        assert_eq!(api_requests.len(), 1);
-        assert_eq!(api_requests[0].url.path(), "/logs3");
+        let logs3_requests: Vec<_> = api_requests
+            .iter()
+            .filter(|r| r.url.path() == "/logs3")
+            .collect();
+        assert_eq!(logs3_requests.len(), 1);
 
         // Verify app_server received the /api/project/register request (and login)
         let app_requests = app_server.received_requests().await.unwrap();

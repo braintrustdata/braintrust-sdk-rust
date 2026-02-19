@@ -71,6 +71,11 @@ impl SpanSubmitter for MockBraintrustClient {
         });
         Ok(())
     }
+
+    async fn trigger_flush(&self) -> Result<()> {
+        // Mock: no-op for tests
+        Ok(())
+    }
 }
 
 pub(crate) fn mock_span_builder() -> (SpanBuilder<MockBraintrustClient>, TestSpanCollector) {
