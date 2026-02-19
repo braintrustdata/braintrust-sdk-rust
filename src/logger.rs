@@ -588,17 +588,19 @@ impl WorkerState {
             context,
             span_attributes,
         } = payload;
-        let mut input = input;
-        let mut output = output;
-        let mut expected = expected;
-        let mut error = error;
-        let mut scores = scores;
-        let mut metadata = metadata;
-        let mut metrics = metrics;
-        let mut tags = tags;
-        let mut context = context;
-        let mut span_attributes = span_attributes;
-        let mut extra = HashMap::new();
+        let mut event_fields = MutableSpanEvent {
+            input,
+            output,
+            expected,
+            error,
+            scores,
+            metadata,
+            metrics,
+            tags,
+            context,
+            span_attributes,
+            extra: HashMap::new(),
+        };
 
         let project_id = if let Some(ref project_name) = project_name {
             Some(
@@ -674,21 +676,22 @@ impl WorkerState {
             }
         };
         if let Some(propagated_event) = propagated_event {
-            apply_propagated_event(
-                &propagated_event,
-                &mut input,
-                &mut output,
-                &mut expected,
-                &mut error,
-                &mut scores,
-                &mut metadata,
-                &mut metrics,
-                &mut tags,
-                &mut context,
-                &mut span_attributes,
-                &mut extra,
-            );
+            apply_propagated_event(&propagated_event, &mut event_fields);
         }
+
+        let MutableSpanEvent {
+            input,
+            output,
+            expected,
+            error,
+            scores,
+            metadata,
+            metrics,
+            tags,
+            context,
+            span_attributes,
+            extra,
+        } = event_fields;
 
         let row = Logs3Row {
             id: row_id,
@@ -788,94 +791,105 @@ impl WorkerState {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Debug, Default)]
+struct MutableSpanEvent {
+    input: Option<Value>,
+    output: Option<Value>,
+    expected: Option<Value>,
+    error: Option<Value>,
+    scores: Option<HashMap<String, f64>>,
+    metadata: Option<Map<String, Value>>,
+    metrics: Option<HashMap<String, f64>>,
+    tags: Option<Vec<String>>,
+    context: Option<Value>,
+    span_attributes: Option<crate::types::SpanAttributes>,
+    extra: HashMap<String, Value>,
+}
+
+#[derive(Serialize)]
+struct SerializableSpanEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scores: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span_attributes: Option<Value>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+impl MutableSpanEvent {
+    fn to_event_map(&self) -> Map<String, Value> {
+        let serialized = SerializableSpanEvent {
+            input: self.input.clone(),
+            output: self.output.clone(),
+            expected: self.expected.clone(),
+            error: self.error.clone(),
+            scores: self.scores.as_ref().map(numeric_map_to_value),
+            metadata: self.metadata.clone(),
+            metrics: self.metrics.as_ref().map(numeric_map_to_value),
+            tags: self.tags.clone(),
+            context: self.context.clone(),
+            span_attributes: self
+                .span_attributes
+                .clone()
+                .and_then(|value| serde_json::to_value(value).ok()),
+            extra: self.extra.clone(),
+        };
+        serde_json::to_value(serialized)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default()
+    }
+
+    fn apply_merged_event_map(&mut self, mut event: Map<String, Value>) {
+        self.input = event.remove("input");
+        self.output = event.remove("output");
+        self.expected = event.remove("expected");
+        self.error = event.remove("error");
+        self.scores = event.remove("scores").and_then(parse_numeric_map);
+        self.metadata = event.remove("metadata").and_then(|value| match value {
+            Value::Object(map) => Some(map),
+            _ => None,
+        });
+        self.metrics = event.remove("metrics").and_then(parse_numeric_map);
+        self.tags = event.remove("tags").and_then(parse_string_array);
+        self.context = event.remove("context");
+        self.span_attributes = event
+            .remove("span_attributes")
+            .and_then(|value| serde_json::from_value(value).ok());
+        self.extra = HashMap::from_iter(event);
+    }
+}
+
+fn numeric_map_to_value(map: &HashMap<String, f64>) -> Value {
+    Value::Object(Map::from_iter(
+        map.iter()
+            .map(|(key, value)| (key.clone(), Value::from(*value))),
+    ))
+}
+
 fn apply_propagated_event(
     propagated_event: &Map<String, Value>,
-    input: &mut Option<Value>,
-    output: &mut Option<Value>,
-    expected: &mut Option<Value>,
-    error: &mut Option<Value>,
-    scores: &mut Option<HashMap<String, f64>>,
-    metadata: &mut Option<Map<String, Value>>,
-    metrics: &mut Option<HashMap<String, f64>>,
-    tags: &mut Option<Vec<String>>,
-    context: &mut Option<Value>,
-    span_attributes: &mut Option<crate::types::SpanAttributes>,
-    extra: &mut HashMap<String, Value>,
+    event_fields: &mut MutableSpanEvent,
 ) {
-    let mut event = Map::new();
-    if let Some(value) = input.clone() {
-        event.insert("input".to_string(), value);
-    }
-    if let Some(value) = output.clone() {
-        event.insert("output".to_string(), value);
-    }
-    if let Some(value) = expected.clone() {
-        event.insert("expected".to_string(), value);
-    }
-    if let Some(value) = error.clone() {
-        event.insert("error".to_string(), value);
-    }
-    if let Some(value) = scores.as_ref().map(|m| {
-        Value::Object(Map::from_iter(
-            m.iter()
-                .map(|(key, value)| (key.clone(), Value::from(*value))),
-        ))
-    }) {
-        event.insert("scores".to_string(), value);
-    }
-    if let Some(value) = metadata.clone().map(Value::Object) {
-        event.insert("metadata".to_string(), value);
-    }
-    if let Some(value) = metrics.as_ref().map(|m| {
-        Value::Object(Map::from_iter(
-            m.iter()
-                .map(|(key, value)| (key.clone(), Value::from(*value))),
-        ))
-    }) {
-        event.insert("metrics".to_string(), value);
-    }
-    if let Some(value) = tags
-        .clone()
-        .map(|v| Value::Array(v.into_iter().map(Value::from).collect()))
-    {
-        event.insert("tags".to_string(), value);
-    }
-    if let Some(value) = context.clone() {
-        event.insert("context".to_string(), value);
-    }
-    if let Some(attributes) = span_attributes
-        .clone()
-        .and_then(|value| serde_json::to_value(value).ok())
-    {
-        event.insert("span_attributes".to_string(), attributes);
-    }
-    event.extend(
-        extra
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
-
+    let mut event = event_fields.to_event_map();
     merge_event_maps(&mut event, propagated_event);
-
-    *input = event.remove("input");
-    *output = event.remove("output");
-    *expected = event.remove("expected");
-    *error = event.remove("error");
-    *scores = event.remove("scores").and_then(parse_numeric_map);
-    *metadata = event.remove("metadata").and_then(|value| match value {
-        Value::Object(map) => Some(map),
-        _ => None,
-    });
-    *metrics = event.remove("metrics").and_then(parse_numeric_map);
-    *tags = event.remove("tags").and_then(parse_string_array);
-    *context = event.remove("context");
-    *span_attributes = event
-        .remove("span_attributes")
-        .and_then(|value| serde_json::from_value(value).ok());
-
-    extra.clear();
-    extra.extend(event);
+    event_fields.apply_merged_event_map(event);
 }
 
 fn merge_event_maps(merge_into: &mut Map<String, Value>, merge_from: &Map<String, Value>) {
@@ -1117,59 +1131,48 @@ mod tests {
             ),
         ]);
 
-        let mut input = None;
-        let mut output = None;
-        let mut expected = None;
-        let mut error = None;
-        let mut scores = None;
-        let mut metadata = None;
-        let mut metrics = Some(HashMap::from_iter([("start".to_string(), 1.0)]));
-        let mut tags = None;
-        let mut context = None;
-        let mut span_attributes = Some(crate::types::SpanAttributes {
-            name: Some("child".to_string()),
-            span_type: Some(crate::types::SpanType::Facet),
-            purpose: None,
-            extra: HashMap::new(),
-        });
-        let mut extra = HashMap::new();
+        let mut event_fields = MutableSpanEvent {
+            metrics: Some(HashMap::from_iter([("start".to_string(), 1.0)])),
+            span_attributes: Some(crate::types::SpanAttributes {
+                name: Some("child".to_string()),
+                span_type: Some(crate::types::SpanType::Facet),
+                purpose: None,
+                extra: HashMap::new(),
+            }),
+            ..Default::default()
+        };
 
-        apply_propagated_event(
-            &propagated_event,
-            &mut input,
-            &mut output,
-            &mut expected,
-            &mut error,
-            &mut scores,
-            &mut metadata,
-            &mut metrics,
-            &mut tags,
-            &mut context,
-            &mut span_attributes,
-            &mut extra,
-        );
+        apply_propagated_event(&propagated_event, &mut event_fields);
 
         assert_eq!(
-            metrics.as_ref().and_then(|m| m.get("start").copied()),
+            event_fields
+                .metrics
+                .as_ref()
+                .and_then(|m| m.get("start").copied()),
             Some(1.0)
         );
         assert_eq!(
-            metrics.as_ref().and_then(|m| m.get("foo").copied()),
+            event_fields
+                .metrics
+                .as_ref()
+                .and_then(|m| m.get("foo").copied()),
             Some(0.1)
         );
         assert_eq!(
-            span_attributes
+            event_fields
+                .span_attributes
                 .as_ref()
                 .and_then(|attrs| attrs.purpose.as_deref()),
             Some("scorer")
         );
         assert_eq!(
-            span_attributes
+            event_fields
+                .span_attributes
                 .as_ref()
                 .and_then(|attrs| attrs.extra.get("source")),
             Some(&json!("propagated"))
         );
-        assert!(extra.contains_key("_async_scoring_control"));
+        assert!(event_fields.extra.contains_key("_async_scoring_control"));
     }
 
     #[tokio::test]
