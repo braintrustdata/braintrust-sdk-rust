@@ -6,6 +6,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -587,6 +588,17 @@ impl WorkerState {
             context,
             span_attributes,
         } = payload;
+        let mut input = input;
+        let mut output = output;
+        let mut expected = expected;
+        let mut error = error;
+        let mut scores = scores;
+        let mut metadata = metadata;
+        let mut metrics = metrics;
+        let mut tags = tags;
+        let mut context = context;
+        let mut span_attributes = span_attributes;
+        let mut extra = HashMap::new();
 
         let project_id = if let Some(ref project_name) = project_name {
             Some(
@@ -605,7 +617,7 @@ impl WorkerState {
         // row_id and span_id come from payload - generated once at span creation, reused on every flush
 
         // Determine destination and span hierarchy based on parent info
-        let (root_span_id, span_parents, destination) = match parent_info {
+        let (root_span_id, span_parents, destination, propagated_event) = match parent_info {
             None => {
                 // No parent - use project_id if available, otherwise fail
                 let dest = match project_id {
@@ -614,32 +626,43 @@ impl WorkerState {
                         anyhow::bail!("no destination: either parent_info or project_name required")
                     }
                 };
-                (span_id.clone(), None, dest)
+                (span_id.clone(), None, dest, None)
             }
-            Some(ParentSpanInfo::Experiment { object_id }) => {
-                (span_id.clone(), None, LogDestination::experiment(object_id))
-            }
+            Some(ParentSpanInfo::Experiment { object_id }) => (
+                span_id.clone(),
+                None,
+                LogDestination::experiment(object_id),
+                None,
+            ),
             Some(ParentSpanInfo::ProjectLogs { object_id }) => (
                 span_id.clone(),
                 None,
                 LogDestination::project_logs(object_id),
+                None,
             ),
             Some(ParentSpanInfo::ProjectName { project_name }) => {
                 let proj_id = self
                     .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name)
                     .await?;
-                (span_id.clone(), None, LogDestination::project_logs(proj_id))
+                (
+                    span_id.clone(),
+                    None,
+                    LogDestination::project_logs(proj_id),
+                    None,
+                )
             }
             Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
                 span_id.clone(),
                 None,
                 LogDestination::playground_logs(object_id),
+                None,
             ),
             Some(ParentSpanInfo::FullSpan {
                 object_type,
                 object_id,
                 span_id: parent_span_id,
                 root_span_id: parent_root_span_id,
+                propagated_event,
             }) => {
                 let span_parents = Some(vec![parent_span_id]);
                 let dest = match object_type {
@@ -647,9 +670,25 @@ impl WorkerState {
                     SpanObjectType::ProjectLogs => LogDestination::project_logs(object_id),
                     SpanObjectType::PlaygroundLogs => LogDestination::playground_logs(object_id),
                 };
-                (parent_root_span_id, span_parents, dest)
+                (parent_root_span_id, span_parents, dest, propagated_event)
             }
         };
+        if let Some(propagated_event) = propagated_event {
+            apply_propagated_event(
+                &propagated_event,
+                &mut input,
+                &mut output,
+                &mut expected,
+                &mut error,
+                &mut scores,
+                &mut metadata,
+                &mut metrics,
+                &mut tags,
+                &mut context,
+                &mut span_attributes,
+                &mut extra,
+            );
+        }
 
         let row = Logs3Row {
             id: row_id,
@@ -670,6 +709,7 @@ impl WorkerState {
             tags,
             context,
             span_attributes,
+            extra,
             created: Utc::now(),
         };
 
@@ -748,11 +788,145 @@ impl WorkerState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_propagated_event(
+    propagated_event: &Map<String, Value>,
+    input: &mut Option<Value>,
+    output: &mut Option<Value>,
+    expected: &mut Option<Value>,
+    error: &mut Option<Value>,
+    scores: &mut Option<HashMap<String, f64>>,
+    metadata: &mut Option<Map<String, Value>>,
+    metrics: &mut Option<HashMap<String, f64>>,
+    tags: &mut Option<Vec<String>>,
+    context: &mut Option<Value>,
+    span_attributes: &mut Option<crate::types::SpanAttributes>,
+    extra: &mut HashMap<String, Value>,
+) {
+    let mut event = Map::new();
+    if let Some(value) = input.clone() {
+        event.insert("input".to_string(), value);
+    }
+    if let Some(value) = output.clone() {
+        event.insert("output".to_string(), value);
+    }
+    if let Some(value) = expected.clone() {
+        event.insert("expected".to_string(), value);
+    }
+    if let Some(value) = error.clone() {
+        event.insert("error".to_string(), value);
+    }
+    if let Some(value) = scores.as_ref().map(|m| {
+        Value::Object(Map::from_iter(
+            m.iter()
+                .map(|(key, value)| (key.clone(), Value::from(*value))),
+        ))
+    }) {
+        event.insert("scores".to_string(), value);
+    }
+    if let Some(value) = metadata.clone().map(Value::Object) {
+        event.insert("metadata".to_string(), value);
+    }
+    if let Some(value) = metrics.as_ref().map(|m| {
+        Value::Object(Map::from_iter(
+            m.iter()
+                .map(|(key, value)| (key.clone(), Value::from(*value))),
+        ))
+    }) {
+        event.insert("metrics".to_string(), value);
+    }
+    if let Some(value) = tags
+        .clone()
+        .map(|v| Value::Array(v.into_iter().map(Value::from).collect()))
+    {
+        event.insert("tags".to_string(), value);
+    }
+    if let Some(value) = context.clone() {
+        event.insert("context".to_string(), value);
+    }
+    if let Some(attributes) = span_attributes
+        .clone()
+        .and_then(|value| serde_json::to_value(value).ok())
+    {
+        event.insert("span_attributes".to_string(), attributes);
+    }
+    event.extend(
+        extra
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+
+    merge_event_maps(&mut event, propagated_event);
+
+    *input = event.remove("input");
+    *output = event.remove("output");
+    *expected = event.remove("expected");
+    *error = event.remove("error");
+    *scores = event.remove("scores").and_then(parse_numeric_map);
+    *metadata = event.remove("metadata").and_then(|value| match value {
+        Value::Object(map) => Some(map),
+        _ => None,
+    });
+    *metrics = event.remove("metrics").and_then(parse_numeric_map);
+    *tags = event.remove("tags").and_then(parse_string_array);
+    *context = event.remove("context");
+    *span_attributes = event
+        .remove("span_attributes")
+        .and_then(|value| serde_json::from_value(value).ok());
+
+    extra.clear();
+    extra.extend(event);
+}
+
+fn merge_event_maps(merge_into: &mut Map<String, Value>, merge_from: &Map<String, Value>) {
+    for (key, merge_from_value) in merge_from {
+        match (merge_into.get_mut(key), merge_from_value) {
+            (Some(Value::Object(merge_into_object)), Value::Object(merge_from_object)) => {
+                merge_event_maps(merge_into_object, merge_from_object);
+            }
+            (Some(Value::Array(merge_into_array)), Value::Array(merge_from_array))
+                if key == "tags" =>
+            {
+                for item in merge_from_array {
+                    if !merge_into_array.iter().any(|existing| existing == item) {
+                        merge_into_array.push(item.clone());
+                    }
+                }
+            }
+            _ => {
+                merge_into.insert(key.clone(), merge_from_value.clone());
+            }
+        }
+    }
+}
+
+fn parse_numeric_map(value: Value) -> Option<HashMap<String, f64>> {
+    match value {
+        Value::Object(map) => Some(HashMap::from_iter(
+            map.into_iter()
+                .filter_map(|(key, value)| value.as_f64().map(|number| (key, number))),
+        )),
+        _ => None,
+    }
+}
+
+fn parse_string_array(value: Value) -> Option<Vec<String>> {
+    match value {
+        Value::Array(values) => Some(
+            values
+                .into_iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::span::SpanLog;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -927,6 +1101,75 @@ mod tests {
             .expect("logs request present");
         let body: Value = serde_json::from_slice(&logs_request.body).expect("json");
         assert!(body.get("rows").is_some());
+    }
+
+    #[test]
+    fn apply_propagated_event_merges_fields_and_extra() {
+        let propagated_event = Map::from_iter([
+            ("metrics".to_string(), json!({ "foo": 0.1 })),
+            (
+                "span_attributes".to_string(),
+                json!({ "purpose": "scorer", "source": "propagated" }),
+            ),
+            (
+                "_async_scoring_control".to_string(),
+                json!({ "kind": "state_override", "state": { "status": "disabled" } }),
+            ),
+        ]);
+
+        let mut input = None;
+        let mut output = None;
+        let mut expected = None;
+        let mut error = None;
+        let mut scores = None;
+        let mut metadata = None;
+        let mut metrics = Some(HashMap::from_iter([("start".to_string(), 1.0)]));
+        let mut tags = None;
+        let mut context = None;
+        let mut span_attributes = Some(crate::types::SpanAttributes {
+            name: Some("child".to_string()),
+            span_type: Some(crate::types::SpanType::Facet),
+            purpose: None,
+            extra: HashMap::new(),
+        });
+        let mut extra = HashMap::new();
+
+        apply_propagated_event(
+            &propagated_event,
+            &mut input,
+            &mut output,
+            &mut expected,
+            &mut error,
+            &mut scores,
+            &mut metadata,
+            &mut metrics,
+            &mut tags,
+            &mut context,
+            &mut span_attributes,
+            &mut extra,
+        );
+
+        assert_eq!(
+            metrics.as_ref().and_then(|m| m.get("start").copied()),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics.as_ref().and_then(|m| m.get("foo").copied()),
+            Some(0.1)
+        );
+        assert_eq!(
+            span_attributes
+                .as_ref()
+                .and_then(|attrs| attrs.purpose.as_deref()),
+            Some("scorer")
+        );
+        assert_eq!(
+            span_attributes
+                .as_ref()
+                .and_then(|attrs| attrs.extra.get("source")),
+            Some(&json!("propagated"))
+        );
+        assert!(extra.contains_key("_async_scoring_control"));
     }
 
     #[tokio::test]
