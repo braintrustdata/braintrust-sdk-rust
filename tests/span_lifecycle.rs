@@ -5,9 +5,24 @@ use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+// Helper to create a mock login response
+fn mock_login_response(orgs: &[(&str, &str)]) -> ResponseTemplate {
+    let org_info: Vec<_> = orgs
+        .iter()
+        .map(|(id, name)| json!({ "id": id, "name": name }))
+        .collect();
+    ResponseTemplate::new(200).set_body_json(json!({ "org_info": org_info }))
+}
+
 #[tokio::test]
 async fn span_lifecycle_flushes_to_logs_endpoint() {
     let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
+        .mount(&server)
+        .await;
 
     Mock::given(method("POST"))
         .and(path("/api/project/register"))
@@ -28,13 +43,15 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
         .api_key("test-key")
         .api_url(server.uri())
         .app_url(server.uri())
+        .blocking_login(true)
         .build()
         .await
         .expect("client");
 
     let span = client
-        .span_builder_with_credentials("token", "org-id")
-        .org_name("org-name")
+        .span_builder()
+        .await
+        .unwrap()
         .project_name("demo-project")
         .build();
     span.log(

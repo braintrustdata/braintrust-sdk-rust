@@ -212,8 +212,7 @@ pub(crate) trait SpanSubmitter: Send + Sync {
 pub struct SpanBuilder<S: SpanSubmitter> {
     submitter: Arc<S>,
     token: String,
-    org_id: String,
-    org_name: Option<String>,
+    org_name: String,
     project_name: Option<String>,
     parent_info: Option<ParentSpanInfo>,
     span_type: SpanType,
@@ -225,7 +224,6 @@ impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
         Self {
             submitter: Arc::clone(&self.submitter),
             token: self.token.clone(),
-            org_id: self.org_id.clone(),
             org_name: self.org_name.clone(),
             project_name: self.project_name.clone(),
             parent_info: self.parent_info.clone(),
@@ -240,23 +238,17 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
     pub(crate) fn new(
         submitter: Arc<S>,
         token: impl Into<String>,
-        org_id: impl Into<String>,
+        org_name: impl Into<String>,
     ) -> Self {
         Self {
             submitter,
             token: token.into(),
-            org_id: org_id.into(),
-            org_name: None,
+            org_name: org_name.into(),
             project_name: None,
             parent_info: None,
             span_type: SpanType::default(),
             purpose: None,
         }
-    }
-
-    pub fn org_name(mut self, org_name: impl Into<String>) -> Self {
-        self.org_name = Some(org_name.into());
-        self
     }
 
     pub fn project_name(mut self, project_name: impl Into<String>) -> Self {
@@ -298,7 +290,6 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
                 row_id,
                 span_id,
                 has_flushed: false,
-                org_id: self.org_id,
                 org_name: self.org_name,
                 project_name: self.project_name,
                 start_time,
@@ -431,8 +422,7 @@ struct SpanData {
     row_id: String,
     span_id: String,
     has_flushed: bool,
-    org_id: String,
-    org_name: Option<String>,
+    org_name: String,
     project_name: Option<String>,
     name: Option<String>,
     span_type: SpanType,
@@ -468,8 +458,8 @@ impl From<SpanData> for SpanPayload {
             row_id: data.row_id,
             span_id: data.span_id,
             is_merge: data.has_flushed, // First flush = false (replace), subsequent = true (merge)
-            org_id: data.org_id,
-            org_name: data.org_name,
+            org_id: String::new(),
+            org_name: Some(data.org_name),
             project_name: data.project_name,
             input: data.input,
             output: data.output,

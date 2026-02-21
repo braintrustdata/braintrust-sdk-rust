@@ -92,7 +92,7 @@ pub(crate) struct SpanAttributes {
 }
 
 /// The destination for a log row. Each variant represents a mutually exclusive
-/// target: an experiment, project logs, or playground logs.
+/// target: an experiment, project logs, playground logs, or dataset.
 ///
 /// NOTE: The `untagged` attribute is only safe if the field sets are also
 /// mutually exclusive.
@@ -108,6 +108,8 @@ pub(crate) enum LogDestination {
         prompt_session_id: String,
         log_id: String,
     },
+    /// Log to a dataset.
+    Dataset { dataset_id: String },
 }
 
 impl LogDestination {
@@ -131,6 +133,13 @@ impl LogDestination {
         Self::PlaygroundLogs {
             prompt_session_id: prompt_session_id.into(),
             log_id: "x".to_string(),
+        }
+    }
+
+    /// Create a new dataset destination.
+    pub fn dataset(dataset_id: impl Into<String>) -> Self {
+        Self::Dataset {
+            dataset_id: dataset_id.into(),
         }
     }
 }
@@ -212,6 +221,9 @@ pub enum ParentSpanInfo {
         project_name: String,
     },
     PlaygroundLogs {
+        object_id: String,
+    },
+    Dataset {
         object_id: String,
     },
     FullSpan {
