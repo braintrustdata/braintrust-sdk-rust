@@ -82,6 +82,7 @@ pub struct BraintrustClientBuilder {
     default_project: Option<String>,
     queue_size: usize,
     blocking_login: bool,
+    skip_login: bool,
 }
 
 impl BraintrustClientBuilder {
@@ -102,6 +103,7 @@ impl BraintrustClientBuilder {
             default_project: std::env::var("BRAINTRUST_DEFAULT_PROJECT").ok(),
             queue_size: DEFAULT_QUEUE_SIZE,
             blocking_login: false,
+            skip_login: false,
         }
     }
 
@@ -150,18 +152,21 @@ impl BraintrustClientBuilder {
         self
     }
 
+    /// Skip login entirely (default: false).
+    ///
+    /// When `true`, the API key is not required and no login request is made.
+    /// Use this when the client is only needed for submitting spans with
+    /// explicit credentials via [`BraintrustClient::span_builder_with_credentials`].
+    pub fn skip_login(mut self, skip: bool) -> Self {
+        self.skip_login = skip;
+        self
+    }
+
     /// Build the client, performing login.
     ///
     /// If `blocking_login` is true, waits for login to complete.
     /// Otherwise, login happens in the background with retry logic.
     pub async fn build(self) -> Result<BraintrustClient> {
-        // Validate required fields
-        let api_key = self.api_key.ok_or_else(|| {
-            BraintrustError::InvalidConfig(
-                "API key required: set BRAINTRUST_API_KEY or call .api_key()".into(),
-            )
-        })?;
-
         let app_url_str = self.app_url.unwrap_or_else(|| DEFAULT_APP_URL.into());
         let api_url_str = self.api_url.unwrap_or_else(|| DEFAULT_API_URL.into());
 
@@ -188,16 +193,24 @@ impl BraintrustClientBuilder {
                 login_notify: Notify::new(),
                 http_client,
                 default_project: self.default_project,
+                login_skipped: self.skip_login,
             }),
         };
 
-        // Perform login
-        if self.blocking_login {
-            client
-                .perform_login(&api_key, self.org_name.as_deref())
-                .await?;
-        } else {
-            client.start_background_login(api_key, self.org_name);
+        if !self.skip_login {
+            let api_key = self.api_key.ok_or_else(|| {
+                BraintrustError::InvalidConfig(
+                    "API key required: set BRAINTRUST_API_KEY or call .api_key()".into(),
+                )
+            })?;
+
+            if self.blocking_login {
+                client
+                    .perform_login(&api_key, self.org_name.as_deref())
+                    .await?;
+            } else {
+                client.start_background_login(api_key, self.org_name);
+            }
         }
 
         Ok(client)
@@ -226,6 +239,7 @@ struct ClientInner {
     login_notify: Notify,
     http_client: reqwest::Client,
     default_project: Option<String>,
+    login_skipped: bool,
 }
 
 impl std::fmt::Debug for ClientInner {
@@ -267,6 +281,11 @@ impl BraintrustClient {
     ///
     /// Returns the login state once available, or an error if login times out.
     pub async fn wait_for_login(&self) -> Result<LoginState> {
+        if self.inner.login_skipped {
+            return Err(BraintrustError::InvalidConfig(
+                "wait_for_login() not available when skip_login is enabled".into(),
+            ));
+        }
         self.wait_for_login_state().await
     }
 
@@ -296,6 +315,11 @@ impl BraintrustClient {
     /// # }
     /// ```
     pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder<Self>> {
+        if self.inner.login_skipped {
+            return Err(BraintrustError::InvalidConfig(
+                "span_builder() requires login; use span_builder_with_credentials() when skip_login is enabled".into(),
+            ));
+        }
         let state = self.wait_for_login_state().await?;
         let mut builder =
             crate::span::SpanBuilder::new(Arc::new(self.clone()), &state.api_key, &state.org_id);
@@ -1551,5 +1575,150 @@ mod tests {
             register_on_api.is_empty(),
             "/api/project/register should not go to api_server"
         );
+    }
+
+    #[tokio::test]
+    async fn skip_login_builds_without_api_key() {
+        std::env::remove_var("BRAINTRUST_API_KEY");
+
+        let client = BraintrustClient::builder()
+            .app_url("https://example.com")
+            .api_url("https://example.com")
+            .skip_login(true)
+            .build()
+            .await
+            .expect("should build without api key when skip_login is true");
+
+        assert!(!client.is_logged_in().await);
+    }
+
+    #[tokio::test]
+    async fn skip_login_with_credentials_works() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/project/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "project": { "id": "proj-id" }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let client = BraintrustClient::builder()
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .skip_login(true)
+            .build()
+            .await
+            .expect("client");
+
+        let span = client
+            .span_builder_with_credentials("explicit-token", "explicit-org-id")
+            .project_name("demo-project")
+            .build();
+
+        span.log(SpanLog {
+            input: Some(Value::String("test".into())),
+            ..Default::default()
+        })
+        .await;
+        span.flush().await.expect("flush");
+        client.flush().await.expect("client flush");
+
+        let logs_request = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.url.path() == "/logs3")
+            .expect("logs request present");
+        let body: Value = serde_json::from_slice(&logs_request.body).expect("json");
+        let rows = body.get("rows").and_then(|r| r.as_array()).unwrap();
+        assert_eq!(
+            rows[0].get("org_id").and_then(|v| v.as_str()),
+            Some("explicit-org-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_login_span_builder_fails_fast() {
+        let client = BraintrustClient::builder()
+            .app_url("https://example.com")
+            .api_url("https://example.com")
+            .skip_login(true)
+            .build()
+            .await
+            .expect("client");
+
+        let result = client.span_builder().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, BraintrustError::InvalidConfig(_)));
+        assert!(
+            err.to_string().contains("span_builder_with_credentials"),
+            "error should mention span_builder_with_credentials: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_login_wait_for_login_fails_fast() {
+        let client = BraintrustClient::builder()
+            .app_url("https://example.com")
+            .api_url("https://example.com")
+            .skip_login(true)
+            .build()
+            .await
+            .expect("client");
+
+        let result = client.wait_for_login().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, BraintrustError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn skip_login_false_still_requires_api_key() {
+        std::env::remove_var("BRAINTRUST_API_KEY");
+
+        let result = BraintrustClient::builder()
+            .app_url("https://example.com")
+            .skip_login(false)
+            .build()
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, BraintrustError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn skip_login_with_api_key_skips_login() {
+        let server = MockServer::start().await;
+
+        // No login mock mounted — if login is attempted it would fail or not match
+        Mock::given(method("POST"))
+            .and(path("/api/apikey/login"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = BraintrustClient::builder()
+            .api_key("test-api-key")
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .skip_login(true)
+            .build()
+            .await
+            .expect("should build even with api_key when skip_login is true");
+
+        assert!(!client.is_logged_in().await);
     }
 }

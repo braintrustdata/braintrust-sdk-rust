@@ -208,6 +208,7 @@ pub(crate) trait SpanSubmitter: Send + Sync {
     ) -> Result<()>;
 }
 
+#[derive(Debug)]
 #[allow(private_bounds)]
 pub struct SpanBuilder<S: SpanSubmitter> {
     submitter: Arc<S>,
