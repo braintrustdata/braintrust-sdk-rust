@@ -1,3 +1,6 @@
+//! Logs3 batch uploader (currently unused, kept for future reference).
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use backoff::backoff::Backoff;

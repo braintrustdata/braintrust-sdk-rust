@@ -245,6 +245,7 @@ pub(crate) struct Logs3OverflowReference {
 /// Note: `function_data` is included to match the TypeScript SDK's key set, but is not
 /// yet a field on `Logs3Row`. It will be populated once a `FunctionLogs` destination
 /// type is added in a future release.
+#[allow(dead_code)]
 pub(crate) const OBJECT_ID_KEYS: &[&str] = &[
     "experiment_id",
     "dataset_id",
