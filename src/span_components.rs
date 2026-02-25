@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use std::fmt;
 
 use crate::error::{BraintrustError, Result};
-use crate::types::SpanObjectType;
+use crate::types::{ParentSpanInfo, SpanObjectType};
 
 const ENCODING_VERSION_V3: u8 = 3;
 const ENCODING_VERSION_V4: u8 = 4;
@@ -370,6 +370,50 @@ impl SpanComponents {
                 .and_then(|v| v.as_object().cloned()),
         })
     }
+
+    /// Convert SpanComponents to ParentSpanInfo for creating child spans
+    pub fn to_parent_span_info(&self) -> Result<ParentSpanInfo> {
+        // For FullSpan variant, we need object_id, span_id, and root_span_id
+        let object_id = self.object_id.clone().ok_or_else(|| {
+            BraintrustError::InvalidConfig("object_id required for parent span".to_string())
+        })?;
+        let span_id = self.span_id.clone().ok_or_else(|| {
+            BraintrustError::InvalidConfig("span_id required for parent span".to_string())
+        })?;
+        let root_span_id = self.root_span_id.clone().ok_or_else(|| {
+            BraintrustError::InvalidConfig("root_span_id required for parent span".to_string())
+        })?;
+
+        Ok(ParentSpanInfo::FullSpan {
+            object_type: self.object_type,
+            object_id,
+            span_id,
+            root_span_id,
+            propagated_event: self.propagated_event.clone(),
+        })
+    }
+
+    /// Create SpanComponents from ParentSpanInfo
+    pub fn from_parent_span_info(parent: &ParentSpanInfo) -> Option<Self> {
+        match parent {
+            ParentSpanInfo::FullSpan {
+                object_type,
+                object_id,
+                span_id,
+                root_span_id,
+                propagated_event,
+            } => Some(Self {
+                object_type: *object_type,
+                object_id: Some(object_id.clone()),
+                compute_object_metadata_args: None,
+                row_id: None,
+                span_id: Some(span_id.clone()),
+                root_span_id: Some(root_span_id.clone()),
+                propagated_event: propagated_event.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for SpanComponents {
@@ -516,5 +560,66 @@ mod tests {
         // UUID
         assert!(try_parse_uuid("550e8400-e29b-41d4-a716-446655440000").is_some());
         assert!(try_parse_uuid("550e8400e29b41d4a716446655440000").is_some());
+    }
+
+    #[test]
+    fn test_to_parent_span_info() {
+        let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+        components.object_id = Some("project-123".to_string());
+        components.span_id = Some("span-456".to_string());
+        components.root_span_id = Some("root-789".to_string());
+
+        let mut propagated = Map::new();
+        propagated.insert(
+            "test_key".to_string(),
+            Value::String("test_value".to_string()),
+        );
+        components.propagated_event = Some(propagated);
+
+        let parent = components.to_parent_span_info().unwrap();
+
+        match parent {
+            ParentSpanInfo::FullSpan {
+                object_type,
+                object_id,
+                span_id,
+                root_span_id,
+                propagated_event,
+            } => {
+                assert_eq!(object_type, SpanObjectType::ProjectLogs);
+                assert_eq!(object_id, "project-123");
+                assert_eq!(span_id, "span-456");
+                assert_eq!(root_span_id, "root-789");
+                assert!(propagated_event.is_some());
+                let event = propagated_event.unwrap();
+                assert_eq!(
+                    event.get("test_key").and_then(|v| v.as_str()),
+                    Some("test_value")
+                );
+            }
+            _ => panic!("Expected FullSpan variant"),
+        }
+    }
+
+    #[test]
+    fn test_from_parent_span_info() {
+        let mut propagated = Map::new();
+        propagated.insert("key".to_string(), Value::String("value".to_string()));
+
+        let parent = ParentSpanInfo::FullSpan {
+            object_type: SpanObjectType::Experiment,
+            object_id: "exp-123".to_string(),
+            span_id: "span-456".to_string(),
+            root_span_id: "root-789".to_string(),
+            propagated_event: Some(propagated),
+        };
+
+        let components = SpanComponents::from_parent_span_info(&parent).unwrap();
+
+        assert_eq!(components.object_type, SpanObjectType::Experiment);
+        assert_eq!(components.object_id, Some("exp-123".to_string()));
+        assert_eq!(components.span_id, Some("span-456".to_string()));
+        assert_eq!(components.root_span_id, Some("root-789".to_string()));
+        assert!(components.propagated_event.is_some());
     }
 }
