@@ -25,6 +25,10 @@ impl SpanObjectType {
             SpanObjectType::PlaygroundLogs => "playground_logs",
         }
     }
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        Self::try_from(value).ok()
+    }
 }
 
 impl fmt::Display for SpanObjectType {

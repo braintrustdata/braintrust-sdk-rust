@@ -5,6 +5,7 @@ mod log_queue;
 mod logger;
 mod logs3;
 mod span;
+mod span_components;
 mod stream;
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -19,6 +20,7 @@ pub use logger::{
 };
 pub use logs3::{Logs3BatchUploader, Logs3UploadResult};
 pub use span::{SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanLogBuilderError};
+pub use span_components::SpanComponents;
 pub use stream::{
     wrap_stream_with_span, BraintrustStream, ChatMessage, ChatMessageBuilder,
     ChatMessageBuilderError, FinalizedStream, FinalizedStreamBuilder, FinalizedStreamBuilderError,
