@@ -23,10 +23,27 @@ pub const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
 /// Organization info returned from login.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrgInfo {
-    pub id: String,
-    pub name: String,
+    id: String,
+    name: String,
     #[serde(default)]
-    pub api_url: Option<String>,
+    api_url: Option<String>,
+}
+
+impl OrgInfo {
+    /// The organization's unique ID.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The organization's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The organization's API URL, if set.
+    pub fn api_url(&self) -> Option<&str> {
+        self.api_url.as_deref()
+    }
 }
 
 /// Response from the login endpoint.
@@ -164,11 +181,11 @@ pub struct BraintrustClientBuilder {
     blocking_login: bool,
     skip_login: bool,
     /// Maximum items per HTTP batch.
-    pub batch_max_items: Option<usize>,
+    batch_max_items: Option<usize>,
     /// Maximum bytes per HTTP batch.
-    pub batch_max_bytes: Option<usize>,
+    batch_max_bytes: Option<usize>,
     /// Maximum queue capacity (None = unlimited).
-    pub queue_max_size: Option<usize>,
+    queue_max_size: Option<usize>,
 }
 
 impl BraintrustClientBuilder {
