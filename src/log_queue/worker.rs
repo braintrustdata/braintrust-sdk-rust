@@ -21,10 +21,7 @@ pub(super) struct SubmitCommand {
     pub(super) parent_info: Option<ParentSpanInfo>,
 }
 
-pub(super) async fn run_worker(
-    mut receiver: mpsc::Receiver<LogCommand>,
-    core: Arc<LogQueueCore>,
-) {
+pub(super) async fn run_worker(mut receiver: mpsc::Receiver<LogCommand>, core: Arc<LogQueueCore>) {
     loop {
         match receiver.recv().await {
             Some(LogCommand::Flush(response)) => {

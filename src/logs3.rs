@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use tokio::time::sleep;
 
 use crate::error::{BraintrustError, Result};
+use crate::log_queue::batch_items;
 
 const DEFAULT_MAX_REQUEST_SIZE: usize = 6 * 1024 * 1024;
 const LOGS_API_VERSION: u8 = 2;
@@ -136,7 +137,9 @@ impl Logs3BatchUploader {
 
         let batch_limit_rows = batch_max_num_items.max(1);
         let batch_limit_bytes = (limits.max_request_size / 2).max(1);
-        let batches = batch_items(&row_payloads, batch_limit_rows, batch_limit_bytes);
+        let batches = batch_items(row_payloads, batch_limit_rows, batch_limit_bytes, |item| {
+            item.row_bytes
+        });
 
         let mut result = Logs3UploadResult::default();
         for batch in batches {
@@ -458,34 +461,6 @@ fn construct_logs3_payload(items: &[RowPayload]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{{\"rows\":[{rows}],\"api_version\":{LOGS_API_VERSION}}}")
-}
-
-fn batch_items(
-    items: &[RowPayload],
-    batch_max_num_items: usize,
-    batch_max_num_bytes: usize,
-) -> Vec<Vec<RowPayload>> {
-    let max_items = batch_max_num_items.max(1);
-    let max_bytes = batch_max_num_bytes.max(1);
-    let mut output: Vec<Vec<RowPayload>> = Vec::new();
-    let mut batch: Vec<RowPayload> = Vec::new();
-    let mut batch_len = 0usize;
-
-    for item in items {
-        if !batch.is_empty()
-            && (batch.len() >= max_items || batch_len + item.row_bytes >= max_bytes)
-        {
-            output.push(batch);
-            batch = Vec::new();
-            batch_len = 0;
-        }
-        batch_len += item.row_bytes;
-        batch.push(item.clone());
-    }
-    if !batch.is_empty() {
-        output.push(batch);
-    }
-    output
 }
 
 fn header_map_from_pairs(headers: Option<&HashMap<String, String>>) -> Result<HeaderMap> {

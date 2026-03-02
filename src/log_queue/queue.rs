@@ -208,7 +208,8 @@ impl LogQueueCore {
                 return Ok(());
             }
 
-            // Items were added during flush — trigger another round
+            // Queue is non-empty — items arrived while the flush was running.
+            // Loop back to the top, which calls trigger_flush_background() again.
         }
     }
 
@@ -491,8 +492,8 @@ impl LogQueueCore {
             .login_state
             .app_url()
             .ok_or_else(|| anyhow::anyhow!("cannot register project: not logged in"))?;
-        let app_url = Url::parse(&app_url_str)
-            .map_err(|e| anyhow::anyhow!("invalid app URL: {e}"))?;
+        let app_url =
+            Url::parse(&app_url_str).map_err(|e| anyhow::anyhow!("invalid app URL: {e}"))?;
         let url = app_url
             .join("api/project/register")
             .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
@@ -630,9 +631,7 @@ impl LogQueueCore {
                     ..
                 }) => match object_type {
                     SpanObjectType::Experiment => LogDestination::experiment(object_id.clone()),
-                    SpanObjectType::ProjectLogs => {
-                        LogDestination::project_logs(object_id.clone())
-                    }
+                    SpanObjectType::ProjectLogs => LogDestination::project_logs(object_id.clone()),
                     SpanObjectType::PlaygroundLogs => {
                         LogDestination::playground_logs(object_id.clone())
                     }
