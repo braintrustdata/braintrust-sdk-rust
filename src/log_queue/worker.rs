@@ -2,23 +2,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
-use crate::types::{ParentSpanInfo, SpanPayload};
-
 use super::queue::LogQueueCore;
 
-/// Commands sent through the worker channel.
-/// Submit commands are no longer routed through this channel; they are pushed
-/// directly to `LogQueueCore` by `LogQueue::submit`. This channel is now
-/// exclusively for flush coordination.
+/// Commands sent through the worker channel (flush coordination only).
 pub(super) enum LogCommand {
     Flush(oneshot::Sender<std::result::Result<(), anyhow::Error>>),
     TriggerFlush,
-}
-
-pub(super) struct SubmitCommand {
-    pub(super) token: String,
-    pub(super) payload: SpanPayload,
-    pub(super) parent_info: Option<ParentSpanInfo>,
 }
 
 pub(super) async fn run_worker(mut receiver: mpsc::Receiver<LogCommand>, core: Arc<LogQueueCore>) {

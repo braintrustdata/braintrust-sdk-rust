@@ -8,7 +8,7 @@ use super::config::LogQueueConfig;
 use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry};
 use super::merge::merge_row_into;
 use super::row_key::RowKey;
-use super::worker::{LogCommand, SubmitCommand};
+use super::worker::LogCommand;
 use crate::error::{BraintrustError, Result};
 use crate::logger::LoginState;
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
@@ -46,6 +46,16 @@ struct ProjectInfo {
     id: String,
 }
 
+/// A raw span payload queued for deferred preparation and flushing.
+///
+/// Fields are private — construction and destructuring happen only within this
+/// module. `worker.rs` never touches the fields directly.
+struct SubmitCommand {
+    token: String,
+    payload: SpanPayload,
+    parent_info: Option<ParentSpanInfo>,
+}
+
 type CmdChannel = (Sender<SubmitCommand>, Receiver<SubmitCommand>);
 
 /// Create a command channel (bounded or unbounded) based on the queue config.
@@ -69,8 +79,8 @@ pub(super) struct LogQueueCore {
     channel: ArcSwap<CmdChannel>,
     dropped_count: AtomicUsize,
     last_drop_log_time: AtomicU64,
-    pub(super) config: LogQueueConfig,
-    pub(super) login_state: LoginState,
+    config: LogQueueConfig,
+    login_state: LoginState,
     client: reqwest::Client,
     /// Cache of (org_id:project_name) → project_id to avoid redundant HTTP calls.
     project_cache: TokioMutex<IndexMap<String, String>>,
@@ -103,7 +113,7 @@ impl LogQueueCore {
     /// This is called by `LogQueue::submit` so that ALL drops (queue-full and
     /// channel-closed) are handled uniformly here — with drop count tracking,
     /// throttled warnings, and optional debug dumps.
-    pub(super) fn push(self: &Arc<Self>, cmd: SubmitCommand) {
+    fn push(self: &Arc<Self>, cmd: SubmitCommand) {
         let channel = self.channel.load();
         match channel.0.try_send(cmd) {
             Ok(()) => {}
@@ -111,22 +121,10 @@ impl LogQueueCore {
                 self.dropped_count.fetch_add(1, Ordering::Relaxed);
                 self.log_drop_warning();
                 self.dump_dropped_row_if_configured(cmd);
-                return;
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.dropped_count.fetch_add(1, Ordering::Relaxed);
                 self.log_drop_warning();
-                return;
-            }
-        }
-
-        if !self.config.sync_flush() {
-            // Spawn trigger in background (non-blocking)
-            let core = self.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    core.trigger_flush_background().await;
-                });
             }
         }
     }
@@ -752,6 +750,11 @@ impl LogQueue {
             payload,
             parent_info,
         });
+        // Signal the worker to flush. try_send is non-blocking and best-effort:
+        // if the channel is full the worker already has a flush pending.
+        if !self.core.config.sync_flush() {
+            let _ = self.worker_sender.try_send(LogCommand::TriggerFlush);
+        }
     }
 
     /// Flush all pending data through the worker, waiting for completion.
