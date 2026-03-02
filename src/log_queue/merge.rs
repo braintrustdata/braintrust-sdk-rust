@@ -1,7 +1,29 @@
-use crate::json_merge::{deep_merge, deep_merge_maps_with_stop_paths};
+use crate::json_merge::{deep_merge, deep_merge_maps_with_stop_paths, deep_merge_with_stop_paths};
 use crate::types::{Logs3Row, SpanAttributes};
 use indexmap::IndexSet;
 use std::collections::HashSet;
+
+/// Extract the sub-paths for a given top-level field from `merge_paths`.
+///
+/// Per the Braintrust API, `merge_paths` elements are top-level-prefixed:
+/// `["input", "data"]` means "within `input`, stop deep merge at `data`".
+///
+/// Returns the set of sub-paths (with the leading field name stripped) to use
+/// as stop paths when calling `deep_merge_with_stop_paths` on that field.
+/// Returns an empty set if no paths in `merge_paths` start with `field`.
+fn extract_sub_paths<'a>(
+    merge_paths: &'a Option<Vec<Vec<String>>>,
+    field: &str,
+) -> HashSet<Vec<&'a str>> {
+    let Some(paths) = merge_paths else {
+        return HashSet::new();
+    };
+    paths
+        .iter()
+        .filter(|path| path.first().map(|s| s.as_str()) == Some(field))
+        .map(|path| path[1..].iter().map(|s| s.as_str()).collect())
+        .collect()
+}
 
 /// Merge source row into target row.
 ///
@@ -27,34 +49,72 @@ use std::collections::HashSet;
 /// `Some(true)`.  Any future code that explicitly sets `is_merge = Some(false)` would
 /// need to re-evaluate this logic to stay aligned with TypeScript.
 pub(crate) fn merge_row_into(target: &mut Logs3Row, source: Logs3Row) {
-    // Deep merge JSON fields
+    // Deep merge JSON fields, respecting merge_paths stop paths.
+    // Paths in merge_paths are top-level-prefixed: ["input", "key"] means "within
+    // input, stop deep merge at key". We strip the leading field name and pass the
+    // remaining sub-paths to deep_merge_with_stop_paths.
     if let Some(source_input) = source.input {
         match &mut target.input {
-            Some(target_input) => deep_merge(target_input, &source_input),
+            Some(target_input) => {
+                let stop_paths = extract_sub_paths(&source.merge_paths, "input");
+                if stop_paths.is_empty() {
+                    deep_merge(target_input, &source_input);
+                } else {
+                    deep_merge_with_stop_paths(target_input, &source_input, &stop_paths);
+                }
+            }
             None => target.input = Some(source_input),
         }
     }
     if let Some(source_output) = source.output {
         match &mut target.output {
-            Some(target_output) => deep_merge(target_output, &source_output),
+            Some(target_output) => {
+                let stop_paths = extract_sub_paths(&source.merge_paths, "output");
+                if stop_paths.is_empty() {
+                    deep_merge(target_output, &source_output);
+                } else {
+                    deep_merge_with_stop_paths(target_output, &source_output, &stop_paths);
+                }
+            }
             None => target.output = Some(source_output),
         }
     }
     if let Some(source_expected) = source.expected {
         match &mut target.expected {
-            Some(target_expected) => deep_merge(target_expected, &source_expected),
+            Some(target_expected) => {
+                let stop_paths = extract_sub_paths(&source.merge_paths, "expected");
+                if stop_paths.is_empty() {
+                    deep_merge(target_expected, &source_expected);
+                } else {
+                    deep_merge_with_stop_paths(target_expected, &source_expected, &stop_paths);
+                }
+            }
             None => target.expected = Some(source_expected),
         }
     }
     if let Some(source_error) = source.error {
         match &mut target.error {
-            Some(target_error) => deep_merge(target_error, &source_error),
+            Some(target_error) => {
+                let stop_paths = extract_sub_paths(&source.merge_paths, "error");
+                if stop_paths.is_empty() {
+                    deep_merge(target_error, &source_error);
+                } else {
+                    deep_merge_with_stop_paths(target_error, &source_error, &stop_paths);
+                }
+            }
             None => target.error = Some(source_error),
         }
     }
     if let Some(source_context) = source.context {
         match &mut target.context {
-            Some(target_context) => deep_merge(target_context, &source_context),
+            Some(target_context) => {
+                let stop_paths = extract_sub_paths(&source.merge_paths, "context");
+                if stop_paths.is_empty() {
+                    deep_merge(target_context, &source_context);
+                } else {
+                    deep_merge_with_stop_paths(target_context, &source_context, &stop_paths);
+                }
+            }
             None => target.context = Some(source_context),
         }
     }
@@ -70,19 +130,14 @@ pub(crate) fn merge_row_into(target: &mut Logs3Row, source: Logs3Row) {
             .extend(source_metrics);
     }
 
-    // Deep merge metadata.
-    // If source has merge_paths, use them as stop paths for the deep merge.
+    // Deep merge metadata, respecting merge_paths stop paths.
+    // Paths like ["metadata", "config"] mean "within metadata, stop at config".
+    // We strip the leading "metadata" component just like the other JSON fields.
     if let Some(source_meta) = source.metadata {
         match &mut target.metadata {
             Some(target_meta) => {
-                if let Some(ref merge_paths) = source.merge_paths {
-                    // Convert merge_paths to HashSet of string slices for deep_merge_with_stop_paths
-                    let stop_paths: HashSet<Vec<&str>> = merge_paths
-                        .iter()
-                        .map(|path| path.iter().map(|s| s.as_str()).collect())
-                        .collect();
-                    deep_merge_maps_with_stop_paths(target_meta, &source_meta, &stop_paths);
-                } else {
+                let stop_paths = extract_sub_paths(&source.merge_paths, "metadata");
+                if stop_paths.is_empty() {
                     // Convert to serde_json::Value for deep merge, then back to Map
                     let mut target_value = serde_json::Value::Object(target_meta.clone());
                     let source_value = serde_json::Value::Object(source_meta);
@@ -90,6 +145,8 @@ pub(crate) fn merge_row_into(target: &mut Logs3Row, source: Logs3Row) {
                     if let serde_json::Value::Object(merged) = target_value {
                         *target_meta = merged;
                     }
+                } else {
+                    deep_merge_maps_with_stop_paths(target_meta, &source_meta, &stop_paths);
                 }
             }
             None => target.metadata = Some(source_meta),
@@ -480,8 +537,8 @@ mod tests {
             m.insert("other".to_string(), json!({"b": 2}));
             m
         });
-        // Stop path at "config" - should replace entire config object
-        source.merge_paths = Some(vec![vec!["config".to_string()]]);
+        // Top-level-prefixed stop path: ["metadata", "config"] stops deep merge of metadata.config
+        source.merge_paths = Some(vec![vec!["metadata".to_string(), "config".to_string()]]);
 
         merge_row_into(&mut target, source);
 
@@ -516,8 +573,12 @@ mod tests {
             );
             m
         });
-        // Stop at config.llm - should replace entire llm object
-        source.merge_paths = Some(vec![vec!["config".to_string(), "llm".to_string()]]);
+        // Top-level-prefixed stop path: ["metadata", "config", "llm"] stops at metadata.config.llm
+        source.merge_paths = Some(vec![vec![
+            "metadata".to_string(),
+            "config".to_string(),
+            "llm".to_string(),
+        ]]);
 
         merge_row_into(&mut target, source);
 
@@ -751,8 +812,11 @@ mod tests {
             m.insert("path3".to_string(), json!({"f": 6}));
             m
         });
-        // Stop at path1 and path2 - should replace entire objects
-        source.merge_paths = Some(vec![vec!["path1".to_string()], vec!["path2".to_string()]]);
+        // Top-level-prefixed stop paths for metadata
+        source.merge_paths = Some(vec![
+            vec!["metadata".to_string(), "path1".to_string()],
+            vec!["metadata".to_string(), "path2".to_string()],
+        ]);
 
         merge_row_into(&mut target, source);
 
@@ -762,5 +826,129 @@ mod tests {
         assert_eq!(metadata.get("path2").unwrap(), &json!({"c": 30}));
         // path3 should be deep merged (not a stop path)
         assert_eq!(metadata.get("path3").unwrap(), &json!({"e": 5, "f": 6}));
+    }
+
+    #[test]
+    fn test_merge_paths_apply_to_input_field() {
+        let mut target = make_base_row("1");
+        target.input = Some(json!({"config": {"model": "gpt-4", "temp": 0.7}, "other": {"a": 1}}));
+
+        let mut source = make_base_row("1");
+        source.input = Some(json!({"config": {"model": "gpt-3.5"}, "other": {"b": 2}}));
+        // ["input", "config"] means: within input, stop deep merge at "config"
+        source.merge_paths = Some(vec![vec!["input".to_string(), "config".to_string()]]);
+
+        merge_row_into(&mut target, source);
+
+        let input = target.input.unwrap();
+        // config should be replaced entirely (stop path)
+        assert_eq!(input["config"], json!({"model": "gpt-3.5"}));
+        // other should be deep merged (not a stop path)
+        assert_eq!(input["other"], json!({"a": 1, "b": 2}));
+    }
+
+    #[test]
+    fn test_merge_paths_apply_to_output_field() {
+        let mut target = make_base_row("1");
+        target.output = Some(json!({"result": {"x": 1, "y": 2}, "meta": {"count": 1}}));
+
+        let mut source = make_base_row("1");
+        source.output = Some(json!({"result": {"x": 10}, "meta": {"extra": 99}}));
+        // ["output", "result"] means: within output, stop deep merge at "result"
+        source.merge_paths = Some(vec![vec!["output".to_string(), "result".to_string()]]);
+
+        merge_row_into(&mut target, source);
+
+        let output = target.output.unwrap();
+        // result should be replaced entirely (stop path)
+        assert_eq!(output["result"], json!({"x": 10}));
+        // meta should be deep merged (not a stop path)
+        assert_eq!(output["meta"], json!({"count": 1, "extra": 99}));
+    }
+
+    #[test]
+    fn test_merge_paths_require_toplevel_prefix_for_metadata() {
+        let mut target = make_base_row("1");
+        target.metadata = Some({
+            let mut m = serde_json::Map::new();
+            m.insert("config".to_string(), json!({"model": "gpt-4", "temp": 0.7}));
+            m.insert("other".to_string(), json!({"a": 1}));
+            m
+        });
+
+        let mut source = make_base_row("1");
+        source.metadata = Some({
+            let mut m = serde_json::Map::new();
+            m.insert("config".to_string(), json!({"model": "gpt-3.5"}));
+            m.insert("other".to_string(), json!({"b": 2}));
+            m
+        });
+        // Correctly prefixed path: ["metadata", "config"] stops at metadata.config
+        source.merge_paths = Some(vec![vec!["metadata".to_string(), "config".to_string()]]);
+
+        merge_row_into(&mut target, source);
+
+        let metadata = target.metadata.unwrap();
+        // config should be replaced (stop path with correct top-level prefix)
+        assert_eq!(metadata["config"], json!({"model": "gpt-3.5"}));
+        // other should be deep merged (not a stop path)
+        assert_eq!(metadata["other"], json!({"a": 1, "b": 2}));
+    }
+
+    #[test]
+    fn test_merge_row_reference_impl_matches() {
+        // Verify that merge_row_into produces the same result as independently
+        // deep-merging each JSON field — the "reference implementation" check.
+        let mut target = make_base_row("1");
+        target.input = Some(json!({"a": {"nested": 1}, "b": 2}));
+        target.output = Some(json!({"x": {"y": 10}}));
+        target.expected = Some(json!({"exp": {"a": 1}}));
+        target.error = Some(json!({"msg": "error", "code": 500}));
+        target.context = Some(json!({"ctx": {"key": "val"}}));
+
+        let source_input = json!({"a": {"extra": 2}, "c": 3});
+        let source_output = json!({"x": {"z": 20}, "w": 5});
+        let source_expected = json!({"exp": {"b": 2}});
+        let source_error = json!({"stack": "trace"});
+        let source_context = json!({"ctx": {"other": "val2"}});
+
+        // Build reference by deep-merging each field independently
+        let mut ref_input = target.input.clone().unwrap();
+        deep_merge(&mut ref_input, &source_input);
+        let mut ref_output = target.output.clone().unwrap();
+        deep_merge(&mut ref_output, &source_output);
+        let mut ref_expected = target.expected.clone().unwrap();
+        deep_merge(&mut ref_expected, &source_expected);
+        let mut ref_error = target.error.clone().unwrap();
+        deep_merge(&mut ref_error, &source_error);
+        let mut ref_context = target.context.clone().unwrap();
+        deep_merge(&mut ref_context, &source_context);
+
+        let mut source = make_base_row("1");
+        source.input = Some(source_input);
+        source.output = Some(source_output);
+        source.expected = Some(source_expected);
+        source.error = Some(source_error);
+        source.context = Some(source_context);
+
+        merge_row_into(&mut target, source);
+
+        assert_eq!(target.input.as_ref().unwrap(), &ref_input, "input mismatch");
+        assert_eq!(
+            target.output.as_ref().unwrap(),
+            &ref_output,
+            "output mismatch"
+        );
+        assert_eq!(
+            target.expected.as_ref().unwrap(),
+            &ref_expected,
+            "expected mismatch"
+        );
+        assert_eq!(target.error.as_ref().unwrap(), &ref_error, "error mismatch");
+        assert_eq!(
+            target.context.as_ref().unwrap(),
+            &ref_context,
+            "context mismatch"
+        );
     }
 }

@@ -1,12 +1,17 @@
+use anyhow::Context;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
 use super::batching::batch_and_serialize_rows;
 use super::config::LogQueueConfig;
 use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry};
 use super::merge::merge_row_into;
 use super::row_key::RowKey;
-use super::worker::{LogCommand, SubmitCommand, WorkerConfig};
+use super::worker::{LogCommand, SubmitCommand};
 use crate::error::{BraintrustError, Result};
 use crate::logger::LoginState;
-use crate::types::{Logs3Row, ParentSpanInfo, SpanPayload};
+use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use futures::future::join_all;
@@ -19,8 +24,32 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use url::Url;
 
-/// Create a row channel (bounded or unbounded) based on the queue config.
-fn make_row_channel(config: &LogQueueConfig) -> (Sender<Logs3Row>, Receiver<Logs3Row>) {
+/// Request body for project registration.
+#[derive(Serialize)]
+struct ProjectRegisterRequest<'a> {
+    project_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org_name: Option<&'a str>,
+}
+
+/// Response from project registration.
+#[derive(Deserialize)]
+struct ProjectRegisterResponse {
+    project: ProjectInfo,
+}
+
+/// Project info in registration response.
+#[derive(Deserialize)]
+struct ProjectInfo {
+    id: String,
+}
+
+type CmdChannel = (Sender<SubmitCommand>, Receiver<SubmitCommand>);
+
+/// Create a command channel (bounded or unbounded) based on the queue config.
+fn make_cmd_channel(config: &LogQueueConfig) -> CmdChannel {
     if config.enforce_queue_size_limit() {
         bounded(config.queue_max_size())
     } else {
@@ -35,12 +64,16 @@ fn make_row_channel(config: &LogQueueConfig) -> (Sender<Logs3Row>, Receiver<Logs
 /// their own interior mutability where needed.
 pub(super) struct LogQueueCore {
     /// Lock-free queue channel (sender, receiver) pair, atomically swappable.
-    channel: ArcSwap<(Sender<Logs3Row>, Receiver<Logs3Row>)>,
+    /// Holds unprocessed `SubmitCommand`s; preparation (project registration, row
+    /// building) happens during `flush_internal`.
+    channel: ArcSwap<CmdChannel>,
     dropped_count: AtomicUsize,
     last_drop_log_time: AtomicU64,
     pub(super) config: LogQueueConfig,
     pub(super) login_state: LoginState,
     client: reqwest::Client,
+    /// Cache of (org_id:project_name) → project_id to avoid redundant HTTP calls.
+    project_cache: TokioMutex<IndexMap<String, String>>,
     /// Handle to the currently in-progress flush task, if any.
     /// Using JoinHandle allows checking completion status and awaiting the result.
     flush_handle: TokioMutex<Option<JoinHandle<std::result::Result<(), anyhow::Error>>>>,
@@ -51,31 +84,33 @@ pub(super) struct LogQueueCore {
 
 impl LogQueueCore {
     fn new(config: LogQueueConfig, login_state: LoginState, client: reqwest::Client) -> Arc<Self> {
-        let (row_sender, row_receiver) = make_row_channel(&config);
+        let (cmd_sender, cmd_receiver) = make_cmd_channel(&config);
         Arc::new(Self {
-            channel: ArcSwap::from_pointee((row_sender, row_receiver)),
+            channel: ArcSwap::from_pointee((cmd_sender, cmd_receiver)),
             dropped_count: AtomicUsize::new(0),
             last_drop_log_time: AtomicU64::new(0),
             config,
             login_state,
             client,
+            project_cache: TokioMutex::new(IndexMap::new()),
             flush_handle: TokioMutex::new(None),
             version_info: OnceCell::new(),
         })
     }
 
-    /// Push a row directly to the lock-free queue.
+    /// Push a submit command directly to the lock-free queue.
     ///
-    /// Called by the worker after building the row. In normal mode (`sync_flush=false`),
-    /// triggers a background flush. In sync mode, caller must call `flush()` explicitly.
-    pub(super) fn push(self: &Arc<Self>, row: Logs3Row) {
+    /// This is called by `LogQueue::submit` so that ALL drops (queue-full and
+    /// channel-closed) are handled uniformly here — with drop count tracking,
+    /// throttled warnings, and optional debug dumps.
+    pub(super) fn push(self: &Arc<Self>, cmd: SubmitCommand) {
         let channel = self.channel.load();
-        match channel.0.try_send(row) {
+        match channel.0.try_send(cmd) {
             Ok(()) => {}
-            Err(TrySendError::Full(row)) => {
+            Err(TrySendError::Full(cmd)) => {
                 self.dropped_count.fetch_add(1, Ordering::Relaxed);
                 self.log_drop_warning();
-                self.dump_dropped_row_if_configured(row);
+                self.dump_dropped_row_if_configured(cmd);
                 return;
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -107,6 +142,13 @@ impl LogQueueCore {
             if !handle.is_finished() {
                 // Flush already in progress
                 return;
+            }
+        }
+
+        // Consume the finished handle to surface any panic or error from the task.
+        if let Some(handle) = guard.take() {
+            if let Err(err) = handle.await {
+                warn!("background flush task failed: {:?}", err);
             }
         }
 
@@ -186,14 +228,15 @@ impl LogQueueCore {
             .await
     }
 
-    /// Internal flush implementation: drain → chunk → merge → batch → send.
+    /// Internal flush implementation: drain → prepare → chunk → merge → batch → send.
     ///
-    /// Rows are drained atomically, then processed in sequential chunks of
-    /// `min(batch_max_items, flush_chunk_size)` (matching TypeScript SDK).
+    /// Commands are drained atomically. Each command is prepared (project
+    /// registration, row building) before batching. Rows are then processed in
+    /// sequential chunks of `min(batch_max_items, flush_chunk_size)`.
     /// Within each chunk, batches are sent concurrently.
     async fn flush_internal(self: &Arc<Self>) {
-        let rows = self.drain_all();
-        if rows.is_empty() {
+        let cmds = self.drain_all();
+        if cmds.is_empty() {
             return;
         }
 
@@ -214,6 +257,26 @@ impl LogQueueCore {
                 return;
             }
         };
+
+        // Prepare rows from submit commands (project registration, destination resolution).
+        let mut rows = Vec::with_capacity(cmds.len());
+        for cmd in cmds {
+            let SubmitCommand {
+                token,
+                payload,
+                parent_info,
+            } = cmd;
+            match self.prepare_row(&token, payload, parent_info).await {
+                Ok(row) => rows.push(row),
+                Err(e) => {
+                    warn!(error = %e, "failed to prepare span, dropping");
+                }
+            }
+        }
+
+        if rows.is_empty() {
+            return;
+        }
 
         let (max_request_size, can_use_overflow) = self
             .get_version_info(&api_url, &api_key, org_name.as_deref())
@@ -288,11 +351,188 @@ impl LogQueueCore {
         }
     }
 
-    /// Drain all rows from the queue with precise flush boundaries.
+    /// Prepare a `Logs3Row` from a submit command's token, payload, and parent info.
+    ///
+    /// Resolves the destination (including calling the project registration API
+    /// if needed) and builds the complete row for the flush pipeline.
+    async fn prepare_row(
+        &self,
+        token: &str,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    ) -> std::result::Result<Logs3Row, anyhow::Error> {
+        let SpanPayload {
+            row_id,
+            span_id,
+            is_merge,
+            org_id,
+            org_name,
+            project_name,
+            input,
+            output,
+            expected,
+            error,
+            scores,
+            metadata,
+            metrics,
+            tags,
+            context,
+            span_attributes,
+            object_delete,
+        } = payload;
+
+        let project_id = if let Some(ref pn) = project_name {
+            Some(
+                self.ensure_project_id(token, &org_id, org_name.as_deref(), pn)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let (root_span_id, span_parents, destination) = match parent_info {
+            None => {
+                let dest = match project_id {
+                    Some(pid) => LogDestination::project_logs(pid),
+                    None => {
+                        anyhow::bail!("no destination: either parent_info or project_name required")
+                    }
+                };
+                (span_id.clone(), None, dest)
+            }
+            Some(ParentSpanInfo::Experiment { object_id }) => {
+                (span_id.clone(), None, LogDestination::experiment(object_id))
+            }
+            Some(ParentSpanInfo::ProjectLogs { object_id }) => (
+                span_id.clone(),
+                None,
+                LogDestination::project_logs(object_id),
+            ),
+            Some(ParentSpanInfo::ProjectName { project_name }) => {
+                let proj_id = self
+                    .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name)
+                    .await?;
+                (span_id.clone(), None, LogDestination::project_logs(proj_id))
+            }
+            Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
+                span_id.clone(),
+                None,
+                LogDestination::playground_logs(object_id),
+            ),
+            Some(ParentSpanInfo::Dataset { object_id }) => {
+                (span_id.clone(), None, LogDestination::dataset(object_id))
+            }
+            Some(ParentSpanInfo::FullSpan {
+                object_type,
+                object_id,
+                span_id: parent_span_id,
+                root_span_id: parent_root_span_id,
+                propagated_event: _,
+            }) => {
+                let span_parents = Some(vec![parent_span_id]);
+                let dest = match object_type {
+                    SpanObjectType::Experiment => LogDestination::experiment(object_id),
+                    SpanObjectType::ProjectLogs => LogDestination::project_logs(object_id),
+                    SpanObjectType::PlaygroundLogs => LogDestination::playground_logs(object_id),
+                };
+                (parent_root_span_id, span_parents, dest)
+            }
+        };
+
+        Ok(Logs3Row {
+            id: row_id,
+            is_merge: if is_merge { Some(true) } else { None },
+            merge_paths: None,
+            span_id,
+            root_span_id,
+            span_parents,
+            destination,
+            org_id,
+            org_name,
+            input,
+            output,
+            expected,
+            error,
+            scores,
+            metadata,
+            metrics,
+            tags,
+            context,
+            span_attributes,
+            extra: HashMap::new(),
+            created: Utc::now(),
+            xact_id: None,
+            object_delete,
+            audit_source: Some("api".to_string()),
+        })
+    }
+
+    /// Ensure a project ID is available for the given project name, registering
+    /// it via the API if it is not yet cached.
+    ///
+    /// Uses `login_state.app_url()` for the registration endpoint so the URL
+    /// doesn't need to be passed separately.
+    async fn ensure_project_id(
+        &self,
+        token: &str,
+        org_id: &str,
+        org_name: Option<&str>,
+        project_name: &str,
+    ) -> std::result::Result<String, anyhow::Error> {
+        let cache_key = format!("{org_id}:{project_name}");
+        {
+            let cache = self.project_cache.lock().await;
+            if let Some(project_id) = cache.get(&cache_key) {
+                return Ok(project_id.clone());
+            }
+        }
+
+        let app_url_str = self
+            .login_state
+            .app_url()
+            .ok_or_else(|| anyhow::anyhow!("cannot register project: not logged in"))?;
+        let app_url = Url::parse(&app_url_str)
+            .map_err(|e| anyhow::anyhow!("invalid app URL: {e}"))?;
+        let url = app_url
+            .join("api/project/register")
+            .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
+
+        let request = ProjectRegisterRequest {
+            project_name,
+            org_id: (!org_id.is_empty()).then_some(org_id),
+            org_name,
+        };
+
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .json(&request)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("register project failed: [{status}] {text}");
+        }
+
+        let register_response: ProjectRegisterResponse = response
+            .json()
+            .await
+            .context("failed to parse project registration response")?;
+
+        {
+            let mut cache = self.project_cache.lock().await;
+            cache.insert(cache_key, register_response.project.id.clone());
+        }
+        Ok(register_response.project.id)
+    }
+
+    /// Drain all commands from the queue with precise flush boundaries.
     ///
     /// Atomically swaps in a new channel using lock-free CAS, then drains the old channel.
-    fn drain_all(&self) -> Vec<Logs3Row> {
-        let (new_sender, new_receiver) = make_row_channel(&self.config);
+    fn drain_all(&self) -> Vec<SubmitCommand> {
+        let (new_sender, new_receiver) = make_cmd_channel(&self.config);
         let old_channel = self.channel.swap(Arc::new((new_sender, new_receiver)));
         let mut items = Vec::new();
         while let Ok(item) = old_channel.1.try_recv() {
@@ -349,9 +589,9 @@ impl LogQueueCore {
         }
     }
 
-    /// If debug directories are configured, serialize the dropped row and write it to disk.
-    /// Spawns a background task — best-effort, non-blocking.
-    fn dump_dropped_row_if_configured(&self, row: Logs3Row) {
+    /// If debug directories are configured, serialize the dropped command's payload
+    /// and write it to disk. Spawns a background task — best-effort, non-blocking.
+    fn dump_dropped_row_if_configured(&self, cmd: SubmitCommand) {
         let all_dir = self.config.all_publish_payloads_dir();
         let failed_dir = self.config.failed_publish_payloads_dir();
         let dirs: Vec<_> = [all_dir, failed_dir].into_iter().flatten().collect();
@@ -362,7 +602,72 @@ impl LogQueueCore {
             return;
         };
         handle.spawn(async move {
-            let payload = match serde_json::to_vec(&serde_json::json!({
+            let SubmitCommand {
+                token: _,
+                payload,
+                parent_info,
+            } = cmd;
+
+            // Build a best-effort destination from parent_info (project registration
+            // hasn't happened yet, so project-name-based destinations are unknown).
+            let span_id = payload.span_id.clone();
+            let destination = match parent_info.as_ref() {
+                Some(ParentSpanInfo::Experiment { object_id }) => {
+                    LogDestination::experiment(object_id.clone())
+                }
+                Some(ParentSpanInfo::ProjectLogs { object_id }) => {
+                    LogDestination::project_logs(object_id.clone())
+                }
+                Some(ParentSpanInfo::PlaygroundLogs { object_id }) => {
+                    LogDestination::playground_logs(object_id.clone())
+                }
+                Some(ParentSpanInfo::Dataset { object_id }) => {
+                    LogDestination::dataset(object_id.clone())
+                }
+                Some(ParentSpanInfo::FullSpan {
+                    object_type,
+                    object_id,
+                    ..
+                }) => match object_type {
+                    SpanObjectType::Experiment => LogDestination::experiment(object_id.clone()),
+                    SpanObjectType::ProjectLogs => {
+                        LogDestination::project_logs(object_id.clone())
+                    }
+                    SpanObjectType::PlaygroundLogs => {
+                        LogDestination::playground_logs(object_id.clone())
+                    }
+                },
+                _ => LogDestination::project_logs("unknown".to_string()),
+            };
+
+            let row = Logs3Row {
+                id: payload.row_id,
+                span_id: span_id.clone(),
+                is_merge: if payload.is_merge { Some(true) } else { None },
+                merge_paths: None,
+                root_span_id: span_id,
+                span_parents: None,
+                destination,
+                org_id: payload.org_id,
+                org_name: payload.org_name,
+                input: payload.input,
+                output: payload.output,
+                expected: payload.expected,
+                error: payload.error,
+                scores: payload.scores,
+                metadata: payload.metadata,
+                metrics: payload.metrics,
+                tags: payload.tags,
+                context: payload.context,
+                span_attributes: payload.span_attributes,
+                extra: HashMap::new(),
+                created: Utc::now(),
+                xact_id: None,
+                object_delete: payload.object_delete,
+                audit_source: Some("api".to_string()),
+            };
+
+            let payload_bytes = match serde_json::to_vec(&serde_json::json!({
                 "rows": [row],
                 "api_version": crate::types::LOGS_API_VERSION,
             })) {
@@ -373,7 +678,7 @@ impl LogQueueCore {
                 }
             };
             for dir in dirs {
-                if let Err(e) = save_payload_debug(&payload, Some(dir), "dropped") {
+                if let Err(e) = save_payload_debug(&payload_bytes, Some(dir), "dropped") {
                     warn!(error = %e, "failed to write dropped row to debug dir");
                 }
             }
@@ -384,8 +689,9 @@ impl LogQueueCore {
 /// Lock-free log queue with batching and HTTP dispatch.
 ///
 /// This is the complete log processing system:
-/// - Owns the background worker for payload preparation and project registration
-/// - Lock-free queue for accumulating rows (bounded or unbounded)
+/// - Owns the background worker for flush coordination
+/// - Lock-free queue for accumulating submit commands (bounded or unbounded)
+/// - Row preparation (project registration, destination resolution) deferred to flush time
 /// - Automatic batching and serialization via spawn_blocking
 /// - HTTP dispatch with retry logic (concurrent per-chunk batches)
 /// - Atomic drain for precise flush boundaries
@@ -394,10 +700,8 @@ impl LogQueueCore {
 #[derive(Clone)]
 pub struct LogQueue {
     /// All shared state, also held by the background worker via Arc.
-    /// The worker never calls submit() on this — it only uses push() and flush()
-    /// directly on the core.
     core: Arc<LogQueueCore>,
-    /// Channel to the background worker (for submit/flush commands).
+    /// Channel to the background worker (for flush commands only).
     worker_sender: mpsc::Sender<LogCommand>,
     /// Handle to the background worker task.
     #[allow(dead_code)]
@@ -407,27 +711,20 @@ pub struct LogQueue {
 impl LogQueue {
     /// Create a new log queue that spawns and owns the background worker.
     ///
-    /// The worker handles payload preparation, project registration, and dispatches
-    /// rows into the internal lock-free queue for batching and HTTP dispatch.
+    /// The worker handles flush coordination; row preparation (project registration,
+    /// destination resolution) happens inside `flush_internal` at flush time.
     pub fn new(
         config: LogQueueConfig,
         login_state: LoginState,
         client: reqwest::Client,
-        app_url: Url,
         worker_queue_size: usize,
     ) -> Self {
         let core = LogQueueCore::new(config, login_state.clone(), client.clone());
 
         let (worker_sender, worker_receiver) = mpsc::channel(worker_queue_size.max(32));
 
-        let worker_config = WorkerConfig {
-            app_url,
-            client: client.clone(),
-        };
-
         let worker_handle = Arc::new(tokio::spawn(super::worker::run_worker(
             worker_receiver,
-            worker_config,
             core.clone(),
         )));
 
@@ -438,34 +735,24 @@ impl LogQueue {
         }
     }
 
-    /// Submit a span payload for processing by the background worker.
+    /// Submit a span payload for processing.
     ///
-    /// The worker handles project registration and row preparation,
-    /// then pushes the row into the lock-free queue for batching and HTTP dispatch.
-    /// Submit a span payload synchronously (fire-and-forget).
-    /// Uses try_send to avoid blocking the caller. If the worker channel is full,
-    /// the item is silently dropped (logged as a warning).
+    /// The command is pushed directly into the lock-free queue. All drops
+    /// (queue-full and channel-closed) go through `LogQueueCore::push`, which
+    /// handles drop counting, throttled warnings, and optional debug dumps
+    /// uniformly. Row preparation (project registration, destination resolution)
+    /// is deferred to flush time.
     pub fn submit(
         &self,
         token: impl Into<String>,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) {
-        let cmd = LogCommand::Submit(Box::new(SubmitCommand {
+        self.core.push(SubmitCommand {
             token: token.into(),
             payload,
             parent_info,
-        }));
-        if let Err(e) = self.worker_sender.try_send(cmd) {
-            match e {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    warn!("log worker queue is full, dropping span (backpressure)");
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    warn!("log worker channel closed, dropping span");
-                }
-            }
-        }
+        });
     }
 
     /// Flush all pending data through the worker, waiting for completion.
@@ -530,34 +817,32 @@ impl Drop for LogQueue {
 mod tests {
     use super::*;
     use crate::log_queue::config::LogQueueConfig;
-    use std::collections::HashMap;
 
-    fn make_test_row(id: &str) -> Logs3Row {
-        Logs3Row {
-            id: id.to_string(),
-            span_id: id.to_string(),
-            is_merge: None,
-            merge_paths: None,
-            root_span_id: "root".to_string(),
-            span_parents: None,
-            destination: crate::types::LogDestination::experiment("test"),
-            org_id: "org".to_string(),
-            org_name: Some("test-org".to_string()),
-            input: None,
-            output: None,
-            expected: None,
-            error: None,
-            scores: None,
-            metadata: None,
-            metrics: None,
-            tags: None,
-            context: None,
-            span_attributes: None,
-            extra: HashMap::new(),
-            created: chrono::Utc::now(),
-            xact_id: None,
-            object_delete: None,
-            audit_source: None,
+    fn make_test_cmd(id: &str) -> SubmitCommand {
+        SubmitCommand {
+            token: "test-token".to_string(),
+            payload: SpanPayload {
+                row_id: id.to_string(),
+                span_id: id.to_string(),
+                is_merge: false,
+                org_id: "org".to_string(),
+                org_name: Some("test-org".to_string()),
+                project_name: None,
+                input: None,
+                output: None,
+                expected: None,
+                error: None,
+                scores: None,
+                metadata: None,
+                metrics: None,
+                tags: None,
+                context: None,
+                span_attributes: None,
+                object_delete: None,
+            },
+            parent_info: Some(ParentSpanInfo::Experiment {
+                object_id: "exp-test".to_string(),
+            }),
         }
     }
 
@@ -570,27 +855,26 @@ mod tests {
             .sync_flush(true) // Disable auto-flush to avoid background HTTP calls
             .build();
         let login_state = LoginState::new();
-        let app_url = Url::parse("https://www.example.com").unwrap();
-        LogQueue::new(config, login_state, reqwest::Client::new(), app_url, 256)
+        LogQueue::new(config, login_state, reqwest::Client::new(), 256)
     }
 
     #[tokio::test]
     async fn test_push_queues_item() {
         let queue = make_queue(10);
         assert!(queue.core.is_empty());
-        queue.core.push(make_test_row("1"));
+        queue.core.push(make_test_cmd("1"));
         assert_eq!(queue.core.len(), 1);
     }
 
     #[tokio::test]
     async fn test_push_drops_when_full() {
         let queue = make_queue(2);
-        queue.core.push(make_test_row("1"));
-        queue.core.push(make_test_row("2"));
+        queue.core.push(make_test_cmd("1"));
+        queue.core.push(make_test_cmd("2"));
         assert_eq!(queue.core.len(), 2);
 
         // This push should be dropped since the queue is full
-        queue.core.push(make_test_row("3"));
+        queue.core.push(make_test_cmd("3"));
         assert_eq!(queue.core.len(), 2);
         // The throttled warning fires immediately on the first drop (last_drop_log_time
         // starts at 0, which is well beyond the throttle window), resetting the counter.
@@ -607,19 +891,18 @@ mod tests {
             .sync_flush(true)
             .build();
         let login_state = LoginState::new();
-        let app_url = Url::parse("https://www.example.com").unwrap();
-        let queue = LogQueue::new(config, login_state, reqwest::Client::new(), app_url, 256);
+        let queue = LogQueue::new(config, login_state, reqwest::Client::new(), 256);
 
-        queue.core.push(make_test_row("1")); // fills queue
+        queue.core.push(make_test_cmd("1")); // fills queue
 
         // First drop: warning fires (last_drop_log_time=0 is always past throttle),
         // resets counter to 0 and records timestamp.
-        queue.core.push(make_test_row("2")); // dropped, count reset to 0 after warning
+        queue.core.push(make_test_cmd("2")); // dropped, count reset to 0 after warning
         assert_eq!(queue.core.dropped_count(), 0);
 
         // Subsequent drops within the same throttle window accumulate without reset.
-        queue.core.push(make_test_row("3")); // dropped, counter now 1
-        queue.core.push(make_test_row("4")); // dropped, counter now 2
+        queue.core.push(make_test_cmd("3")); // dropped, counter now 1
+        queue.core.push(make_test_cmd("4")); // dropped, counter now 2
         assert_eq!(queue.core.dropped_count(), 2);
     }
 
@@ -630,12 +913,11 @@ mod tests {
             .sync_flush(true)
             .build();
         let login_state = LoginState::new();
-        let app_url = Url::parse("https://www.example.com").unwrap();
-        let queue = LogQueue::new(config, login_state, reqwest::Client::new(), app_url, 256);
+        let queue = LogQueue::new(config, login_state, reqwest::Client::new(), 256);
 
         // Push many more items than the default queue_max_size
         for i in 0..20_000 {
-            queue.core.push(make_test_row(&i.to_string()));
+            queue.core.push(make_test_cmd(&i.to_string()));
         }
         assert_eq!(queue.core.len(), 20_000);
         assert_eq!(queue.core.dropped_count(), 0);
@@ -644,9 +926,9 @@ mod tests {
     #[tokio::test]
     async fn test_drain_all_returns_all_items() {
         let queue = make_queue(10);
-        queue.core.push(make_test_row("1"));
-        queue.core.push(make_test_row("2"));
-        queue.core.push(make_test_row("3"));
+        queue.core.push(make_test_cmd("1"));
+        queue.core.push(make_test_cmd("2"));
+        queue.core.push(make_test_cmd("3"));
 
         let drained = queue.core.drain_all();
         assert_eq!(drained.len(), 3);
@@ -657,14 +939,14 @@ mod tests {
     async fn test_drain_all_atomic_boundary() {
         // Items pushed after drain starts should go to the new channel, not the drained batch
         let queue = make_queue(10);
-        queue.core.push(make_test_row("1"));
-        queue.core.push(make_test_row("2"));
+        queue.core.push(make_test_cmd("1"));
+        queue.core.push(make_test_cmd("2"));
 
         let drained = queue.core.drain_all();
         assert_eq!(drained.len(), 2);
 
         // Push after drain goes to the new channel
-        queue.core.push(make_test_row("3"));
+        queue.core.push(make_test_cmd("3"));
         assert_eq!(queue.core.len(), 1);
     }
 
@@ -673,7 +955,7 @@ mod tests {
         // make_queue uses sync_flush=true, so push() should not trigger background flush
         let queue = make_queue(10);
 
-        queue.core.push(make_test_row("1"));
+        queue.core.push(make_test_cmd("1"));
         // No flush should be in progress - in sync mode user calls flush() explicitly
         assert!(queue.core.flush_handle.try_lock().unwrap().is_none());
         assert_eq!(queue.core.len(), 1);

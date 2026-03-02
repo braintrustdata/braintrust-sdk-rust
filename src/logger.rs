@@ -306,7 +306,6 @@ impl BraintrustClientBuilder {
             log_config,
             login_state.clone(),
             http_client.clone(),
-            app_url.clone(),
             self.queue_size,
         );
 

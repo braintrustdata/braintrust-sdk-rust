@@ -83,4 +83,8 @@ async fn flush_is_fire_and_forget() {
     // The actual HTTP submission (which fails) happens in the background.
     let result = span.flush().await;
     assert!(result.is_ok(), "flush() should be fire-and-forget");
+
+    // Drain pending items before drop so the Drop impl's synchronous flush path
+    // is a no-op (queue is empty). The 500 from project registration is swallowed.
+    let _ = client.flush().await;
 }
