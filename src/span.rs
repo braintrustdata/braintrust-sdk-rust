@@ -200,12 +200,18 @@ impl SpanLogBuilder {
 
 #[async_trait]
 pub(crate) trait SpanSubmitter: Send + Sync {
-    async fn submit(
+    /// Submit a span payload synchronously (fire-and-forget).
+    /// The payload is queued internally and processed by a background worker.
+    /// Dropping is handled internally if the queue is full.
+    fn submit(
         &self,
         token: impl Into<String> + Send,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
-    ) -> Result<()>;
+    );
+
+    /// Trigger a non-blocking background flush.
+    async fn trigger_flush(&self) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -401,8 +407,8 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, self.parent_info.clone())
-            .await
+            .submit(self.token.clone(), payload, self.parent_info.clone());
+        Ok(())
     }
 
     /// Mark the span as ended with the current timestamp.
@@ -424,6 +430,12 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         }
         inner.end_time = Some(end_time);
         end_time
+    }
+
+    /// Trigger a non-blocking background flush.
+    /// Useful for streaming writes to get partial updates visible immediately.
+    pub async fn trigger_flush(&self) -> Result<()> {
+        self.submitter.trigger_flush().await
     }
 }
 
@@ -482,6 +494,7 @@ impl From<SpanData> for SpanPayload {
             tags: (!data.tags.is_empty()).then_some(data.tags),
             context: data.context,
             span_attributes: has_attributes.then_some(span_attributes),
+            object_delete: None,
         }
     }
 }
