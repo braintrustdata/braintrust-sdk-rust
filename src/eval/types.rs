@@ -156,9 +156,6 @@ pub struct EvalSummary<I, O> {
     pub successful_cases: usize,
     /// Number of failed evaluations
     pub failed_cases: usize,
-    /// Experiment ID (if logged to Braintrust)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub experiment_id: Option<String>,
     /// Dataset ID (if using Braintrust dataset)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset_id: Option<String>,

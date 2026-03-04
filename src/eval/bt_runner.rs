@@ -284,7 +284,7 @@ impl BtEvalRunner {
     /// - In **normal mode**: runs the evaluator and sends results via SSE if configured.
     ///
     /// If the eval name does not pass the configured filters, it is skipped silently.
-    pub async fn eval<I, O>(&mut self, _project: &str, opts: EvalOpts<I, O>) -> Result<()>
+    pub async fn eval<I, O>(&mut self, project: &str, mut opts: EvalOpts<I, O>) -> Result<()>
     where
         I: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
         O: Serialize + DeserializeOwned + Send + Sync + PartialEq + Clone + 'static,
@@ -298,6 +298,11 @@ impl BtEvalRunner {
         if self.config.list {
             self.registered_names.push(name);
             return Ok(());
+        }
+
+        // Set the project name from the argument if not already set in opts
+        if opts.project_name.is_none() {
+            opts.project_name = Some(project.to_string());
         }
 
         let client = self

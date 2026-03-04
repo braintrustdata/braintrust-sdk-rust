@@ -130,10 +130,14 @@ impl LevenshteinScorer {
         self
     }
 
-    /// Calculate Levenshtein distance between two strings
+    /// Calculate Levenshtein distance between two strings.
+    ///
+    /// Uses a single-row vector for O(n) space complexity.
     fn levenshtein_distance(s1: &str, s2: &str) -> usize {
-        let len1 = s1.chars().count();
-        let len2 = s2.chars().count();
+        let s1_chars: Vec<char> = s1.chars().collect();
+        let s2_chars: Vec<char> = s2.chars().collect();
+        let len1 = s1_chars.len();
+        let len2 = s2_chars.len();
 
         if len1 == 0 {
             return len2;
@@ -142,34 +146,23 @@ impl LevenshteinScorer {
             return len1;
         }
 
-        let mut matrix = vec![vec![0; len2 + 1]; len1 + 1];
-
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..=len1 {
-            matrix[i][0] = i;
-        }
-        #[allow(clippy::needless_range_loop)]
-        for j in 0..=len2 {
-            matrix[0][j] = j;
-        }
-
-        let s1_chars: Vec<char> = s1.chars().collect();
-        let s2_chars: Vec<char> = s2.chars().collect();
+        let mut row: Vec<usize> = (0..=len2).collect();
 
         for (i, c1) in s1_chars.iter().enumerate() {
+            let mut prev = i;
+            row[0] = i + 1;
             for (j, c2) in s2_chars.iter().enumerate() {
-                let cost = if c1 == c2 { 0 } else { 1 };
-                matrix[i + 1][j + 1] = std::cmp::min(
-                    std::cmp::min(
-                        matrix[i][j + 1] + 1, // deletion
-                        matrix[i + 1][j] + 1, // insertion
-                    ),
-                    matrix[i][j] + cost, // substitution
-                );
+                let tmp = row[j + 1];
+                row[j + 1] = if c1 == c2 {
+                    prev
+                } else {
+                    1 + prev.min(tmp).min(row[j])
+                };
+                prev = tmp;
             }
         }
 
-        matrix[len1][len2]
+        row[len2]
     }
 }
 
@@ -197,7 +190,7 @@ where
         let distance = Self::levenshtein_distance(args.output, expected);
 
         let score = if self.normalize {
-            let max_len = std::cmp::max(args.output.len(), expected.len());
+            let max_len = std::cmp::max(args.output.chars().count(), expected.chars().count());
             if max_len == 0 {
                 1.0
             } else {

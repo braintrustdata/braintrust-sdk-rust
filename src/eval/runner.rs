@@ -25,6 +25,8 @@ pub struct EvalOpts<I, O> {
     pub task: Box<dyn Task<I, O>>,
     /// Scorers to evaluate outputs
     pub scorers: Vec<Box<dyn Scorer<I, O>>>,
+    /// Braintrust project to log results to
+    pub project_name: Option<String>,
     /// Optional experiment name for Braintrust logging
     pub experiment_name: Option<String>,
     /// Optional metadata for the evaluation
@@ -150,14 +152,14 @@ where
             // Collect completed futures if we have many pending
             while futures.len() >= opts.max_concurrency {
                 if let Some(result) = futures.next().await {
-                    results.push(result);
+                    results.push(result?);
                 }
             }
         }
 
         // Collect remaining futures
         while let Some(result) = futures.next().await {
-            results.push(result);
+            results.push(result?);
         }
 
         // End root span
@@ -189,7 +191,6 @@ where
             total_cases: case_count,
             successful_cases: successful,
             failed_cases: failed,
-            experiment_id: None, // TODO: Get from experiment API when available
             dataset_id,
         })
     }
@@ -203,20 +204,12 @@ where
         client: &BraintrustClient,
         case_num: usize,
         quiet: bool,
-    ) -> EvalResult<I, O> {
-        // Create span for this case
-        // Note: Currently we don't have a way to create nested child spans easily,
-        // so we create a sibling span instead. This is a limitation we can improve later.
-        let case_span = match client.span_builder().await {
-            Ok(builder) => builder.span_type(crate::SpanType::Eval).build(),
-            Err(_) => {
-                // Fallback if span builder fails
-                client
-                    .span_builder_with_credentials("", "")
-                    .span_type(crate::SpanType::Eval)
-                    .build()
-            }
-        };
+    ) -> Result<EvalResult<I, O>> {
+        let case_span = client
+            .span_builder()
+            .await?
+            .span_type(crate::SpanType::Eval)
+            .build();
 
         // Build initial span log with name, input, and expected
         let mut log_builder = crate::SpanLog::builder().name(format!("case-{}", case_num));
@@ -259,7 +252,7 @@ where
                     .await;
                 case_span.end().await;
 
-                return EvalResult {
+                return Ok(EvalResult {
                     input: case.input.clone(),
                     output: None, // Task failed, no output
                     expected: case.expected.clone(),
@@ -268,7 +261,7 @@ where
                     tags: case.tags.clone(),
                     error: Some(e.to_string()),
                     span_id: None,
-                };
+                });
             }
         };
 
@@ -344,7 +337,7 @@ where
             println!("Case {}: {}", case_num, score_str);
         }
 
-        EvalResult {
+        Ok(EvalResult {
             input: case.input.clone(),
             output: Some(output.clone()),
             expected: case.expected.clone(),
@@ -353,7 +346,7 @@ where
             tags: final_tags,
             error: None,
             span_id: None,
-        }
+        })
     }
 }
 
