@@ -482,13 +482,20 @@ impl<S: SpanSubmitter> SpanHandle<S> {
             _ => (SpanObjectType::ProjectLogs, None),
         };
 
+        // Use root_span_id from parent_info (FullSpan) if available, otherwise
+        // fall back to this span's own span_id (it is the root).
+        let root_span_id = match &self.parent_info {
+            Some(ParentSpanInfo::FullSpan { root_span_id, .. }) => Some(root_span_id.clone()),
+            _ => Some(inner.span_id.clone()),
+        };
+
         Ok(SpanComponents {
             object_type,
             object_id,
             compute_object_metadata_args: None,
             row_id: Some(inner.row_id.clone()),
             span_id: Some(inner.span_id.clone()),
-            root_span_id: Some(inner.span_id.clone()), // Use span_id as root if not specified
+            root_span_id,
             propagated_event: inner.propagated_event.clone(),
         })
     }
