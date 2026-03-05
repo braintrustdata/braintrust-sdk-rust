@@ -1,4 +1,5 @@
 mod error;
+pub mod eval;
 mod extractors;
 mod json_merge;
 mod log_queue;
