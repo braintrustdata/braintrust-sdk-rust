@@ -8,6 +8,12 @@ use tokio::sync::Notify;
 use url::Url;
 
 use crate::error::{BraintrustError, Result};
+use crate::experiments::api::{
+    BaseExperimentFetcher, BaseExperimentRequest, BaseExperimentResponse,
+    ExperimentComparisonFetcher, ExperimentComparisonResponse, ExperimentRegisterRequest,
+    ExperimentRegisterResponse, ExperimentRegistrar,
+};
+use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::SpanSubmitter;
 use crate::types::{ParentSpanInfo, SpanPayload};
@@ -641,6 +647,41 @@ impl BraintrustClient {
         }
     }
 
+    /// Create an experiment builder with explicit credentials.
+    ///
+    /// Note: This will be deprecated in favor of `experiment_builder()` once
+    /// the login-flow branch lands and credentials are stored in the client.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let experiment = client
+    ///     .experiment_builder_with_credentials(&api_key, &org_id)
+    ///     .project_name("my-project")
+    ///     .experiment_name("baseline")
+    ///     .build()?;
+    /// ```
+    pub fn experiment_builder_with_credentials(
+        &self,
+        token: impl Into<String>,
+        org_id: impl Into<String>,
+    ) -> ExperimentBuilder<Self> {
+        let token = token.into();
+        let org_id = org_id.into();
+
+        // Populate login state with explicit credentials so flush_internal() can send data.
+        let _ = self.inner.login_state.set(
+            token.clone(),
+            org_id.clone(),
+            String::new(), // org_name unknown without login
+            self.inner.api_url.to_string(),
+            self.inner.app_url.to_string(),
+        );
+
+        let submitter = Arc::new(self.clone());
+        ExperimentBuilder::new(submitter, token, org_id)
+    }
+
     /// Submit a span payload for logging (fire-and-forget).
     ///
     /// Returns immediately after queuing. HTTP submission happens in the background.
@@ -717,6 +758,155 @@ impl SpanSubmitter for BraintrustClient {
 
     async fn trigger_flush(&self) -> Result<()> {
         self.trigger_flush().await
+    }
+}
+
+// Experiment trait implementations for BraintrustClient
+#[async_trait::async_trait]
+impl ExperimentRegistrar for BraintrustClient {
+    async fn register_experiment(
+        &self,
+        token: &str,
+        request: ExperimentRegisterRequest,
+    ) -> Result<ExperimentRegisterResponse> {
+        let url = self
+            .inner
+            .app_url
+            .join("api/experiment/register")
+            .map_err(|e| {
+                BraintrustError::InvalidConfig(format!("invalid experiment register url: {e}"))
+            })?;
+
+        let response = self
+            .inner
+            .http_client
+            .post(url)
+            .bearer_auth(token)
+            .json(&request)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(BraintrustError::Api {
+                status: status.as_u16(),
+                message: format!("register experiment failed: {text}"),
+            });
+        }
+
+        let register_response: ExperimentRegisterResponse = response.json().await.map_err(|e| {
+            BraintrustError::Background(format!(
+                "failed to parse experiment registration response: {e}"
+            ))
+        })?;
+
+        Ok(register_response)
+    }
+}
+
+#[async_trait::async_trait]
+impl BaseExperimentFetcher for BraintrustClient {
+    async fn fetch_base_experiment(
+        &self,
+        token: &str,
+        experiment_id: &str,
+    ) -> Result<Option<BaseExperimentInfo>> {
+        let url = self
+            .inner
+            .app_url
+            .join("api/base_experiment/get_id")
+            .map_err(|e| {
+                BraintrustError::InvalidConfig(format!("invalid base experiment url: {e}"))
+            })?;
+
+        let request = BaseExperimentRequest {
+            id: experiment_id.to_string(),
+        };
+
+        let response = self
+            .inner
+            .http_client
+            .post(url)
+            .bearer_auth(token)
+            .json(&request)
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        // 400 means no base experiment - return None
+        if status.as_u16() == 400 {
+            return Ok(None);
+        }
+
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(BraintrustError::Api {
+                status: status.as_u16(),
+                message: format!("fetch base experiment failed: {text}"),
+            });
+        }
+
+        let base_response: BaseExperimentResponse = response.json().await.map_err(|e| {
+            BraintrustError::Background(format!("failed to parse base experiment response: {e}"))
+        })?;
+
+        match (base_response.base_exp_id, base_response.base_exp_name) {
+            (Some(id), Some(name)) => Ok(Some(BaseExperimentInfo { id, name })),
+            _ => Ok(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ExperimentComparisonFetcher for BraintrustClient {
+    async fn fetch_experiment_comparison(
+        &self,
+        token: &str,
+        experiment_id: &str,
+        base_experiment_id: Option<&str>,
+    ) -> Result<ExperimentComparisonResponse> {
+        let mut url = self
+            .inner
+            .app_url
+            .join("experiment-comparison2")
+            .map_err(|e| {
+                BraintrustError::InvalidConfig(format!("invalid experiment comparison url: {e}"))
+            })?;
+
+        url.query_pairs_mut()
+            .append_pair("experiment_id", experiment_id);
+
+        if let Some(base_id) = base_experiment_id {
+            url.query_pairs_mut()
+                .append_pair("base_experiment_id", base_id);
+        }
+
+        let response = self
+            .inner
+            .http_client
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(BraintrustError::Api {
+                status: status.as_u16(),
+                message: format!("fetch experiment comparison failed: {text}"),
+            });
+        }
+
+        let comparison: ExperimentComparisonResponse = response.json().await.map_err(|e| {
+            BraintrustError::Background(format!(
+                "failed to parse experiment comparison response: {e}"
+            ))
+        })?;
+
+        Ok(comparison)
     }
 }
 
