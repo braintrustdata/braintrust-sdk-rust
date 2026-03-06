@@ -9,7 +9,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::types::{ParentSpanInfo, SpanAttributes, SpanPayload, SpanType};
+use crate::span_components::SpanComponents;
+use crate::types::{ParentSpanInfo, SpanAttributes, SpanObjectType, SpanPayload, SpanType};
 
 /// Error type for SpanLog builder validation.
 #[derive(Debug, Clone, PartialEq)]
@@ -307,6 +308,18 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
                 .ok()
         });
 
+        // Extract propagated_event from parent if available
+        let propagated_event = self.parent_info.as_ref().and_then(|parent| {
+            if let ParentSpanInfo::FullSpan {
+                propagated_event, ..
+            } = parent
+            {
+                propagated_event.clone()
+            } else {
+                None
+            }
+        });
+
         SpanHandle {
             submitter: Arc::clone(&self.submitter),
             token: self.token,
@@ -322,6 +335,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
                 start_time,
                 span_type: self.span_type,
                 purpose: self.purpose,
+                propagated_event,
                 ..Default::default()
             })),
         }
@@ -456,6 +470,54 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     pub async fn trigger_flush(&self) -> Result<()> {
         self.submitter.trigger_flush().await
     }
+
+    /// Export the span as SpanComponents for passing to other systems or SDKs.
+    /// This creates a serializable representation that can be used as a parent span
+    /// in another context (e.g., across service boundaries via HTTP headers).
+    ///
+    /// The exported SpanComponents includes the span's IDs and any propagated_event
+    /// data that should flow to child spans.
+    pub async fn export(&self) -> Result<SpanComponents> {
+        let inner = self.inner.lock().await;
+
+        // Determine object_type and object_id from parent_info if available,
+        // otherwise default to ProjectLogs
+        let (object_type, object_id) = match &self.parent_info {
+            Some(ParentSpanInfo::Experiment { object_id }) => {
+                (SpanObjectType::Experiment, Some(object_id.clone()))
+            }
+            Some(ParentSpanInfo::ProjectLogs { object_id }) => {
+                (SpanObjectType::ProjectLogs, Some(object_id.clone()))
+            }
+            Some(ParentSpanInfo::PlaygroundLogs { object_id }) => {
+                (SpanObjectType::PlaygroundLogs, Some(object_id.clone()))
+            }
+            Some(ParentSpanInfo::FullSpan {
+                object_type,
+                object_id,
+                ..
+            }) => (*object_type, Some(object_id.clone())),
+            // Default to ProjectLogs if no parent
+            _ => (SpanObjectType::ProjectLogs, None),
+        };
+
+        // Use root_span_id from parent_info (FullSpan) if available, otherwise
+        // fall back to this span's own span_id (it is the root).
+        let root_span_id = match &self.parent_info {
+            Some(ParentSpanInfo::FullSpan { root_span_id, .. }) => Some(root_span_id.clone()),
+            _ => Some(inner.span_id.clone()),
+        };
+
+        Ok(SpanComponents {
+            object_type,
+            object_id,
+            compute_object_metadata_args: None,
+            row_id: Some(inner.row_id.clone()),
+            span_id: Some(inner.span_id.clone()),
+            root_span_id,
+            propagated_event: inner.propagated_event.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Default)]
@@ -480,10 +542,18 @@ struct SpanData {
     context: Option<Value>,
     start_time: Option<f64>,
     end_time: Option<f64>,
+    propagated_event: Option<Map<String, Value>>,
 }
 
 impl From<SpanData> for SpanPayload {
-    fn from(data: SpanData) -> Self {
+    fn from(mut data: SpanData) -> Self {
+        // Apply propagated_event if present - merge its fields into the span data
+        if let Some(propagated_event) = data.propagated_event.take() {
+            apply_propagated_event_to_span_data(&mut data, &propagated_event);
+            // Restore the propagated_event after applying it
+            data.propagated_event = Some(propagated_event);
+        }
+
         let span_attributes = SpanAttributes {
             name: data.name,
             span_type: Some(data.span_type),
@@ -514,6 +584,76 @@ impl From<SpanData> for SpanPayload {
             context: data.context,
             span_attributes: has_attributes.then_some(span_attributes),
             object_delete: None,
+        }
+    }
+}
+
+/// Apply propagated_event data to SpanData by merging it into the span's fields.
+/// This allows parent span metadata to flow down to child spans.
+fn apply_propagated_event_to_span_data(data: &mut SpanData, propagated_event: &Map<String, Value>) {
+    for (key, value) in propagated_event {
+        match key.as_str() {
+            "input" if data.input.is_none() => {
+                data.input = Some(value.clone());
+            }
+            "output" if data.output.is_none() => {
+                data.output = Some(value.clone());
+            }
+            "expected" if data.expected.is_none() => {
+                data.expected = Some(value.clone());
+            }
+            "error" if data.error.is_none() => {
+                if let Some(s) = value.as_str() {
+                    data.error = Some(Value::String(s.to_string()));
+                }
+            }
+            "scores" => {
+                if let Some(obj) = value.as_object() {
+                    for (score_key, score_val) in obj {
+                        if let Some(score) = score_val.as_f64() {
+                            data.scores.entry(score_key.clone()).or_insert(score);
+                        }
+                    }
+                }
+            }
+            "metadata" => {
+                if let Some(obj) = value.as_object() {
+                    for (meta_key, meta_val) in obj {
+                        data.metadata
+                            .entry(meta_key.clone())
+                            .or_insert_with(|| meta_val.clone());
+                    }
+                }
+            }
+            "metrics" => {
+                if let Some(obj) = value.as_object() {
+                    for (metric_key, metric_val) in obj {
+                        if let Some(metric) = metric_val.as_f64() {
+                            data.metrics.entry(metric_key.clone()).or_insert(metric);
+                        }
+                    }
+                }
+            }
+            "tags" => {
+                if let Some(arr) = value.as_array() {
+                    for tag_val in arr {
+                        if let Some(tag) = tag_val.as_str() {
+                            if !data.tags.contains(&tag.to_string()) {
+                                data.tags.push(tag.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            "context" if data.context.is_none() => {
+                data.context = Some(value.clone());
+            }
+            _ => {
+                // Unknown fields go into metadata
+                data.metadata
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
         }
     }
 }
@@ -698,5 +838,85 @@ mod tests {
         let second = span.end_with_time(456.0).await;
         assert_eq!(first, 123.0);
         assert_eq!(second, 123.0);
+    }
+
+    #[tokio::test]
+    async fn propagated_event_flows_to_child_span() {
+        use crate::types::SpanObjectType;
+
+        // Create a parent span with propagated_event
+        let mut parent_propagated = Map::new();
+        parent_propagated.insert("parent_key".to_string(), json!("parent_value"));
+        parent_propagated.insert("metadata".to_string(), json!({"inherited": "data"}));
+
+        let parent_info = ParentSpanInfo::FullSpan {
+            object_type: SpanObjectType::ProjectLogs,
+            object_id: "project-123".to_string(),
+            span_id: "parent-span-id".to_string(),
+            root_span_id: "root-span-id".to_string(),
+            propagated_event: Some(parent_propagated),
+        };
+
+        // Build child span with parent
+        let (builder, collector) = mock_span_builder();
+        let span = builder.parent_info(parent_info).build();
+
+        // Log to the child span
+        span.log(
+            SpanLog::builder()
+                .input(json!({"child": "input"}))
+                .build()
+                .expect("build"),
+        )
+        .await;
+
+        span.flush().await.expect("flush");
+
+        // Verify propagated_event data was merged into the span
+        let captured = collector.spans().into_iter().next().unwrap();
+
+        // Check that metadata from propagated_event is present
+        let metadata = captured.payload.metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata.get("inherited").and_then(|v| v.as_str()),
+            Some("data"),
+            "Inherited metadata should be present"
+        );
+        assert_eq!(
+            metadata.get("parent_key").and_then(|v| v.as_str()),
+            Some("parent_value"),
+            "Parent key should be in metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn span_export_includes_propagated_event() {
+        use crate::types::SpanObjectType;
+
+        // Create a span with propagated_event
+        let mut propagated = Map::new();
+        propagated.insert("test_key".to_string(), json!("test_value"));
+
+        let parent_info = ParentSpanInfo::FullSpan {
+            object_type: SpanObjectType::Experiment,
+            object_id: "exp-123".to_string(),
+            span_id: "span-456".to_string(),
+            root_span_id: "root-789".to_string(),
+            propagated_event: Some(propagated),
+        };
+
+        let (builder, _collector) = mock_span_builder();
+        let span = builder.parent_info(parent_info).build();
+
+        // Export the span
+        let exported = span.export().await.unwrap();
+
+        // Verify exported SpanComponents has propagated_event
+        assert!(exported.propagated_event.is_some());
+        let event = exported.propagated_event.unwrap();
+        assert_eq!(
+            event.get("test_key").and_then(|v| v.as_str()),
+            Some("test_value")
+        );
     }
 }
