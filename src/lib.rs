@@ -6,6 +6,7 @@ mod json_merge;
 mod log_queue;
 mod logger;
 mod logs3;
+mod prompt;
 mod span;
 mod span_components;
 mod stream;
@@ -21,12 +22,15 @@ pub use experiments::{
     GitMetadataSettings, MetricSummary, ProjectMetadata, RepoInfo, ScoreSummary,
 };
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
+pub use lingua::universal::{AssistantContent, TokenBudget, UserContent};
+pub use lingua::{Message, UniversalParams, UniversalRequest};
 pub use log_queue::LogQueueConfig;
 pub use logger::{
     BraintrustClient, BraintrustClientBuilder, LoginState, OrgInfo, DEFAULT_API_URL,
     DEFAULT_APP_URL,
 };
 pub use logs3::{Logs3BatchUploader, Logs3UploadResult};
+pub use prompt::{Prompt, PromptBuilder, PromptBuilderError};
 pub use span::{SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanLogBuilderError};
 pub use span_components::SpanComponents;
 pub use stream::{
