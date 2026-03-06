@@ -58,14 +58,14 @@ impl MockBraintrustClient {
 
 #[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
-    fn submit(
+    async fn submit(
         &self,
-        token: impl Into<String> + Send,
+        token: String,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) {
         self.collector.push(CapturedSpan {
-            token: token.into(),
+            token,
             payload,
             parent: parent_info,
         });

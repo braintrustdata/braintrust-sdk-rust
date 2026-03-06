@@ -197,7 +197,6 @@ impl<
             tags: feedback.tags,
             context: None,
             span_attributes: None,
-            object_delete: None,
         };
 
         let parent_info = ParentSpanInfo::Experiment {
@@ -205,7 +204,8 @@ impl<
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info));
+            .submit(self.token.clone(), payload, Some(parent_info))
+            .await;
     }
 
     /// Get a summary of the experiment's performance.
@@ -378,7 +378,6 @@ impl<
             tags: event.tags,
             context: event.context,
             span_attributes: None,
-            object_delete: None,
         };
 
         let parent_info = ParentSpanInfo::Experiment {
@@ -386,7 +385,8 @@ impl<
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info));
+            .submit(self.token.clone(), payload, Some(parent_info))
+            .await;
     }
 
     /// Fetch the base experiment used for comparison.

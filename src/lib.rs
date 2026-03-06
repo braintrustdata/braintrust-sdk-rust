@@ -1,3 +1,4 @@
+mod dataset;
 mod error;
 pub mod eval;
 mod experiments;
@@ -13,6 +14,10 @@ mod stream;
 pub(crate) mod test_utils;
 mod types;
 
+pub use dataset::{
+    DatasetBuilder, DatasetBuilderError, DatasetInsert, DatasetInsertBuilder,
+    DatasetInsertBuilderError, DatasetIterator, DatasetRecord, DatasetSummary,
+};
 pub use error::{BraintrustError, Result};
 pub use experiments::{
     BaseExperimentInfo, Experiment, ExperimentBuilder, ExperimentBuilderError, ExperimentLog,

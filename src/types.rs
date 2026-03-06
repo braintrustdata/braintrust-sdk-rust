@@ -333,9 +333,6 @@ pub(crate) struct SpanPayload {
     pub tags: Option<Vec<String>>,
     pub context: Option<Value>,
     pub span_attributes: Option<SpanAttributes>,
-    /// When `true`, marks this row for deletion on the server.
-    /// Matches TS SDK's `_object_delete` / `OBJECT_DELETE_FIELD`.
-    pub object_delete: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
