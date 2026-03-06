@@ -13,6 +13,7 @@ categories = ["api-bindings", "asynchronous", "development-tools"]
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+lingua = { git = "https://github.com/braintrustdata/lingua.git" }
 bon = "3"
 arc-swap = "1"
 async-trait = "0.1"

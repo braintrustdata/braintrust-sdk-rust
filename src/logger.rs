@@ -15,6 +15,7 @@ use crate::experiments::api::{
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
 use crate::log_queue::{LogQueue, LogQueueConfig};
+use crate::prompt::{PromptBuilder, PromptFetchRequest, PromptFetchResponse, PromptFetcher};
 use crate::span::SpanSubmitter;
 use crate::types::{ParentSpanInfo, SpanPayload};
 
@@ -505,6 +506,13 @@ impl BraintrustClient {
         crate::span::SpanBuilder::new(submitter, token, org_id)
     }
 
+    /// Create a prompt builder with an explicit API token.
+    ///
+    /// Use this if you already have the token and don't want to use the login state.
+    pub fn prompt_builder_with_credentials(&self, token: impl Into<String>) -> PromptBuilder<Self> {
+        PromptBuilder::new(Arc::new(self.clone()), token)
+    }
+
     /// Perform login synchronously.
     async fn perform_login(&self, api_key: &str, org_name: Option<&str>) -> Result<()> {
         let login_url = self
@@ -907,6 +915,64 @@ impl ExperimentComparisonFetcher for BraintrustClient {
         })?;
 
         Ok(comparison)
+    }
+}
+
+#[async_trait::async_trait]
+impl PromptFetcher for BraintrustClient {
+    async fn fetch_prompt(
+        &self,
+        token: &str,
+        request: PromptFetchRequest,
+    ) -> Result<PromptFetchResponse> {
+        let mut url = self
+            .inner
+            .api_url
+            .join("v1/prompt")
+            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
+
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("slug", &request.slug);
+            if let Some(project_id) = &request.project_id {
+                query.append_pair("project_id", project_id);
+            }
+            if let Some(project_name) = &request.project_name {
+                query.append_pair("project_name", project_name);
+            }
+            if let Some(version) = &request.version {
+                query.append_pair("version", version);
+            }
+            if let Some(environment) = &request.environment {
+                query.append_pair("environment", environment);
+            }
+        }
+
+        let response = self
+            .inner
+            .http_client
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| BraintrustError::Network(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(BraintrustError::Api {
+                status: status.as_u16(),
+                message: body,
+            });
+        }
+
+        response
+            .json::<PromptFetchResponse>()
+            .await
+            .map_err(|e| BraintrustError::Api {
+                status: 200,
+                message: format!("Failed to parse prompt response: {}", e),
+            })
     }
 }
 
