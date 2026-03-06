@@ -225,6 +225,7 @@ pub struct SpanBuilder<S: SpanSubmitter> {
     parent_info: Option<ParentSpanInfo>,
     span_type: SpanType,
     purpose: Option<String>,
+    start_time_override: Option<f64>,
 }
 
 impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
@@ -238,6 +239,7 @@ impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
             parent_info: self.parent_info.clone(),
             span_type: self.span_type,
             purpose: self.purpose.clone(),
+            start_time_override: self.start_time_override,
         }
     }
 }
@@ -258,7 +260,13 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
             parent_info: None,
             span_type: SpanType::default(),
             purpose: None,
+            start_time_override: None,
         }
+    }
+
+    pub fn start_time(mut self, start_time: f64) -> Self {
+        self.start_time_override = Some(start_time);
+        self
     }
 
     pub fn org_name(mut self, org_name: impl Into<String>) -> Self {
@@ -292,15 +300,18 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
         // Generate both IDs ONCE at span creation - reused for all flushes
         let row_id = Uuid::new_v4().to_string();
         let span_id = Uuid::new_v4().to_string();
-        let start_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .ok();
+        let start_time = self.start_time_override.or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .ok()
+        });
 
         SpanHandle {
             submitter: Arc::clone(&self.submitter),
             token: self.token,
             parent_info: self.parent_info,
+            row_id: row_id.clone(),
             inner: Arc::new(Mutex::new(SpanData {
                 row_id,
                 span_id,
@@ -322,6 +333,8 @@ pub struct SpanHandle<S: SpanSubmitter> {
     submitter: Arc<S>,
     token: String,
     parent_info: Option<ParentSpanInfo>,
+    /// Stable identifier set at creation, accessible without locking.
+    row_id: String,
     inner: Arc<Mutex<SpanData>>,
 }
 
@@ -331,6 +344,7 @@ impl<S: SpanSubmitter> Clone for SpanHandle<S> {
             submitter: Arc::clone(&self.submitter),
             token: self.token.clone(),
             parent_info: self.parent_info.clone(),
+            row_id: self.row_id.clone(),
             inner: Arc::clone(&self.inner),
         }
     }
@@ -338,6 +352,11 @@ impl<S: SpanSubmitter> Clone for SpanHandle<S> {
 
 #[allow(private_bounds)]
 impl<S: SpanSubmitter> SpanHandle<S> {
+    /// Return the stable row ID for this span, usable with `log_feedback()` and `update_span()`.
+    pub fn row_id(&self) -> &str {
+        &self.row_id
+    }
+
     /// Log event data to this span. All fields are optional.
     /// Multiple calls will merge data (later values overwrite earlier ones).
     pub async fn log(&self, event: SpanLog) {

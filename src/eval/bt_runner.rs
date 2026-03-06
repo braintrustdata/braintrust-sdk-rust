@@ -399,7 +399,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    // Serialize tests that mutate BT_EVAL_FILTER_PARSED to avoid race conditions.
+    static FILTER_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_env_flag() {
@@ -409,6 +414,7 @@ mod tests {
 
     #[test]
     fn test_parse_filters_empty() {
+        let _guard = FILTER_ENV_MUTEX.lock().unwrap();
         // When BT_EVAL_FILTER_PARSED is not set, filters should be empty
         std::env::remove_var("BT_EVAL_FILTER_PARSED");
         let filters = parse_filters();
@@ -417,6 +423,7 @@ mod tests {
 
     #[test]
     fn test_parse_filters_valid() {
+        let _guard = FILTER_ENV_MUTEX.lock().unwrap();
         std::env::set_var(
             "BT_EVAL_FILTER_PARSED",
             r#"[{"path":["name"],"pattern":"foo.*"}]"#,
@@ -430,6 +437,7 @@ mod tests {
 
     #[test]
     fn test_parse_filters_invalid_json() {
+        let _guard = FILTER_ENV_MUTEX.lock().unwrap();
         std::env::set_var("BT_EVAL_FILTER_PARSED", "not-json");
         let filters = parse_filters();
         assert!(filters.is_empty());
