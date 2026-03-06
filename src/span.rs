@@ -201,12 +201,12 @@ impl SpanLogBuilder {
 
 #[async_trait]
 pub(crate) trait SpanSubmitter: Send + Sync {
-    /// Submit a span payload synchronously (fire-and-forget).
+    /// Submit a span payload for queuing (fire-and-forget).
     /// The payload is queued internally and processed by a background worker.
     /// Dropping is handled internally if the queue is full.
-    fn submit(
+    async fn submit(
         &self,
-        token: impl Into<String> + Send,
+        token: String,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     );
@@ -440,7 +440,8 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, self.parent_info.clone());
+            .submit(self.token.clone(), payload, self.parent_info.clone())
+            .await;
         Ok(())
     }
 
@@ -583,7 +584,6 @@ impl From<SpanData> for SpanPayload {
             tags: (!data.tags.is_empty()).then_some(data.tags),
             context: data.context,
             span_attributes: has_attributes.then_some(span_attributes),
-            object_delete: None,
         }
     }
 }

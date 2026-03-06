@@ -377,7 +377,6 @@ impl LogQueueCore {
             tags,
             context,
             span_attributes,
-            object_delete,
         } = payload;
 
         let project_id = if let Some(ref pn) = project_name {
@@ -461,7 +460,7 @@ impl LogQueueCore {
             extra: HashMap::new(),
             created: Utc::now(),
             xact_id: None,
-            object_delete,
+            object_delete: None,
             audit_source: Some("api".to_string()),
         })
     }
@@ -660,7 +659,7 @@ impl LogQueueCore {
                 extra: HashMap::new(),
                 created: Utc::now(),
                 xact_id: None,
-                object_delete: payload.object_delete,
+                object_delete: None,
                 audit_source: Some("api".to_string()),
             };
 
@@ -840,7 +839,6 @@ mod tests {
                 tags: None,
                 context: None,
                 span_attributes: None,
-                object_delete: None,
             },
             parent_info: Some(ParentSpanInfo::Experiment {
                 object_id: "exp-test".to_string(),

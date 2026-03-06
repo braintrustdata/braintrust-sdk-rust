@@ -7,6 +7,10 @@ use serde_json::{Map, Value};
 use tokio::sync::Notify;
 use url::Url;
 
+use crate::dataset::{
+    BTQLQuery, BTQLResponse, DatasetBuilder, DatasetFetcher, DatasetRegisterRequest,
+    DatasetRegisterResponse, DatasetRegistrar, DatasetSummarizer, DatasetSummaryResponse,
+};
 use crate::error::{BraintrustError, Result};
 use crate::experiments::api::{
     BaseExperimentFetcher, BaseExperimentRequest, BaseExperimentResponse,
@@ -481,6 +485,24 @@ impl BraintrustClient {
         Ok(builder)
     }
 
+    /// Create a dataset builder using the logged-in state.
+    ///
+    /// This waits for login to complete if it hasn't already.
+    pub async fn dataset_builder(&self) -> Result<DatasetBuilder<Self>> {
+        let state = self.wait_for_login_state().await?;
+        let api_key = state
+            .api_key()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        let org_name = state
+            .org_name()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        Ok(DatasetBuilder::new(
+            Arc::new(self.clone()),
+            api_key,
+            org_name,
+        ))
+    }
+
     /// Create a span builder with explicit token and org_id.
     ///
     /// Use this if you already have the org_id and don't want to use the login state.
@@ -747,9 +769,9 @@ impl Drop for BraintrustClient {
 
 #[async_trait::async_trait]
 impl SpanSubmitter for BraintrustClient {
-    fn submit(
+    async fn submit(
         &self,
-        token: impl Into<String> + Send,
+        token: String,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) {
@@ -907,6 +929,128 @@ impl ExperimentComparisonFetcher for BraintrustClient {
         })?;
 
         Ok(comparison)
+    }
+}
+
+// Dataset trait implementations for BraintrustClient
+#[async_trait::async_trait]
+impl DatasetRegistrar for BraintrustClient {
+    async fn register_dataset(
+        &self,
+        token: &str,
+        request: DatasetRegisterRequest,
+    ) -> Result<DatasetRegisterResponse> {
+        let url = self
+            .inner
+            .app_url
+            .join("api/dataset/register")
+            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
+
+        let response = self
+            .inner
+            .http_client
+            .post(url)
+            .bearer_auth(token)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| BraintrustError::Network(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(BraintrustError::Api {
+                status: status.as_u16(),
+                message: body,
+            });
+        }
+
+        response
+            .json::<DatasetRegisterResponse>()
+            .await
+            .map_err(|e| BraintrustError::Api {
+                status: 200,
+                message: format!("Failed to parse dataset register response: {}", e),
+            })
+    }
+}
+
+#[async_trait::async_trait]
+impl DatasetFetcher for BraintrustClient {
+    async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse> {
+        let url = self
+            .inner
+            .api_url
+            .join("btql")
+            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
+
+        let response = self
+            .inner
+            .http_client
+            .post(url)
+            .bearer_auth(token)
+            .json(&query)
+            .send()
+            .await
+            .map_err(|e| BraintrustError::Network(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(BraintrustError::Api {
+                status: status.as_u16(),
+                message: body,
+            });
+        }
+
+        response
+            .json::<BTQLResponse>()
+            .await
+            .map_err(|e| BraintrustError::Api {
+                status: 200,
+                message: format!("Failed to parse BTQL response: {}", e),
+            })
+    }
+}
+
+#[async_trait::async_trait]
+impl DatasetSummarizer for BraintrustClient {
+    async fn fetch_dataset_summary(
+        &self,
+        token: &str,
+        dataset_id: &str,
+    ) -> Result<DatasetSummaryResponse> {
+        let url = self
+            .inner
+            .api_url
+            .join(&format!("dataset-summary?dataset_id={dataset_id}"))
+            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
+
+        let response = self
+            .inner
+            .http_client
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| BraintrustError::Network(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(BraintrustError::Api {
+                status: status.as_u16(),
+                message: body,
+            });
+        }
+
+        response
+            .json::<DatasetSummaryResponse>()
+            .await
+            .map_err(|e| BraintrustError::Api {
+                status: 200,
+                message: format!("Failed to parse dataset summary response: {}", e),
+            })
     }
 }
 
