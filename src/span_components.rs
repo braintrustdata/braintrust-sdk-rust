@@ -152,27 +152,28 @@ impl SpanComponents {
         }
 
         // Try to encode span_id as hex (8-byte, 16 hex chars)
-        if let Some(ref span_id) = self.span_id {
-            if let Some(hex_bytes) = try_parse_hex_span_id(span_id) {
+        if let Some(span_id) = self.span_id.as_deref().map(canonicalize_span_component_id) {
+            if let Some(hex_bytes) = try_parse_hex_span_id(&span_id) {
                 let mut entry = vec![FieldId::SpanId as u8];
                 entry.extend_from_slice(&hex_bytes);
                 hex_entries.push(entry);
             } else {
-                json_obj.insert("span_id".to_string(), Value::String(span_id.clone()));
+                json_obj.insert("span_id".to_string(), Value::String(span_id));
             }
         }
 
         // Try to encode root_span_id as hex (16-byte, 32 hex chars)
-        if let Some(ref root_span_id) = self.root_span_id {
-            if let Some(hex_bytes) = try_parse_hex_trace_id(root_span_id) {
+        if let Some(root_span_id) = self
+            .root_span_id
+            .as_deref()
+            .map(canonicalize_span_component_id)
+        {
+            if let Some(hex_bytes) = try_parse_hex_trace_id(&root_span_id) {
                 let mut entry = vec![FieldId::RootSpanId as u8];
                 entry.extend_from_slice(&hex_bytes);
                 hex_entries.push(entry);
             } else {
-                json_obj.insert(
-                    "root_span_id".to_string(),
-                    Value::String(root_span_id.clone()),
-                );
+                json_obj.insert("root_span_id".to_string(), Value::String(root_span_id));
             }
         }
 
@@ -361,10 +362,10 @@ impl SpanComponents {
                 .and_then(|v| v.as_str().map(String::from)),
             span_id: json_obj
                 .remove("span_id")
-                .and_then(|v| v.as_str().map(String::from)),
+                .and_then(|v| v.as_str().map(canonicalize_span_component_id)),
             root_span_id: json_obj
                 .remove("root_span_id")
-                .and_then(|v| v.as_str().map(String::from)),
+                .and_then(|v| v.as_str().map(canonicalize_span_component_id)),
             propagated_event: json_obj
                 .remove("propagated_event")
                 .and_then(|v| v.as_object().cloned()),
@@ -387,8 +388,8 @@ impl SpanComponents {
         Ok(ParentSpanInfo::FullSpan {
             object_type: self.object_type,
             object_id,
-            span_id,
-            root_span_id,
+            span_id: canonicalize_span_component_id(&span_id),
+            root_span_id: canonicalize_span_component_id(&root_span_id),
             propagated_event: self.propagated_event.clone(),
         })
     }
@@ -407,8 +408,8 @@ impl SpanComponents {
                 object_id: Some(object_id.clone()),
                 compute_object_metadata_args: None,
                 row_id: None,
-                span_id: Some(span_id.clone()),
-                root_span_id: Some(root_span_id.clone()),
+                span_id: Some(canonicalize_span_component_id(span_id)),
+                root_span_id: Some(canonicalize_span_component_id(root_span_id)),
                 propagated_event: propagated_event.clone(),
             }),
             _ => None,
@@ -448,6 +449,12 @@ fn try_parse_uuid(s: &str) -> Option<Vec<u8>> {
     }
 
     Some(bytes)
+}
+
+pub(crate) fn canonicalize_span_component_id(s: &str) -> String {
+    try_parse_uuid(s)
+        .map(|bytes| format_hex(&bytes))
+        .unwrap_or_else(|| s.to_string())
 }
 
 /// Try to parse an 8-byte span ID (16 hex characters)
@@ -506,6 +513,26 @@ fn format_uuid(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_v4_json_only(object_type: SpanObjectType, json_obj: Map<String, Value>) -> String {
+        let mut bytes = vec![ENCODING_VERSION_V4, object_type as u8, 0];
+        bytes.extend(serde_json::to_vec(&json_obj).unwrap());
+        BASE64.encode(bytes)
+    }
+
+    fn encode_v3_with_uuid_fields(
+        object_type: SpanObjectType,
+        fields: &[(FieldId, &str)],
+        json_obj: Map<String, Value>,
+    ) -> String {
+        let mut bytes = vec![ENCODING_VERSION_V3, object_type as u8, fields.len() as u8];
+        for (field_id, uuid) in fields {
+            bytes.push(*field_id as u8);
+            bytes.extend(try_parse_uuid(uuid).unwrap());
+        }
+        bytes.extend(serde_json::to_vec(&json_obj).unwrap());
+        BASE64.encode(bytes)
+    }
 
     #[test]
     fn test_span_components_roundtrip() {
@@ -621,5 +648,106 @@ mod tests {
         assert_eq!(components.span_id, Some("span-456".to_string()));
         assert_eq!(components.root_span_id, Some("root-789".to_string()));
         assert!(components.propagated_event.is_some());
+    }
+
+    #[test]
+    fn test_parse_v4_normalizes_dashed_span_ids_from_json() {
+        let mut json_obj = Map::new();
+        json_obj.insert(
+            "object_id".to_string(),
+            Value::String("project-123".to_string()),
+        );
+        json_obj.insert(
+            "span_id".to_string(),
+            Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+        );
+        json_obj.insert(
+            "root_span_id".to_string(),
+            Value::String("12345678-1234-1234-1234-1234567890ab".to_string()),
+        );
+
+        let encoded = encode_v4_json_only(SpanObjectType::ProjectLogs, json_obj);
+        let decoded = SpanComponents::parse(&encoded).unwrap();
+
+        assert_eq!(
+            decoded.span_id,
+            Some("550e8400e29b41d4a716446655440000".to_string())
+        );
+        assert_eq!(
+            decoded.root_span_id,
+            Some("123456781234123412341234567890ab".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_v3_normalizes_uuid_span_ids() {
+        let mut json_obj = Map::new();
+        json_obj.insert(
+            "object_id".to_string(),
+            Value::String("project-123".to_string()),
+        );
+
+        let encoded = encode_v3_with_uuid_fields(
+            SpanObjectType::ProjectLogs,
+            &[
+                (FieldId::SpanId, "550e8400-e29b-41d4-a716-446655440000"),
+                (FieldId::RootSpanId, "12345678-1234-1234-1234-1234567890ab"),
+            ],
+            json_obj,
+        );
+        let decoded = SpanComponents::parse(&encoded).unwrap();
+
+        assert_eq!(
+            decoded.span_id,
+            Some("550e8400e29b41d4a716446655440000".to_string())
+        );
+        assert_eq!(
+            decoded.root_span_id,
+            Some("123456781234123412341234567890ab".to_string())
+        );
+    }
+
+    #[test]
+    fn test_to_parent_span_info_normalizes_dashed_ids() {
+        let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+        components.object_id = Some("project-123".to_string());
+        components.span_id = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+        components.root_span_id = Some("12345678-1234-1234-1234-1234567890ab".to_string());
+
+        let parent = components.to_parent_span_info().unwrap();
+
+        match parent {
+            ParentSpanInfo::FullSpan {
+                span_id,
+                root_span_id,
+                ..
+            } => {
+                assert_eq!(span_id, "550e8400e29b41d4a716446655440000");
+                assert_eq!(root_span_id, "123456781234123412341234567890ab");
+            }
+            _ => panic!("Expected FullSpan variant"),
+        }
+    }
+
+    #[test]
+    fn test_from_parent_span_info_normalizes_dashed_ids() {
+        let parent = ParentSpanInfo::FullSpan {
+            object_type: SpanObjectType::Experiment,
+            object_id: "exp-123".to_string(),
+            span_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            root_span_id: "12345678-1234-1234-1234-1234567890ab".to_string(),
+            propagated_event: None,
+        };
+
+        let components = SpanComponents::from_parent_span_info(&parent).unwrap();
+
+        assert_eq!(
+            components.span_id,
+            Some("550e8400e29b41d4a716446655440000".to_string())
+        );
+        assert_eq!(
+            components.root_span_id,
+            Some("123456781234123412341234567890ab".to_string())
+        );
     }
 }

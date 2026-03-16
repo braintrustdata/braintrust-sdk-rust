@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::span_components::SpanComponents;
+use crate::span_components::{canonicalize_span_component_id, SpanComponents};
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanObjectType, SpanPayload, SpanType};
 
 /// Error type for SpanLog builder validation.
@@ -505,8 +505,10 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         // Use root_span_id from parent_info (FullSpan) if available, otherwise
         // fall back to this span's own span_id (it is the root).
         let root_span_id = match &self.parent_info {
-            Some(ParentSpanInfo::FullSpan { root_span_id, .. }) => Some(root_span_id.clone()),
-            _ => Some(inner.span_id.clone()),
+            Some(ParentSpanInfo::FullSpan { root_span_id, .. }) => {
+                Some(canonicalize_span_component_id(root_span_id))
+            }
+            _ => Some(canonicalize_span_component_id(&inner.span_id)),
         };
 
         Ok(SpanComponents {
@@ -514,7 +516,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
             object_id,
             compute_object_metadata_args: None,
             row_id: Some(inner.row_id.clone()),
-            span_id: Some(inner.span_id.clone()),
+            span_id: Some(canonicalize_span_component_id(&inner.span_id)),
             root_span_id,
             propagated_event: inner.propagated_event.clone(),
         })
@@ -918,5 +920,18 @@ mod tests {
             event.get("test_key").and_then(|v| v.as_str()),
             Some("test_value")
         );
+    }
+
+    #[tokio::test]
+    async fn span_export_normalizes_span_ids_but_keeps_row_id() {
+        let (span, _collector) = build_test_span();
+
+        let exported = span.export().await.unwrap();
+
+        assert_eq!(exported.row_id.as_deref(), Some(span.row_id()));
+        let span_id = exported.span_id.expect("span_id");
+        let root_span_id = exported.root_span_id.expect("root_span_id");
+        assert!(!span_id.contains('-'));
+        assert!(!root_span_id.contains('-'));
     }
 }
