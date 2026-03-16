@@ -1020,11 +1020,12 @@ impl DatasetSummarizer for BraintrustClient {
         token: &str,
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse> {
-        let url = self
+        let mut url = self
             .inner
             .api_url
-            .join(&format!("dataset-summary?dataset_id={dataset_id}"))
+            .join("dataset-summary")
             .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
+        url.query_pairs_mut().append_pair("dataset_id", dataset_id);
 
         let response = self
             .inner

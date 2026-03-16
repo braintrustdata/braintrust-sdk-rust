@@ -529,7 +529,7 @@ pub struct Dataset<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + Datase
     dataset_name: String,
     description: Option<String>,
     metadata: Option<Map<String, Value>>,
-    lazy_metadata: OnceCell<DatasetMetadata>,
+    lazy_metadata: OnceCell<std::result::Result<DatasetMetadata, String>>,
     pending_rows: Arc<Mutex<Vec<PendingDatasetRow>>>,
 }
 
@@ -561,7 +561,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     Dataset<S>
 {
     /// Ensure the dataset is registered, returning cached metadata.
-    async fn ensure_registered(&self) -> DatasetMetadata {
+    async fn ensure_registered(&self) -> Result<&DatasetMetadata> {
         self.lazy_metadata
             .get_or_init(|| async {
                 let request = DatasetRegisterRequest {
@@ -573,26 +573,21 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                 };
 
                 match self.submitter.register_dataset(&self.token, request).await {
-                    Ok(response) => DatasetMetadata {
+                    Ok(response) => Ok(DatasetMetadata {
                         dataset_id: response.dataset.id,
                         project_id: response.project.id,
-                    },
-                    Err(e) => {
-                        tracing::warn!("dataset registration failed: {}", e);
-                        DatasetMetadata {
-                            dataset_id: String::new(),
-                            project_id: String::new(),
-                        }
-                    }
+                    }),
+                    Err(e) => Err(e.to_string()),
                 }
             })
             .await
-            .clone()
+            .as_ref()
+            .map_err(|e| crate::error::BraintrustError::InvalidConfig(e.clone()))
     }
 
     /// Get the dataset ID (triggers registration if needed).
-    pub async fn dataset_id(&self) -> String {
-        self.ensure_registered().await.dataset_id
+    pub async fn dataset_id(&self) -> Result<String> {
+        Ok(self.ensure_registered().await?.dataset_id.clone())
     }
 
     /// Get the dataset name.
@@ -660,14 +655,14 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     /// Fetch records with pagination.
     ///
     /// Returns an iterator that fetches records in batches.
-    pub async fn fetch(&self, batch_size: Option<usize>) -> DatasetIterator<S> {
-        let metadata = self.ensure_registered().await;
-        DatasetIterator::new(
+    pub async fn fetch(&self, batch_size: Option<usize>) -> Result<DatasetIterator<S>> {
+        let metadata = self.ensure_registered().await?;
+        Ok(DatasetIterator::new(
             Arc::clone(&self.submitter),
             self.token.clone(),
-            metadata.dataset_id,
+            metadata.dataset_id.clone(),
             batch_size.unwrap_or(1000),
-        )
+        ))
     }
 
     /// Get dataset summary statistics.
@@ -675,7 +670,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         // Flush pending operations first
         self.flush().await?;
 
-        let metadata = self.ensure_registered().await;
+        let metadata = self.ensure_registered().await?;
 
         // Fetch summary from API
         let response = self
@@ -696,7 +691,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 
     /// Flush all pending operations.
     pub async fn flush(&self) -> Result<()> {
-        let metadata = self.ensure_registered().await;
+        let metadata = self.ensure_registered().await?;
         let rows = {
             let mut pending = self.pending_rows.lock().await;
             std::mem::take(&mut *pending)

@@ -215,7 +215,7 @@ async fn dataset_fetch_returns_records() {
         .expect("dataset builder");
 
     // Fetch records
-    let iter = dataset.fetch(Some(10)).await;
+    let iter = dataset.fetch(Some(10)).await.expect("fetch");
     let records = iter.collect().await;
 
     assert_eq!(records.len(), 2);
