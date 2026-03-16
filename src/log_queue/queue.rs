@@ -11,7 +11,6 @@ use super::row_key::RowKey;
 use super::worker::LogCommand;
 use crate::error::{BraintrustError, Result};
 use crate::logger::LoginState;
-use crate::span_components::canonicalize_span_component_id;
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender, TrySendError};
@@ -379,8 +378,6 @@ impl LogQueueCore {
             context,
             span_attributes,
         } = payload;
-        let span_id = canonicalize_span_component_id(&span_id);
-
         let project_id = if let Some(ref pn) = project_name {
             Some(
                 self.ensure_project_id(token, &org_id, org_name.as_deref(), pn)
@@ -429,17 +426,13 @@ impl LogQueueCore {
                 root_span_id: parent_root_span_id,
                 propagated_event: _,
             }) => {
-                let span_parents = Some(vec![canonicalize_span_component_id(&parent_span_id)]);
+                let span_parents = Some(vec![parent_span_id]);
                 let dest = match object_type {
                     SpanObjectType::Experiment => LogDestination::experiment(object_id),
                     SpanObjectType::ProjectLogs => LogDestination::project_logs(object_id),
                     SpanObjectType::PlaygroundLogs => LogDestination::playground_logs(object_id),
                 };
-                (
-                    canonicalize_span_component_id(&parent_root_span_id),
-                    span_parents,
-                    dest,
-                )
+                (parent_root_span_id, span_parents, dest)
             }
         };
 
@@ -614,7 +607,7 @@ impl LogQueueCore {
 
             // Build a best-effort destination from parent_info (project registration
             // hasn't happened yet, so project-name-based destinations are unknown).
-            let span_id = canonicalize_span_component_id(&payload.span_id);
+            let span_id = payload.span_id.clone();
             let destination = match parent_info.as_ref() {
                 Some(ParentSpanInfo::Experiment { object_id }) => {
                     LogDestination::experiment(object_id.clone())
@@ -945,8 +938,8 @@ mod tests {
     async fn test_prepare_row_normalizes_outgoing_span_ids() {
         let queue = make_queue(10);
         let payload = SpanPayload {
-            row_id: "row-1".to_string(),
-            span_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            row_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            span_id: "550e8400e29b41d4a716446655440000".to_string(),
             is_merge: false,
             org_id: "org".to_string(),
             org_name: Some("test-org".to_string()),
@@ -965,8 +958,8 @@ mod tests {
         let parent_info = Some(ParentSpanInfo::FullSpan {
             object_type: SpanObjectType::Experiment,
             object_id: "exp-test".to_string(),
-            span_id: "12345678-1234-1234-1234-1234567890ab".to_string(),
-            root_span_id: "87654321-4321-4321-4321-ba0987654321".to_string(),
+            span_id: "123456781234123412341234567890ab".to_string(),
+            root_span_id: "87654321432143214321ba0987654321".to_string(),
             propagated_event: None,
         });
 
@@ -976,6 +969,7 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(row.id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert_eq!(row.span_id, "550e8400e29b41d4a716446655440000");
         assert_eq!(row.root_span_id, "87654321432143214321ba0987654321");
         assert_eq!(

@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fmt;
+use uuid::Uuid;
 
 use crate::error::{BraintrustError, Result};
 use crate::types::{ParentSpanInfo, SpanObjectType};
@@ -152,28 +153,27 @@ impl SpanComponents {
         }
 
         // Try to encode span_id as hex (8-byte, 16 hex chars)
-        if let Some(span_id) = self.span_id.as_deref().map(canonicalize_span_component_id) {
-            if let Some(hex_bytes) = try_parse_hex_span_id(&span_id) {
+        if let Some(ref span_id) = self.span_id {
+            if let Some(hex_bytes) = try_parse_hex_span_id(span_id) {
                 let mut entry = vec![FieldId::SpanId as u8];
                 entry.extend_from_slice(&hex_bytes);
                 hex_entries.push(entry);
             } else {
-                json_obj.insert("span_id".to_string(), Value::String(span_id));
+                json_obj.insert("span_id".to_string(), Value::String(span_id.clone()));
             }
         }
 
         // Try to encode root_span_id as hex (16-byte, 32 hex chars)
-        if let Some(root_span_id) = self
-            .root_span_id
-            .as_deref()
-            .map(canonicalize_span_component_id)
-        {
-            if let Some(hex_bytes) = try_parse_hex_trace_id(&root_span_id) {
+        if let Some(ref root_span_id) = self.root_span_id {
+            if let Some(hex_bytes) = try_parse_hex_trace_id(root_span_id) {
                 let mut entry = vec![FieldId::RootSpanId as u8];
                 entry.extend_from_slice(&hex_bytes);
                 hex_entries.push(entry);
             } else {
-                json_obj.insert("root_span_id".to_string(), Value::String(root_span_id));
+                json_obj.insert(
+                    "root_span_id".to_string(),
+                    Value::String(root_span_id.clone()),
+                );
             }
         }
 
@@ -353,19 +353,19 @@ impl SpanComponents {
             object_type,
             object_id: json_obj
                 .remove("object_id")
-                .and_then(|v| v.as_str().map(String::from)),
+                .and_then(|v| v.as_str().map(normalize_parsed_id)),
             compute_object_metadata_args: json_obj
                 .remove("compute_object_metadata_args")
                 .and_then(|v| v.as_object().cloned()),
             row_id: json_obj
                 .remove("row_id")
-                .and_then(|v| v.as_str().map(String::from)),
+                .and_then(|v| v.as_str().map(normalize_parsed_id)),
             span_id: json_obj
                 .remove("span_id")
-                .and_then(|v| v.as_str().map(canonicalize_span_component_id)),
+                .and_then(|v| v.as_str().map(normalize_parsed_id)),
             root_span_id: json_obj
                 .remove("root_span_id")
-                .and_then(|v| v.as_str().map(canonicalize_span_component_id)),
+                .and_then(|v| v.as_str().map(normalize_parsed_id)),
             propagated_event: json_obj
                 .remove("propagated_event")
                 .and_then(|v| v.as_object().cloned()),
@@ -388,8 +388,8 @@ impl SpanComponents {
         Ok(ParentSpanInfo::FullSpan {
             object_type: self.object_type,
             object_id,
-            span_id: canonicalize_span_component_id(&span_id),
-            root_span_id: canonicalize_span_component_id(&root_span_id),
+            span_id,
+            root_span_id,
             propagated_event: self.propagated_event.clone(),
         })
     }
@@ -408,8 +408,8 @@ impl SpanComponents {
                 object_id: Some(object_id.clone()),
                 compute_object_metadata_args: None,
                 row_id: None,
-                span_id: Some(canonicalize_span_component_id(span_id)),
-                root_span_id: Some(canonicalize_span_component_id(root_span_id)),
+                span_id: Some(span_id.clone()),
+                root_span_id: Some(root_span_id.clone()),
                 propagated_event: propagated_event.clone(),
             }),
             _ => None,
@@ -433,28 +433,15 @@ impl std::str::FromStr for SpanComponents {
 
 /// Try to parse a UUID string into 16 bytes
 fn try_parse_uuid(s: &str) -> Option<Vec<u8>> {
-    // Remove hyphens if present
-    let clean = s.replace('-', "");
-
-    // UUID should be 32 hex characters (16 bytes)
-    if clean.len() != 32 {
-        return None;
-    }
-
-    let mut bytes = Vec::with_capacity(16);
-    for i in 0..16 {
-        let hex = &clean[i * 2..i * 2 + 2];
-        let byte = u8::from_str_radix(hex, 16).ok()?;
-        bytes.push(byte);
-    }
-
-    Some(bytes)
+    Uuid::parse_str(s).ok().map(|uuid| uuid.as_bytes().to_vec())
 }
 
-pub(crate) fn canonicalize_span_component_id(s: &str) -> String {
-    try_parse_uuid(s)
-        .map(|bytes| format_hex(&bytes))
-        .unwrap_or_else(|| s.to_string())
+// Older SDKs may export dashed UUIDs; parse normalizes them so the rest of the
+// Rust code can assume IDs are already in canonical undashed form.
+fn normalize_parsed_id(s: &str) -> String {
+    Uuid::parse_str(s)
+        .map(|uuid| uuid.simple().to_string())
+        .unwrap_or_else(|_| s.to_string())
 }
 
 /// Try to parse an 8-byte span ID (16 hex characters)
@@ -538,6 +525,7 @@ mod tests {
     fn test_span_components_roundtrip() {
         let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
         components.object_id = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+        components.row_id = Some("12345678-1234-1234-1234-1234567890ab".to_string());
         components.span_id = Some("0123456789abcdef".to_string());
         components.root_span_id = Some("0123456789abcdef0123456789abcdef".to_string());
 
@@ -545,7 +533,14 @@ mod tests {
         let decoded = SpanComponents::parse(&encoded).unwrap();
 
         assert_eq!(decoded.object_type, SpanObjectType::ProjectLogs);
-        assert_eq!(decoded.object_id, components.object_id);
+        assert_eq!(
+            decoded.object_id,
+            Some("550e8400e29b41d4a716446655440000".to_string())
+        );
+        assert_eq!(
+            decoded.row_id,
+            Some("123456781234123412341234567890ab".to_string())
+        );
         assert_eq!(decoded.span_id, components.span_id);
         assert_eq!(decoded.root_span_id, components.root_span_id);
     }
@@ -655,7 +650,11 @@ mod tests {
         let mut json_obj = Map::new();
         json_obj.insert(
             "object_id".to_string(),
-            Value::String("project-123".to_string()),
+            Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+        );
+        json_obj.insert(
+            "row_id".to_string(),
+            Value::String("12345678-1234-1234-1234-1234567890ab".to_string()),
         );
         json_obj.insert(
             "span_id".to_string(),
@@ -670,6 +669,14 @@ mod tests {
         let decoded = SpanComponents::parse(&encoded).unwrap();
 
         assert_eq!(
+            decoded.object_id,
+            Some("550e8400e29b41d4a716446655440000".to_string())
+        );
+        assert_eq!(
+            decoded.row_id,
+            Some("123456781234123412341234567890ab".to_string())
+        );
+        assert_eq!(
             decoded.span_id,
             Some("550e8400e29b41d4a716446655440000".to_string())
         );
@@ -681,15 +688,13 @@ mod tests {
 
     #[test]
     fn test_parse_v3_normalizes_uuid_span_ids() {
-        let mut json_obj = Map::new();
-        json_obj.insert(
-            "object_id".to_string(),
-            Value::String("project-123".to_string()),
-        );
+        let json_obj = Map::new();
 
         let encoded = encode_v3_with_uuid_fields(
             SpanObjectType::ProjectLogs,
             &[
+                (FieldId::ObjectId, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                (FieldId::RowId, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
                 (FieldId::SpanId, "550e8400-e29b-41d4-a716-446655440000"),
                 (FieldId::RootSpanId, "12345678-1234-1234-1234-1234567890ab"),
             ],
@@ -697,6 +702,14 @@ mod tests {
         );
         let decoded = SpanComponents::parse(&encoded).unwrap();
 
+        assert_eq!(
+            decoded.object_id,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
+        assert_eq!(
+            decoded.row_id,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string())
+        );
         assert_eq!(
             decoded.span_id,
             Some("550e8400e29b41d4a716446655440000".to_string())
@@ -708,9 +721,9 @@ mod tests {
     }
 
     #[test]
-    fn test_to_parent_span_info_normalizes_dashed_ids() {
+    fn test_to_parent_span_info_preserves_existing_ids() {
         let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
-        components.object_id = Some("project-123".to_string());
+        components.object_id = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string());
         components.span_id = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
         components.root_span_id = Some("12345678-1234-1234-1234-1234567890ab".to_string());
 
@@ -718,22 +731,24 @@ mod tests {
 
         match parent {
             ParentSpanInfo::FullSpan {
+                object_id,
                 span_id,
                 root_span_id,
                 ..
             } => {
-                assert_eq!(span_id, "550e8400e29b41d4a716446655440000");
-                assert_eq!(root_span_id, "123456781234123412341234567890ab");
+                assert_eq!(object_id, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+                assert_eq!(span_id, "550e8400-e29b-41d4-a716-446655440000");
+                assert_eq!(root_span_id, "12345678-1234-1234-1234-1234567890ab");
             }
             _ => panic!("Expected FullSpan variant"),
         }
     }
 
     #[test]
-    fn test_from_parent_span_info_normalizes_dashed_ids() {
+    fn test_from_parent_span_info_preserves_existing_ids() {
         let parent = ParentSpanInfo::FullSpan {
             object_type: SpanObjectType::Experiment,
-            object_id: "exp-123".to_string(),
+            object_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             span_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             root_span_id: "12345678-1234-1234-1234-1234567890ab".to_string(),
             propagated_event: None,
@@ -742,12 +757,16 @@ mod tests {
         let components = SpanComponents::from_parent_span_info(&parent).unwrap();
 
         assert_eq!(
+            components.object_id,
+            Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string())
+        );
+        assert_eq!(
             components.span_id,
-            Some("550e8400e29b41d4a716446655440000".to_string())
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
         );
         assert_eq!(
             components.root_span_id,
-            Some("123456781234123412341234567890ab".to_string())
+            Some("12345678-1234-1234-1234-1234567890ab".to_string())
         );
     }
 }
