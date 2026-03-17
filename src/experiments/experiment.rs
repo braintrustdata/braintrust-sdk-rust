@@ -22,7 +22,7 @@ use crate::experiments::metadata::{
 use crate::experiments::span_builder::ExperimentSpanBuilder;
 use crate::experiments::summary::{ExperimentSummary, MetricSummary, ScoreSummary};
 use crate::span::{SpanBuilder, SpanHandle, SpanLog, SpanSubmitter};
-use crate::types::{ParentSpanInfo, SpanPayload, SpanType};
+use crate::types::{ParentSpanInfo, SpanAttributes, SpanPayload, SpanType};
 
 /// Metadata from experiment registration, cached after lazy initialization.
 #[derive(Debug, Clone)]
@@ -184,6 +184,7 @@ impl<
             row_id: id.to_string(),
             span_id: id.to_string(), // Use same ID for merge
             is_merge: true,
+            span_components: None,
             org_id: self.org_id.clone(),
             org_name: self.org_name.clone(),
             project_name: None,
@@ -365,6 +366,7 @@ impl<
             row_id: id.to_string(),
             span_id: id.to_string(),
             is_merge: true,
+            span_components: None,
             org_id: self.org_id.clone(),
             org_name: self.org_name.clone(),
             project_name: None,
@@ -377,7 +379,12 @@ impl<
             metrics: event.metrics,
             tags: event.tags,
             context: event.context,
-            span_attributes: None,
+            span_attributes: event.name.map(|name| SpanAttributes {
+                name: Some(name),
+                span_type: None,
+                purpose: None,
+                extra: HashMap::new(),
+            }),
         };
 
         let parent_info = ParentSpanInfo::Experiment {
