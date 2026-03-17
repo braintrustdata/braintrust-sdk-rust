@@ -532,6 +532,57 @@ impl BraintrustClient {
     ///
     /// Validation happens before queuing. The actual upload remains asynchronous.
     pub async fn update_span(&self, exported: &str, event: crate::span::SpanLog) -> Result<()> {
+        let login_state = if self.inner.login_state.is_logged_in() {
+            self.inner.login_state.clone()
+        } else if self.inner.login_skipped {
+            return Err(BraintrustError::InvalidConfig(
+                "update_span() requires credentials; call span_builder_with_credentials() or experiment_builder_with_credentials() first when skip_login is enabled".into(),
+            ));
+        } else {
+            self.wait_for_login_state().await?
+        };
+
+        let api_key = login_state
+            .api_key()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        let org_id = login_state
+            .org_id()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        self.update_span_internal(api_key, org_id, login_state.org_name(), exported, event)
+    }
+
+    /// Update an existing span using explicit credentials instead of shared login state.
+    ///
+    /// This is the safe entrypoint for multi-tenant `skip_login` clients.
+    pub async fn update_span_with_credentials(
+        &self,
+        token: impl Into<String>,
+        org_id: impl Into<String>,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> Result<()> {
+        let token = token.into();
+        let org_id = org_id.into();
+
+        let _ = self.inner.login_state.set(
+            token.clone(),
+            org_id.clone(),
+            String::new(),
+            self.inner.api_url.to_string(),
+            self.inner.app_url.to_string(),
+        );
+
+        self.update_span_internal(token, org_id, None, exported, event)
+    }
+
+    fn update_span_internal(
+        &self,
+        token: String,
+        org_id: String,
+        org_name: Option<String>,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> Result<()> {
         let components = SpanComponents::parse(exported)?;
         let row_id = components.row_id.clone().ok_or_else(|| {
             BraintrustError::InvalidConfig("Exported span must have a row_id".into())
@@ -573,22 +624,6 @@ impl BraintrustClient {
             }
         }
 
-        let login_state = if self.inner.login_state.is_logged_in() {
-            self.inner.login_state.clone()
-        } else if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
-                "update_span() requires credentials; call span_builder_with_credentials() or experiment_builder_with_credentials() first when skip_login is enabled".into(),
-            ));
-        } else {
-            self.wait_for_login_state().await?
-        };
-
-        let api_key = login_state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_id = login_state
-            .org_id()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
         let span_id = components.span_id.clone().unwrap_or_else(|| row_id.clone());
 
         let payload = SpanPayload {
@@ -597,7 +632,7 @@ impl BraintrustClient {
             is_merge: true,
             span_components: Some(components),
             org_id,
-            org_name: login_state.org_name(),
+            org_name,
             project_name: None,
             input: event.input,
             output: event.output,
@@ -616,7 +651,7 @@ impl BraintrustClient {
             }),
         };
 
-        self.submit_payload(api_key, payload, None);
+        self.submit_payload(token, payload, None);
         Ok(())
     }
 

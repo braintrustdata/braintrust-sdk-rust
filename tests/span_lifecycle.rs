@@ -134,6 +134,69 @@ async fn client_update_span_uses_exported_ids_for_project_logs() {
 }
 
 #[tokio::test]
+async fn client_update_span_with_credentials_works_without_priming_login_state() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build()
+        .await
+        .expect("client");
+
+    let exported = SpanComponents {
+        object_type: SpanObjectType::ProjectLogs,
+        object_id: Some("proj-id".to_string()),
+        compute_object_metadata_args: None,
+        row_id: Some("row-id".to_string()),
+        span_id: Some("span-id".to_string()),
+        root_span_id: Some("root-id".to_string()),
+        propagated_event: None,
+    }
+    .to_str();
+
+    client
+        .update_span_with_credentials(
+            "token",
+            "org-id",
+            &exported,
+            SpanLog::builder()
+                .output(json!({"status": "updated"}))
+                .build()
+                .expect("build"),
+        )
+        .await
+        .expect("update");
+    client.flush().await.expect("flush");
+
+    let logs_requests: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .collect();
+    assert_eq!(logs_requests.len(), 1);
+
+    let body: Value = serde_json::from_slice(&logs_requests[0].body).expect("json body");
+    let row = body["rows"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .expect("row");
+    assert_eq!(row["id"], "row-id");
+    assert_eq!(row["project_id"], "proj-id");
+    assert_eq!(row["span_id"], "span-id");
+    assert_eq!(row["root_span_id"], "root-id");
+}
+
+#[tokio::test]
 async fn client_update_span_resolves_project_name_from_exported_compute_metadata_args() {
     let server = MockServer::start().await;
 
