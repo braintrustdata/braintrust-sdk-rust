@@ -694,38 +694,41 @@ impl LogQueueCore {
 
             let span_components = payload.span_components.clone();
 
-            // Build a best-effort destination from parent_info (project registration
-            // hasn't happened yet, so project-name-based destinations are unknown).
             let span_id = payload.span_id.clone();
-            let destination = if let Some(span_components) = span_components.as_ref() {
-                if let Some(object_id) = span_components.object_id.as_ref() {
-                    match span_components.object_type {
-                        SpanObjectType::Experiment => LogDestination::experiment(object_id.clone()),
-                        SpanObjectType::ProjectLogs => {
-                            LogDestination::project_logs(object_id.clone())
-                        }
-                        SpanObjectType::PlaygroundLogs => {
-                            LogDestination::playground_logs(object_id.clone())
-                        }
+            let destination = match span_components.as_ref() {
+                Some(span_components) => match (
+                    span_components.object_type,
+                    span_components.object_id.as_ref(),
+                ) {
+                    (SpanObjectType::Experiment, Some(object_id)) => {
+                        LogDestination::experiment(object_id.clone())
                     }
-                } else if let Some(project_id) = span_components
-                    .compute_object_metadata_args
-                    .as_ref()
-                    .and_then(|args| args.get("project_id"))
-                    .and_then(Value::as_str)
-                {
-                    LogDestination::project_logs(project_id.to_string())
-                } else {
-                    LogDestination::project_logs("unknown".to_string())
-                }
-            } else {
-                match parent_info.as_ref() {
+                    (SpanObjectType::ProjectLogs, Some(object_id)) => {
+                        LogDestination::project_logs(object_id.clone())
+                    }
+                    (SpanObjectType::PlaygroundLogs, Some(object_id)) => {
+                        LogDestination::playground_logs(object_id.clone())
+                    }
+                    (SpanObjectType::ProjectLogs, None) => match span_components
+                        .compute_object_metadata_args
+                        .as_ref()
+                        .and_then(|args| args.get("project_id"))
+                        .and_then(Value::as_str)
+                    {
+                        Some(project_id) => LogDestination::project_logs(project_id.to_string()),
+                        None => return,
+                    },
+                    (SpanObjectType::Experiment, None) => return,
+                    (SpanObjectType::PlaygroundLogs, None) => return,
+                },
+                None => match parent_info.as_ref() {
                     Some(ParentSpanInfo::Experiment { object_id }) => {
                         LogDestination::experiment(object_id.clone())
                     }
                     Some(ParentSpanInfo::ProjectLogs { object_id }) => {
                         LogDestination::project_logs(object_id.clone())
                     }
+                    Some(ParentSpanInfo::ProjectName { .. }) => return,
                     Some(ParentSpanInfo::PlaygroundLogs { object_id }) => {
                         LogDestination::playground_logs(object_id.clone())
                     }
@@ -745,8 +748,8 @@ impl LogQueueCore {
                             LogDestination::playground_logs(object_id.clone())
                         }
                     },
-                    _ => LogDestination::project_logs("unknown".to_string()),
-                }
+                    None => return,
+                },
             };
 
             let root_span_id = span_components
