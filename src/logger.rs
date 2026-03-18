@@ -20,7 +20,8 @@ use crate::experiments::api::{
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::SpanSubmitter;
-use crate::types::{ParentSpanInfo, SpanPayload};
+use crate::span_components::SpanComponents;
+use crate::types::{ParentSpanInfo, SpanAttributes, SpanObjectType, SpanPayload};
 
 // 30s covers both quick API calls (login, project registration) and slower batch log uploads.
 // The TypeScript SDK applies no explicit timeout.
@@ -525,6 +526,133 @@ impl BraintrustClient {
 
         let submitter = Arc::new(self.clone());
         crate::span::SpanBuilder::new(submitter, token, org_id)
+    }
+
+    /// Update an existing span using the output of `SpanHandle::export()`.
+    ///
+    /// Validation happens before queuing. The actual upload remains asynchronous.
+    pub async fn update_span(&self, exported: &str, event: crate::span::SpanLog) -> Result<()> {
+        let login_state = if self.inner.login_state.is_logged_in() {
+            self.inner.login_state.clone()
+        } else if self.inner.login_skipped {
+            return Err(BraintrustError::InvalidConfig(
+                "update_span() requires credentials; call span_builder_with_credentials() or experiment_builder_with_credentials() first when skip_login is enabled".into(),
+            ));
+        } else {
+            self.wait_for_login_state().await?
+        };
+
+        let api_key = login_state
+            .api_key()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        let org_id = login_state
+            .org_id()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        self.update_span_internal(api_key, org_id, login_state.org_name(), exported, event)
+    }
+
+    /// Update an existing span using explicit credentials instead of shared login state.
+    ///
+    /// This is the safe entrypoint for multi-tenant `skip_login` clients.
+    pub async fn update_span_with_credentials(
+        &self,
+        token: impl Into<String>,
+        org_id: impl Into<String>,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> Result<()> {
+        let token = token.into();
+        let org_id = org_id.into();
+
+        let _ = self.inner.login_state.set(
+            token.clone(),
+            org_id.clone(),
+            String::new(),
+            self.inner.api_url.to_string(),
+            self.inner.app_url.to_string(),
+        );
+
+        self.update_span_internal(token, org_id, None, exported, event)
+    }
+
+    fn update_span_internal(
+        &self,
+        token: String,
+        org_id: String,
+        org_name: Option<String>,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> Result<()> {
+        let components = SpanComponents::parse(exported)?;
+        let row_id = components.row_id.clone().ok_or_else(|| {
+            BraintrustError::InvalidConfig("Exported span must have a row_id".into())
+        })?;
+
+        if components.root_span_id.is_some() != components.span_id.is_some() {
+            return Err(BraintrustError::InvalidConfig(
+                "both root_span_id and span_id must be set, or neither".into(),
+            ));
+        }
+
+        if components.object_id.is_none() {
+            match components.object_type {
+                SpanObjectType::ProjectLogs => {
+                    let args = components.compute_object_metadata_args.as_ref().ok_or_else(|| {
+                        BraintrustError::InvalidConfig(
+                            "Exported project-log span must include object_id or compute_object_metadata_args".into(),
+                        )
+                    })?;
+                    let has_project_id = args.get("project_id").and_then(Value::as_str).is_some();
+                    let has_project_name =
+                        args.get("project_name").and_then(Value::as_str).is_some();
+                    if !has_project_id && !has_project_name {
+                        return Err(BraintrustError::InvalidConfig(
+                            "project-log compute_object_metadata_args must include project_id or project_name".into(),
+                        ));
+                    }
+                }
+                SpanObjectType::Experiment => {
+                    return Err(BraintrustError::InvalidConfig(
+                        "Exported experiment span must include object_id".into(),
+                    ));
+                }
+                SpanObjectType::PlaygroundLogs => {
+                    return Err(BraintrustError::InvalidConfig(
+                        "Exported playground span must include object_id".into(),
+                    ));
+                }
+            }
+        }
+
+        let span_id = components.span_id.clone().unwrap_or_else(|| row_id.clone());
+
+        let payload = SpanPayload {
+            row_id,
+            span_id,
+            is_merge: true,
+            span_components: Some(components),
+            org_id,
+            org_name,
+            project_name: None,
+            input: event.input,
+            output: event.output,
+            expected: event.expected,
+            error: event.error,
+            scores: event.scores,
+            metadata: event.metadata,
+            metrics: event.metrics,
+            tags: event.tags,
+            context: event.context,
+            span_attributes: event.name.map(|name| SpanAttributes {
+                name: Some(name),
+                span_type: None,
+                purpose: None,
+                extra: HashMap::new(),
+            }),
+        };
+
+        self.submit_payload(token, payload, None);
+        Ok(())
     }
 
     /// Perform login synchronously.

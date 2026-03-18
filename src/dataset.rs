@@ -712,6 +712,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                 row_id: row.id.clone(),
                 span_id: row.id,
                 is_merge: row.is_merge,
+                span_components: None,
                 org_id: String::new(),
                 org_name: Some(self.org_name.clone()),
                 project_name: Some(self.project_name.clone()),
