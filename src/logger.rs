@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use crate::experiments::api::{
     ExperimentRegisterResponse, ExperimentRegistrar,
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
+use crate::http::build_http_client;
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::SpanSubmitter;
 use crate::span_components::SpanComponents;
@@ -188,6 +190,7 @@ pub struct BraintrustClientBuilder {
     api_url: Option<String>,
     org_name: Option<String>,
     default_project: Option<String>,
+    ca_bundle: Option<PathBuf>,
     queue_size: usize,
     blocking_login: bool,
     skip_login: bool,
@@ -215,6 +218,7 @@ impl BraintrustClientBuilder {
             api_url: std::env::var("BRAINTRUST_API_URL").ok(),
             org_name: std::env::var("BRAINTRUST_ORG_NAME").ok(),
             default_project: std::env::var("BRAINTRUST_DEFAULT_PROJECT").ok(),
+            ca_bundle: None,
             queue_size: DEFAULT_QUEUE_SIZE,
             blocking_login: false,
             skip_login: false,
@@ -276,6 +280,12 @@ impl BraintrustClientBuilder {
         self
     }
 
+    /// Set a custom PEM CA bundle used for HTTPS requests made by the SDK client.
+    pub fn ca_bundle(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_bundle = Some(path.into());
+        self
+    }
+
     /// Set the internal queue size for buffering log events.
     pub fn queue_size(mut self, size: usize) -> Self {
         self.queue_size = size;
@@ -314,10 +324,7 @@ impl BraintrustClientBuilder {
         let api_url = Url::parse(&api_url_str)
             .map_err(|e| BraintrustError::InvalidConfig(format!("invalid api_url: {}", e)))?;
 
-        let http_client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
+        let http_client = build_http_client(REQUEST_TIMEOUT, self.ca_bundle.as_deref())?;
 
         // Create login state (initially empty, populated by login)
         let login_state = LoginState::new();
@@ -1391,6 +1398,23 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, BraintrustError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn builder_accepts_custom_ca_bundle_when_login_is_skipped() {
+        let path = crate::http::tests::write_temp_bundle(crate::http::tests::VALID_TEST_CERT_PEM);
+
+        let client = BraintrustClient::builder()
+            .app_url("https://example.com")
+            .api_url("https://example.com")
+            .ca_bundle(&path)
+            .skip_login(true)
+            .build()
+            .await;
+
+        std::fs::remove_file(&path).expect("remove temp bundle");
+
+        assert!(client.is_ok());
     }
 
     #[tokio::test]

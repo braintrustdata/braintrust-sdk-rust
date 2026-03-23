@@ -3,6 +3,7 @@ mod error;
 pub mod eval;
 mod experiments;
 mod extractors;
+mod http;
 mod json_merge;
 mod log_queue;
 mod logger;
