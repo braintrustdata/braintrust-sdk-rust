@@ -509,10 +509,23 @@ impl<S: SpanSubmitter> SpanHandle<S> {
             _ => Some(inner.span_id.clone()),
         };
 
+        let compute_object_metadata_args = if object_id.is_none() {
+            inner.project_name.as_ref().map(|project_name| {
+                let mut args = Map::new();
+                args.insert(
+                    "project_name".to_string(),
+                    Value::String(project_name.clone()),
+                );
+                args
+            })
+        } else {
+            None
+        };
+
         Ok(SpanComponents {
             object_type,
             object_id,
-            compute_object_metadata_args: None,
+            compute_object_metadata_args,
             row_id: Some(inner.row_id.clone()),
             span_id: Some(inner.span_id.clone()),
             root_span_id,
@@ -571,6 +584,7 @@ impl From<SpanData> for SpanPayload {
             row_id: data.row_id,
             span_id: data.span_id,
             is_merge: data.has_flushed, // First flush = false (replace), subsequent = true (merge)
+            span_components: None,
             org_id: data.org_id,
             org_name: data.org_name,
             project_name: data.project_name,
@@ -917,6 +931,24 @@ mod tests {
         assert_eq!(
             event.get("test_key").and_then(|v| v.as_str()),
             Some("test_value")
+        );
+    }
+
+    #[tokio::test]
+    async fn span_export_includes_compute_object_metadata_args_for_project_logs() {
+        let (builder, _collector) = mock_span_builder();
+        let span = builder.project_name("demo-project").build();
+
+        let exported = span.export().await.unwrap();
+
+        assert_eq!(exported.object_type, SpanObjectType::ProjectLogs);
+        assert!(exported.object_id.is_none());
+        let args = exported
+            .compute_object_metadata_args
+            .expect("compute args should be exported");
+        assert_eq!(
+            args.get("project_name").and_then(|value| value.as_str()),
+            Some("demo-project")
         );
     }
 }

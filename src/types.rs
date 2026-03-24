@@ -6,6 +6,8 @@ use serde_json::{Map, Value};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::fmt;
 
+use crate::span_components::SpanComponents;
+
 pub const LOGS_API_VERSION: u8 = 2;
 
 /// The type of span object, serialized as its integer representation for wire compatibility.
@@ -320,6 +322,7 @@ pub(crate) struct SpanPayload {
     pub row_id: String,
     pub span_id: String,
     pub is_merge: bool,
+    pub span_components: Option<SpanComponents>,
     pub org_id: String,
     pub org_name: Option<String>,
     pub project_name: Option<String>,
