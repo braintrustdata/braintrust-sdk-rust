@@ -747,10 +747,8 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                 object_id: metadata.dataset_id.clone(),
             };
 
-            let _ = self
-                .submitter
-                .submit(self.token.clone(), payload, Some(parent_info))
-                .await;
+            self.submitter
+                .submit(self.token.clone(), payload, Some(parent_info));
         }
 
         Ok(())

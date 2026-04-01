@@ -859,7 +859,7 @@ where
                             .metric("time_to_first_token", ttft_secs)
                             .build()
                         {
-                            span.log(log).await;
+                            span.log(log);
                         }
                     }
 
@@ -886,8 +886,7 @@ where
                                 span.log(SpanLog {
                                     output: Some(output),
                                     ..Default::default()
-                                })
-                                .await;
+                                });
                             }
                         }
                         drop(agg);
@@ -988,7 +987,7 @@ async fn finalize_span<Sub: SpanSubmitter>(
                     builder = builder.metrics(metrics);
                 }
                 if let Ok(log) = builder.build() {
-                    span.log(log).await;
+                    span.log(log);
                 }
             }
             Err(e) => {
@@ -996,7 +995,7 @@ async fn finalize_span<Sub: SpanSubmitter>(
             }
         }
     }
-    span.end().await;
+    span.end();
     // Flush span with aggregated output
     if let Err(e) = span.flush().await {
         tracing::warn!("Failed to flush span: {}", e);

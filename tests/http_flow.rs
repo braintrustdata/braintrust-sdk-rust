@@ -39,8 +39,7 @@ async fn submits_with_bearer_token() {
             .input(Value::String("input".into()))
             .build()
             .expect("build"),
-    )
-    .await;
+    );
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");
 
@@ -79,10 +78,20 @@ async fn flush_is_fire_and_forget() {
         .project_name("demo")
         .build();
 
-    // flush() queues the data and returns immediately.
-    // The actual HTTP submission (which fails) happens in the background.
+    span.log(
+        SpanLog::builder()
+            .input(Value::String("input".into()))
+            .build()
+            .expect("build"),
+    );
+
+    // flush() waits for queued work to be processed. Background submission errors
+    // are still swallowed by the queue and should not bubble out here.
     let result = span.flush().await;
-    assert!(result.is_ok(), "flush() should be fire-and-forget");
+    assert!(
+        result.is_ok(),
+        "flush() should not surface background submission errors"
+    );
 
     // Drain pending items before drop so the Drop impl's synchronous flush path
     // is a no-op (queue is empty). The 500 from project registration is swallowed.

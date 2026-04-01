@@ -561,7 +561,7 @@ impl BraintrustClient {
     /// Update an existing span using explicit credentials instead of shared login state.
     ///
     /// This is the safe entrypoint for multi-tenant `skip_login` clients.
-    pub async fn update_span_with_credentials(
+    pub fn update_span_with_credentials(
         &self,
         token: impl Into<String>,
         org_id: impl Into<String>,
@@ -904,17 +904,16 @@ impl Drop for BraintrustClient {
 
 #[async_trait::async_trait]
 impl SpanSubmitter for BraintrustClient {
-    async fn submit(
-        &self,
-        token: String,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) {
+    fn submit(&self, token: String, payload: SpanPayload, parent_info: Option<ParentSpanInfo>) {
         self.submit_payload(token, payload, parent_info)
     }
 
+    async fn flush(&self) -> Result<()> {
+        BraintrustClient::flush(self).await
+    }
+
     async fn trigger_flush(&self) -> Result<()> {
-        self.trigger_flush().await
+        BraintrustClient::trigger_flush(self).await
     }
 }
 
@@ -1463,8 +1462,7 @@ mod tests {
                     .input(Value::String("hello".into()))
                     .build()
                     .expect("build"),
-            )
-            .await;
+            );
             span.flush().await.expect("flush");
             client.flush().await.expect("client flush");
         }
@@ -1524,8 +1522,7 @@ mod tests {
                 .input(Value::String("input".into()))
                 .build()
                 .expect("build"),
-        )
-        .await;
+        );
         span.flush().await.expect("flush");
         client.flush().await.expect("client flush");
 
@@ -1753,8 +1750,7 @@ mod tests {
         span.log(SpanLog {
             input: Some(Value::String("test".into())),
             ..Default::default()
-        })
-        .await;
+        });
         span.flush().await.expect("flush");
         client.flush().await.expect("client flush");
 
@@ -1811,8 +1807,7 @@ mod tests {
         span.log(SpanLog {
             input: Some(Value::String("test".into())),
             ..Default::default()
-        })
-        .await;
+        });
         span.flush().await.expect("flush");
         client.flush().await.expect("client flush");
 
@@ -1889,8 +1884,7 @@ mod tests {
         span.log(SpanLog {
             input: Some(Value::String("test".into())),
             ..Default::default()
-        })
-        .await;
+        });
         span.flush().await.expect("flush");
         client.flush().await.expect("client flush");
 

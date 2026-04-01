@@ -58,17 +58,16 @@ impl MockBraintrustClient {
 
 #[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
-    async fn submit(
-        &self,
-        token: String,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) {
+    fn submit(&self, token: String, payload: SpanPayload, parent_info: Option<ParentSpanInfo>) {
         self.collector.push(CapturedSpan {
             token,
             payload,
             parent: parent_info,
         });
+    }
+
+    async fn flush(&self) -> Result<()> {
+        Ok(())
     }
 
     async fn trigger_flush(&self) -> Result<()> {

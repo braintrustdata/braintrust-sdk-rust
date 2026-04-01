@@ -45,8 +45,7 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
             .output(Value::String("output".into()))
             .build()
             .expect("build"),
-    )
-    .await;
+    );
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");
 
@@ -172,7 +171,6 @@ async fn client_update_span_with_credentials_works_without_priming_login_state()
                 .build()
                 .expect("build"),
         )
-        .await
         .expect("update");
     client.flush().await.expect("flush");
 
