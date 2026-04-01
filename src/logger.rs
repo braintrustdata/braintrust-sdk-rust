@@ -561,7 +561,7 @@ impl BraintrustClient {
     /// Update an existing span using explicit credentials instead of shared login state.
     ///
     /// This is the safe entrypoint for multi-tenant `skip_login` clients.
-    pub async fn update_span_with_credentials(
+    pub fn update_span_with_credentials(
         &self,
         token: impl Into<String>,
         org_id: impl Into<String>,

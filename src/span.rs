@@ -398,15 +398,15 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     ///
     /// Calling `end()` multiple times is idempotent: once an end time is set,
     /// subsequent calls return the same value without overwriting it.
-    pub async fn end(&self) -> f64 {
-        self.end_with_time(epoch_secs()).await
+    pub fn end(&self) -> f64 {
+        self.end_with_time(epoch_secs())
     }
 
     /// Mark the span as ended with an explicit timestamp (seconds since Unix epoch).
     ///
     /// Calling this multiple times is idempotent: once an end time is set,
     /// subsequent calls return the previously-set value.
-    pub async fn end_with_time(&self, end_time: f64) -> f64 {
+    pub fn end_with_time(&self, end_time: f64) -> f64 {
         let (end_time, payload) = {
             let mut inner = self
                 .inner
@@ -436,7 +436,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     ///
     /// The exported SpanComponents includes the span's IDs and any propagated_event
     /// data that should flow to child spans.
-    pub async fn export(&self) -> Result<SpanComponents> {
+    pub fn export(&self) -> Result<SpanComponents> {
         let inner = self
             .inner
             .lock()
@@ -844,7 +844,7 @@ mod tests {
     #[tokio::test]
     async fn end_sets_end_metric_on_flush() {
         let (span, collector) = build_test_span();
-        span.end_with_time(123.0).await;
+        span.end_with_time(123.0);
         span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
@@ -855,8 +855,8 @@ mod tests {
     #[tokio::test]
     async fn end_is_idempotent() {
         let (span, _collector) = build_test_span();
-        let first = span.end_with_time(123.0).await;
-        let second = span.end_with_time(456.0).await;
+        let first = span.end_with_time(123.0);
+        let second = span.end_with_time(456.0);
         assert_eq!(first, 123.0);
         assert_eq!(second, 123.0);
     }
@@ -931,7 +931,7 @@ mod tests {
         let span = builder.parent_info(parent_info).build();
 
         // Export the span
-        let exported = span.export().await.unwrap();
+        let exported = span.export().unwrap();
 
         // Verify exported SpanComponents has propagated_event
         assert!(exported.propagated_event.is_some());
@@ -947,7 +947,7 @@ mod tests {
         let (builder, _collector) = mock_span_builder();
         let span = builder.project_name("demo-project").build();
 
-        let exported = span.export().await.unwrap();
+        let exported = span.export().unwrap();
 
         assert_eq!(exported.object_type, SpanObjectType::ProjectLogs);
         assert!(exported.object_id.is_none());

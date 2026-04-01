@@ -171,7 +171,6 @@ async fn client_update_span_with_credentials_works_without_priming_login_state()
                 .build()
                 .expect("build"),
         )
-        .await
         .expect("update");
     client.flush().await.expect("flush");
 
