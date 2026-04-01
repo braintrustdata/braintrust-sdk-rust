@@ -357,7 +357,10 @@ pub enum ParentSpanInfo {
     },
     FullSpan {
         object_type: SpanObjectType,
-        object_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        object_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compute_object_metadata_args: Option<Map<String, Value>>,
         span_id: String,
         root_span_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -869,9 +872,10 @@ mod tests {
     fn parent_span_info_full_span_serializes_object_type_as_u8() {
         let parent = ParentSpanInfo::FullSpan {
             object_type: SpanObjectType::Experiment,
-            object_id: "exp-123".to_string(),
+            object_id: Some("exp-123".to_string()),
             span_id: "span-1".to_string(),
             root_span_id: "root-1".to_string(),
+            compute_object_metadata_args: None,
             propagated_event: None,
         };
 
@@ -908,9 +912,10 @@ mod tests {
     fn parent_span_info_serializes_propagated_event() {
         let parent = ParentSpanInfo::FullSpan {
             object_type: SpanObjectType::ProjectLogs,
-            object_id: "proj-123".to_string(),
+            object_id: Some("proj-123".to_string()),
             span_id: "span-1".to_string(),
             root_span_id: "root-1".to_string(),
+            compute_object_metadata_args: None,
             propagated_event: Some(Map::from_iter([(
                 "metrics".to_string(),
                 json!({ "foo": 0.1 }),

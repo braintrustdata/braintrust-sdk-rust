@@ -467,15 +467,52 @@ impl LogQueueCore {
             Some(ParentSpanInfo::FullSpan {
                 object_type,
                 object_id,
+                compute_object_metadata_args,
                 span_id: parent_span_id,
                 root_span_id: parent_root_span_id,
                 propagated_event: _,
             }) => {
                 let span_parents = Some(vec![parent_span_id]);
                 let dest = match object_type {
-                    SpanObjectType::Experiment => LogDestination::experiment(object_id),
-                    SpanObjectType::ProjectLogs => LogDestination::project_logs(object_id),
-                    SpanObjectType::PlaygroundLogs => LogDestination::playground_logs(object_id),
+                    SpanObjectType::Experiment => {
+                        LogDestination::experiment(object_id.ok_or_else(|| {
+                            anyhow::anyhow!("experiment parent span is missing object_id")
+                        })?)
+                    }
+                    SpanObjectType::ProjectLogs => {
+                        if let Some(object_id) = object_id {
+                            LogDestination::project_logs(object_id)
+                        } else {
+                            let args = compute_object_metadata_args.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "project-log parent span is missing compute_object_metadata_args"
+                                )
+                            })?;
+                            if let Some(project_id) = args.get("project_id").and_then(Value::as_str)
+                            {
+                                LogDestination::project_logs(project_id.to_string())
+                            } else {
+                                let project_name = args
+                                    .get("project_name")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| anyhow::anyhow!("missing project_name"))?;
+                                let project_id = self
+                                    .ensure_project_id(
+                                        token,
+                                        &org_id,
+                                        org_name.as_deref(),
+                                        project_name,
+                                    )
+                                    .await?;
+                                LogDestination::project_logs(project_id)
+                            }
+                        }
+                    }
+                    SpanObjectType::PlaygroundLogs => {
+                        LogDestination::playground_logs(object_id.ok_or_else(|| {
+                            anyhow::anyhow!("playground parent span is missing object_id")
+                        })?)
+                    }
                 };
                 (parent_root_span_id, span_parents, dest)
             }
@@ -740,13 +777,18 @@ impl LogQueueCore {
                         object_id,
                         ..
                     }) => match object_type {
-                        SpanObjectType::Experiment => LogDestination::experiment(object_id.clone()),
-                        SpanObjectType::ProjectLogs => {
-                            LogDestination::project_logs(object_id.clone())
-                        }
-                        SpanObjectType::PlaygroundLogs => {
-                            LogDestination::playground_logs(object_id.clone())
-                        }
+                        SpanObjectType::Experiment => match object_id.clone() {
+                            Some(object_id) => LogDestination::experiment(object_id),
+                            None => return,
+                        },
+                        SpanObjectType::ProjectLogs => match object_id.clone() {
+                            Some(object_id) => LogDestination::project_logs(object_id),
+                            None => return,
+                        },
+                        SpanObjectType::PlaygroundLogs => match object_id.clone() {
+                            Some(object_id) => LogDestination::playground_logs(object_id),
+                            None => return,
+                        },
                     },
                     None => return,
                 },

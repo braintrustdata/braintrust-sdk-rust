@@ -373,10 +373,6 @@ impl SpanComponents {
 
     /// Convert SpanComponents to ParentSpanInfo for creating child spans
     pub fn to_parent_span_info(&self) -> Result<ParentSpanInfo> {
-        // For FullSpan variant, we need object_id, span_id, and root_span_id
-        let object_id = self.object_id.clone().ok_or_else(|| {
-            BraintrustError::InvalidConfig("object_id required for parent span".to_string())
-        })?;
         let span_id = self.span_id.clone().ok_or_else(|| {
             BraintrustError::InvalidConfig("span_id required for parent span".to_string())
         })?;
@@ -384,9 +380,28 @@ impl SpanComponents {
             BraintrustError::InvalidConfig("root_span_id required for parent span".to_string())
         })?;
 
+        match self.object_type {
+            SpanObjectType::ProjectLogs => {
+                if self.object_id.is_none() && self.compute_object_metadata_args.is_none() {
+                    return Err(BraintrustError::InvalidConfig(
+                        "project-log parent span requires object_id or compute_object_metadata_args"
+                            .to_string(),
+                    ));
+                }
+            }
+            SpanObjectType::Experiment | SpanObjectType::PlaygroundLogs => {
+                if self.object_id.is_none() {
+                    return Err(BraintrustError::InvalidConfig(
+                        "object_id required for parent span".to_string(),
+                    ));
+                }
+            }
+        }
+
         Ok(ParentSpanInfo::FullSpan {
             object_type: self.object_type,
-            object_id,
+            object_id: self.object_id.clone(),
+            compute_object_metadata_args: self.compute_object_metadata_args.clone(),
             span_id,
             root_span_id,
             propagated_event: self.propagated_event.clone(),
@@ -399,13 +414,14 @@ impl SpanComponents {
             ParentSpanInfo::FullSpan {
                 object_type,
                 object_id,
+                compute_object_metadata_args,
                 span_id,
                 root_span_id,
                 propagated_event,
             } => Some(Self {
                 object_type: *object_type,
-                object_id: Some(object_id.clone()),
-                compute_object_metadata_args: None,
+                object_id: object_id.clone(),
+                compute_object_metadata_args: compute_object_metadata_args.clone(),
                 row_id: None,
                 span_id: Some(span_id.clone()),
                 root_span_id: Some(root_span_id.clone()),
@@ -585,9 +601,10 @@ mod tests {
                 span_id,
                 root_span_id,
                 propagated_event,
+                ..
             } => {
                 assert_eq!(object_type, SpanObjectType::ProjectLogs);
-                assert_eq!(object_id, "project-123");
+                assert_eq!(object_id, Some("project-123".to_string()));
                 assert_eq!(span_id, "span-456");
                 assert_eq!(root_span_id, "root-789");
                 assert!(propagated_event.is_some());
@@ -608,9 +625,10 @@ mod tests {
 
         let parent = ParentSpanInfo::FullSpan {
             object_type: SpanObjectType::Experiment,
-            object_id: "exp-123".to_string(),
+            object_id: Some("exp-123".to_string()),
             span_id: "span-456".to_string(),
             root_span_id: "root-789".to_string(),
+            compute_object_metadata_args: None,
             propagated_event: Some(propagated),
         };
 
