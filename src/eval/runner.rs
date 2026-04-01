@@ -92,7 +92,7 @@ where
             log_builder = log_builder.tags(tags.clone());
         }
 
-        root_span.log(log_builder.build().unwrap()).await;
+        root_span.log(log_builder.build().unwrap());
 
         // Get dataset ID if available
         let dataset_id = opts.dataset.id();
@@ -232,7 +232,7 @@ where
             log_builder = log_builder.tags(tags.clone());
         }
 
-        case_span.log(log_builder.build().unwrap()).await;
+        case_span.log(log_builder.build().unwrap());
 
         // Create hooks for the task
         let hooks = TaskHooks::new(&case_span, case.expected.as_ref());
@@ -248,8 +248,7 @@ where
                             .error(json!(e.to_string()))
                             .build()
                             .unwrap(),
-                    )
-                    .await;
+                    );
                 case_span.end().await;
 
                 return Ok(EvalResult {
@@ -273,8 +272,7 @@ where
                         .output(output_json)
                         .build()
                         .unwrap(),
-                )
-                .await;
+                );
         }
 
         // Run scorers in parallel
@@ -324,7 +322,7 @@ where
         if let Some(tags) = &final_tags {
             final_log = final_log.tags(tags.clone());
         }
-        case_span.log(final_log.build().unwrap()).await;
+        case_span.log(final_log.build().unwrap());
 
         case_span.end().await;
 

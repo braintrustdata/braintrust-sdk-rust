@@ -45,8 +45,7 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
             .output(Value::String("output".into()))
             .build()
             .expect("build"),
-    )
-    .await;
+    );
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");
 

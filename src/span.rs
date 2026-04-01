@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -204,12 +203,10 @@ pub(crate) trait SpanSubmitter: Send + Sync {
     /// Submit a span payload for queuing (fire-and-forget).
     /// The payload is queued internally and processed by a background worker.
     /// Dropping is handled internally if the queue is full.
-    async fn submit(
-        &self,
-        token: String,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    );
+    fn submit(&self, token: String, payload: SpanPayload, parent_info: Option<ParentSpanInfo>);
+
+    /// Flush all queued span data through to the server.
+    async fn flush(&self) -> Result<()>;
 
     /// Trigger a non-blocking background flush.
     async fn trigger_flush(&self) -> Result<()>;
@@ -373,76 +370,25 @@ impl<S: SpanSubmitter> SpanHandle<S> {
 
     /// Log event data to this span. All fields are optional.
     /// Multiple calls will merge data (later values overwrite earlier ones).
-    pub async fn log(&self, event: SpanLog) {
-        let mut inner = self.inner.lock().await;
-
-        if let Some(name) = event.name {
-            inner.name = Some(name);
-        }
-        if let Some(input) = event.input {
-            inner.input = Some(input);
-        }
-        if let Some(output) = event.output {
-            inner.output = Some(output);
-        }
-        if let Some(expected) = event.expected {
-            inner.expected = Some(expected);
-        }
-        if let Some(error) = event.error {
-            inner.error = Some(error);
-        }
-        if let Some(scores) = event.scores {
-            for (key, value) in scores {
-                inner.scores.insert(key, value);
-            }
-        }
-        if let Some(metadata) = event.metadata {
-            for (key, value) in metadata {
-                inner.metadata.insert(key, value);
-            }
-        }
-        if let Some(metrics) = event.metrics {
-            for (key, value) in metrics {
-                inner.metrics.insert(key, value);
-            }
-        }
-        if let Some(tags) = event.tags {
-            inner.tags.extend(tags);
-        }
-        if let Some(context) = event.context {
-            inner.context = Some(context);
-        }
-    }
-
-    /// Flush span data to Braintrust. Can be called multiple times - last writer wins.
-    /// Each call updates the same span (same row_id and span_id).
-    /// First flush sends with is_merge=false (replace), subsequent flushes send is_merge=true (merge).
-    ///
-    /// This does not mark the span as completed. Call [`SpanHandle::end`] to set
-    /// the `end` metric before final flush.
-    pub async fn flush(&self) -> Result<()> {
-        let payload: SpanPayload = {
-            let mut inner = self.inner.lock().await;
-            if let Some(start) = inner.start_time {
-                inner.metrics.entry("start".to_string()).or_insert(start);
-            }
-            if let Some(end) = inner.end_time {
-                inner.metrics.insert("end".to_string(), end);
-            }
-
-            // Create payload from current state (captures has_flushed for is_merge)
-            let payload: SpanPayload = inner.clone().into();
-
-            // Mark as flushed for subsequent calls
-            inner.has_flushed = true;
-
-            payload
+    /// Each call synchronously queues the current span snapshot for background processing.
+    pub fn log(&self, event: SpanLog) {
+        let payload = {
+            let mut inner = self.inner.lock().expect("span mutex should not be poisoned");
+            apply_span_log_to_data(&mut inner, event);
+            current_span_payload(&mut inner)
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, self.parent_info.clone())
-            .await;
-        Ok(())
+            .submit(self.token.clone(), payload, self.parent_info.clone());
+    }
+
+    /// Flush all queued span data through to Braintrust.
+    ///
+    /// This does not create a new queued span update. Call [`SpanHandle::log`] or
+    /// [`SpanHandle::end`] first to submit changes, then call `flush()` when you need
+    /// to ensure the background queue has been processed.
+    pub async fn flush(&self) -> Result<()> {
+        self.submitter.flush().await
     }
 
     /// Mark the span as ended with the current timestamp.
@@ -458,11 +404,17 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     /// Calling this multiple times is idempotent: once an end time is set,
     /// subsequent calls return the previously-set value.
     pub async fn end_with_time(&self, end_time: f64) -> f64 {
-        let mut inner = self.inner.lock().await;
-        if let Some(existing) = inner.end_time {
-            return existing;
-        }
-        inner.end_time = Some(end_time);
+        let (end_time, payload) = {
+            let mut inner = self.inner.lock().expect("span mutex should not be poisoned");
+            if let Some(existing) = inner.end_time {
+                return existing;
+            }
+            inner.end_time = Some(end_time);
+            (end_time, current_span_payload(&mut inner))
+        };
+
+        self.submitter
+            .submit(self.token.clone(), payload, self.parent_info.clone());
         end_time
     }
 
@@ -479,7 +431,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     /// The exported SpanComponents includes the span's IDs and any propagated_event
     /// data that should flow to child spans.
     pub async fn export(&self) -> Result<SpanComponents> {
-        let inner = self.inner.lock().await;
+        let inner = self.inner.lock().expect("span mutex should not be poisoned");
 
         // Determine object_type and object_id from parent_info if available,
         // otherwise default to ProjectLogs
@@ -542,6 +494,58 @@ impl<S: SpanSubmitter> SpanHandle<S> {
             propagated_event: inner.propagated_event.clone(),
         })
     }
+}
+
+fn apply_span_log_to_data(inner: &mut SpanData, event: SpanLog) {
+    if let Some(name) = event.name {
+        inner.name = Some(name);
+    }
+    if let Some(input) = event.input {
+        inner.input = Some(input);
+    }
+    if let Some(output) = event.output {
+        inner.output = Some(output);
+    }
+    if let Some(expected) = event.expected {
+        inner.expected = Some(expected);
+    }
+    if let Some(error) = event.error {
+        inner.error = Some(error);
+    }
+    if let Some(scores) = event.scores {
+        for (key, value) in scores {
+            inner.scores.insert(key, value);
+        }
+    }
+    if let Some(metadata) = event.metadata {
+        for (key, value) in metadata {
+            inner.metadata.insert(key, value);
+        }
+    }
+    if let Some(metrics) = event.metrics {
+        for (key, value) in metrics {
+            inner.metrics.insert(key, value);
+        }
+    }
+    if let Some(tags) = event.tags {
+        inner.tags.extend(tags);
+    }
+    if let Some(context) = event.context {
+        inner.context = Some(context);
+    }
+}
+
+fn current_span_payload(inner: &mut SpanData) -> SpanPayload {
+    if let Some(start) = inner.start_time {
+        inner.metrics.entry("start".to_string()).or_insert(start);
+    }
+    if let Some(end) = inner.end_time {
+        inner.metrics.insert("end".to_string(), end);
+    }
+
+    let payload: SpanPayload = inner.clone().into();
+    inner.has_flushed = true;
+    payload
 }
 
 #[derive(Clone, Default)]
@@ -705,8 +709,7 @@ mod tests {
                 .output(json!({"output": "world"}))
                 .build()
                 .expect("build"),
-        )
-        .await;
+        );
         span.flush().await.expect("flush");
 
         let spans = collector.spans();
@@ -731,8 +734,7 @@ mod tests {
                 }))
                 .build()
                 .expect("build"),
-        )
-        .await;
+        );
         span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
@@ -758,8 +760,7 @@ mod tests {
                 .input(json!("data"))
                 .build()
                 .expect("build"),
-        )
-        .await;
+        );
         span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
@@ -792,8 +793,7 @@ mod tests {
                 .context(json!({"source": "test"}))
                 .build()
                 .expect("build"),
-        )
-        .await;
+        );
         span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
@@ -815,8 +815,7 @@ mod tests {
                 .error(json!({"message": "Something went wrong", "code": 500}))
                 .build()
                 .expect("build"),
-        )
-        .await;
+        );
         span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
@@ -834,8 +833,7 @@ mod tests {
                 .input(json!({"input": "hello"}))
                 .build()
                 .expect("build"),
-        )
-        .await;
+        );
         span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
@@ -892,8 +890,7 @@ mod tests {
                 .input(json!({"child": "input"}))
                 .build()
                 .expect("build"),
-        )
-        .await;
+        );
 
         span.flush().await.expect("flush");
 

@@ -749,8 +749,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 
             let _ = self
                 .submitter
-                .submit(self.token.clone(), payload, Some(parent_info))
-                .await;
+                .submit(self.token.clone(), payload, Some(parent_info));
         }
 
         Ok(())

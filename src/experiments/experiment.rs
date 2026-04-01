@@ -127,7 +127,7 @@ impl<
 
         // Convert ExperimentLog to SpanLog and log
         let span_log = event.into_span_log();
-        span.log(span_log).await;
+        span.log(span_log);
 
         // Record end time for next log() call
         let end_time = SystemTime::now()
@@ -205,8 +205,7 @@ impl<
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info))
-            .await;
+            .submit(self.token.clone(), payload, Some(parent_info));
     }
 
     /// Get a summary of the experiment's performance.
@@ -339,7 +338,7 @@ impl<
     ///
     /// ```ignore
     /// let result = experiment.traced(|span| async move {
-    ///     span.log(SpanLog::builder().input(json!({"x": 1})).build().unwrap()).await;
+    ///     span.log(SpanLog::builder().input(json!({"x": 1})).build().unwrap());
     ///     compute_result()
     /// }).await;
     /// ```
@@ -392,8 +391,7 @@ impl<
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info))
-            .await;
+            .submit(self.token.clone(), payload, Some(parent_info));
     }
 
     /// Fetch the base experiment used for comparison.
