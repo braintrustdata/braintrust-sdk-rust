@@ -497,41 +497,31 @@ impl<S: SpanSubmitter> SpanHandle<S> {
 }
 
 fn apply_span_log_to_data(inner: &mut SpanData, event: SpanLog) {
-    if let Some(name) = event.name {
-        inner.name = Some(name);
+    macro_rules! replace_if_some {
+        ($($field:ident),* $(,)?) => {
+            $(
+                if let Some(value) = event.$field {
+                    inner.$field = Some(value);
+                }
+            )*
+        };
     }
-    if let Some(input) = event.input {
-        inner.input = Some(input);
+
+    macro_rules! merge_map_if_some {
+        ($($field:ident),* $(,)?) => {
+            $(
+                if let Some(values) = event.$field {
+                    inner.$field.extend(values);
+                }
+            )*
+        };
     }
-    if let Some(output) = event.output {
-        inner.output = Some(output);
-    }
-    if let Some(expected) = event.expected {
-        inner.expected = Some(expected);
-    }
-    if let Some(error) = event.error {
-        inner.error = Some(error);
-    }
-    if let Some(scores) = event.scores {
-        for (key, value) in scores {
-            inner.scores.insert(key, value);
-        }
-    }
-    if let Some(metadata) = event.metadata {
-        for (key, value) in metadata {
-            inner.metadata.insert(key, value);
-        }
-    }
-    if let Some(metrics) = event.metrics {
-        for (key, value) in metrics {
-            inner.metrics.insert(key, value);
-        }
-    }
+
+    replace_if_some!(name, input, output, expected, error, context);
+    merge_map_if_some!(scores, metadata, metrics);
+
     if let Some(tags) = event.tags {
         inner.tags.extend(tags);
-    }
-    if let Some(context) = event.context {
-        inner.context = Some(context);
     }
 }
 
