@@ -242,13 +242,12 @@ where
             Ok(output) => output,
             Err(e) => {
                 // Log error to span
-                case_span
-                    .log(
-                        crate::SpanLog::builder()
-                            .error(json!(e.to_string()))
-                            .build()
-                            .unwrap(),
-                    );
+                case_span.log(
+                    crate::SpanLog::builder()
+                        .error(json!(e.to_string()))
+                        .build()
+                        .unwrap(),
+                );
                 case_span.end().await;
 
                 return Ok(EvalResult {
@@ -266,13 +265,12 @@ where
 
         // Set output in span
         if let Ok(output_json) = serde_json::to_value(&output) {
-            case_span
-                .log(
-                    crate::SpanLog::builder()
-                        .output(output_json)
-                        .build()
-                        .unwrap(),
-                );
+            case_span.log(
+                crate::SpanLog::builder()
+                    .output(output_json)
+                    .build()
+                    .unwrap(),
+            );
         }
 
         // Run scorers in parallel

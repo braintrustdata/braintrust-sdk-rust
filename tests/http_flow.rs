@@ -88,7 +88,10 @@ async fn flush_is_fire_and_forget() {
     // flush() waits for queued work to be processed. Background submission errors
     // are still swallowed by the queue and should not bubble out here.
     let result = span.flush().await;
-    assert!(result.is_ok(), "flush() should not surface background submission errors");
+    assert!(
+        result.is_ok(),
+        "flush() should not surface background submission errors"
+    );
 
     // Drain pending items before drop so the Drop impl's synchronous flush path
     // is a no-op (queue is empty). The 500 from project registration is swallowed.

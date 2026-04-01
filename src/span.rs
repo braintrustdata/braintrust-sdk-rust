@@ -373,7 +373,10 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     /// Each call synchronously queues the current span snapshot for background processing.
     pub fn log(&self, event: SpanLog) {
         let payload = {
-            let mut inner = self.inner.lock().expect("span mutex should not be poisoned");
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("span mutex should not be poisoned");
             apply_span_log_to_data(&mut inner, event);
             current_span_payload(&mut inner)
         };
@@ -405,7 +408,10 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     /// subsequent calls return the previously-set value.
     pub async fn end_with_time(&self, end_time: f64) -> f64 {
         let (end_time, payload) = {
-            let mut inner = self.inner.lock().expect("span mutex should not be poisoned");
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("span mutex should not be poisoned");
             if let Some(existing) = inner.end_time {
                 return existing;
             }
@@ -431,7 +437,10 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     /// The exported SpanComponents includes the span's IDs and any propagated_event
     /// data that should flow to child spans.
     pub async fn export(&self) -> Result<SpanComponents> {
-        let inner = self.inner.lock().expect("span mutex should not be poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .expect("span mutex should not be poisoned");
 
         // Determine object_type and object_id from parent_info if available,
         // otherwise default to ProjectLogs
