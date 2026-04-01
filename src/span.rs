@@ -483,24 +483,32 @@ impl<S: SpanSubmitter> SpanHandle<S> {
 
         // Determine object_type and object_id from parent_info if available,
         // otherwise default to ProjectLogs
-        let (object_type, object_id) = match &self.parent_info {
-            Some(ParentSpanInfo::Experiment { object_id }) => {
-                (SpanObjectType::Experiment, Some(object_id.clone()))
-            }
-            Some(ParentSpanInfo::ProjectLogs { object_id }) => {
-                (SpanObjectType::ProjectLogs, Some(object_id.clone()))
-            }
-            Some(ParentSpanInfo::PlaygroundLogs { object_id }) => {
-                (SpanObjectType::PlaygroundLogs, Some(object_id.clone()))
-            }
-            Some(ParentSpanInfo::FullSpan {
-                object_type,
-                object_id,
-                ..
-            }) => (*object_type, Some(object_id.clone())),
-            // Default to ProjectLogs if no parent
-            _ => (SpanObjectType::ProjectLogs, None),
-        };
+        let (object_type, object_id, inherited_compute_object_metadata_args) =
+            match &self.parent_info {
+                Some(ParentSpanInfo::Experiment { object_id }) => {
+                    (SpanObjectType::Experiment, Some(object_id.clone()), None)
+                }
+                Some(ParentSpanInfo::ProjectLogs { object_id }) => {
+                    (SpanObjectType::ProjectLogs, Some(object_id.clone()), None)
+                }
+                Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
+                    SpanObjectType::PlaygroundLogs,
+                    Some(object_id.clone()),
+                    None,
+                ),
+                Some(ParentSpanInfo::FullSpan {
+                    object_type,
+                    object_id,
+                    compute_object_metadata_args,
+                    ..
+                }) => (
+                    *object_type,
+                    object_id.clone(),
+                    compute_object_metadata_args.clone(),
+                ),
+                // Default to ProjectLogs if no parent
+                _ => (SpanObjectType::ProjectLogs, None, None),
+            };
 
         // Use root_span_id from parent_info (FullSpan) if available, otherwise
         // fall back to this span's own span_id (it is the root).
@@ -510,16 +518,18 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         };
 
         let compute_object_metadata_args = if object_id.is_none() {
-            inner.project_name.as_ref().map(|project_name| {
-                let mut args = Map::new();
-                args.insert(
-                    "project_name".to_string(),
-                    Value::String(project_name.clone()),
-                );
-                args
+            inherited_compute_object_metadata_args.or_else(|| {
+                inner.project_name.as_ref().map(|project_name| {
+                    let mut args = Map::new();
+                    args.insert(
+                        "project_name".to_string(),
+                        Value::String(project_name.clone()),
+                    );
+                    args
+                })
             })
         } else {
-            None
+            inherited_compute_object_metadata_args
         };
 
         Ok(SpanComponents {
@@ -865,9 +875,10 @@ mod tests {
 
         let parent_info = ParentSpanInfo::FullSpan {
             object_type: SpanObjectType::ProjectLogs,
-            object_id: "project-123".to_string(),
+            object_id: Some("project-123".to_string()),
             span_id: "parent-span-id".to_string(),
             root_span_id: "root-span-id".to_string(),
+            compute_object_metadata_args: None,
             propagated_event: Some(parent_propagated),
         };
 
@@ -913,9 +924,10 @@ mod tests {
 
         let parent_info = ParentSpanInfo::FullSpan {
             object_type: SpanObjectType::Experiment,
-            object_id: "exp-123".to_string(),
+            object_id: Some("exp-123".to_string()),
             span_id: "span-456".to_string(),
             root_span_id: "root-789".to_string(),
+            compute_object_metadata_args: None,
             propagated_event: Some(propagated),
         };
 
