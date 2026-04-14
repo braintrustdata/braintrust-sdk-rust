@@ -125,7 +125,9 @@ impl SseWriter {
 }
 
 fn create_sse_writer() -> Option<Arc<SseWriter>> {
-    // Try Unix domain socket first (BT_EVAL_SSE_SOCK)
+    // Unix socket SSE is only available on Unix platforms; Windows continues
+    // to the TCP fallback below.
+    #[cfg(unix)]
     if let Ok(sock_path) = std::env::var("BT_EVAL_SSE_SOCK") {
         if !sock_path.is_empty() {
             match std::os::unix::net::UnixStream::connect(&sock_path) {
