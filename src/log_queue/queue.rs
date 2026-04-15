@@ -401,7 +401,7 @@ impl LogQueueCore {
                 merge_paths: None,
                 span_id,
                 root_span_id,
-                span_parents: None,
+                span_parents: span_components.span_parents.clone(),
                 destination,
                 org_id,
                 org_name,
@@ -470,6 +470,7 @@ impl LogQueueCore {
                 compute_object_metadata_args,
                 span_id: parent_span_id,
                 root_span_id: parent_root_span_id,
+                span_parents: _,
                 propagated_event: _,
             }) => {
                 let span_parents = Some(vec![parent_span_id]);
@@ -804,7 +805,9 @@ impl LogQueueCore {
                 is_merge: if payload.is_merge { Some(true) } else { None },
                 merge_paths: None,
                 root_span_id,
-                span_parents: None,
+                span_parents: span_components
+                    .as_ref()
+                    .and_then(|components| components.span_parents.clone()),
                 destination,
                 org_id: payload.org_id,
                 org_name: payload.org_name,

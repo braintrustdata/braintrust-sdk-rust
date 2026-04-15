@@ -477,6 +477,10 @@ impl<S: SpanSubmitter> SpanHandle<S> {
             Some(ParentSpanInfo::FullSpan { root_span_id, .. }) => Some(root_span_id.clone()),
             _ => Some(inner.span_id.clone()),
         };
+        let span_parents = match &self.parent_info {
+            Some(ParentSpanInfo::FullSpan { span_id, .. }) => Some(vec![span_id.clone()]),
+            _ => None,
+        };
 
         let compute_object_metadata_args = if object_id.is_none() {
             inherited_compute_object_metadata_args.or_else(|| {
@@ -500,6 +504,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
             row_id: Some(inner.row_id.clone()),
             span_id: Some(inner.span_id.clone()),
             root_span_id,
+            span_parents,
             propagated_event: inner.propagated_event.clone(),
         })
     }
@@ -876,6 +881,7 @@ mod tests {
             span_id: "parent-span-id".to_string(),
             root_span_id: "root-span-id".to_string(),
             compute_object_metadata_args: None,
+            span_parents: None,
             propagated_event: Some(parent_propagated),
         };
 
@@ -924,6 +930,7 @@ mod tests {
             span_id: "span-456".to_string(),
             root_span_id: "root-789".to_string(),
             compute_object_metadata_args: None,
+            span_parents: None,
             propagated_event: Some(propagated),
         };
 
@@ -940,6 +947,7 @@ mod tests {
             event.get("test_key").and_then(|v| v.as_str()),
             Some("test_value")
         );
+        assert_eq!(exported.span_parents, Some(vec!["span-456".to_string()]));
     }
 
     #[tokio::test]

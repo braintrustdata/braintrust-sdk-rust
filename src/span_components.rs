@@ -70,6 +70,10 @@ pub struct SpanComponents {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_span_id: Option<String>,
 
+    /// Direct parent span IDs for this span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_parents: Option<Vec<String>>,
+
     /// Event data to propagate to child spans (e.g., prompt versions, metadata)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub propagated_event: Option<Map<String, Value>>,
@@ -85,6 +89,7 @@ impl SpanComponents {
             row_id: None,
             span_id: None,
             root_span_id: None,
+            span_parents: None,
             propagated_event: None,
         }
     }
@@ -193,6 +198,12 @@ impl SpanComponents {
         }
         if let Some(ref event) = self.propagated_event {
             json_obj.insert("propagated_event".to_string(), Value::Object(event.clone()));
+        }
+        if let Some(ref span_parents) = self.span_parents {
+            json_obj.insert(
+                "span_parents".to_string(),
+                Value::Array(span_parents.iter().cloned().map(Value::String).collect()),
+            );
         }
 
         if !json_obj.is_empty() {
@@ -365,6 +376,25 @@ impl SpanComponents {
             root_span_id: json_obj
                 .remove("root_span_id")
                 .and_then(|v| v.as_str().map(String::from)),
+            span_parents: match json_obj.remove("span_parents") {
+                None => None,
+                Some(Value::Array(values)) => Some(
+                    values
+                        .into_iter()
+                        .map(|value| match value {
+                            Value::String(value) => Ok(value),
+                            _ => Err(BraintrustError::InvalidConfig(
+                                "span_parents must be an array of strings".to_string(),
+                            )),
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                Some(_) => {
+                    return Err(BraintrustError::InvalidConfig(
+                        "span_parents must be an array of strings".to_string(),
+                    ))
+                }
+            },
             propagated_event: json_obj
                 .remove("propagated_event")
                 .and_then(|v| v.as_object().cloned()),
@@ -404,6 +434,7 @@ impl SpanComponents {
             compute_object_metadata_args: self.compute_object_metadata_args.clone(),
             span_id,
             root_span_id,
+            span_parents: self.span_parents.clone(),
             propagated_event: self.propagated_event.clone(),
         })
     }
@@ -417,6 +448,7 @@ impl SpanComponents {
                 compute_object_metadata_args,
                 span_id,
                 root_span_id,
+                span_parents,
                 propagated_event,
             } => Some(Self {
                 object_type: *object_type,
@@ -425,6 +457,7 @@ impl SpanComponents {
                 row_id: None,
                 span_id: Some(span_id.clone()),
                 root_span_id: Some(root_span_id.clone()),
+                span_parents: span_parents.clone(),
                 propagated_event: propagated_event.clone(),
             }),
             _ => None,
@@ -529,6 +562,7 @@ mod tests {
         components.object_id = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
         components.span_id = Some("0123456789abcdef".to_string());
         components.root_span_id = Some("0123456789abcdef0123456789abcdef".to_string());
+        components.span_parents = Some(vec!["parent-a".to_string()]);
 
         let encoded = components.to_str();
         let decoded = SpanComponents::parse(&encoded).unwrap();
@@ -537,6 +571,7 @@ mod tests {
         assert_eq!(decoded.object_id, components.object_id);
         assert_eq!(decoded.span_id, components.span_id);
         assert_eq!(decoded.root_span_id, components.root_span_id);
+        assert_eq!(decoded.span_parents, components.span_parents);
     }
 
     #[test]
@@ -584,6 +619,7 @@ mod tests {
         components.object_id = Some("project-123".to_string());
         components.span_id = Some("span-456".to_string());
         components.root_span_id = Some("root-789".to_string());
+        components.span_parents = Some(vec!["parent-a".to_string()]);
 
         let mut propagated = Map::new();
         propagated.insert(
@@ -600,6 +636,7 @@ mod tests {
                 object_id,
                 span_id,
                 root_span_id,
+                span_parents,
                 propagated_event,
                 ..
             } => {
@@ -607,6 +644,7 @@ mod tests {
                 assert_eq!(object_id, Some("project-123".to_string()));
                 assert_eq!(span_id, "span-456");
                 assert_eq!(root_span_id, "root-789");
+                assert_eq!(span_parents, Some(vec!["parent-a".to_string()]));
                 assert!(propagated_event.is_some());
                 let event = propagated_event.unwrap();
                 assert_eq!(
@@ -629,6 +667,7 @@ mod tests {
             span_id: "span-456".to_string(),
             root_span_id: "root-789".to_string(),
             compute_object_metadata_args: None,
+            span_parents: Some(vec!["parent-a".to_string()]),
             propagated_event: Some(propagated),
         };
 
@@ -638,6 +677,48 @@ mod tests {
         assert_eq!(components.object_id, Some("exp-123".to_string()));
         assert_eq!(components.span_id, Some("span-456".to_string()));
         assert_eq!(components.root_span_id, Some("root-789".to_string()));
+        assert_eq!(components.span_parents, Some(vec!["parent-a".to_string()]));
         assert!(components.propagated_event.is_some());
+    }
+
+    #[test]
+    fn test_parse_v3_json_remainder_preserves_span_parents() {
+        let payload = serde_json::json!({
+            "object_type": SpanObjectType::ProjectLogs as u8,
+            "object_id": "project-123",
+            "row_id": "row-123",
+            "span_id": "span-123",
+            "root_span_id": "root-123",
+            "span_parents": ["parent-a"],
+        });
+        let encoded = BASE64.encode(
+            [
+                vec![ENCODING_VERSION_V3, SpanObjectType::ProjectLogs as u8, 0],
+                serde_json::to_vec(&payload).unwrap(),
+            ]
+            .concat(),
+        );
+
+        let decoded = SpanComponents::parse(&encoded).unwrap();
+
+        assert_eq!(decoded.span_parents, Some(vec!["parent-a".to_string()]));
+    }
+
+    #[test]
+    fn test_parse_rejects_invalid_span_parents() {
+        let payload = serde_json::json!({
+            "object_type": SpanObjectType::ProjectLogs as u8,
+            "span_parents": [123],
+        });
+        let encoded = BASE64.encode(
+            [
+                vec![ENCODING_VERSION_V4, SpanObjectType::ProjectLogs as u8, 0],
+                serde_json::to_vec(&payload).unwrap(),
+            ]
+            .concat(),
+        );
+
+        let err = SpanComponents::parse(&encoded).unwrap_err();
+        assert!(matches!(err, BraintrustError::InvalidConfig(_)));
     }
 }
