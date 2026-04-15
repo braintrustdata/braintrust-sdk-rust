@@ -202,13 +202,7 @@ impl SpanComponents {
         if let Some(ref span_parents) = self.span_parents {
             json_obj.insert(
                 "span_parents".to_string(),
-                Value::Array(
-                    span_parents
-                        .iter()
-                        .cloned()
-                        .map(Value::String)
-                        .collect(),
-                ),
+                Value::Array(span_parents.iter().cloned().map(Value::String).collect()),
             );
         }
 
