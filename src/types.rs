@@ -364,6 +364,8 @@ pub enum ParentSpanInfo {
         span_id: String,
         root_span_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        span_parents: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         propagated_event: Option<Map<String, Value>>,
     },
 }
@@ -876,6 +878,7 @@ mod tests {
             span_id: "span-1".to_string(),
             root_span_id: "root-1".to_string(),
             compute_object_metadata_args: None,
+            span_parents: Some(vec!["parent-1".to_string()]),
             propagated_event: None,
         };
 
@@ -884,6 +887,7 @@ mod tests {
 
         // SpanObjectType serializes as u8 for wire compatibility
         assert_eq!(obj.get("object_type").unwrap(), 1);
+        assert_eq!(obj.get("span_parents").unwrap(), &json!(["parent-1"]));
     }
 
     #[test]
@@ -894,15 +898,21 @@ mod tests {
                 "object_type": 1,
                 "object_id": "exp-123",
                 "span_id": "span-1",
-                "root_span_id": "root-1"
+                "root_span_id": "root-1",
+                "span_parents": ["parent-1"]
             }
         });
 
         let parent: ParentSpanInfo = serde_json::from_value(json).unwrap();
 
         match parent {
-            ParentSpanInfo::FullSpan { object_type, .. } => {
+            ParentSpanInfo::FullSpan {
+                object_type,
+                span_parents,
+                ..
+            } => {
                 assert_eq!(object_type, SpanObjectType::Experiment);
+                assert_eq!(span_parents, Some(vec!["parent-1".to_string()]));
             }
             _ => panic!("Expected FullSpan variant"),
         }
@@ -916,6 +926,7 @@ mod tests {
             span_id: "span-1".to_string(),
             root_span_id: "root-1".to_string(),
             compute_object_metadata_args: None,
+            span_parents: Some(vec!["parent-1".to_string()]),
             propagated_event: Some(Map::from_iter([(
                 "metrics".to_string(),
                 json!({ "foo": 0.1 }),
@@ -928,6 +939,7 @@ mod tests {
             obj.get("propagated_event").unwrap(),
             &json!({ "metrics": { "foo": 0.1 } })
         );
+        assert_eq!(obj.get("span_parents").unwrap(), &json!(["parent-1"]));
     }
 
     #[test]
