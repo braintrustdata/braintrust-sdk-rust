@@ -13,6 +13,8 @@ mod span_components;
 mod stream;
 #[cfg(test)]
 pub(crate) mod test_utils;
+#[cfg(feature = "auto-instrumentation")]
+mod tracing_layer;
 mod types;
 
 pub use dataset::{
@@ -42,6 +44,8 @@ pub use stream::{
     OutputChoiceBuilderError, StreamMetadata, StreamMetadataBuilder, StreamMetadataBuilderError,
     ToolCall, ToolCallBuilder, ToolCallBuilderError,
 };
+#[cfg(feature = "auto-instrumentation")]
+pub use tracing_layer::{BraintrustTracingLayer, GenAISpanContext};
 pub use types::{
     CompletionTokensDetails, InvalidSpanObjectType, ParentSpanInfo, PromptTokensDetails,
     SpanObjectType, SpanType, Usage, UsageMetrics,
