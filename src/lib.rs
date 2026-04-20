@@ -1,5 +1,6 @@
 mod dataset;
 mod error;
+#[cfg(unix)]
 pub mod eval;
 mod experiments;
 mod extractors;
