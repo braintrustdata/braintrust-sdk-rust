@@ -747,9 +747,17 @@ struct StreamUsage {
     accepted_prediction_tokens: Option<i64>,
     #[serde(default, alias = "rejected_prediction_tokens")]
     rejected_prediction_tokens: Option<i64>,
-    #[serde(default, alias = "prompt_tokens_details", alias = "input_tokens_details")]
+    #[serde(
+        default,
+        alias = "prompt_tokens_details",
+        alias = "input_tokens_details"
+    )]
     prompt_tokens_details: Option<PromptTokensDetails>,
-    #[serde(default, alias = "completion_tokens_details", alias = "output_tokens_details")]
+    #[serde(
+        default,
+        alias = "completion_tokens_details",
+        alias = "output_tokens_details"
+    )]
     completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
@@ -772,7 +780,11 @@ struct PromptTokensDetails {
 struct CompletionTokensDetails {
     #[serde(default, alias = "audio_tokens", alias = "completion_audio_tokens")]
     pub(crate) audio_tokens: Option<i64>,
-    #[serde(default, alias = "reasoning_tokens", alias = "completion_reasoning_tokens")]
+    #[serde(
+        default,
+        alias = "reasoning_tokens",
+        alias = "completion_reasoning_tokens"
+    )]
     pub(crate) reasoning_tokens: Option<i64>,
 }
 
@@ -866,8 +878,10 @@ impl BraintrustStream {
                     crate::types::CompletionTokensDetails::new(
                         c.audio_tokens.and_then(|v| u32::try_from(v).ok()),
                         c.reasoning_tokens.and_then(|v| u32::try_from(v).ok()),
-                        u.accepted_prediction_tokens.and_then(|v| u32::try_from(v).ok()),
-                        u.rejected_prediction_tokens.and_then(|v| u32::try_from(v).ok()),
+                        u.accepted_prediction_tokens
+                            .and_then(|v| u32::try_from(v).ok()),
+                        u.rejected_prediction_tokens
+                            .and_then(|v| u32::try_from(v).ok()),
                     )
                 });
 
