@@ -741,6 +741,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                 } else {
                     None
                 },
+                extra: std::collections::HashMap::new(),
             };
 
             let parent_info = ParentSpanInfo::Dataset {

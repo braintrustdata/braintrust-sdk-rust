@@ -23,7 +23,7 @@ use crate::http::build_http_client;
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::SpanSubmitter;
 use crate::span_components::SpanComponents;
-use crate::types::{ParentSpanInfo, SpanAttributes, SpanObjectType, SpanPayload};
+use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
 
 // 30s covers both quick API calls (login, project registration) and slower batch log uploads.
 // The TypeScript SDK applies no explicit timeout.
@@ -632,15 +632,7 @@ impl BraintrustClient {
         }
 
         let span_id = components.span_id.clone().unwrap_or_else(|| row_id.clone());
-
-        let payload = SpanPayload {
-            row_id,
-            span_id,
-            is_merge: true,
-            span_components: Some(components),
-            org_id,
-            org_name,
-            project_name: None,
+        let mut event_data = SpanEventData {
             input: event.input,
             output: event.output,
             expected: event.expected,
@@ -656,6 +648,31 @@ impl BraintrustClient {
                 purpose: None,
                 extra: HashMap::new(),
             }),
+            extra: HashMap::new(),
+        };
+        if let Some(propagated_event) = components.propagated_event.as_ref() {
+            event_data.apply_propagated_event(propagated_event);
+        }
+
+        let payload = SpanPayload {
+            row_id,
+            span_id,
+            is_merge: true,
+            span_components: Some(components),
+            org_id,
+            org_name,
+            project_name: None,
+            input: event_data.input,
+            output: event_data.output,
+            expected: event_data.expected,
+            error: event_data.error,
+            scores: event_data.scores,
+            metadata: event_data.metadata,
+            metrics: event_data.metrics,
+            tags: event_data.tags,
+            context: event_data.context,
+            span_attributes: event_data.span_attributes,
+            extra: event_data.extra,
         };
 
         self.submit_payload(token, payload, None);

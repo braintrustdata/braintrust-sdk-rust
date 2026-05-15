@@ -97,6 +97,141 @@ pub(crate) struct SpanAttributes {
     pub extra: HashMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SpanEventData {
+    pub input: Option<Value>,
+    pub output: Option<Value>,
+    pub expected: Option<Value>,
+    pub error: Option<Value>,
+    pub scores: Option<HashMap<String, f64>>,
+    pub metadata: Option<Map<String, Value>>,
+    pub metrics: Option<HashMap<String, f64>>,
+    pub tags: Option<Vec<String>>,
+    pub context: Option<Value>,
+    pub span_attributes: Option<SpanAttributes>,
+    pub extra: HashMap<String, Value>,
+}
+
+impl SpanEventData {
+    pub fn apply_propagated_event(&mut self, propagated_event: &Map<String, Value>) {
+        let mut event = self.to_event_map();
+        merge_event_maps(&mut event, propagated_event);
+        self.apply_merged_event_map(event);
+    }
+
+    fn to_event_map(&self) -> Map<String, Value> {
+        let mut event = Map::new();
+
+        if let Some(input) = &self.input {
+            event.insert("input".to_string(), input.clone());
+        }
+        if let Some(output) = &self.output {
+            event.insert("output".to_string(), output.clone());
+        }
+        if let Some(expected) = &self.expected {
+            event.insert("expected".to_string(), expected.clone());
+        }
+        if let Some(error) = &self.error {
+            event.insert("error".to_string(), error.clone());
+        }
+        if let Some(scores) = &self.scores {
+            event.insert("scores".to_string(), numeric_map_to_value(scores));
+        }
+        if let Some(metadata) = &self.metadata {
+            event.insert("metadata".to_string(), Value::Object(metadata.clone()));
+        }
+        if let Some(metrics) = &self.metrics {
+            event.insert("metrics".to_string(), numeric_map_to_value(metrics));
+        }
+        if let Some(tags) = &self.tags {
+            event.insert(
+                "tags".to_string(),
+                Value::Array(tags.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        if let Some(context) = &self.context {
+            event.insert("context".to_string(), context.clone());
+        }
+        if let Some(span_attributes) = &self.span_attributes {
+            if let Ok(value) = serde_json::to_value(span_attributes) {
+                event.insert("span_attributes".to_string(), value);
+            }
+        }
+        event.extend(self.extra.clone());
+        event
+    }
+
+    fn apply_merged_event_map(&mut self, mut event: Map<String, Value>) {
+        self.input = event.remove("input");
+        self.output = event.remove("output");
+        self.expected = event.remove("expected");
+        self.error = event.remove("error");
+        self.scores = event.remove("scores").and_then(parse_numeric_map);
+        self.metadata = event.remove("metadata").and_then(|value| match value {
+            Value::Object(map) => Some(map),
+            _ => None,
+        });
+        self.metrics = event.remove("metrics").and_then(parse_numeric_map);
+        self.tags = event.remove("tags").and_then(parse_string_array);
+        self.context = event.remove("context");
+        self.span_attributes = event
+            .remove("span_attributes")
+            .and_then(|value| serde_json::from_value(value).ok());
+        self.extra = HashMap::from_iter(event);
+    }
+}
+
+fn numeric_map_to_value(map: &HashMap<String, f64>) -> Value {
+    Value::Object(Map::from_iter(
+        map.iter()
+            .map(|(key, value)| (key.clone(), Value::from(*value))),
+    ))
+}
+
+fn parse_numeric_map(value: Value) -> Option<HashMap<String, f64>> {
+    match value {
+        Value::Object(map) => Some(HashMap::from_iter(
+            map.into_iter()
+                .filter_map(|(key, value)| value.as_f64().map(|number| (key, number))),
+        )),
+        _ => None,
+    }
+}
+
+fn parse_string_array(value: Value) -> Option<Vec<String>> {
+    match value {
+        Value::Array(values) => Some(
+            values
+                .into_iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn merge_event_maps(merge_into: &mut Map<String, Value>, merge_from: &Map<String, Value>) {
+    for (key, merge_from_value) in merge_from {
+        match (merge_into.get_mut(key), merge_from_value) {
+            (Some(Value::Object(merge_into_object)), Value::Object(merge_from_object)) => {
+                merge_event_maps(merge_into_object, merge_from_object);
+            }
+            (Some(Value::Array(merge_into_array)), Value::Array(merge_from_array))
+                if key == "tags" =>
+            {
+                for item in merge_from_array {
+                    if !merge_into_array.iter().any(|existing| existing == item) {
+                        merge_into_array.push(item.clone());
+                    }
+                }
+            }
+            _ => {
+                merge_into.insert(key.clone(), merge_from_value.clone());
+            }
+        }
+    }
+}
+
 /// The `log_id` used for regular (non-playground) log destinations (experiments, project
 /// logs, datasets). Matches the TypeScript SDK's `GLOBAL_ID`.
 pub(crate) const GLOBAL_LOG_ID: &str = "g";
@@ -336,6 +471,7 @@ pub(crate) struct SpanPayload {
     pub tags: Option<Vec<String>>,
     pub context: Option<Value>,
     pub span_attributes: Option<SpanAttributes>,
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,7 +2,6 @@ use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 
 use super::batching::batch_and_serialize_rows;
 use super::config::LogQueueConfig;
@@ -379,6 +378,7 @@ impl LogQueueCore {
             tags,
             context,
             span_attributes,
+            extra,
         } = payload;
 
         if let Some(span_components) = span_components {
@@ -415,7 +415,7 @@ impl LogQueueCore {
                 tags,
                 context,
                 span_attributes,
-                extra: HashMap::new(),
+                extra,
                 created: Utc::now(),
                 xact_id: None,
                 object_delete: None,
@@ -539,7 +539,7 @@ impl LogQueueCore {
             tags,
             context,
             span_attributes,
-            extra: HashMap::new(),
+            extra,
             created: Utc::now(),
             xact_id: None,
             object_delete: None,
@@ -821,7 +821,7 @@ impl LogQueueCore {
                 tags: payload.tags,
                 context: payload.context,
                 span_attributes: payload.span_attributes,
-                extra: HashMap::new(),
+                extra: payload.extra,
                 created: Utc::now(),
                 xact_id: None,
                 object_delete: None,
@@ -1005,6 +1005,7 @@ mod tests {
                 tags: None,
                 context: None,
                 span_attributes: None,
+                extra: std::collections::HashMap::new(),
             },
             parent_info: Some(ParentSpanInfo::Experiment {
                 object_id: "exp-test".to_string(),
