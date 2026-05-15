@@ -9,7 +9,10 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::span_components::SpanComponents;
-use crate::types::{ParentSpanInfo, SpanAttributes, SpanObjectType, SpanPayload, SpanType};
+use crate::types::{
+    ParentSpanInfo, SpanAttributes, SpanObjectType, SpanPayload, SpanType,
+    INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD,
+};
 
 /// Error type for SpanLog builder validation.
 #[derive(Debug, Clone, PartialEq)]
@@ -624,6 +627,10 @@ impl From<SpanData> for SpanPayload {
 /// This allows parent span metadata to flow down to child spans.
 fn apply_propagated_event_to_span_data(data: &mut SpanData, propagated_event: &Map<String, Value>) {
     for (key, value) in propagated_event {
+        if key == INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD {
+            continue;
+        }
+
         match key.as_str() {
             "input" if data.input.is_none() => {
                 data.input = Some(value.clone());

@@ -9,6 +9,8 @@ use std::fmt;
 use crate::span_components::SpanComponents;
 
 pub const LOGS_API_VERSION: u8 = 2;
+pub(crate) const INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD: &str =
+    "_bt_internal_override_pagination_key";
 
 /// The type of span object, serialized as its integer representation for wire compatibility.
 #[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
