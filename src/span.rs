@@ -10,8 +10,7 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::span_components::SpanComponents;
 use crate::types::{
-    ParentSpanInfo, SpanAttributes, SpanObjectType, SpanPayload, SpanType,
-    INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD,
+    ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
 };
 
 /// Error type for SpanLog builder validation.
@@ -581,14 +580,7 @@ struct SpanData {
 }
 
 impl From<SpanData> for SpanPayload {
-    fn from(mut data: SpanData) -> Self {
-        // Apply propagated_event if present - merge its fields into the span data
-        if let Some(propagated_event) = data.propagated_event.take() {
-            apply_propagated_event_to_span_data(&mut data, &propagated_event);
-            // Restore the propagated_event after applying it
-            data.propagated_event = Some(propagated_event);
-        }
-
+    fn from(data: SpanData) -> Self {
         let span_attributes = SpanAttributes {
             name: data.name,
             span_type: Some(data.span_type),
@@ -601,14 +593,7 @@ impl From<SpanData> for SpanPayload {
             || span_attributes.span_type.is_some()
             || span_attributes.purpose.is_some();
 
-        Self {
-            row_id: data.row_id,
-            span_id: data.span_id,
-            is_merge: data.has_flushed, // First flush = false (replace), subsequent = true (merge)
-            span_components: None,
-            org_id: data.org_id,
-            org_name: data.org_name,
-            project_name: data.project_name,
+        let mut event_data = SpanEventData {
             input: data.input,
             output: data.output,
             expected: data.expected,
@@ -619,80 +604,32 @@ impl From<SpanData> for SpanPayload {
             tags: (!data.tags.is_empty()).then_some(data.tags),
             context: data.context,
             span_attributes: has_attributes.then_some(span_attributes),
-        }
-    }
-}
+            extra: HashMap::new(),
+        };
 
-/// Apply propagated_event data to SpanData by merging it into the span's fields.
-/// This allows parent span metadata to flow down to child spans.
-fn apply_propagated_event_to_span_data(data: &mut SpanData, propagated_event: &Map<String, Value>) {
-    for (key, value) in propagated_event {
-        if key == INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD {
-            continue;
+        if let Some(propagated_event) = data.propagated_event {
+            event_data.apply_propagated_event(&propagated_event);
         }
 
-        match key.as_str() {
-            "input" if data.input.is_none() => {
-                data.input = Some(value.clone());
-            }
-            "output" if data.output.is_none() => {
-                data.output = Some(value.clone());
-            }
-            "expected" if data.expected.is_none() => {
-                data.expected = Some(value.clone());
-            }
-            "error" if data.error.is_none() => {
-                if let Some(s) = value.as_str() {
-                    data.error = Some(Value::String(s.to_string()));
-                }
-            }
-            "scores" => {
-                if let Some(obj) = value.as_object() {
-                    for (score_key, score_val) in obj {
-                        if let Some(score) = score_val.as_f64() {
-                            data.scores.entry(score_key.clone()).or_insert(score);
-                        }
-                    }
-                }
-            }
-            "metadata" => {
-                if let Some(obj) = value.as_object() {
-                    for (meta_key, meta_val) in obj {
-                        data.metadata
-                            .entry(meta_key.clone())
-                            .or_insert_with(|| meta_val.clone());
-                    }
-                }
-            }
-            "metrics" => {
-                if let Some(obj) = value.as_object() {
-                    for (metric_key, metric_val) in obj {
-                        if let Some(metric) = metric_val.as_f64() {
-                            data.metrics.entry(metric_key.clone()).or_insert(metric);
-                        }
-                    }
-                }
-            }
-            "tags" => {
-                if let Some(arr) = value.as_array() {
-                    for tag_val in arr {
-                        if let Some(tag) = tag_val.as_str() {
-                            if !data.tags.contains(&tag.to_string()) {
-                                data.tags.push(tag.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            "context" if data.context.is_none() => {
-                data.context = Some(value.clone());
-            }
-            _ => {
-                // Unknown fields go into metadata
-                data.metadata
-                    .entry(key.clone())
-                    .or_insert_with(|| value.clone());
-            }
+        Self {
+            row_id: data.row_id,
+            span_id: data.span_id,
+            is_merge: data.has_flushed, // First flush = false (replace), subsequent = true (merge)
+            span_components: None,
+            org_id: data.org_id,
+            org_name: data.org_name,
+            project_name: data.project_name,
+            input: event_data.input,
+            output: event_data.output,
+            expected: event_data.expected,
+            error: event_data.error,
+            scores: event_data.scores,
+            metadata: event_data.metadata,
+            metrics: event_data.metrics,
+            tags: event_data.tags,
+            context: event_data.context,
+            span_attributes: event_data.span_attributes,
+            extra: event_data.extra,
         }
     }
 }
@@ -881,6 +818,10 @@ mod tests {
         let mut parent_propagated = Map::new();
         parent_propagated.insert("parent_key".to_string(), json!("parent_value"));
         parent_propagated.insert("metadata".to_string(), json!({"inherited": "data"}));
+        parent_propagated.insert(
+            "span_attributes".to_string(),
+            json!({"purpose": "scorer", "skip_realtime": true}),
+        );
 
         let parent_info = ParentSpanInfo::FullSpan {
             object_type: SpanObjectType::ProjectLogs,
@@ -917,9 +858,19 @@ mod tests {
             "Inherited metadata should be present"
         );
         assert_eq!(
-            metadata.get("parent_key").and_then(|v| v.as_str()),
+            captured
+                .payload
+                .extra
+                .get("parent_key")
+                .and_then(|v| v.as_str()),
             Some("parent_value"),
-            "Parent key should be in metadata"
+            "Unknown propagated fields should remain top-level extras"
+        );
+        let span_attributes = captured.payload.span_attributes.as_ref().unwrap();
+        assert_eq!(span_attributes.purpose.as_deref(), Some("scorer"));
+        assert_eq!(
+            span_attributes.extra.get("skip_realtime"),
+            Some(&json!(true))
         );
     }
 

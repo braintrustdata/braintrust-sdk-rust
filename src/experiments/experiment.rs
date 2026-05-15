@@ -198,6 +198,7 @@ impl<
             tags: feedback.tags,
             context: None,
             span_attributes: None,
+            extra: HashMap::new(),
         };
 
         let parent_info = ParentSpanInfo::Experiment {
@@ -384,6 +385,7 @@ impl<
                 purpose: None,
                 extra: HashMap::new(),
             }),
+            extra: HashMap::new(),
         };
 
         let parent_info = ParentSpanInfo::Experiment {

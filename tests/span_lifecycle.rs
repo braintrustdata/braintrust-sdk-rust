@@ -320,7 +320,7 @@ async fn client_update_span_with_credentials_includes_exported_span_parents() {
 }
 
 #[tokio::test]
-async fn client_update_span_with_credentials_inherits_exported_pagination_key() {
+async fn client_update_span_with_credentials_inherits_exported_propagated_event() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -345,10 +345,32 @@ async fn client_update_span_with_credentials_inherits_exported_pagination_key() 
         span_id: Some("span-id".to_string()),
         root_span_id: Some("root-id".to_string()),
         span_parents: Some(vec!["parent-id".to_string()]),
-        propagated_event: Some(Map::from_iter([(
-            INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD.to_string(),
-            json!("p07589456150966042624"),
-        )])),
+        propagated_event: Some(Map::from_iter([
+            (
+                INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD.to_string(),
+                json!("p07589456150966042624"),
+            ),
+            (
+                "_async_scoring_control".to_string(),
+                json!({
+                    "kind": "state_override",
+                    "state": { "status": "disabled" },
+                }),
+            ),
+            (
+                "metadata".to_string(),
+                json!({
+                    "source": "parent",
+                    "nested": { "from_parent": true },
+                }),
+            ),
+            ("metrics".to_string(), json!({ "parent_tokens": 12 })),
+            ("tags".to_string(), json!(["propagated"])),
+            (
+                "span_attributes".to_string(),
+                json!({ "purpose": "scorer", "skip_realtime": true }),
+            ),
+        ])),
     }
     .to_str();
 
@@ -359,6 +381,13 @@ async fn client_update_span_with_credentials_inherits_exported_pagination_key() 
                 "org-id",
                 &exported,
                 SpanLog::builder()
+                    .name("exported-child")
+                    .metadata(Map::from_iter([(
+                        "nested".to_string(),
+                        json!({ "from_child": true }),
+                    )]))
+                    .metric("child_latency_ms", 42.0)
+                    .tag("request")
                     .output(json!({ "status": output }))
                     .build()
                     .expect("build"),
@@ -386,12 +415,45 @@ async fn client_update_span_with_credentials_inherits_exported_pagination_key() 
             row[INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD],
             "p07589456150966042624"
         );
+        assert_eq!(
+            row["_async_scoring_control"],
+            json!({
+                "kind": "state_override",
+                "state": { "status": "disabled" },
+            })
+        );
+        assert_eq!(
+            row["metadata"],
+            json!({
+                "source": "parent",
+                "nested": {
+                    "from_parent": true,
+                    "from_child": true,
+                },
+            })
+        );
+        assert_eq!(
+            row["metrics"],
+            json!({
+                "parent_tokens": 12.0,
+                "child_latency_ms": 42.0,
+            })
+        );
+        assert_eq!(row["tags"], json!(["request", "propagated"]));
+        assert_eq!(
+            row["span_attributes"],
+            json!({
+                "name": "exported-child",
+                "purpose": "scorer",
+                "skip_realtime": true,
+            })
+        );
         assert_eq!(row["span_parents"], json!(["parent-id"]));
     }
 }
 
 #[tokio::test]
-async fn child_span_inherits_parent_pagination_key() {
+async fn child_span_inherits_parent_propagated_event() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -417,14 +479,31 @@ async fn child_span_inherits_parent_pagination_key() {
             span_id: "parent-span-id".to_string(),
             root_span_id: "root-id".to_string(),
             span_parents: None,
-            propagated_event: Some(Map::from_iter([(
-                INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD.to_string(),
-                json!("p07589456150966042624"),
-            )])),
+            propagated_event: Some(Map::from_iter([
+                (
+                    INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD.to_string(),
+                    json!("p07589456150966042624"),
+                ),
+                (
+                    "_async_scoring_control".to_string(),
+                    json!({
+                        "kind": "state_override",
+                        "state": { "status": "disabled" },
+                    }),
+                ),
+                ("metadata".to_string(), json!({"source": "parent"})),
+                ("tags".to_string(), json!(["propagated"])),
+                (
+                    "span_attributes".to_string(),
+                    json!({ "purpose": "scorer", "skip_realtime": true }),
+                ),
+            ])),
         })
         .build();
     span.log(
         SpanLog::builder()
+            .metadata(Map::from_iter([("child".to_string(), json!(true))]))
+            .tag("request")
             .output(json!({"status": "child"}))
             .build()
             .expect("build"),
@@ -449,6 +528,23 @@ async fn child_span_inherits_parent_pagination_key() {
         row[INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD],
         "p07589456150966042624"
     );
+    assert_eq!(
+        row["_async_scoring_control"],
+        json!({
+            "kind": "state_override",
+            "state": { "status": "disabled" },
+        })
+    );
+    assert_eq!(
+        row["metadata"],
+        json!({
+            "source": "parent",
+            "child": true,
+        })
+    );
+    assert_eq!(row["tags"], json!(["request", "propagated"]));
+    assert_eq!(row["span_attributes"]["purpose"], "scorer");
+    assert_eq!(row["span_attributes"]["skip_realtime"], true);
     assert_eq!(row["span_parents"], json!(["parent-span-id"]));
     assert!(row
         .get("metadata")

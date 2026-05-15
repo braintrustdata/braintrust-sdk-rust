@@ -185,6 +185,15 @@ pub(crate) fn merge_row_into(target: &mut Logs3Row, source: Logs3Row) {
         }
     }
 
+    for (key, source_value) in source.extra {
+        match target.extra.get_mut(&key) {
+            Some(target_value) => deep_merge(target_value, &source_value),
+            None => {
+                target.extra.insert(key, source_value);
+            }
+        }
+    }
+
     // Combine merge_paths from both entries.
     // Only retain merge paths if both entries are merge-type entries.
     let final_is_merge = target.is_merge.unwrap_or(false) && source.is_merge.unwrap_or(false);

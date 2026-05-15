@@ -2,7 +2,6 @@ use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 
 use super::batching::batch_and_serialize_rows;
 use super::config::LogQueueConfig;
@@ -12,10 +11,7 @@ use super::row_key::RowKey;
 use super::worker::LogCommand;
 use crate::error::{BraintrustError, Result};
 use crate::logger::LoginState;
-use crate::types::{
-    LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload,
-    INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD,
-};
+use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use futures::future::join_all;
@@ -382,9 +378,8 @@ impl LogQueueCore {
             tags,
             context,
             span_attributes,
+            extra,
         } = payload;
-
-        let extra = inherited_logs3_extra(span_components.as_ref(), parent_info.as_ref());
 
         if let Some(span_components) = span_components {
             let destination = self
@@ -736,7 +731,6 @@ impl LogQueueCore {
             } = cmd;
 
             let span_components = payload.span_components.clone();
-            let extra = inherited_logs3_extra(span_components.as_ref(), parent_info.as_ref());
 
             let span_id = payload.span_id.clone();
             let destination = match span_components.as_ref() {
@@ -827,7 +821,7 @@ impl LogQueueCore {
                 tags: payload.tags,
                 context: payload.context,
                 span_attributes: payload.span_attributes,
-                extra,
+                extra: payload.extra,
                 created: Utc::now(),
                 xact_id: None,
                 object_delete: None,
@@ -851,32 +845,6 @@ impl LogQueueCore {
             }
         });
     }
-}
-
-fn inherited_logs3_extra(
-    span_components: Option<&crate::span_components::SpanComponents>,
-    parent_info: Option<&ParentSpanInfo>,
-) -> HashMap<String, Value> {
-    let propagated_event = span_components
-        .and_then(|components| components.propagated_event.as_ref())
-        .or_else(|| match parent_info {
-            Some(ParentSpanInfo::FullSpan {
-                propagated_event: Some(propagated_event),
-                ..
-            }) => Some(propagated_event),
-            _ => None,
-        });
-
-    let mut extra = HashMap::new();
-    if let Some(Value::String(pagination_key)) =
-        propagated_event.and_then(|event| event.get(INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD))
-    {
-        extra.insert(
-            INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD.to_string(),
-            Value::String(pagination_key.clone()),
-        );
-    }
-    extra
 }
 
 /// Lock-free log queue with batching and HTTP dispatch.
@@ -1037,6 +1005,7 @@ mod tests {
                 tags: None,
                 context: None,
                 span_attributes: None,
+                extra: std::collections::HashMap::new(),
             },
             parent_info: Some(ParentSpanInfo::Experiment {
                 object_id: "exp-test".to_string(),
