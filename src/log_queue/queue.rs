@@ -1,6 +1,4 @@
-use anyhow::Context;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::batching::batch_and_serialize_rows;
@@ -9,8 +7,10 @@ use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry}
 use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use super::worker::LogCommand;
+use crate::api::registrations::ProjectRegisterRequest;
+use crate::api::ApiClient;
+use crate::api::LoginState;
 use crate::error::{BraintrustError, Result};
-use crate::logger::LoginState;
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender, TrySendError};
@@ -22,36 +22,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, OnceCell};
 use tokio::task::JoinHandle;
 use tracing::warn;
-use url::Url;
-
-/// Request body for project registration.
-#[derive(Serialize)]
-struct ProjectRegisterRequest<'a> {
-    project_name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_name: Option<&'a str>,
-}
-
-/// Response from project registration.
-#[derive(Deserialize)]
-struct ProjectRegisterResponse {
-    project: ProjectInfo,
-}
-
-/// Project info in registration response.
-#[derive(Deserialize)]
-struct ProjectInfo {
-    id: String,
-}
 
 /// A raw span payload queued for deferred preparation and flushing.
 ///
 /// Fields are private — construction and destructuring happen only within this
 /// module. `worker.rs` never touches the fields directly.
 struct SubmitCommand {
-    token: String,
     payload: SpanPayload,
     parent_info: Option<ParentSpanInfo>,
 }
@@ -81,8 +57,8 @@ pub(super) struct LogQueueCore {
     last_drop_log_time: AtomicU64,
     config: LogQueueConfig,
     login_state: LoginState,
-    client: reqwest::Client,
-    /// Cache of (org_id:project_name) → project_id to avoid redundant HTTP calls.
+    api: OnceCell<ApiClient>,
+    /// Cache of (session org_id:project_name) → project_id to avoid redundant HTTP calls.
     project_cache: TokioMutex<IndexMap<String, String>>,
     /// Handle to the currently in-progress flush task, if any.
     /// Using JoinHandle allows checking completion status and awaiting the result.
@@ -93,7 +69,7 @@ pub(super) struct LogQueueCore {
 }
 
 impl LogQueueCore {
-    fn new(config: LogQueueConfig, login_state: LoginState, client: reqwest::Client) -> Arc<Self> {
+    fn new(config: LogQueueConfig, login_state: LoginState) -> Arc<Self> {
         let (cmd_sender, cmd_receiver) = make_cmd_channel(&config);
         Arc::new(Self {
             channel: ArcSwap::from_pointee((cmd_sender, cmd_receiver)),
@@ -101,7 +77,7 @@ impl LogQueueCore {
             last_drop_log_time: AtomicU64::new(0),
             config,
             login_state,
-            client,
+            api: OnceCell::new(),
             project_cache: TokioMutex::new(IndexMap::new()),
             flush_handle: TokioMutex::new(None),
             version_info: OnceCell::new(),
@@ -157,10 +133,7 @@ impl LogQueueCore {
         };
 
         let core = self.clone();
-        let join_handle = runtime_handle.spawn(async move {
-            core.flush_internal().await;
-            Ok(())
-        });
+        let join_handle = runtime_handle.spawn(async move { core.flush_internal().await });
 
         *guard = Some(join_handle);
     }
@@ -213,18 +186,31 @@ impl LogQueueCore {
 
     /// Get the cached (max_request_size, can_use_overflow) from GET /version.
     /// Fetches lazily on first call and caches the result.
-    async fn get_version_info(
-        &self,
-        api_url: &Url,
-        token: &str,
-        org_name: Option<&str>,
-    ) -> (usize, bool) {
+    async fn get_version_info(&self) -> (usize, bool) {
         *self
             .version_info
             .get_or_init(|| async {
-                fetch_version_info(&self.client, api_url, token, org_name).await
+                match self.api().await {
+                    Ok(api) => fetch_version_info(&api).await,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to initialize API client for version fetch");
+                        (crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2, false)
+                    }
+                }
             })
             .await
+    }
+
+    async fn api(&self) -> std::result::Result<ApiClient, anyhow::Error> {
+        self.api
+            .get_or_try_init(|| async {
+                self.login_state
+                    .api_client()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to initialize API client: {e}"))
+            })
+            .await
+            .cloned()
     }
 
     /// Internal flush implementation: drain → prepare → chunk → merge → batch → send.
@@ -233,39 +219,21 @@ impl LogQueueCore {
     /// registration, row building) before batching. Rows are then processed in
     /// sequential chunks of `min(batch_max_items, flush_chunk_size)`.
     /// Within each chunk, batches are sent concurrently.
-    async fn flush_internal(self: &Arc<Self>) {
+    async fn flush_internal(self: &Arc<Self>) -> std::result::Result<(), anyhow::Error> {
+        let api = self.api().await?;
         let cmds = self.drain_all();
         if cmds.is_empty() {
-            return;
+            return Ok(());
         }
-
-        let (api_key, api_url_str) = match (self.login_state.api_key(), self.login_state.api_url())
-        {
-            (Some(key), Some(url)) => (key, url),
-            _ => {
-                warn!("Cannot flush logs: not logged in");
-                return;
-            }
-        };
-        let org_name = self.login_state.org_name();
-
-        let api_url = match Url::parse(&api_url_str) {
-            Ok(url) => url,
-            Err(e) => {
-                warn!(error = %e, "Invalid API URL from login state");
-                return;
-            }
-        };
 
         // Prepare rows from submit commands (project registration, destination resolution).
         let mut rows = Vec::with_capacity(cmds.len());
         for cmd in cmds {
             let SubmitCommand {
-                token,
                 payload,
                 parent_info,
             } = cmd;
-            match self.prepare_row(&token, payload, parent_info).await {
+            match self.prepare_row(payload, parent_info).await {
                 Ok(row) => rows.push(row),
                 Err(e) => {
                     warn!(error = %e, "failed to prepare span, dropping");
@@ -274,12 +242,10 @@ impl LogQueueCore {
         }
 
         if rows.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let (max_request_size, can_use_overflow) = self
-            .get_version_info(&api_url, &api_key, org_name.as_deref())
-            .await;
+        let (max_request_size, can_use_overflow) = self.get_version_info().await;
 
         // Effective batch byte limit: the smaller of the locally configured limit and half the
         // server-advertised max request size. This mirrors the TypeScript SDK which uses
@@ -329,10 +295,7 @@ impl LogQueueCore {
                 .into_iter()
                 .map(|batch| {
                     send_batch_with_retry(
-                        &self.client,
-                        &api_url,
-                        &api_key,
-                        org_name.as_deref(),
+                        &api,
                         batch,
                         &self.config,
                         max_request_size,
@@ -348,15 +311,16 @@ impl LogQueueCore {
                 }
             }
         }
+
+        Ok(())
     }
 
-    /// Prepare a `Logs3Row` from a submit command's token, payload, and parent info.
+    /// Prepare a `Logs3Row` from a submit command's payload and parent info.
     ///
     /// Resolves the destination (including calling the project registration API
     /// if needed) and builds the complete row for the flush pipeline.
     async fn prepare_row(
         &self,
-        token: &str,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> std::result::Result<Logs3Row, anyhow::Error> {
@@ -383,12 +347,7 @@ impl LogQueueCore {
 
         if let Some(span_components) = span_components {
             let destination = self
-                .destination_from_span_components(
-                    token,
-                    &org_id,
-                    org_name.as_deref(),
-                    &span_components,
-                )
+                .destination_from_span_components(&span_components)
                 .await?;
             let root_span_id = span_components
                 .root_span_id
@@ -424,10 +383,7 @@ impl LogQueueCore {
         }
 
         let project_id = if let Some(ref pn) = project_name {
-            Some(
-                self.ensure_project_id(token, &org_id, org_name.as_deref(), pn)
-                    .await?,
-            )
+            Some(self.ensure_project_id(pn).await?)
         } else {
             None
         };
@@ -451,9 +407,7 @@ impl LogQueueCore {
                 LogDestination::project_logs(object_id),
             ),
             Some(ParentSpanInfo::ProjectName { project_name }) => {
-                let proj_id = self
-                    .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name)
-                    .await?;
+                let proj_id = self.ensure_project_id(&project_name).await?;
                 (span_id.clone(), None, LogDestination::project_logs(proj_id))
             }
             Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
@@ -497,14 +451,7 @@ impl LogQueueCore {
                                     .get("project_name")
                                     .and_then(Value::as_str)
                                     .ok_or_else(|| anyhow::anyhow!("missing project_name"))?;
-                                let project_id = self
-                                    .ensure_project_id(
-                                        token,
-                                        &org_id,
-                                        org_name.as_deref(),
-                                        project_name,
-                                    )
-                                    .await?;
+                                let project_id = self.ensure_project_id(project_name).await?;
                                 LogDestination::project_logs(project_id)
                             }
                         }
@@ -549,9 +496,6 @@ impl LogQueueCore {
 
     async fn destination_from_span_components(
         &self,
-        token: &str,
-        org_id: &str,
-        org_name: Option<&str>,
         span_components: &crate::span_components::SpanComponents,
     ) -> std::result::Result<LogDestination, anyhow::Error> {
         if let Some(object_id) = span_components.object_id.as_ref() {
@@ -577,9 +521,7 @@ impl LogQueueCore {
                     .get("project_name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing project_name"))?;
-                let project_id = self
-                    .ensure_project_id(token, org_id, org_name, project_name)
-                    .await?;
+                let project_id = self.ensure_project_id(project_name).await?;
                 Ok(LogDestination::project_logs(project_id))
             }
             SpanObjectType::Experiment => anyhow::bail!("experiment span is missing object_id"),
@@ -592,15 +534,14 @@ impl LogQueueCore {
     /// Ensure a project ID is available for the given project name, registering
     /// it via the API if it is not yet cached.
     ///
-    /// Uses `login_state.app_url()` for the registration endpoint so the URL
-    /// doesn't need to be passed separately.
+    /// Uses the authenticated API client's session org context for registration.
     async fn ensure_project_id(
         &self,
-        token: &str,
-        org_id: &str,
-        org_name: Option<&str>,
         project_name: &str,
     ) -> std::result::Result<String, anyhow::Error> {
+        let api = self.api().await?;
+        let org_id = api.org_id()?;
+        let org_name = api.org_name();
         let cache_key = format!("{org_id}:{project_name}");
         {
             let cache = self.project_cache.lock().await;
@@ -609,45 +550,23 @@ impl LogQueueCore {
             }
         }
 
-        let app_url_str = self
-            .login_state
-            .app_url()
-            .ok_or_else(|| anyhow::anyhow!("cannot register project: not logged in"))?;
-        let app_url =
-            Url::parse(&app_url_str).map_err(|e| anyhow::anyhow!("invalid app URL: {e}"))?;
-        let url = app_url
-            .join("api/project/register")
-            .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
-
         let request = ProjectRegisterRequest {
-            project_name,
-            org_id: (!org_id.is_empty()).then_some(org_id),
+            project_name: project_name.to_string(),
+            org_id: (!org_id.is_empty()).then_some(org_id.clone()),
             org_name,
         };
 
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("register project failed: [{status}] {text}");
-        }
-
-        let register_response: ProjectRegisterResponse = response
-            .json()
+        let register_response = api
+            .registrations()
+            .register_project(request)
             .await
-            .context("failed to parse project registration response")?;
+            .map_err(|e| anyhow::anyhow!("register project failed: {e}"))?;
 
         {
             let mut cache = self.project_cache.lock().await;
-            cache.insert(cache_key, register_response.project.id.clone());
+            cache.insert(cache_key, register_response.project().id().to_string());
         }
-        Ok(register_response.project.id)
+        Ok(register_response.project().id().to_string())
     }
 
     /// Drain all commands from the queue with precise flush boundaries.
@@ -725,7 +644,6 @@ impl LogQueueCore {
         };
         handle.spawn(async move {
             let SubmitCommand {
-                token: _,
                 payload,
                 parent_info,
             } = cmd;
@@ -830,7 +748,7 @@ impl LogQueueCore {
 
             let payload_bytes = match serde_json::to_vec(&serde_json::json!({
                 "rows": [row],
-                "api_version": crate::types::LOGS_API_VERSION,
+                "api_version": crate::api::logs3::LOGS_API_VERSION,
             })) {
                 Ok(b) => b,
                 Err(e) => {
@@ -874,13 +792,8 @@ impl LogQueue {
     ///
     /// The worker handles flush coordination; row preparation (project registration,
     /// destination resolution) happens inside `flush_internal` at flush time.
-    pub fn new(
-        config: LogQueueConfig,
-        login_state: LoginState,
-        client: reqwest::Client,
-        worker_queue_size: usize,
-    ) -> Self {
-        let core = LogQueueCore::new(config, login_state.clone(), client.clone());
+    pub fn new(config: LogQueueConfig, login_state: LoginState, worker_queue_size: usize) -> Self {
+        let core = LogQueueCore::new(config, login_state);
 
         let (worker_sender, worker_receiver) = mpsc::channel(worker_queue_size.max(32));
 
@@ -903,14 +816,8 @@ impl LogQueue {
     /// handles drop counting, throttled warnings, and optional debug dumps
     /// uniformly. Row preparation (project registration, destination resolution)
     /// is deferred to flush time.
-    pub fn submit(
-        &self,
-        token: impl Into<String>,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) {
+    pub fn submit(&self, payload: SpanPayload, parent_info: Option<ParentSpanInfo>) {
         self.core.push(SubmitCommand {
-            token: token.into(),
             payload,
             parent_info,
         });
@@ -948,8 +855,7 @@ impl LogQueue {
 
 impl Drop for LogQueue {
     fn drop(&mut self) {
-        // Skip if not logged in (flush would return early anyway) or the lock-free
-        // queue is visibly empty.
+        // Skip if the lock-free queue is visibly empty.
         //
         // Note: `is_empty()` only inspects the lock-free row queue, not the worker's
         // mpsc channel. Items submitted but not yet processed by the worker would be
@@ -957,7 +863,7 @@ impl Drop for LogQueue {
         // Drop and the worker task), and when it does occur the worker's own "channel
         // closed" handler performs a final flush. Callers that need a hard guarantee
         // should call `flush_all()` before dropping.
-        if !self.core.login_state.is_logged_in() || self.core.is_empty() {
+        if self.core.is_empty() {
             return;
         }
 
@@ -965,11 +871,13 @@ impl Drop for LogQueue {
         // worker ensures any Submit commands ahead of this Drop in the mpsc queue are
         // processed before the flush begins.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    let _ = self.flush_all().await;
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let _ = self.flush_all().await;
+                    });
                 });
-            });
+            }
         } else {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
@@ -983,10 +891,12 @@ impl Drop for LogQueue {
 mod tests {
     use super::*;
     use crate::log_queue::config::LogQueueConfig;
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_test_cmd(id: &str) -> SubmitCommand {
         SubmitCommand {
-            token: "test-token".to_string(),
             payload: SpanPayload {
                 row_id: id.to_string(),
                 span_id: id.to_string(),
@@ -1013,16 +923,39 @@ mod tests {
         }
     }
 
+    fn test_login_state() -> LoginState {
+        test_login_state_with_urls(
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            "org-id",
+            "test-org",
+        )
+    }
+
+    fn test_login_state_with_urls(
+        api_url: impl Into<String>,
+        app_url: impl Into<String>,
+        org_id: impl Into<String>,
+        org_name: impl Into<String>,
+    ) -> LoginState {
+        let state = LoginState::new();
+        assert!(state.set(
+            "token".to_string(),
+            org_id.into(),
+            org_name.into(),
+            api_url.into(),
+            app_url.into(),
+        ));
+        state
+    }
+
     fn make_queue(max_size: usize) -> LogQueue {
-        // No login state set - prevents background flushes from making real HTTP calls
-        // which would hang tests waiting for connections to non-existent servers.
         let config = LogQueueConfig::builder()
             .queue_max_size(max_size)
             .enforce_queue_size_limit(true) // Enable bounding so drop tests work correctly
             .sync_flush(true) // Disable auto-flush to avoid background HTTP calls
             .build();
-        let login_state = LoginState::new();
-        LogQueue::new(config, login_state, reqwest::Client::new(), 256)
+        LogQueue::new(config, test_login_state(), 256)
     }
 
     #[tokio::test]
@@ -1057,8 +990,7 @@ mod tests {
             .enforce_queue_size_limit(true)
             .sync_flush(true)
             .build();
-        let login_state = LoginState::new();
-        let queue = LogQueue::new(config, login_state, reqwest::Client::new(), 256);
+        let queue = LogQueue::new(config, test_login_state(), 256);
 
         queue.core.push(make_test_cmd("1")); // fills queue
 
@@ -1079,8 +1011,7 @@ mod tests {
             .enforce_queue_size_limit(false)
             .sync_flush(true)
             .build();
-        let login_state = LoginState::new();
-        let queue = LogQueue::new(config, login_state, reqwest::Client::new(), 256);
+        let queue = LogQueue::new(config, test_login_state(), 256);
 
         // Push many more items than the default queue_max_size
         for i in 0..20_000 {
@@ -1126,5 +1057,77 @@ mod tests {
         // No flush should be in progress - in sync mode user calls flush() explicitly
         assert!(queue.core.flush_handle.try_lock().unwrap().is_none());
         assert_eq!(queue.core.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_registration_uses_api_client_org_context_and_row_keeps_payload_org() {
+        let api_server = MockServer::start().await;
+        let app_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/project/register"))
+            .and(header("authorization", "Bearer token"))
+            .and(header("x-bt-org-name", "Session Org"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "project": { "id": "project-id" }
+            })))
+            .mount(&app_server)
+            .await;
+
+        let queue = LogQueue::new(
+            LogQueueConfig::builder().sync_flush(true).build(),
+            test_login_state_with_urls(
+                api_server.uri(),
+                app_server.uri(),
+                "session-org-id",
+                "Session Org",
+            ),
+            256,
+        );
+
+        let mut payload = make_test_cmd("row-1").payload;
+        payload.project_name = Some("Project".to_string());
+        payload.org_id = "payload-org-id".to_string();
+        payload.org_name = Some("Payload Org".to_string());
+
+        let row = queue
+            .core
+            .prepare_row(payload, None)
+            .await
+            .expect("prepared row");
+
+        assert_eq!(row.org_id, "payload-org-id");
+        assert_eq!(row.org_name.as_deref(), Some("Payload Org"));
+        match row.destination {
+            LogDestination::ProjectLogs { project_id, .. } => assert_eq!(project_id, "project-id"),
+            other => panic!("expected project logs destination, got {other:?}"),
+        }
+
+        let mut second_payload = make_test_cmd("row-2").payload;
+        second_payload.project_name = Some("Project".to_string());
+        second_payload.org_id = "different-payload-org-id".to_string();
+        second_payload.org_name = Some("Different Payload Org".to_string());
+
+        let second_row = queue
+            .core
+            .prepare_row(second_payload, None)
+            .await
+            .expect("prepared second row");
+
+        match second_row.destination {
+            LogDestination::ProjectLogs { project_id, .. } => assert_eq!(project_id, "project-id"),
+            other => panic!("expected project logs destination, got {other:?}"),
+        }
+
+        let app_requests = app_server.received_requests().await.expect("app requests");
+        assert_eq!(app_requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(&app_requests[0].body).expect("register body");
+        assert_eq!(body["project_name"], "Project");
+        assert_eq!(body["org_id"], "session-org-id");
+        assert_eq!(body["org_name"], "Session Org");
+
+        let api_requests = api_server.received_requests().await.expect("api requests");
+        assert!(api_requests.is_empty());
     }
 }

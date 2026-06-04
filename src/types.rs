@@ -8,8 +8,6 @@ use std::fmt;
 
 use crate::span_components::SpanComponents;
 
-pub const LOGS_API_VERSION: u8 = 2;
-
 /// The type of span object, serialized as its integer representation for wire compatibility.
 #[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
 #[repr(u8)]
@@ -339,62 +337,6 @@ impl LogDestination {
         }
     }
 }
-
-/// Response from POST logs3/overflow — provides a signed URL to upload the payload.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Logs3OverflowUpload {
-    pub method: String,
-    pub signed_url: String,
-    pub headers: Option<HashMap<String, String>>,
-    pub fields: Option<HashMap<String, String>>,
-    pub key: String,
-}
-
-/// A single row's overflow metadata, sent when requesting the overflow upload URL.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Logs3OverflowInputRow {
-    /// Key identifying fields extracted from the row (experiment_id, dataset_id, etc.)
-    pub object_ids: serde_json::Map<String, Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_delete: Option<bool>,
-    pub input_row: Logs3OverflowInputRowMeta,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Logs3OverflowInputRowMeta {
-    pub byte_size: usize,
-}
-
-/// Reference sent to POST logs3 after a successful overflow upload.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Logs3OverflowRequest {
-    pub rows: Logs3OverflowReference,
-    pub api_version: u8,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Logs3OverflowReference {
-    #[serde(rename = "type")]
-    pub reference_type: &'static str,
-    pub key: String,
-}
-
-/// The object ID keys that identify a row's destination, used for overflow metadata.
-/// Matches the TypeScript SDK's OBJECT_ID_KEYS.
-///
-/// Note: `function_data` is included to match the TypeScript SDK's key set, but is not
-/// yet a field on `Logs3Row`. It will be populated once a `FunctionLogs` destination
-/// type is added in a future release.
-#[allow(dead_code)]
-pub(crate) const OBJECT_ID_KEYS: &[&str] = &[
-    "experiment_id",
-    "dataset_id",
-    "prompt_session_id",
-    "project_id",
-    "log_id",
-    "function_data",
-];
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Logs3Row {

@@ -4,8 +4,6 @@ use thiserror::Error;
 pub enum BraintrustError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
-    #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
     #[error("network error: {0}")]
     Network(String),
     #[error("API error ({status}): {message}")]

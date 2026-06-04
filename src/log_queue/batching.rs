@@ -1,5 +1,6 @@
 use super::config::LogQueueConfig;
-use crate::types::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, Logs3Row, LOGS_API_VERSION};
+use crate::api::logs3::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, LOGS_API_VERSION};
+use crate::types::Logs3Row;
 use tracing::warn;
 
 /// Generic batching function — matches TypeScript SDK's `batchItems()`.
@@ -77,10 +78,11 @@ pub(crate) fn batch_and_serialize_rows(
                 }
             };
             let overflow_row = Logs3OverflowInputRow {
+                object_ids: overflow_row.object_ids().clone(),
+                is_delete: overflow_row.is_delete(),
                 input_row: Logs3OverflowInputRowMeta {
                     byte_size: row_bytes.len(),
                 },
-                ..overflow_row
             };
             Some((row_bytes, overflow_row))
         })
@@ -176,7 +178,7 @@ fn build_overflow_row_from_logs3row(row: &Logs3Row) -> Logs3OverflowInputRow {
     Logs3OverflowInputRow {
         object_ids,
         is_delete: row.object_delete.filter(|&b| b),
-        input_row: Logs3OverflowInputRowMeta { byte_size: 0 }, // Will be updated after serialization
+        input_row: Logs3OverflowInputRowMeta { byte_size: 0 },
     }
 }
 
@@ -184,7 +186,7 @@ fn build_overflow_row_from_logs3row(row: &Logs3Row) -> Logs3OverflowInputRow {
 mod tests {
     use super::*;
     use crate::log_queue::config::LogQueueConfig;
-    use crate::types::LogDestination;
+    use crate::types::{LogDestination, Logs3Row};
     use chrono::Utc;
     use std::collections::HashMap;
 
@@ -266,8 +268,8 @@ mod tests {
 
         // Should have experiment_id in object_ids
         let overflow_row = &batches[0].overflow_rows[0];
-        assert!(overflow_row.object_ids.contains_key("experiment_id"));
-        assert!(!overflow_row.object_ids.contains_key("project_id"));
+        assert!(overflow_row.object_ids().contains_key("experiment_id"));
+        assert!(!overflow_row.object_ids().contains_key("project_id"));
     }
 
     #[test]
@@ -277,7 +279,7 @@ mod tests {
         let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes());
 
         let overflow_row = &batches[0].overflow_rows[0];
-        assert!(overflow_row.input_row.byte_size > 0);
+        assert!(overflow_row.input_row().byte_size() > 0);
     }
 
     #[test]
@@ -305,7 +307,7 @@ mod tests {
         assert_eq!(batches.len(), 1);
         let overflow_row = &batches[0].overflow_rows[0];
         assert_eq!(
-            overflow_row.is_delete,
+            overflow_row.is_delete(),
             Some(true),
             "is_delete should be true when _object_delete=true"
         );
@@ -319,7 +321,7 @@ mod tests {
 
         let overflow_row = &batches[0].overflow_rows[0];
         assert!(
-            overflow_row.is_delete.is_none(),
+            overflow_row.is_delete().is_none(),
             "is_delete should be None when _object_delete is not set"
         );
     }

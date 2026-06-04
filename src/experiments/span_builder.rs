@@ -48,7 +48,6 @@ impl<'a, S: SpanSubmitter + 'static> ExperimentSpanBuilder<'a, S> {
         // because the destination is determined by the experiment_id.
         let mut builder = SpanBuilder::new(
             Arc::clone(&self.experiment.submitter),
-            self.experiment.token.clone(),
             self.experiment.org_id.clone(),
         )
         .parent_info(parent_info)

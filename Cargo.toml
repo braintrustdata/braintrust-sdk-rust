@@ -10,6 +10,9 @@ license = "Apache-2.0"
 keywords = ["braintrust", "logging", "tracing", "observability"]
 categories = ["api-bindings", "asynchronous", "development-tools"]
 
+[features]
+internal-api = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
@@ -24,6 +27,7 @@ crossbeam = "0.8"
 indexmap = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
+serde_html_form = "0.2"
 serde_json = "1"
 serde_repr = "0.1"
 thiserror = "1"
