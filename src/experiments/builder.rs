@@ -7,8 +7,8 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use tokio::sync::{Mutex, OnceCell};
 
+use crate::api::registrations::RepoInfo;
 use crate::experiments::experiment::Experiment;
-use crate::experiments::metadata::RepoInfo;
 use crate::span::SpanSubmitter;
 
 /// Error type for ExperimentBuilder validation.

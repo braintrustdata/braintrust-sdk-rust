@@ -9,16 +9,12 @@ use serde_json::{Map, Value};
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
-use crate::error::Result;
-use crate::experiments::api::{
-    BaseExperimentFetcher, ExperimentComparisonFetcher, ExperimentRegisterRequest,
-    ExperimentRegistrar,
-};
+use crate::api::comparisons::{BaseExperimentFetcher, ExperimentComparisonFetcher};
+use crate::api::registrations::{ExperimentRegisterRequest, ExperimentRegistrar, RepoInfo};
+use crate::error::{BraintrustError, Result};
 use crate::experiments::event_log::ExperimentLog;
 use crate::experiments::feedback::Feedback;
-use crate::experiments::metadata::{
-    BaseExperimentInfo, ExportedExperiment, ProjectMetadata, RepoInfo,
-};
+use crate::experiments::metadata::{BaseExperimentInfo, ExportedExperiment, ProjectMetadata};
 use crate::experiments::span_builder::ExperimentSpanBuilder;
 use crate::experiments::summary::{ExperimentSummary, MetricSummary, ScoreSummary};
 use crate::span::{SpanBuilder, SpanHandle, SpanLog, SpanSubmitter};
@@ -205,8 +201,7 @@ impl<
             object_id: metadata.experiment_id.clone(),
         };
 
-        self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info));
+        self.submitter.submit(payload, Some(parent_info));
     }
 
     /// Get a summary of the experiment's performance.
@@ -230,11 +225,7 @@ impl<
         // Fetch comparison data from API
         let comparison = self
             .submitter
-            .fetch_experiment_comparison(
-                &self.token,
-                &metadata.experiment_id,
-                base_exp_id.as_deref(),
-            )
+            .fetch_experiment_comparison(&metadata.experiment_id, base_exp_id.as_deref())
             .await?;
 
         // Build summary from comparison response
@@ -246,47 +237,47 @@ impl<
         );
 
         // Set comparison experiment name if present
-        if let Some(base_name) = comparison.base_experiment_name {
-            summary.set_comparison_experiment_name(base_name);
+        if let Some(base_name) = comparison.base_experiment_name() {
+            summary.set_comparison_experiment_name(base_name.to_string());
         }
 
         // Convert scores from comparison response
         let scores: HashMap<String, ScoreSummary> = comparison
-            .scores
-            .into_iter()
+            .scores()
+            .iter()
             .map(|(name, data)| {
-                let mut score_summary = ScoreSummary::new(name.clone(), data.score);
-                if let Some(diff) = data.diff {
+                let mut score_summary = ScoreSummary::new(name.clone(), data.score());
+                if let Some(diff) = data.diff() {
                     score_summary.set_diff(diff);
                 }
-                if let Some(improvements) = data.improvements {
+                if let Some(improvements) = data.improvements() {
                     score_summary.set_improvements(improvements);
                 }
-                if let Some(regressions) = data.regressions {
+                if let Some(regressions) = data.regressions() {
                     score_summary.set_regressions(regressions);
                 }
-                (name, score_summary)
+                (name.to_string(), score_summary)
             })
             .collect();
         summary.set_scores(scores);
 
         // Convert metrics from comparison response
-        if !comparison.metrics.is_empty() {
+        if !comparison.metrics().is_empty() {
             let metrics: HashMap<String, MetricSummary> = comparison
-                .metrics
-                .into_iter()
+                .metrics()
+                .iter()
                 .map(|(name, data)| {
-                    let mut metric_summary = MetricSummary::new(name.clone(), data.metric);
-                    if let Some(diff) = data.diff {
+                    let mut metric_summary = MetricSummary::new(name.clone(), data.metric());
+                    if let Some(diff) = data.diff() {
                         metric_summary.set_diff(diff);
                     }
-                    if let Some(improvements) = data.improvements {
+                    if let Some(improvements) = data.improvements() {
                         metric_summary.set_improvements(improvements);
                     }
-                    if let Some(regressions) = data.regressions {
+                    if let Some(regressions) = data.regressions() {
                         metric_summary.set_regressions(regressions);
                     }
-                    (name, metric_summary)
+                    (name.to_string(), metric_summary)
                 })
                 .collect();
             summary.set_metrics(metrics);
@@ -392,8 +383,7 @@ impl<
             object_id: metadata.experiment_id.clone(),
         };
 
-        self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info));
+        self.submitter.submit(payload, Some(parent_info));
     }
 
     /// Fetch the base experiment used for comparison.
@@ -401,9 +391,23 @@ impl<
     /// Returns `None` if no base experiment has been configured or detected.
     pub async fn fetch_base_experiment(&self) -> Result<Option<BaseExperimentInfo>> {
         let metadata = self.ensure_registered().await;
-        self.submitter
-            .fetch_base_experiment(&self.token, &metadata.experiment_id)
+        let response = match self
+            .submitter
+            .fetch_base_experiment(&metadata.experiment_id)
             .await
+        {
+            Ok(response) => response,
+            Err(BraintrustError::Api { status: 400, .. }) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        match (response.base_exp_id(), response.base_exp_name()) {
+            (Some(id), Some(name)) => Ok(Some(BaseExperimentInfo {
+                id: id.to_string(),
+                name: name.to_string(),
+            })),
+            _ => Ok(None),
+        }
     }
 
     /// Export experiment context for distributed tracing.
@@ -440,9 +444,9 @@ impl<
                     .await
                 {
                     Ok(response) => ExperimentMetadata {
-                        project_id: response.project.id,
-                        experiment_id: response.experiment.id,
-                        experiment_name: response.experiment.name,
+                        project_id: response.project().id().to_string(),
+                        experiment_id: response.experiment().id().to_string(),
+                        experiment_name: response.experiment().name().to_string(),
                     },
                     Err(e) => {
                         // Log error but return placeholder to avoid blocking
@@ -474,14 +478,10 @@ impl<
 
         // Note: When using ParentSpanInfo::Experiment, we don't need project_name
         // because the destination is determined by the experiment_id.
-        let mut builder = SpanBuilder::new(
-            Arc::clone(&self.submitter),
-            self.token.clone(),
-            self.org_id.clone(),
-        )
-        .parent_info(parent_info)
-        .span_type(SpanType::Eval)
-        .start_time(start_time);
+        let mut builder = SpanBuilder::new(Arc::clone(&self.submitter), self.org_id.clone())
+            .parent_info(parent_info)
+            .span_type(SpanType::Eval)
+            .start_time(start_time);
 
         if let Some(org_name) = &self.org_name {
             builder = builder.org_name(org_name.clone());

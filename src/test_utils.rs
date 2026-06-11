@@ -35,8 +35,6 @@ impl TestSpanCollector {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CapturedSpan {
-    #[allow(dead_code)]
-    pub token: String,
     pub payload: SpanPayload,
     pub parent: Option<ParentSpanInfo>,
 }
@@ -58,9 +56,8 @@ impl MockBraintrustClient {
 
 #[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
-    fn submit(&self, token: String, payload: SpanPayload, parent_info: Option<ParentSpanInfo>) {
+    fn submit(&self, payload: SpanPayload, parent_info: Option<ParentSpanInfo>) {
         self.collector.push(CapturedSpan {
-            token,
             payload,
             parent: parent_info,
         });
@@ -78,7 +75,7 @@ impl SpanSubmitter for MockBraintrustClient {
 
 pub(crate) fn mock_span_builder() -> (SpanBuilder<MockBraintrustClient>, TestSpanCollector) {
     let (submitter, collector) = MockBraintrustClient::new();
-    let builder = SpanBuilder::new(submitter, "test-token", "org-id");
+    let builder = SpanBuilder::new(submitter, "org-id");
     (builder, collector)
 }
 
