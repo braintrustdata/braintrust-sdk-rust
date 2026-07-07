@@ -47,10 +47,10 @@ pub enum ProjectLogsIdentifier {
     ProjectName(String),
 }
 
+/// Internal structure for deserializing project logs metadata from
+/// `compute_object_metadata_args`.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ProjectLogsMetadataArgs {
-    /// Project logs metadata used to reconstruct an identifier when
-    /// `compute_object_metadata_args` is present without a direct `object_id`.
     project_id: Option<String>,
     project_name: Option<String>,
 }
@@ -551,6 +551,21 @@ impl SpanComponents {
 /// Resolution prefers a non-empty `object_id`. If that is absent, it falls back
 /// to `project_id` in `compute_object_metadata_args`, then to `project_name`.
 /// Returns `None` when none of those values are present and non-empty.
+///
+/// # Examples
+///
+/// ```
+/// use braintrust_sdk_rust::{project_logs_identifier, ProjectLogsIdentifier};
+/// use serde_json::{Map, Value};
+///
+/// let mut args = Map::new();
+/// args.insert("project_name".to_string(), Value::String("demo".to_string()));
+///
+/// assert_eq!(
+///     project_logs_identifier(None, Some(&args)),
+///     Some(ProjectLogsIdentifier::ProjectName("demo".to_string()))
+/// );
+/// ```
 pub fn project_logs_identifier(
     object_id: Option<&str>,
     compute_object_metadata_args: Option<&Map<String, Value>>,
