@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::span_components::SpanComponents;
+use crate::span_components::{ProjectLogsIdentifier, SpanComponents};
 use crate::types::{
     ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
 };
@@ -917,12 +917,11 @@ mod tests {
 
         assert_eq!(exported.object_type, SpanObjectType::ProjectLogs);
         assert!(exported.object_id.is_none());
-        let args = exported
-            .compute_object_metadata_args
-            .expect("compute args should be exported");
         assert_eq!(
-            args.get("project_name").and_then(|value| value.as_str()),
-            Some("demo-project")
+            exported.project_logs_identifier(),
+            Some(ProjectLogsIdentifier::ProjectName(
+                "demo-project".to_string()
+            ))
         );
     }
 }
