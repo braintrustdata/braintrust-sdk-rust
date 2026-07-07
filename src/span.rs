@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::span_components::{SpanComponents};
+use crate::span_components::SpanComponents;
 use crate::types::{
     ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
 };
@@ -646,6 +646,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{build_test_span, mock_span_builder};
     use crate::types::{usage_metrics_to_map, UsageMetrics};
+    use crate::ProjectLogsIdentifier;
     use serde_json::json;
 
     #[tokio::test]
