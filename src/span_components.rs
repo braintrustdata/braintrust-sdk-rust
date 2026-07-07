@@ -49,6 +49,8 @@ pub enum ProjectLogsIdentifier {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ProjectLogsMetadataArgs {
+    /// Project logs metadata used to reconstruct an identifier when
+    /// `compute_object_metadata_args` is present without a direct `object_id`.
     project_id: Option<String>,
     project_name: Option<String>,
 }
@@ -413,6 +415,12 @@ impl SpanComponents {
         })
     }
 
+    /// Returns the project logs identifier represented by these components.
+    ///
+    /// This returns `Some` when the components identify a project logs parent by
+    /// direct `object_id`, by `project_id` in `compute_object_metadata_args`, or
+    /// by `project_name` in `compute_object_metadata_args`, in that order. It
+    /// returns `None` when no identifier can be resolved.
     pub fn project_logs_identifier(&self) -> Option<ProjectLogsIdentifier> {
         project_logs_identifier(
             self.object_id.as_deref(),
@@ -420,6 +428,12 @@ impl SpanComponents {
         )
     }
 
+    /// Converts these components into [`ParentSpanInfo`], resolving project logs
+    /// metadata into an object ID when possible.
+    ///
+    /// Unlike [`SpanComponents::to_parent_span_info`], this helper first checks
+    /// `compute_object_metadata_args` for a project logs identifier and promotes a
+    /// resolved project ID into `object_id` before building the parent info.
     pub fn to_parent_span_info_resolving_metadata(&self) -> Result<ParentSpanInfo> {
         let mut components = self.clone();
         if matches!(components.object_type, SpanObjectType::ProjectLogs)
@@ -532,6 +546,11 @@ impl SpanComponents {
     }
 }
 
+/// Resolves the project logs identifier from explicit object metadata.
+///
+/// Resolution prefers a non-empty `object_id`. If that is absent, it falls back
+/// to `project_id` in `compute_object_metadata_args`, then to `project_name`.
+/// Returns `None` when none of those values are present and non-empty.
 pub fn project_logs_identifier(
     object_id: Option<&str>,
     compute_object_metadata_args: Option<&Map<String, Value>>,
