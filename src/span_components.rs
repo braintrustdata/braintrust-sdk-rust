@@ -41,18 +41,6 @@ impl FieldId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProjectLogsIdentifier {
-    ObjectId(String),
-    ProjectName(String),
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ProjectLogsMetadataArgs {
-    project_id: Option<String>,
-    project_name: Option<String>,
-}
-
 /// SpanComponents represents the serialized form of parent span information
 /// that can be passed in HTTP headers or exported/imported between SDKs.
 ///
@@ -413,61 +401,6 @@ impl SpanComponents {
         })
     }
 
-    pub fn project_logs_identifier(&self) -> Option<ProjectLogsIdentifier> {
-        project_logs_identifier(
-            self.object_id.as_deref(),
-            self.compute_object_metadata_args.as_ref(),
-        )
-    }
-
-    pub fn to_parent_span_info_resolving_metadata(&self) -> Result<ParentSpanInfo> {
-        let mut components = self.clone();
-        if matches!(components.object_type, SpanObjectType::ProjectLogs)
-            && components.object_id.is_none()
-        {
-            if let Some(ProjectLogsIdentifier::ObjectId(object_id)) =
-                components.project_logs_identifier()
-            {
-                components.object_id = Some(object_id);
-            }
-        }
-
-        if components.span_id.is_some() || components.root_span_id.is_some() {
-            return components.to_parent_span_info();
-        }
-
-        match components.object_type {
-            SpanObjectType::Experiment => components
-                .object_id
-                .map(|object_id| ParentSpanInfo::Experiment { object_id })
-                .ok_or_else(|| {
-                    BraintrustError::InvalidConfig(
-                        "object_id required for experiment parent".to_string(),
-                    )
-                }),
-            SpanObjectType::ProjectLogs => match components.project_logs_identifier() {
-                Some(ProjectLogsIdentifier::ObjectId(object_id)) => {
-                    Ok(ParentSpanInfo::ProjectLogs { object_id })
-                }
-                Some(ProjectLogsIdentifier::ProjectName(project_name)) => {
-                    Ok(ParentSpanInfo::ProjectName { project_name })
-                }
-                None => Err(BraintrustError::InvalidConfig(
-                    "project-log parent requires object_id, project_id, or project_name"
-                        .to_string(),
-                )),
-            },
-            SpanObjectType::PlaygroundLogs => components
-                .object_id
-                .map(|object_id| ParentSpanInfo::PlaygroundLogs { object_id })
-                .ok_or_else(|| {
-                    BraintrustError::InvalidConfig(
-                        "object_id required for playground parent".to_string(),
-                    )
-                }),
-        }
-    }
-
     /// Convert SpanComponents to ParentSpanInfo for creating child spans
     pub fn to_parent_span_info(&self) -> Result<ParentSpanInfo> {
         let span_id = self.span_id.clone().ok_or_else(|| {
@@ -479,9 +412,9 @@ impl SpanComponents {
 
         match self.object_type {
             SpanObjectType::ProjectLogs => {
-                if self.project_logs_identifier().is_none() {
+                if self.object_id.is_none() && self.compute_object_metadata_args.is_none() {
                     return Err(BraintrustError::InvalidConfig(
-                        "project-log parent span requires object_id, project_id, or project_name"
+                        "project-log parent span requires object_id or compute_object_metadata_args"
                             .to_string(),
                     ));
                 }
@@ -530,30 +463,6 @@ impl SpanComponents {
             _ => None,
         }
     }
-}
-
-pub fn project_logs_identifier(
-    object_id: Option<&str>,
-    compute_object_metadata_args: Option<&Map<String, Value>>,
-) -> Option<ProjectLogsIdentifier> {
-    if let Some(object_id) = object_id.filter(|object_id| !object_id.is_empty()) {
-        return Some(ProjectLogsIdentifier::ObjectId(object_id.to_string()));
-    }
-
-    let args = compute_object_metadata_args?;
-    let metadata: ProjectLogsMetadataArgs =
-        serde_json::from_value(Value::Object(args.clone())).ok()?;
-
-    metadata
-        .project_id
-        .filter(|project_id| !project_id.is_empty())
-        .map(ProjectLogsIdentifier::ObjectId)
-        .or_else(|| {
-            metadata
-                .project_name
-                .filter(|project_name| !project_name.is_empty())
-                .map(ProjectLogsIdentifier::ProjectName)
-        })
 }
 
 impl fmt::Display for SpanComponents {
@@ -646,10 +555,6 @@ fn format_uuid(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn project_metadata(key: &str, value: &str) -> Map<String, Value> {
-        Map::from_iter([(key.to_string(), Value::String(value.to_string()))])
-    }
 
     #[test]
     fn test_span_components_roundtrip() {
@@ -748,87 +653,6 @@ mod tests {
                 );
             }
             _ => panic!("Expected FullSpan variant"),
-        }
-    }
-
-    #[test]
-    fn test_project_logs_identifier_prefers_object_id() {
-        let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
-        components.object_id = Some("project-object".to_string());
-        components.compute_object_metadata_args =
-            Some(project_metadata("project_name", "project-name"));
-
-        assert_eq!(
-            components.project_logs_identifier(),
-            Some(ProjectLogsIdentifier::ObjectId(
-                "project-object".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn test_project_logs_parent_info_from_project_id_metadata() {
-        let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
-        components.compute_object_metadata_args =
-            Some(project_metadata("project_id", "project-id"));
-
-        match components.to_parent_span_info_resolving_metadata().unwrap() {
-            ParentSpanInfo::ProjectLogs { object_id } => assert_eq!(object_id, "project-id"),
-            _ => panic!("Expected ProjectLogs parent"),
-        }
-    }
-
-    #[test]
-    fn test_project_logs_parent_info_from_project_name_metadata() {
-        let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
-        components.compute_object_metadata_args =
-            Some(project_metadata("project_name", "project-name"));
-
-        match components.to_parent_span_info_resolving_metadata().unwrap() {
-            ParentSpanInfo::ProjectName { project_name } => {
-                assert_eq!(project_name, "project-name")
-            }
-            _ => panic!("Expected ProjectName parent"),
-        }
-    }
-
-    #[test]
-    fn test_full_project_logs_parent_info_fills_project_id_metadata() {
-        let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
-        components.compute_object_metadata_args =
-            Some(project_metadata("project_id", "project-id"));
-        components.span_id = Some("span-456".to_string());
-        components.root_span_id = Some("root-789".to_string());
-
-        match components.to_parent_span_info_resolving_metadata().unwrap() {
-            ParentSpanInfo::FullSpan { object_id, .. } => {
-                assert_eq!(object_id, Some("project-id".to_string()));
-            }
-            _ => panic!("Expected FullSpan parent"),
-        }
-    }
-
-    #[test]
-    fn test_full_project_logs_parent_info_preserves_project_name_metadata() {
-        let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
-        components.compute_object_metadata_args =
-            Some(project_metadata("project_name", "project-name"));
-        components.span_id = Some("span-456".to_string());
-        components.root_span_id = Some("root-789".to_string());
-
-        match components.to_parent_span_info_resolving_metadata().unwrap() {
-            ParentSpanInfo::FullSpan {
-                object_id,
-                compute_object_metadata_args,
-                ..
-            } => {
-                assert_eq!(object_id, None);
-                assert_eq!(
-                    compute_object_metadata_args,
-                    Some(project_metadata("project_name", "project-name"))
-                );
-            }
-            _ => panic!("Expected FullSpan parent"),
         }
     }
 

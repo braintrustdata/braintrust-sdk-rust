@@ -1,6 +1,7 @@
 use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::batching::batch_and_serialize_rows;
 use super::config::LogQueueConfig;
@@ -10,7 +11,6 @@ use super::row_key::RowKey;
 use super::worker::LogCommand;
 use crate::error::{BraintrustError, Result};
 use crate::logger::LoginState;
-use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender, TrySendError};
@@ -481,28 +481,31 @@ impl LogQueueCore {
                         })?)
                     }
                     SpanObjectType::ProjectLogs => {
-                        match project_logs_identifier(
-                            object_id.as_deref(),
-                            compute_object_metadata_args.as_ref(),
-                        ) {
-                            Some(ProjectLogsIdentifier::ObjectId(object_id)) => {
-                                LogDestination::project_logs(object_id)
-                            }
-                            Some(ProjectLogsIdentifier::ProjectName(project_name)) => {
+                        if let Some(object_id) = object_id {
+                            LogDestination::project_logs(object_id)
+                        } else {
+                            let args = compute_object_metadata_args.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "project-log parent span is missing compute_object_metadata_args"
+                                )
+                            })?;
+                            if let Some(project_id) = args.get("project_id").and_then(Value::as_str)
+                            {
+                                LogDestination::project_logs(project_id.to_string())
+                            } else {
+                                let project_name = args
+                                    .get("project_name")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| anyhow::anyhow!("missing project_name"))?;
                                 let project_id = self
                                     .ensure_project_id(
                                         token,
                                         &org_id,
                                         org_name.as_deref(),
-                                        &project_name,
+                                        project_name,
                                     )
                                     .await?;
                                 LogDestination::project_logs(project_id)
-                            }
-                            None => {
-                                anyhow::bail!(
-                                    "project-log parent span is missing object_id, project_id, or project_name"
-                                )
                             }
                         }
                     }
@@ -551,31 +554,38 @@ impl LogQueueCore {
         org_name: Option<&str>,
         span_components: &crate::span_components::SpanComponents,
     ) -> std::result::Result<LogDestination, anyhow::Error> {
+        if let Some(object_id) = span_components.object_id.as_ref() {
+            return Ok(match span_components.object_type {
+                SpanObjectType::Experiment => LogDestination::experiment(object_id.clone()),
+                SpanObjectType::ProjectLogs => LogDestination::project_logs(object_id.clone()),
+                SpanObjectType::PlaygroundLogs => {
+                    LogDestination::playground_logs(object_id.clone())
+                }
+            });
+        }
+
         match span_components.object_type {
-            SpanObjectType::Experiment => span_components
-                .object_id
-                .as_ref()
-                .map(|object_id| LogDestination::experiment(object_id.clone()))
-                .ok_or_else(|| anyhow::anyhow!("experiment span is missing object_id")),
-            SpanObjectType::ProjectLogs => match span_components.project_logs_identifier() {
-                Some(ProjectLogsIdentifier::ObjectId(object_id)) => {
-                    Ok(LogDestination::project_logs(object_id))
+            SpanObjectType::ProjectLogs => {
+                let args = span_components
+                    .compute_object_metadata_args
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing compute_object_metadata_args"))?;
+                if let Some(project_id) = args.get("project_id").and_then(Value::as_str) {
+                    return Ok(LogDestination::project_logs(project_id.to_string()));
                 }
-                Some(ProjectLogsIdentifier::ProjectName(project_name)) => {
-                    let project_id = self
-                        .ensure_project_id(token, org_id, org_name, &project_name)
-                        .await?;
-                    Ok(LogDestination::project_logs(project_id))
-                }
-                None => anyhow::bail!(
-                    "project-log span is missing object_id, project_id, or project_name"
-                ),
-            },
-            SpanObjectType::PlaygroundLogs => span_components
-                .object_id
-                .as_ref()
-                .map(|object_id| LogDestination::playground_logs(object_id.clone()))
-                .ok_or_else(|| anyhow::anyhow!("playground span is missing object_id")),
+                let project_name = args
+                    .get("project_name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing project_name"))?;
+                let project_id = self
+                    .ensure_project_id(token, org_id, org_name, project_name)
+                    .await?;
+                Ok(LogDestination::project_logs(project_id))
+            }
+            SpanObjectType::Experiment => anyhow::bail!("experiment span is missing object_id"),
+            SpanObjectType::PlaygroundLogs => {
+                anyhow::bail!("playground span is missing object_id")
+            }
         }
     }
 
@@ -737,14 +747,15 @@ impl LogQueueCore {
                     (SpanObjectType::PlaygroundLogs, Some(object_id)) => {
                         LogDestination::playground_logs(object_id.clone())
                     }
-                    (SpanObjectType::ProjectLogs, None) => {
-                        match span_components.project_logs_identifier() {
-                            Some(ProjectLogsIdentifier::ObjectId(project_id)) => {
-                                LogDestination::project_logs(project_id)
-                            }
-                            _ => return,
-                        }
-                    }
+                    (SpanObjectType::ProjectLogs, None) => match span_components
+                        .compute_object_metadata_args
+                        .as_ref()
+                        .and_then(|args| args.get("project_id"))
+                        .and_then(Value::as_str)
+                    {
+                        Some(project_id) => LogDestination::project_logs(project_id.to_string()),
+                        None => return,
+                    },
                     (SpanObjectType::Experiment, None) => return,
                     (SpanObjectType::PlaygroundLogs, None) => return,
                 },

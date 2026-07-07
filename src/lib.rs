@@ -34,7 +34,7 @@ pub use logger::{
 };
 pub use logs3::{Logs3BatchUploader, Logs3UploadResult};
 pub use span::{SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanLogBuilderError};
-pub use span_components::{project_logs_identifier, ProjectLogsIdentifier, SpanComponents};
+pub use span_components::SpanComponents;
 pub use stream::{
     wrap_stream_with_span, BraintrustStream, ChatMessage, ChatMessageBuilder,
     ChatMessageBuilderError, FinalizedStream, FinalizedStreamBuilder, FinalizedStreamBuilderError,
