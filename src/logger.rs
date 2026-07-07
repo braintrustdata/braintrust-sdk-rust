@@ -604,15 +604,7 @@ impl BraintrustClient {
         if components.object_id.is_none() {
             match components.object_type {
                 SpanObjectType::ProjectLogs => {
-                    let args = components.compute_object_metadata_args.as_ref().ok_or_else(|| {
-                        BraintrustError::InvalidConfig(
-                            "Exported project-log span must include object_id or compute_object_metadata_args".into(),
-                        )
-                    })?;
-                    let has_project_id = args.get("project_id").and_then(Value::as_str).is_some();
-                    let has_project_name =
-                        args.get("project_name").and_then(Value::as_str).is_some();
-                    if !has_project_id && !has_project_name {
+                    if components.project_logs_identifier().is_none() {
                         return Err(BraintrustError::InvalidConfig(
                             "project-log compute_object_metadata_args must include project_id or project_name".into(),
                         ));

@@ -646,6 +646,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{build_test_span, mock_span_builder};
     use crate::types::{usage_metrics_to_map, UsageMetrics};
+    use crate::ProjectLogsIdentifier;
     use serde_json::json;
 
     #[tokio::test]
@@ -917,12 +918,11 @@ mod tests {
 
         assert_eq!(exported.object_type, SpanObjectType::ProjectLogs);
         assert!(exported.object_id.is_none());
-        let args = exported
-            .compute_object_metadata_args
-            .expect("compute args should be exported");
         assert_eq!(
-            args.get("project_name").and_then(|value| value.as_str()),
-            Some("demo-project")
+            exported.project_logs_identifier(),
+            Some(ProjectLogsIdentifier::ProjectName(
+                "demo-project".to_string()
+            ))
         );
     }
 }
