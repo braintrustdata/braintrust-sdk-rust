@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::span_components::{ProjectLogsIdentifier, SpanComponents};
+use crate::span_components::{SpanComponents};
 use crate::types::{
     ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
 };
