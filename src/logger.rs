@@ -21,7 +21,7 @@ use crate::experiments::api::{
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
 use crate::http::build_http_client;
 use crate::log_queue::{LogQueue, LogQueueConfig};
-use crate::span::SpanSubmitter;
+use crate::span::{merge_span_origin_context, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
 
@@ -200,6 +200,7 @@ pub struct BraintrustClientBuilder {
     batch_max_bytes: Option<usize>,
     /// Maximum queue capacity (None = unlimited).
     queue_max_size: Option<usize>,
+    environment: Option<SpanOriginEnvironment>,
 }
 
 impl BraintrustClientBuilder {
@@ -225,6 +226,7 @@ impl BraintrustClientBuilder {
             batch_max_items: None,
             batch_max_bytes: None,
             queue_max_size: None,
+            environment: None,
         }
     }
 
@@ -311,6 +313,16 @@ impl BraintrustClientBuilder {
         self
     }
 
+    /// Set span-origin environment provenance for spans created by this client.
+    pub fn environment(
+        mut self,
+        environment_type: impl Into<String>,
+        name: Option<impl Into<String>>,
+    ) -> Self {
+        self.environment = Some(SpanOriginEnvironment::new(environment_type, name));
+        self
+    }
+
     /// Build the client, performing login.
     ///
     /// If `blocking_login` is true, waits for login to complete.
@@ -354,6 +366,7 @@ impl BraintrustClientBuilder {
                 http_client,
                 default_project: self.default_project,
                 login_skipped: self.skip_login,
+                environment: self.environment,
             }),
         };
 
@@ -399,6 +412,7 @@ struct ClientInner {
     http_client: reqwest::Client,
     default_project: Option<String>,
     login_skipped: bool,
+    environment: Option<SpanOriginEnvironment>,
 }
 
 impl std::fmt::Debug for ClientInner {
@@ -487,6 +501,12 @@ impl BraintrustClient {
             .org_id()
             .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
         let mut builder = crate::span::SpanBuilder::new(Arc::new(self.clone()), &api_key, &org_id);
+        if let Some(environment) = &self.inner.environment {
+            builder = builder.environment(
+                environment.environment_type.clone(),
+                environment.name.clone(),
+            );
+        }
         if let Some(ref project) = self.inner.default_project {
             builder = builder.project_name(project);
         }
@@ -532,7 +552,14 @@ impl BraintrustClient {
         );
 
         let submitter = Arc::new(self.clone());
-        crate::span::SpanBuilder::new(submitter, token, org_id)
+        let mut builder = crate::span::SpanBuilder::new(submitter, token, org_id);
+        if let Some(environment) = &self.inner.environment {
+            builder = builder.environment(
+                environment.environment_type.clone(),
+                environment.name.clone(),
+            );
+        }
+        builder
     }
 
     /// Update an existing span using the output of `SpanHandle::export()`.
@@ -633,7 +660,7 @@ impl BraintrustClient {
             metadata: event.metadata,
             metrics: event.metrics,
             tags: event.tags,
-            context: event.context,
+            context: merge_span_origin_context(event.context, self.inner.environment.clone()),
             span_attributes: event.name.map(|name| SpanAttributes {
                 name: Some(name),
                 span_type: None,
