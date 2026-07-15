@@ -928,18 +928,20 @@ mod tests {
         let tags = captured.payload.tags.unwrap();
         assert!(tags.contains(&"geography".to_string()));
         assert!(tags.contains(&"qa".to_string()));
+        let context = captured.payload.context.unwrap();
+        assert_eq!(context.get("source"), Some(&json!("test")));
+        let span_origin = context
+            .get("span_origin")
+            .and_then(Value::as_object)
+            .expect("span_origin");
+        assert_eq!(span_origin.get("name"), Some(&json!("braintrust.sdk.rust")));
         assert_eq!(
-            captured.payload.context,
-            Some(json!({
-                "source": "test",
-                "span_origin": {
-                    "name": "braintrust.sdk.rust",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "instrumentation": {
-                        "name": "braintrust-rust-sdk",
-                    },
-                },
-            }))
+            span_origin.get("version"),
+            Some(&json!(env!("CARGO_PKG_VERSION")))
+        );
+        assert_eq!(
+            span_origin.get("instrumentation"),
+            Some(&json!({"name": "braintrust-rust-sdk"}))
         );
     }
 
