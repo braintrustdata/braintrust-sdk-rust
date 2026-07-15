@@ -740,24 +740,7 @@ fn detected_environment() -> Option<SpanOriginEnvironment> {
         });
     }
 
-    let server_name = [
-        ("VERCEL", "vercel"),
-        ("NETLIFY", "netlify"),
-        ("AWS_LAMBDA_FUNCTION_NAME", "aws_lambda"),
-        ("AWS_EXECUTION_ENV", "aws_lambda"),
-        ("K_SERVICE", "cloud_run"),
-        ("FUNCTION_TARGET", "gcp_functions"),
-        ("KUBERNETES_SERVICE_HOST", "kubernetes"),
-        ("ECS_CONTAINER_METADATA_URI", "ecs"),
-        ("ECS_CONTAINER_METADATA_URI_V4", "ecs"),
-        ("DYNO", "heroku"),
-        ("FLY_APP_NAME", "fly"),
-        ("RAILWAY_ENVIRONMENT", "railway"),
-        ("RENDER_SERVICE_NAME", "render"),
-    ]
-    .into_iter()
-    .find_map(|(var, name)| std::env::var(var).ok().map(|_| name.to_string()));
-    if let Some(name) = server_name {
+    if let Some(name) = detected_server_environment_name() {
         return Some(SpanOriginEnvironment {
             environment_type: "server".to_string(),
             name: Some(name),
@@ -765,6 +748,50 @@ fn detected_environment() -> Option<SpanOriginEnvironment> {
     }
 
     None
+}
+
+fn detected_server_environment_name() -> Option<String> {
+    [("VERCEL", "vercel"), ("NETLIFY", "netlify")]
+        .into_iter()
+        .find_map(|(var, name)| std::env::var(var).ok().map(|_| name.to_string()))
+        .or_else(|| {
+            if std::env::var("ECS_CONTAINER_METADATA_URI").is_ok()
+                || std::env::var("ECS_CONTAINER_METADATA_URI_V4").is_ok()
+            {
+                Some("ecs".to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            std::env::var("AWS_EXECUTION_ENV").ok().and_then(|value| {
+                if value.starts_with("AWS_ECS_") {
+                    Some("ecs".to_string())
+                } else if value.starts_with("AWS_Lambda_") {
+                    Some("aws_lambda".to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            std::env::var("AWS_LAMBDA_FUNCTION_NAME")
+                .ok()
+                .map(|_| "aws_lambda".to_string())
+        })
+        .or_else(|| {
+            [
+                ("K_SERVICE", "cloud_run"),
+                ("FUNCTION_TARGET", "gcp_functions"),
+                ("KUBERNETES_SERVICE_HOST", "kubernetes"),
+                ("DYNO", "heroku"),
+                ("FLY_APP_NAME", "fly"),
+                ("RAILWAY_ENVIRONMENT", "railway"),
+                ("RENDER_SERVICE_NAME", "render"),
+            ]
+            .into_iter()
+            .find_map(|(var, name)| std::env::var(var).ok().map(|_| name.to_string()))
+        })
 }
 
 fn env_value(key: &str) -> Option<String> {
