@@ -502,10 +502,7 @@ impl BraintrustClient {
             .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
         let mut builder = crate::span::SpanBuilder::new(Arc::new(self.clone()), &api_key, &org_id);
         if let Some(environment) = &self.inner.environment {
-            builder = builder.environment(
-                environment.environment_type.clone(),
-                environment.name.clone(),
-            );
+            builder = builder.span_origin_environment(environment.clone());
         }
         if let Some(ref project) = self.inner.default_project {
             builder = builder.project_name(project);
@@ -554,10 +551,7 @@ impl BraintrustClient {
         let submitter = Arc::new(self.clone());
         let mut builder = crate::span::SpanBuilder::new(submitter, token, org_id);
         if let Some(environment) = &self.inner.environment {
-            builder = builder.environment(
-                environment.environment_type.clone(),
-                environment.name.clone(),
-            );
+            builder = builder.span_origin_environment(environment.clone());
         }
         builder
     }

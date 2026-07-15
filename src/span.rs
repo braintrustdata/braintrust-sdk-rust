@@ -250,14 +250,14 @@ impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpanOriginEnvironment {
-    pub environment_type: String,
+    pub environment_type: Option<String>,
     pub name: Option<String>,
 }
 
 impl SpanOriginEnvironment {
     pub fn new(environment_type: impl Into<String>, name: Option<impl Into<String>>) -> Self {
         Self {
-            environment_type: environment_type.into(),
+            environment_type: Some(environment_type.into()),
             name: name.map(Into::into),
         }
     }
@@ -320,6 +320,11 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
         name: Option<impl Into<String>>,
     ) -> Self {
         self.environment = Some(SpanOriginEnvironment::new(environment_type, name));
+        self
+    }
+
+    pub(crate) fn span_origin_environment(mut self, environment: SpanOriginEnvironment) -> Self {
+        self.environment = Some(environment);
         self
     }
 
@@ -695,10 +700,9 @@ pub(crate) fn merge_span_origin_context(
     if !span_origin.contains_key("environment") {
         if let Some(environment) = environment {
             let mut env_obj = Map::new();
-            env_obj.insert(
-                "type".to_string(),
-                Value::String(environment.environment_type),
-            );
+            if let Some(environment_type) = environment.environment_type {
+                env_obj.insert("type".to_string(), Value::String(environment_type));
+            }
             if let Some(name) = environment.name {
                 env_obj.insert("name".to_string(), Value::String(name));
             }
@@ -710,8 +714,9 @@ pub(crate) fn merge_span_origin_context(
 }
 
 fn detected_environment() -> Option<SpanOriginEnvironment> {
-    if let Some(environment_type) = env_value("BRAINTRUST_ENVIRONMENT_TYPE") {
-        let name = env_value("BRAINTRUST_ENVIRONMENT_NAME");
+    let environment_type = env_value("BRAINTRUST_ENVIRONMENT_TYPE");
+    let name = env_value("BRAINTRUST_ENVIRONMENT_NAME");
+    if environment_type.is_some() || name.is_some() {
         return Some(SpanOriginEnvironment {
             environment_type,
             name,
@@ -735,14 +740,14 @@ fn detected_environment() -> Option<SpanOriginEnvironment> {
     .or_else(|| std::env::var("CI").ok().map(|_| "ci".to_string()));
     if let Some(name) = ci_name {
         return Some(SpanOriginEnvironment {
-            environment_type: "ci".to_string(),
+            environment_type: Some("ci".to_string()),
             name: Some(name),
         });
     }
 
     if let Some(name) = detected_server_environment_name() {
         return Some(SpanOriginEnvironment {
-            environment_type: "server".to_string(),
+            environment_type: Some("server".to_string()),
             name: Some(name),
         });
     }
@@ -969,6 +974,28 @@ mod tests {
         assert_eq!(
             span_origin.get("instrumentation"),
             Some(&json!({"name": "braintrust-rust-sdk"}))
+        );
+    }
+
+    #[test]
+    fn span_origin_environment_preserves_name_without_type() {
+        let context = merge_span_origin_context(
+            Some(json!({})),
+            Some(SpanOriginEnvironment {
+                environment_type: None,
+                name: Some("staging".to_string()),
+            }),
+        );
+
+        assert_eq!(
+            context
+                .as_ref()
+                .expect("context")
+                .as_object()
+                .and_then(|context| context.get("span_origin"))
+                .and_then(Value::as_object)
+                .and_then(|span_origin| span_origin.get("environment")),
+            Some(&json!({"name": "staging"}))
         );
     }
 
