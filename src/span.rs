@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -226,6 +228,7 @@ pub struct SpanBuilder<S: SpanSubmitter> {
     span_type: SpanType,
     purpose: Option<String>,
     start_time_override: Option<f64>,
+    environment: Option<SpanOriginEnvironment>,
 }
 
 impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
@@ -240,6 +243,22 @@ impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
             span_type: self.span_type,
             purpose: self.purpose.clone(),
             start_time_override: self.start_time_override,
+            environment: self.environment.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanOriginEnvironment {
+    pub environment_type: Option<String>,
+    pub name: Option<String>,
+}
+
+impl SpanOriginEnvironment {
+    pub fn new(environment_type: impl Into<String>, name: Option<impl Into<String>>) -> Self {
+        Self {
+            environment_type: Some(environment_type.into()),
+            name: name.map(Into::into),
         }
     }
 }
@@ -261,6 +280,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
             span_type: SpanType::default(),
             purpose: None,
             start_time_override: None,
+            environment: detected_environment(),
         }
     }
 
@@ -291,6 +311,20 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
 
     pub fn purpose(mut self, purpose: impl Into<String>) -> Self {
         self.purpose = Some(purpose.into());
+        self
+    }
+
+    pub fn environment(
+        mut self,
+        environment_type: impl Into<String>,
+        name: Option<impl Into<String>>,
+    ) -> Self {
+        self.environment = Some(SpanOriginEnvironment::new(environment_type, name));
+        self
+    }
+
+    pub(crate) fn span_origin_environment(mut self, environment: SpanOriginEnvironment) -> Self {
+        self.environment = Some(environment);
         self
     }
 
@@ -334,6 +368,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
                 start_time,
                 span_type: self.span_type,
                 purpose: self.purpose,
+                environment: self.environment,
                 propagated_event,
                 ..Default::default()
             })),
@@ -574,6 +609,7 @@ struct SpanData {
     metrics: HashMap<String, f64>,
     tags: Vec<String>,
     context: Option<Value>,
+    environment: Option<SpanOriginEnvironment>,
     start_time: Option<f64>,
     end_time: Option<f64>,
     propagated_event: Option<Map<String, Value>>,
@@ -602,7 +638,7 @@ impl From<SpanData> for SpanPayload {
             metadata: (!data.metadata.is_empty()).then_some(data.metadata),
             metrics: (!data.metrics.is_empty()).then_some(data.metrics),
             tags: (!data.tags.is_empty()).then_some(data.tags),
-            context: data.context,
+            context: merge_span_origin_context(data.context, data.environment),
             span_attributes: has_attributes.then_some(span_attributes),
             extra: HashMap::new(),
         };
@@ -632,6 +668,177 @@ impl From<SpanData> for SpanPayload {
             extra: event_data.extra,
         }
     }
+}
+
+pub(crate) fn merge_span_origin_context(
+    context: Option<Value>,
+    environment: Option<SpanOriginEnvironment>,
+) -> Option<Value> {
+    let mut base = context.unwrap_or_else(|| json!({}));
+    let Some(obj) = base.as_object_mut() else {
+        return Some(base);
+    };
+
+    let span_origin = obj
+        .entry("span_origin")
+        .or_insert_with(|| json!({}))
+        .as_object_mut();
+    let Some(span_origin) = span_origin else {
+        return Some(base);
+    };
+
+    span_origin
+        .entry("name")
+        .or_insert_with(|| json!("braintrust.sdk.rust"));
+    span_origin
+        .entry("version")
+        .or_insert_with(|| json!(env!("CARGO_PKG_VERSION")));
+    span_origin
+        .entry("instrumentation")
+        .or_insert_with(|| json!({ "name": "braintrust-rust-sdk" }));
+
+    if !span_origin.contains_key("environment") {
+        if let Some(environment) = environment {
+            let mut env_obj = Map::new();
+            if let Some(environment_type) = environment.environment_type {
+                env_obj.insert("type".to_string(), Value::String(environment_type));
+            }
+            if let Some(name) = environment.name {
+                env_obj.insert("name".to_string(), Value::String(name));
+            }
+            span_origin.insert("environment".to_string(), Value::Object(env_obj));
+        }
+    }
+
+    Some(base)
+}
+
+fn detected_environment() -> Option<SpanOriginEnvironment> {
+    let environment_type = env_value("BRAINTRUST_ENVIRONMENT_TYPE");
+    let name = env_value("BRAINTRUST_ENVIRONMENT_NAME");
+    if environment_type.is_some() || name.is_some() {
+        return Some(SpanOriginEnvironment {
+            environment_type,
+            name,
+        });
+    }
+
+    let ci_name = [
+        ("GITHUB_ACTIONS", "github_actions"),
+        ("GITLAB_CI", "gitlab_ci"),
+        ("CIRCLECI", "circleci"),
+        ("BUILDKITE", "buildkite"),
+        ("JENKINS_URL", "jenkins"),
+        ("JENKINS_HOME", "jenkins"),
+        ("TF_BUILD", "azure_pipelines"),
+        ("TEAMCITY_VERSION", "teamcity"),
+        ("TRAVIS", "travis"),
+        ("BITBUCKET_BUILD_NUMBER", "bitbucket"),
+    ]
+    .into_iter()
+    .find_map(|(var, name)| std::env::var(var).ok().map(|_| name.to_string()))
+    .or_else(|| std::env::var("CI").ok().map(|_| "ci".to_string()));
+    if let Some(name) = ci_name {
+        return Some(SpanOriginEnvironment {
+            environment_type: Some("ci".to_string()),
+            name: Some(name),
+        });
+    }
+
+    if let Some(name) = detected_server_environment_name() {
+        return Some(SpanOriginEnvironment {
+            environment_type: Some("server".to_string()),
+            name: Some(name),
+        });
+    }
+
+    None
+}
+
+fn detected_server_environment_name() -> Option<String> {
+    [("VERCEL", "vercel"), ("NETLIFY", "netlify")]
+        .into_iter()
+        .find_map(|(var, name)| std::env::var(var).ok().map(|_| name.to_string()))
+        .or_else(|| {
+            if std::env::var("ECS_CONTAINER_METADATA_URI").is_ok()
+                || std::env::var("ECS_CONTAINER_METADATA_URI_V4").is_ok()
+            {
+                Some("ecs".to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            std::env::var("AWS_EXECUTION_ENV").ok().and_then(|value| {
+                if value.starts_with("AWS_ECS_") {
+                    Some("ecs".to_string())
+                } else if value.starts_with("AWS_Lambda_") {
+                    Some("aws_lambda".to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            std::env::var("AWS_LAMBDA_FUNCTION_NAME")
+                .ok()
+                .map(|_| "aws_lambda".to_string())
+        })
+        .or_else(|| {
+            [
+                ("K_SERVICE", "cloud_run"),
+                ("FUNCTION_TARGET", "gcp_functions"),
+                ("KUBERNETES_SERVICE_HOST", "kubernetes"),
+                ("DYNO", "heroku"),
+                ("FLY_APP_NAME", "fly"),
+                ("RAILWAY_ENVIRONMENT", "railway"),
+                ("RENDER_SERVICE_NAME", "render"),
+            ]
+            .into_iter()
+            .find_map(|(var, name)| std::env::var(var).ok().map(|_| name.to_string()))
+        })
+}
+
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| braintrust_env_file_value(key))
+}
+
+fn braintrust_env_file_value(key: &str) -> Option<String> {
+    let mut dir = std::env::current_dir().ok()?;
+    for _ in 0..=64 {
+        let path: PathBuf = dir.join(".env.braintrust");
+        if path.is_file() {
+            let contents = fs::read_to_string(path).ok()?;
+            for line in contents.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let Some((name, value)) = trimmed.split_once('=') else {
+                    continue;
+                };
+                if name.trim() == key {
+                    return Some(
+                        value
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string(),
+                    )
+                    .filter(|value| !value.is_empty());
+                }
+            }
+            return None;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
 }
 
 fn epoch_secs() -> f64 {
@@ -753,7 +960,43 @@ mod tests {
         let tags = captured.payload.tags.unwrap();
         assert!(tags.contains(&"geography".to_string()));
         assert!(tags.contains(&"qa".to_string()));
-        assert_eq!(captured.payload.context, Some(json!({"source": "test"})));
+        let context = captured.payload.context.unwrap();
+        assert_eq!(context.get("source"), Some(&json!("test")));
+        let span_origin = context
+            .get("span_origin")
+            .and_then(Value::as_object)
+            .expect("span_origin");
+        assert_eq!(span_origin.get("name"), Some(&json!("braintrust.sdk.rust")));
+        assert_eq!(
+            span_origin.get("version"),
+            Some(&json!(env!("CARGO_PKG_VERSION")))
+        );
+        assert_eq!(
+            span_origin.get("instrumentation"),
+            Some(&json!({"name": "braintrust-rust-sdk"}))
+        );
+    }
+
+    #[test]
+    fn span_origin_environment_preserves_name_without_type() {
+        let context = merge_span_origin_context(
+            Some(json!({})),
+            Some(SpanOriginEnvironment {
+                environment_type: None,
+                name: Some("staging".to_string()),
+            }),
+        );
+
+        assert_eq!(
+            context
+                .as_ref()
+                .expect("context")
+                .as_object()
+                .and_then(|context| context.get("span_origin"))
+                .and_then(Value::as_object)
+                .and_then(|span_origin| span_origin.get("environment")),
+            Some(&json!({"name": "staging"}))
+        );
     }
 
     #[tokio::test]
