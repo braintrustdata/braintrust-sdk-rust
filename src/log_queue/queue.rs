@@ -954,6 +954,12 @@ impl Drop for LogQueue {
         // worker ensures any Submit commands ahead of this Drop in the mpsc queue are
         // processed before the flush begins.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // `block_in_place` panics on a current-thread runtime. In that case,
+            // skip the synchronous flush; dropping `worker_sender` closes the
+            // command channel and the worker performs a final flush.
+            if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+                return;
+            }
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
                     let _ = self.flush_all().await;
@@ -1012,6 +1018,29 @@ mod tests {
             .build();
         let login_state = LoginState::new();
         LogQueue::new(config, login_state, reqwest::Client::new(), 256)
+    }
+
+    #[tokio::test]
+    async fn test_drop_does_not_panic_on_current_thread_runtime() {
+        let config = LogQueueConfig::builder()
+            .queue_max_size(10)
+            .enforce_queue_size_limit(true)
+            .sync_flush(true)
+            .build();
+        let login_state = LoginState::new();
+        login_state.set(
+            "test-key".to_string(),
+            "org".to_string(),
+            "test-org".to_string(),
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:9".to_string(),
+        );
+        let queue = LogQueue::new(config, login_state, reqwest::Client::new(), 256);
+        queue.core.push(make_test_cmd("1"));
+        // Logged in + non-empty queue: Drop takes the flush path. `#[tokio::test]`
+        // runs on a current-thread runtime, where this previously panicked in
+        // `block_in_place`.
+        drop(queue);
     }
 
     #[tokio::test]
