@@ -10,6 +10,10 @@ license = "Apache-2.0"
 keywords = ["braintrust", "logging", "tracing", "observability"]
 categories = ["api-bindings", "asynchronous", "development-tools"]
 
+[features]
+default = ["auto-instrumentation"]
+auto-instrumentation = ["dep:tracing-subscriber"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
@@ -30,6 +34,7 @@ thiserror = "1"
 regex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 
@@ -37,6 +42,14 @@ url = "2"
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.5.22"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+tracing-opentelemetry = "0.28"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "auto_instrumentation"
+required-features = ["auto-instrumentation"]
 
 [package.metadata.docs.rs]
 all-features = true
