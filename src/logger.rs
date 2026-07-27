@@ -21,7 +21,7 @@ use crate::experiments::api::{
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
 use crate::http::build_http_client;
 use crate::log_queue::{LogQueue, LogQueueConfig};
-use crate::span::{merge_span_origin_context, SpanOriginEnvironment, SpanSubmitter};
+use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
 
@@ -201,6 +201,7 @@ pub struct BraintrustClientBuilder {
     /// Maximum queue capacity (None = unlimited).
     queue_max_size: Option<usize>,
     environment: Option<SpanOriginEnvironment>,
+    span_origin: Option<SpanOrigin>,
 }
 
 impl BraintrustClientBuilder {
@@ -227,6 +228,7 @@ impl BraintrustClientBuilder {
             batch_max_bytes: None,
             queue_max_size: None,
             environment: None,
+            span_origin: None,
         }
     }
 
@@ -323,6 +325,15 @@ impl BraintrustClientBuilder {
         self
     }
 
+    /// Set a default `context.span_origin` override for all spans created by this client.
+    ///
+    /// Per-builder ([`SpanBuilder::span_origin`](crate::SpanBuilder)) and per-span
+    /// ([`SpanLog::span_origin`](crate::SpanLog)) overrides take precedence.
+    pub fn span_origin(mut self, origin: SpanOrigin) -> Self {
+        self.span_origin = Some(origin);
+        self
+    }
+
     /// Build the client, performing login.
     ///
     /// If `blocking_login` is true, waits for login to complete.
@@ -348,12 +359,16 @@ impl BraintrustClientBuilder {
             .maybe_queue_max_size(self.queue_max_size)
             .build();
 
-        // LogQueue owns the background worker
+        // LogQueue owns the background worker. It is given the client-configured
+        // URLs so that flushes with per-request credentials work without relying on
+        // the shared (set-once) login state to hold URLs.
         let queue = LogQueue::new(
             log_config,
             login_state.clone(),
             http_client.clone(),
             self.queue_size,
+            api_url.clone(),
+            app_url.clone(),
         );
 
         let client = BraintrustClient {
@@ -367,6 +382,7 @@ impl BraintrustClientBuilder {
                 default_project: self.default_project,
                 login_skipped: self.skip_login,
                 environment: self.environment,
+                span_origin: self.span_origin,
             }),
         };
 
@@ -413,6 +429,7 @@ struct ClientInner {
     default_project: Option<String>,
     login_skipped: bool,
     environment: Option<SpanOriginEnvironment>,
+    span_origin: Option<SpanOrigin>,
 }
 
 impl std::fmt::Debug for ClientInner {
@@ -504,6 +521,9 @@ impl BraintrustClient {
         if let Some(environment) = &self.inner.environment {
             builder = builder.span_origin_environment(environment.clone());
         }
+        if let Some(span_origin) = &self.inner.span_origin {
+            builder = builder.span_origin(span_origin.clone());
+        }
         if let Some(ref project) = self.inner.default_project {
             builder = builder.project_name(project);
         }
@@ -530,7 +550,10 @@ impl BraintrustClient {
 
     /// Create a span builder with explicit token and org_id.
     ///
-    /// Use this if you already have the org_id and don't want to use the login state.
+    /// Use this for per-session / multi-tenant logging: the supplied credentials
+    /// travel with each span through the upload pipeline and are NOT written into
+    /// the client's shared login state. Spans created from the same client with
+    /// different `(token, org_id)` pairs each upload with their own credentials.
     pub fn span_builder_with_credentials(
         &self,
         token: impl Into<String>,
@@ -539,19 +562,13 @@ impl BraintrustClient {
         let token = token.into();
         let org_id = org_id.into();
 
-        // Populate login state with explicit credentials
-        let _ = self.inner.login_state.set(
-            token.clone(),
-            org_id.clone(),
-            String::new(), // org_name unknown
-            self.inner.api_url.to_string(),
-            self.inner.app_url.to_string(),
-        );
-
         let submitter = Arc::new(self.clone());
         let mut builder = crate::span::SpanBuilder::new(submitter, token, org_id);
         if let Some(environment) = &self.inner.environment {
             builder = builder.span_origin_environment(environment.clone());
+        }
+        if let Some(span_origin) = &self.inner.span_origin {
+            builder = builder.span_origin(span_origin.clone());
         }
         builder
     }
@@ -581,7 +598,9 @@ impl BraintrustClient {
 
     /// Update an existing span using explicit credentials instead of shared login state.
     ///
-    /// This is the safe entrypoint for multi-tenant `skip_login` clients.
+    /// This is the safe entrypoint for multi-tenant `skip_login` clients: the
+    /// supplied credentials travel with the queued row and are NOT written into
+    /// the client's shared login state.
     pub fn update_span_with_credentials(
         &self,
         token: impl Into<String>,
@@ -591,14 +610,6 @@ impl BraintrustClient {
     ) -> Result<()> {
         let token = token.into();
         let org_id = org_id.into();
-
-        let _ = self.inner.login_state.set(
-            token.clone(),
-            org_id.clone(),
-            String::new(),
-            self.inner.api_url.to_string(),
-            self.inner.app_url.to_string(),
-        );
 
         self.update_span_internal(token, org_id, None, exported, event)
     }
@@ -654,13 +665,27 @@ impl BraintrustClient {
             metadata: event.metadata,
             metrics: event.metrics,
             tags: event.tags,
-            context: merge_span_origin_context(event.context, self.inner.environment.clone()),
-            span_attributes: event.name.map(|name| SpanAttributes {
-                name: Some(name),
-                span_type: None,
-                purpose: None,
-                extra: HashMap::new(),
-            }),
+            context: merge_span_origin_context(
+                event.context,
+                self.inner.environment.clone(),
+                event
+                    .span_origin
+                    .as_ref()
+                    .or(self.inner.span_origin.as_ref()),
+            ),
+            span_attributes: {
+                let extra = event.span_attributes_extra.unwrap_or_default();
+                if event.name.is_some() || !extra.is_empty() {
+                    Some(SpanAttributes {
+                        name: event.name,
+                        span_type: None,
+                        purpose: None,
+                        extra,
+                    })
+                } else {
+                    None
+                }
+            },
             extra: HashMap::new(),
         };
         if let Some(propagated_event) = components.propagated_event.as_ref() {
@@ -898,9 +923,12 @@ impl BraintrustClient {
 
 impl Drop for BraintrustClient {
     fn drop(&mut self) {
-        // Only flush on the last client reference and when the client is logged in.
-        // `strong_count == 1` means no other `BraintrustClient` clones are alive.
-        if Arc::strong_count(&self.inner) != 1 || !self.inner.login_state.is_logged_in() {
+        // Only flush on the last client reference, and only when there is pending
+        // data. `strong_count == 1` means no other `BraintrustClient` clones are
+        // alive. We check queue emptiness rather than login state so that
+        // per-request-credential (skip_login / multi-tenant) callers, which never
+        // populate the shared login state, still get their pending spans flushed.
+        if Arc::strong_count(&self.inner) != 1 || self.inner.queue.is_empty() {
             return;
         }
 
@@ -1855,6 +1883,89 @@ mod tests {
             rows[0].get("org_id").and_then(|v| v.as_str()),
             Some("explicit-org-id")
         );
+    }
+
+    #[tokio::test]
+    async fn per_session_credentials_do_not_leak_and_batch_separately() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        // skip_login: the client never logs in, so any credential leak into the
+        // shared login state would be observable via is_logged_in().
+        let client = BraintrustClient::builder()
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .skip_login(true)
+            .build()
+            .await
+            .expect("client");
+
+        // Two sessions with different (token, org_id). Use ProjectLogs parents so no
+        // project registration HTTP call is needed.
+        let span_a = client
+            .span_builder_with_credentials("token-a", "org-a")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "proj-a".into(),
+            })
+            .build();
+        let span_b = client
+            .span_builder_with_credentials("token-b", "org-b")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "proj-b".into(),
+            })
+            .build();
+
+        span_a.log(SpanLog {
+            input: Some(Value::String("a".into())),
+            ..Default::default()
+        });
+        span_b.log(SpanLog {
+            input: Some(Value::String("b".into())),
+            ..Default::default()
+        });
+        span_a.flush().await.expect("flush a");
+        span_b.flush().await.expect("flush b");
+        client.flush().await.expect("client flush");
+
+        // No credential leak into shared global state.
+        assert!(
+            !client.is_logged_in().await,
+            "per-request credentials must not populate the shared login state"
+        );
+
+        // Each /logs3 request must carry its own bearer token and matching org_id,
+        // and a single request must never mix the two orgs (batched by credentials).
+        let requests = server.received_requests().await.unwrap();
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for request in requests.iter().filter(|r| r.url.path() == "/logs3") {
+            let auth = request
+                .headers
+                .get(&"authorization".parse::<wiremock::http::HeaderName>().unwrap())
+                .map(|values| values.to_string())
+                .expect("authorization header");
+            let body: Value = serde_json::from_slice(&request.body).expect("json");
+            let rows = body.get("rows").and_then(|r| r.as_array()).expect("rows");
+            let orgs: std::collections::HashSet<&str> = rows
+                .iter()
+                .filter_map(|row| row.get("org_id").and_then(Value::as_str))
+                .collect();
+            assert_eq!(orgs.len(), 1, "one request must not mix orgs: {orgs:?}");
+            seen.insert(auth, orgs.into_iter().next().unwrap().to_string());
+        }
+
+        // Each token uploaded exactly its own org's rows, and never the other's.
+        let org_for = |token: &str| -> Option<&String> {
+            seen.iter()
+                .find(|(auth, _)| auth.contains(token))
+                .map(|(_, org)| org)
+        };
+        assert_eq!(org_for("token-a").map(String::as_str), Some("org-a"));
+        assert_eq!(org_for("token-b").map(String::as_str), Some("org-b"));
     }
 
     #[tokio::test]

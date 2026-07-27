@@ -87,8 +87,6 @@ async fn client_update_span_uses_exported_ids_for_project_logs() {
         .build()
         .await
         .expect("client");
-    let _ = client.span_builder_with_credentials("token", "org-id");
-
     let exported = SpanComponents {
         object_type: SpanObjectType::ProjectLogs,
         object_id: Some("proj-id".to_string()),
@@ -102,14 +100,15 @@ async fn client_update_span_uses_exported_ids_for_project_logs() {
     .to_str();
 
     client
-        .update_span(
+        .update_span_with_credentials(
+            "token",
+            "org-id",
             &exported,
             SpanLog::builder()
                 .output(json!({"status": "updated"}))
                 .build()
                 .expect("build"),
         )
-        .await
         .expect("update");
     client.flush().await.expect("flush");
 
@@ -216,8 +215,6 @@ async fn client_update_span_includes_exported_span_parents() {
         .build()
         .await
         .expect("client");
-    let _ = client.span_builder_with_credentials("token", "org-id");
-
     let exported = SpanComponents {
         object_type: SpanObjectType::ProjectLogs,
         object_id: Some("proj-id".to_string()),
@@ -231,14 +228,15 @@ async fn client_update_span_includes_exported_span_parents() {
     .to_str();
 
     client
-        .update_span(
+        .update_span_with_credentials(
+            "token",
+            "org-id",
             &exported,
             SpanLog::builder()
                 .output(json!({"status": "updated"}))
                 .build()
                 .expect("build"),
         )
-        .await
         .expect("update");
     client.flush().await.expect("flush");
 
@@ -597,14 +595,15 @@ async fn client_update_span_resolves_project_name_from_exported_compute_metadata
     .to_str();
 
     client
-        .update_span(
+        .update_span_with_credentials(
+            "token",
+            "org-id",
             &exported,
             SpanLog::builder()
                 .output(json!({"status": "updated"}))
                 .build()
                 .expect("build"),
         )
-        .await
         .expect("update");
     client.flush().await.expect("flush");
 
