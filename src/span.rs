@@ -875,9 +875,7 @@ pub(crate) fn merge_span_origin_context(
         .or_insert_with(|| json!({ "name": default_instrumentation }));
 
     // The `origin` environment override takes precedence over the builder-level environment.
-    let environment = origin
-        .and_then(|o| o.environment.clone())
-        .or(environment);
+    let environment = origin.and_then(|o| o.environment.clone()).or(environment);
 
     if !span_origin.contains_key("environment") {
         if let Some(environment) = environment {
@@ -1351,7 +1349,10 @@ mod tests {
 
         let captured = collector.spans().into_iter().next().unwrap();
         assert_eq!(captured.payload.span_id, "0123456789abcdef");
-        assert_eq!(captured.payload.row_id, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(
+            captured.payload.row_id,
+            "11111111-2222-3333-4444-555555555555"
+        );
     }
 
     #[tokio::test]

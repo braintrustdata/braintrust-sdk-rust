@@ -285,10 +285,7 @@ impl LogQueueCore {
             match self.prepare_row(&token, payload, parent_info).await {
                 Ok(row) => {
                     let key = (token, row.org_id.clone());
-                    let org_name = row
-                        .org_name
-                        .clone()
-                        .or_else(|| self.login_state.org_name());
+                    let org_name = row.org_name.clone().or_else(|| self.login_state.org_name());
                     groups
                         .entry(key)
                         .or_insert_with(|| (org_name, Vec::new()))
@@ -911,7 +908,13 @@ impl LogQueue {
         api_url: Url,
         app_url: Url,
     ) -> Self {
-        let core = LogQueueCore::new(config, login_state.clone(), client.clone(), api_url, app_url);
+        let core = LogQueueCore::new(
+            config,
+            login_state.clone(),
+            client.clone(),
+            api_url,
+            app_url,
+        );
 
         let (worker_sender, worker_receiver) = mpsc::channel(worker_queue_size.max(32));
 

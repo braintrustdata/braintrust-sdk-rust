@@ -1945,7 +1945,11 @@ mod tests {
         for request in requests.iter().filter(|r| r.url.path() == "/logs3") {
             let auth = request
                 .headers
-                .get(&"authorization".parse::<wiremock::http::HeaderName>().unwrap())
+                .get(
+                    &"authorization"
+                        .parse::<wiremock::http::HeaderName>()
+                        .unwrap(),
+                )
                 .map(|values| values.to_string())
                 .expect("authorization header");
             let body: Value = serde_json::from_slice(&request.body).expect("json");
