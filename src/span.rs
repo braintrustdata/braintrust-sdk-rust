@@ -72,6 +72,10 @@ pub struct SpanLog {
     pub(crate) tags: Option<Vec<String>>,
     /// Arbitrary context data.
     pub(crate) context: Option<Value>,
+    /// Override for the auto-injected `context.span_origin`.
+    pub(crate) span_origin: Option<SpanOrigin>,
+    /// Arbitrary passthrough key/values for `span_attributes` (the `extra` map).
+    pub(crate) span_attributes_extra: Option<HashMap<String, Value>>,
 }
 
 impl SpanLog {
@@ -189,6 +193,31 @@ impl SpanLogBuilder {
         self
     }
 
+    /// Override the auto-injected `context.span_origin` (name/version/instrumentation/environment).
+    ///
+    /// When set, the provided fields replace the SDK defaults. Fields left as
+    /// `None` on the [`SpanOrigin`] keep their default value.
+    pub fn span_origin(mut self, origin: SpanOrigin) -> Self {
+        self.inner.span_origin = Some(origin);
+        self
+    }
+
+    /// Set the full `span_attributes` passthrough map (the `extra` fields alongside
+    /// name/type/purpose). Replaces any extras set by prior calls.
+    pub fn span_attributes(mut self, extra: HashMap<String, Value>) -> Self {
+        self.inner.span_attributes_extra = Some(extra);
+        self
+    }
+
+    /// Add a single arbitrary passthrough key/value to `span_attributes`.
+    pub fn span_attribute(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.inner
+            .span_attributes_extra
+            .get_or_insert_with(HashMap::new)
+            .insert(key.into(), value.into());
+        self
+    }
+
     /// Build the SpanLog.
     ///
     /// Currently this always succeeds, but returns a `Result` to allow
@@ -229,6 +258,10 @@ pub struct SpanBuilder<S: SpanSubmitter> {
     purpose: Option<String>,
     start_time_override: Option<f64>,
     environment: Option<SpanOriginEnvironment>,
+    span_id_override: Option<String>,
+    row_id_override: Option<String>,
+    span_origin: Option<SpanOrigin>,
+    span_attributes_extra: HashMap<String, Value>,
 }
 
 impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
@@ -244,6 +277,10 @@ impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
             purpose: self.purpose.clone(),
             start_time_override: self.start_time_override,
             environment: self.environment.clone(),
+            span_id_override: self.span_id_override.clone(),
+            row_id_override: self.row_id_override.clone(),
+            span_origin: self.span_origin.clone(),
+            span_attributes_extra: self.span_attributes_extra.clone(),
         }
     }
 }
@@ -260,6 +297,59 @@ impl SpanOriginEnvironment {
             environment_type: Some(environment_type.into()),
             name: name.map(Into::into),
         }
+    }
+}
+
+/// Overrides for the auto-injected `context.span_origin` object.
+///
+/// By default the SDK stamps `context.span_origin` with
+/// `name = "braintrust.sdk.rust"`, `version = <crate version>`, and
+/// `instrumentation = { "name": "braintrust-rust-sdk" }`. Set any of these fields
+/// to replace the corresponding default. Fields left as `None` keep the default.
+///
+/// Any explicit `span_origin` values already present in a span's `context` take
+/// precedence over these overrides, which in turn take precedence over the
+/// built-in defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpanOrigin {
+    /// Overrides `span_origin.name` (e.g. `"braintrust.plugin.codex"`).
+    pub name: Option<String>,
+    /// Overrides `span_origin.version` (e.g. a plugin version).
+    pub version: Option<String>,
+    /// Overrides `span_origin.instrumentation.name`.
+    pub instrumentation: Option<String>,
+    /// Overrides `span_origin.environment`.
+    pub environment: Option<SpanOriginEnvironment>,
+}
+
+impl SpanOrigin {
+    /// Create an empty override (all defaults preserved).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the `span_origin.name` override.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Set the `span_origin.version` override.
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Set the `span_origin.instrumentation.name` override.
+    pub fn instrumentation(mut self, instrumentation: impl Into<String>) -> Self {
+        self.instrumentation = Some(instrumentation.into());
+        self
+    }
+
+    /// Set the `span_origin.environment` override.
+    pub fn with_environment(mut self, environment: SpanOriginEnvironment) -> Self {
+        self.environment = Some(environment);
+        self
     }
 }
 
@@ -281,11 +371,62 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
             purpose: None,
             start_time_override: None,
             environment: detected_environment(),
+            span_id_override: None,
+            row_id_override: None,
+            span_origin: None,
+            span_attributes_extra: HashMap::new(),
         }
     }
 
     pub fn start_time(mut self, start_time: f64) -> Self {
         self.start_time_override = Some(start_time);
+        self
+    }
+
+    /// Supply a caller-chosen `span_id` for a NEW span instead of a random UUIDv4.
+    ///
+    /// Use this to deterministically re-create a span (e.g. when replaying a
+    /// journal) so the re-emit references the same span. For a root span (no
+    /// parent), this value also becomes the span's `root_span_id`.
+    ///
+    /// The value is used verbatim. For the most compact base64 `SpanComponents`
+    /// export, use a 16-hex-character (8-byte) string; other strings still
+    /// round-trip correctly via the JSON remainder.
+    pub fn span_id(mut self, span_id: impl Into<String>) -> Self {
+        self.span_id_override = Some(span_id.into());
+        self
+    }
+
+    /// Supply a caller-chosen `row_id` for a NEW span instead of a random UUIDv4.
+    ///
+    /// The `row_id` is the server-side merge key: re-emitting a span with the
+    /// same `row_id` (and same destination/org) MERGES into the existing row
+    /// rather than creating a duplicate. Any stable string works; a UUID (v4 or
+    /// v5) is encoded compactly in the base64 `SpanComponents` export.
+    pub fn row_id(mut self, row_id: impl Into<String>) -> Self {
+        self.row_id_override = Some(row_id.into());
+        self
+    }
+
+    /// Override the auto-injected `context.span_origin` for spans built by this builder.
+    ///
+    /// A per-span [`SpanLog::span_origin`](crate::SpanLog) override, if provided,
+    /// takes precedence over this builder-level default.
+    pub fn span_origin(mut self, origin: SpanOrigin) -> Self {
+        self.span_origin = Some(origin);
+        self
+    }
+
+    /// Add a single arbitrary passthrough key/value to `span_attributes` for spans
+    /// built by this builder. Passthrough values from [`SpanLog`] are merged on top.
+    pub fn span_attribute(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.span_attributes_extra.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set the full `span_attributes` passthrough map for spans built by this builder.
+    pub fn span_attributes(mut self, extra: HashMap<String, Value>) -> Self {
+        self.span_attributes_extra = extra;
         self
     }
 
@@ -331,9 +472,15 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
     pub fn build(self) -> SpanHandle<S> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        // Generate both IDs ONCE at span creation - reused for all flushes
-        let row_id = Uuid::new_v4().to_string();
-        let span_id = Uuid::new_v4().to_string();
+        // Generate both IDs ONCE at span creation - reused for all flushes.
+        // Caller-supplied ids (for deterministic re-creation / journal replay) take
+        // precedence; otherwise fall back to fresh UUIDv4s (the historical default).
+        let row_id = self
+            .row_id_override
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let span_id = self
+            .span_id_override
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let start_time = self.start_time_override.or_else(|| {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -369,6 +516,8 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
                 span_type: self.span_type,
                 purpose: self.purpose,
                 environment: self.environment,
+                span_origin: self.span_origin,
+                span_attributes_extra: self.span_attributes_extra,
                 propagated_event,
                 ..Default::default()
             })),
@@ -574,6 +723,14 @@ fn apply_span_log_to_data(inner: &mut SpanData, event: SpanLog) {
     if let Some(tags) = event.tags {
         inner.tags.extend(tags);
     }
+
+    if let Some(span_origin) = event.span_origin {
+        inner.span_origin = Some(span_origin);
+    }
+
+    if let Some(span_attributes_extra) = event.span_attributes_extra {
+        inner.span_attributes_extra.extend(span_attributes_extra);
+    }
 }
 
 fn current_span_payload(inner: &mut SpanData) -> SpanPayload {
@@ -610,6 +767,8 @@ struct SpanData {
     tags: Vec<String>,
     context: Option<Value>,
     environment: Option<SpanOriginEnvironment>,
+    span_origin: Option<SpanOrigin>,
+    span_attributes_extra: HashMap<String, Value>,
     start_time: Option<f64>,
     end_time: Option<f64>,
     propagated_event: Option<Map<String, Value>>,
@@ -621,13 +780,14 @@ impl From<SpanData> for SpanPayload {
             name: data.name,
             span_type: Some(data.span_type),
             purpose: data.purpose,
-            extra: HashMap::new(),
+            extra: data.span_attributes_extra,
         };
 
         // Only include span_attributes if it has meaningful content
         let has_attributes = span_attributes.name.is_some()
             || span_attributes.span_type.is_some()
-            || span_attributes.purpose.is_some();
+            || span_attributes.purpose.is_some()
+            || !span_attributes.extra.is_empty();
 
         let mut event_data = SpanEventData {
             input: data.input,
@@ -638,7 +798,11 @@ impl From<SpanData> for SpanPayload {
             metadata: (!data.metadata.is_empty()).then_some(data.metadata),
             metrics: (!data.metrics.is_empty()).then_some(data.metrics),
             tags: (!data.tags.is_empty()).then_some(data.tags),
-            context: merge_span_origin_context(data.context, data.environment),
+            context: merge_span_origin_context(
+                data.context,
+                data.environment,
+                data.span_origin.as_ref(),
+            ),
             span_attributes: has_attributes.then_some(span_attributes),
             extra: HashMap::new(),
         };
@@ -673,6 +837,7 @@ impl From<SpanData> for SpanPayload {
 pub(crate) fn merge_span_origin_context(
     context: Option<Value>,
     environment: Option<SpanOriginEnvironment>,
+    origin: Option<&SpanOrigin>,
 ) -> Option<Value> {
     let mut base = context.unwrap_or_else(|| json!({}));
     let Some(obj) = base.as_object_mut() else {
@@ -687,15 +852,30 @@ pub(crate) fn merge_span_origin_context(
         return Some(base);
     };
 
+    // Override precedence: values already present in `context.span_origin` win,
+    // then the caller-supplied `origin` override, then the built-in defaults.
+    let default_name = origin
+        .and_then(|o| o.name.clone())
+        .unwrap_or_else(|| "braintrust.sdk.rust".to_string());
+    let default_version = origin
+        .and_then(|o| o.version.clone())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let default_instrumentation = origin
+        .and_then(|o| o.instrumentation.clone())
+        .unwrap_or_else(|| "braintrust-rust-sdk".to_string());
+
     span_origin
         .entry("name")
-        .or_insert_with(|| json!("braintrust.sdk.rust"));
+        .or_insert_with(|| json!(default_name));
     span_origin
         .entry("version")
-        .or_insert_with(|| json!(env!("CARGO_PKG_VERSION")));
+        .or_insert_with(|| json!(default_version));
     span_origin
         .entry("instrumentation")
-        .or_insert_with(|| json!({ "name": "braintrust-rust-sdk" }));
+        .or_insert_with(|| json!({ "name": default_instrumentation }));
+
+    // The `origin` environment override takes precedence over the builder-level environment.
+    let environment = origin.and_then(|o| o.environment.clone()).or(environment);
 
     if !span_origin.contains_key("environment") {
         if let Some(environment) = environment {
@@ -985,6 +1165,7 @@ mod tests {
                 environment_type: None,
                 name: Some("staging".to_string()),
             }),
+            None,
         );
 
         assert_eq!(
@@ -1150,6 +1331,147 @@ mod tests {
             Some("test_value")
         );
         assert_eq!(exported.span_parents, Some(vec!["span-456".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_ids_flow_through_to_payload() {
+        let (builder, collector) = mock_span_builder();
+        let span = builder
+            .span_id("0123456789abcdef")
+            .row_id("11111111-2222-3333-4444-555555555555")
+            .project_name("demo")
+            .build();
+        // row_id() accessor reflects the caller-supplied id immediately.
+        assert_eq!(span.row_id(), "11111111-2222-3333-4444-555555555555");
+
+        span.log(SpanLog::builder().input(json!("x")).build().expect("build"));
+        span.flush().await.expect("flush");
+
+        let captured = collector.spans().into_iter().next().unwrap();
+        assert_eq!(captured.payload.span_id, "0123456789abcdef");
+        assert_eq!(
+            captured.payload.row_id,
+            "11111111-2222-3333-4444-555555555555"
+        );
+    }
+
+    #[tokio::test]
+    async fn unset_ids_default_to_fresh_uuids() {
+        let (span, _collector) = build_test_span();
+        // No override → row_id is a valid v4 UUID (historical behavior preserved).
+        assert!(Uuid::parse_str(span.row_id()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_ids_roundtrip_through_span_components() {
+        let (builder, _collector) = mock_span_builder();
+        let span = builder
+            .span_id("0123456789abcdef")
+            .row_id("11111111-2222-3333-4444-555555555555")
+            .project_name("demo")
+            .build();
+
+        let exported = span.export().expect("export");
+        // Root span: root_span_id defaults to its own span_id.
+        assert_eq!(exported.span_id.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(exported.root_span_id.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(
+            exported.row_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+
+        // Base64 SpanComponents export/parse must preserve the caller-supplied ids.
+        let encoded = exported.to_str();
+        let decoded = SpanComponents::parse(&encoded).expect("parse");
+        assert_eq!(decoded.span_id, exported.span_id);
+        assert_eq!(decoded.root_span_id, exported.root_span_id);
+        assert_eq!(decoded.row_id, exported.row_id);
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_child_span_parents_correctly() {
+        let parent = ParentSpanInfo::FullSpan {
+            object_type: SpanObjectType::ProjectLogs,
+            object_id: Some("proj-1".to_string()),
+            span_id: "aaaaaaaaaaaaaaaa".to_string(),
+            root_span_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            compute_object_metadata_args: None,
+            span_parents: None,
+            propagated_event: None,
+        };
+        let (builder, _collector) = mock_span_builder();
+        let child = builder
+            .parent_info(parent)
+            .span_id("cccccccccccccccc")
+            .build();
+
+        let exported = child.export().expect("export");
+        assert_eq!(exported.span_id.as_deref(), Some("cccccccccccccccc"));
+        // Child inherits root_span_id from the parent.
+        assert_eq!(
+            exported.root_span_id.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            exported.span_parents,
+            Some(vec!["aaaaaaaaaaaaaaaa".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn span_origin_override_and_span_attributes_extra_present_in_row() {
+        let (span, collector) = build_test_span();
+        span.log(
+            SpanLog::builder()
+                .span_origin(
+                    SpanOrigin::new()
+                        .name("braintrust.plugin.codex")
+                        .version("9.9.9")
+                        .instrumentation("codex-plugin"),
+                )
+                .span_attribute("session_id", json!("sess-1"))
+                .build()
+                .expect("build"),
+        );
+        span.flush().await.expect("flush");
+
+        let captured = collector.spans().into_iter().next().unwrap();
+        let context = captured.payload.context.expect("context");
+        let span_origin = context
+            .get("span_origin")
+            .and_then(Value::as_object)
+            .expect("span_origin");
+        assert_eq!(
+            span_origin.get("name"),
+            Some(&json!("braintrust.plugin.codex"))
+        );
+        assert_eq!(span_origin.get("version"), Some(&json!("9.9.9")));
+        assert_eq!(
+            span_origin.get("instrumentation"),
+            Some(&json!({"name": "codex-plugin"}))
+        );
+
+        let attrs = captured.payload.span_attributes.expect("span_attributes");
+        assert_eq!(attrs.extra.get("session_id"), Some(&json!("sess-1")));
+    }
+
+    #[tokio::test]
+    async fn builder_level_span_origin_is_default_and_overridable_per_span() {
+        // Builder-level default applies when the SpanLog does not override.
+        let (builder, collector) = mock_span_builder();
+        let span = builder
+            .span_origin(SpanOrigin::new().name("braintrust.plugin.default"))
+            .build();
+        span.log(SpanLog::builder().input(json!("x")).build().expect("build"));
+        span.flush().await.expect("flush");
+        let captured = collector.spans().into_iter().next().unwrap();
+        let name = captured
+            .payload
+            .context
+            .unwrap()
+            .get("span_origin")
+            .and_then(|o| o.get("name").cloned());
+        assert_eq!(name, Some(json!("braintrust.plugin.default")));
     }
 
     #[tokio::test]

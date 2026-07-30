@@ -33,7 +33,10 @@ pub use logger::{
     DEFAULT_APP_URL,
 };
 pub use logs3::{Logs3BatchUploader, Logs3UploadResult};
-pub use span::{SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanLogBuilderError};
+pub use span::{
+    SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanLogBuilderError, SpanOrigin,
+    SpanOriginEnvironment,
+};
 pub use span_components::{project_logs_identifier, ProjectLogsIdentifier, SpanComponents};
 pub use stream::{
     wrap_stream_with_span, BraintrustStream, ChatMessage, ChatMessageBuilder,

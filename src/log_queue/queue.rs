@@ -82,6 +82,13 @@ pub(super) struct LogQueueCore {
     config: LogQueueConfig,
     login_state: LoginState,
     client: reqwest::Client,
+    /// Client-configured data-plane URL. Used as a fallback for flushing when the
+    /// shared login state has no URL (e.g. per-request-credential callers that
+    /// never log in).
+    api_url: Url,
+    /// Client-configured control-plane URL. Fallback for project registration
+    /// when the shared login state has no URL.
+    app_url: Url,
     /// Cache of (org_id:project_name) → project_id to avoid redundant HTTP calls.
     project_cache: TokioMutex<IndexMap<String, String>>,
     /// Handle to the currently in-progress flush task, if any.
@@ -93,7 +100,13 @@ pub(super) struct LogQueueCore {
 }
 
 impl LogQueueCore {
-    fn new(config: LogQueueConfig, login_state: LoginState, client: reqwest::Client) -> Arc<Self> {
+    fn new(
+        config: LogQueueConfig,
+        login_state: LoginState,
+        client: reqwest::Client,
+        api_url: Url,
+        app_url: Url,
+    ) -> Arc<Self> {
         let (cmd_sender, cmd_receiver) = make_cmd_channel(&config);
         Arc::new(Self {
             channel: ArcSwap::from_pointee((cmd_sender, cmd_receiver)),
@@ -102,6 +115,8 @@ impl LogQueueCore {
             config,
             login_state,
             client,
+            api_url,
+            app_url,
             project_cache: TokioMutex::new(IndexMap::new()),
             flush_handle: TokioMutex::new(None),
             version_info: OnceCell::new(),
@@ -239,26 +254,28 @@ impl LogQueueCore {
             return;
         }
 
-        let (api_key, api_url_str) = match (self.login_state.api_key(), self.login_state.api_url())
-        {
-            (Some(key), Some(url)) => (key, url),
-            _ => {
-                warn!("Cannot flush logs: not logged in");
-                return;
-            }
-        };
-        let org_name = self.login_state.org_name();
-
+        // Resolve the data-plane URL. Prefer the shared login state (covers the
+        // logged-in path, including an org-specific api_url returned by login) and
+        // fall back to the client-configured URL so per-request-credential callers
+        // work without ever populating the shared login state.
+        let api_url_str = self
+            .login_state
+            .api_url()
+            .unwrap_or_else(|| self.api_url.to_string());
         let api_url = match Url::parse(&api_url_str) {
             Ok(url) => url,
             Err(e) => {
-                warn!(error = %e, "Invalid API URL from login state");
+                warn!(error = %e, "Invalid API URL");
                 return;
             }
         };
 
-        // Prepare rows from submit commands (project registration, destination resolution).
-        let mut rows = Vec::with_capacity(cmds.len());
+        // Prepare rows and bucket them by their upload credentials. The batch
+        // "destination" is (token, org_id): rows uploaded with different tokens or
+        // orgs must never be merged or batched into the same request under one
+        // token. `org_name` is carried alongside for the `x-bt-org-name` header.
+        type CredKey = (String, String);
+        let mut groups: IndexMap<CredKey, (Option<String>, Vec<Logs3Row>)> = IndexMap::new();
         for cmd in cmds {
             let SubmitCommand {
                 token,
@@ -266,19 +283,33 @@ impl LogQueueCore {
                 parent_info,
             } = cmd;
             match self.prepare_row(&token, payload, parent_info).await {
-                Ok(row) => rows.push(row),
+                Ok(row) => {
+                    let key = (token, row.org_id.clone());
+                    let org_name = row.org_name.clone().or_else(|| self.login_state.org_name());
+                    groups
+                        .entry(key)
+                        .or_insert_with(|| (org_name, Vec::new()))
+                        .1
+                        .push(row);
+                }
                 Err(e) => {
                     warn!(error = %e, "failed to prepare span, dropping");
                 }
             }
         }
 
-        if rows.is_empty() {
+        if groups.is_empty() {
             return;
         }
 
+        // Version info reflects a server-wide limit, so it is fetched once and
+        // reused across all credential groups (using any group's credentials).
+        let (probe_token, probe_org) = {
+            let ((token, _org_id), (org_name, _rows)) = groups.get_index(0).unwrap();
+            (token.clone(), org_name.clone())
+        };
         let (max_request_size, can_use_overflow) = self
-            .get_version_info(&api_url, &api_key, org_name.as_deref())
+            .get_version_info(&api_url, &probe_token, probe_org.as_deref())
             .await;
 
         // Effective batch byte limit: the smaller of the locally configured limit and half the
@@ -295,56 +326,59 @@ impl LogQueueCore {
             ),
         );
 
-        // Process chunks sequentially (matches TypeScript SDK)
-        let chunks: Vec<Vec<Logs3Row>> = rows.chunks(chunk_size).map(<[_]>::to_vec).collect();
+        for ((token, _org_id), (org_name, rows)) in groups {
+            // Process chunks sequentially (matches TypeScript SDK)
+            let chunks: Vec<Vec<Logs3Row>> = rows.chunks(chunk_size).map(<[_]>::to_vec).collect();
 
-        for chunk in chunks {
-            let config = self.config.clone();
-            let batches = tokio::task::spawn_blocking(move || {
-                let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
-                for row in chunk {
-                    let key = RowKey::from_row(&row);
-                    if let Some(existing) = merged.get_mut(&key) {
-                        if row.is_merge.unwrap_or(false) {
-                            merge_row_into(existing, row);
+            for chunk in chunks {
+                let config = self.config.clone();
+                let batches = tokio::task::spawn_blocking(move || {
+                    let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
+                    for row in chunk {
+                        let key = RowKey::from_row(&row);
+                        if let Some(existing) = merged.get_mut(&key) {
+                            if row.is_merge.unwrap_or(false) {
+                                merge_row_into(existing, row);
+                            } else {
+                                *existing = row;
+                            }
                         } else {
-                            *existing = row;
+                            merged.insert(key, row);
                         }
-                    } else {
-                        merged.insert(key, row);
                     }
-                }
 
-                let rows: Vec<Logs3Row> = merged.into_values().collect();
-                batch_and_serialize_rows(rows, &config, effective_batch_bytes)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, "serialization task panicked, chunk dropped");
-                vec![]
-            });
-
-            // Send all batches in this chunk concurrently (matches TypeScript SDK's Promise.all)
-            let send_futures: Vec<_> = batches
-                .into_iter()
-                .map(|batch| {
-                    send_batch_with_retry(
-                        &self.client,
-                        &api_url,
-                        &api_key,
-                        org_name.as_deref(),
-                        batch,
-                        &self.config,
-                        max_request_size,
-                        can_use_overflow,
-                    )
+                    let rows: Vec<Logs3Row> = merged.into_values().collect();
+                    batch_and_serialize_rows(rows, &config, effective_batch_bytes)
                 })
-                .collect();
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "serialization task panicked, chunk dropped");
+                    vec![]
+                });
 
-            let results = join_all(send_futures).await;
-            for result in results {
-                if let Err(e) = result {
-                    warn!(error = %e, "batch send failed");
+                // Send all batches in this chunk concurrently (matches TypeScript SDK's Promise.all).
+                // Each request uses THIS group's per-request token and org.
+                let send_futures: Vec<_> = batches
+                    .into_iter()
+                    .map(|batch| {
+                        send_batch_with_retry(
+                            &self.client,
+                            &api_url,
+                            &token,
+                            org_name.as_deref(),
+                            batch,
+                            &self.config,
+                            max_request_size,
+                            can_use_overflow,
+                        )
+                    })
+                    .collect();
+
+                let results = join_all(send_futures).await;
+                for result in results {
+                    if let Err(e) = result {
+                        warn!(error = %e, "batch send failed");
+                    }
                 }
             }
         }
@@ -599,12 +633,14 @@ impl LogQueueCore {
             }
         }
 
-        let app_url_str = self
-            .login_state
-            .app_url()
-            .ok_or_else(|| anyhow::anyhow!("cannot register project: not logged in"))?;
-        let app_url =
-            Url::parse(&app_url_str).map_err(|e| anyhow::anyhow!("invalid app URL: {e}"))?;
+        // Prefer the login-state control-plane URL (logged-in path), falling back
+        // to the client-configured URL for per-request-credential callers.
+        let app_url = match self.login_state.app_url() {
+            Some(app_url_str) => {
+                Url::parse(&app_url_str).map_err(|e| anyhow::anyhow!("invalid app URL: {e}"))?
+            }
+            None => self.app_url.clone(),
+        };
         let url = app_url
             .join("api/project/register")
             .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
@@ -863,13 +899,22 @@ impl LogQueue {
     ///
     /// The worker handles flush coordination; row preparation (project registration,
     /// destination resolution) happens inside `flush_internal` at flush time.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: LogQueueConfig,
         login_state: LoginState,
         client: reqwest::Client,
         worker_queue_size: usize,
+        api_url: Url,
+        app_url: Url,
     ) -> Self {
-        let core = LogQueueCore::new(config, login_state.clone(), client.clone());
+        let core = LogQueueCore::new(
+            config,
+            login_state.clone(),
+            client.clone(),
+            api_url,
+            app_url,
+        );
 
         let (worker_sender, worker_receiver) = mpsc::channel(worker_queue_size.max(32));
 
@@ -926,6 +971,14 @@ impl LogQueue {
             .map_err(|e| BraintrustError::Background(e.to_string()))
     }
 
+    /// Return true if the lock-free row queue is approximately empty.
+    ///
+    /// Note: this inspects only the lock-free queue, not the worker's mpsc backlog,
+    /// so it may briefly report empty while a submit is in flight to the worker.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.core.is_empty()
+    }
+
     /// Trigger a non-blocking background flush via the worker.
     pub async fn trigger_flush_command(&self) -> Result<()> {
         self.worker_sender
@@ -937,8 +990,8 @@ impl LogQueue {
 
 impl Drop for LogQueue {
     fn drop(&mut self) {
-        // Skip if not logged in (flush would return early anyway) or the lock-free
-        // queue is visibly empty.
+        // Skip if the lock-free queue is visibly empty. Credentials travel with each
+        // queued row, so a flush works regardless of shared login state.
         //
         // Note: `is_empty()` only inspects the lock-free row queue, not the worker's
         // mpsc channel. Items submitted but not yet processed by the worker would be
@@ -946,13 +999,17 @@ impl Drop for LogQueue {
         // Drop and the worker task), and when it does occur the worker's own "channel
         // closed" handler performs a final flush. Callers that need a hard guarantee
         // should call `flush_all()` before dropping.
-        if !self.core.login_state.is_logged_in() || self.core.is_empty() {
+        if self.core.is_empty() {
             return;
         }
 
         // Use flush_all() rather than core.flush() directly. Routing through the
         // worker ensures any Submit commands ahead of this Drop in the mpsc queue are
         // processed before the flush begins.
+        //
+        // block_in_place panics on current-thread runtimes (e.g. #[tokio::test]
+        // default). In that case we skip the flush here — callers on a current-thread
+        // runtime should call flush_all() explicitly before dropping.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             // `block_in_place` panics on a current-thread runtime. In that case,
             // skip the synchronous flush; dropping `worker_sender` closes the
@@ -1017,7 +1074,14 @@ mod tests {
             .sync_flush(true) // Disable auto-flush to avoid background HTTP calls
             .build();
         let login_state = LoginState::new();
-        LogQueue::new(config, login_state, reqwest::Client::new(), 256)
+        LogQueue::new(
+            config,
+            login_state,
+            reqwest::Client::new(),
+            256,
+            Url::parse("http://localhost").unwrap(),
+            Url::parse("http://localhost").unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -1035,7 +1099,14 @@ mod tests {
             "http://127.0.0.1:9".to_string(),
             "http://127.0.0.1:9".to_string(),
         );
-        let queue = LogQueue::new(config, login_state, reqwest::Client::new(), 256);
+        let queue = LogQueue::new(
+            config,
+            login_state,
+            reqwest::Client::new(),
+            256,
+            Url::parse("http://localhost").unwrap(),
+            Url::parse("http://localhost").unwrap(),
+        );
         queue.core.push(make_test_cmd("1"));
         // Logged in + non-empty queue: Drop takes the flush path. `#[tokio::test]`
         // runs on a current-thread runtime, where this previously panicked in
@@ -1076,7 +1147,14 @@ mod tests {
             .sync_flush(true)
             .build();
         let login_state = LoginState::new();
-        let queue = LogQueue::new(config, login_state, reqwest::Client::new(), 256);
+        let queue = LogQueue::new(
+            config,
+            login_state,
+            reqwest::Client::new(),
+            256,
+            Url::parse("http://localhost").unwrap(),
+            Url::parse("http://localhost").unwrap(),
+        );
 
         queue.core.push(make_test_cmd("1")); // fills queue
 
@@ -1098,7 +1176,14 @@ mod tests {
             .sync_flush(true)
             .build();
         let login_state = LoginState::new();
-        let queue = LogQueue::new(config, login_state, reqwest::Client::new(), 256);
+        let queue = LogQueue::new(
+            config,
+            login_state,
+            reqwest::Client::new(),
+            256,
+            Url::parse("http://localhost").unwrap(),
+            Url::parse("http://localhost").unwrap(),
+        );
 
         // Push many more items than the default queue_max_size
         for i in 0..20_000 {
