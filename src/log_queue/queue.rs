@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use futures::future::join_all;
 use indexmap::IndexMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, OnceCell};
@@ -79,6 +79,7 @@ pub(super) struct LogQueueCore {
     channel: ArcSwap<CmdChannel>,
     dropped_count: AtomicUsize,
     last_drop_log_time: AtomicU64,
+    queue_depth_warning_emitted: AtomicBool,
     config: LogQueueConfig,
     login_state: LoginState,
     client: reqwest::Client,
@@ -112,6 +113,7 @@ impl LogQueueCore {
             channel: ArcSwap::from_pointee((cmd_sender, cmd_receiver)),
             dropped_count: AtomicUsize::new(0),
             last_drop_log_time: AtomicU64::new(0),
+            queue_depth_warning_emitted: AtomicBool::new(false),
             config,
             login_state,
             client,
@@ -131,7 +133,7 @@ impl LogQueueCore {
     fn push(self: &Arc<Self>, cmd: SubmitCommand) {
         let channel = self.channel.load();
         match channel.0.try_send(cmd) {
-            Ok(()) => {}
+            Ok(()) => self.log_queue_depth_warning(channel.1.len()),
             Err(TrySendError::Full(cmd)) => {
                 self.dropped_count.fetch_add(1, Ordering::Relaxed);
                 self.log_drop_warning();
@@ -680,6 +682,9 @@ impl LogQueueCore {
     ///
     /// Atomically swaps in a new channel using lock-free CAS, then drains the old channel.
     fn drain_all(&self) -> Vec<SubmitCommand> {
+        // A new channel starts a new fill cycle, so it may emit the high-water warning.
+        self.queue_depth_warning_emitted
+            .store(false, Ordering::Relaxed);
         let (new_sender, new_receiver) = make_cmd_channel(&self.config);
         let old_channel = self.channel.swap(Arc::new((new_sender, new_receiver)));
         let mut items = Vec::new();
@@ -734,6 +739,23 @@ impl LogQueueCore {
                     count
                 );
             }
+        }
+    }
+
+    /// Warn once per fill cycle when the queue reaches 80% of its configured maximum.
+    fn log_queue_depth_warning(&self, queue_size: usize) {
+        let queue_max_size = self.config.queue_max_size();
+        let warning_threshold = queue_max_size.saturating_mul(4).div_ceil(5);
+
+        if queue_size >= warning_threshold
+            && !self
+                .queue_depth_warning_emitted
+                .swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                queue_size,
+                queue_max_size, "Log queue has reached 80% of the configured maximum depth"
+            );
         }
     }
 
@@ -1120,6 +1142,37 @@ mod tests {
         assert!(queue.core.is_empty());
         queue.core.push(make_test_cmd("1"));
         assert_eq!(queue.core.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_queue_depth_warning_emits_at_eighty_percent_once_per_fill_cycle() {
+        let queue = make_queue(10);
+
+        for id in 1..8 {
+            queue.core.push(make_test_cmd(&id.to_string()));
+        }
+        assert!(!queue
+            .core
+            .queue_depth_warning_emitted
+            .load(Ordering::Relaxed));
+
+        queue.core.push(make_test_cmd("8"));
+        assert!(queue
+            .core
+            .queue_depth_warning_emitted
+            .load(Ordering::Relaxed));
+
+        queue.core.push(make_test_cmd("9"));
+        assert!(queue
+            .core
+            .queue_depth_warning_emitted
+            .load(Ordering::Relaxed));
+
+        queue.core.drain_all();
+        assert!(!queue
+            .core
+            .queue_depth_warning_emitted
+            .load(Ordering::Relaxed));
     }
 
     #[tokio::test]
