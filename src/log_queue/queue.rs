@@ -930,6 +930,11 @@ impl LogQueue {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn enforces_queue_size_limit(&self) -> bool {
+        self.core.config.enforce_queue_size_limit()
+    }
+
     /// Submit a span payload for processing.
     ///
     /// The command is pushed directly into the lock-free queue. All drops
