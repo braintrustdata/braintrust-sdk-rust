@@ -1,3 +1,5 @@
+[![Braintrust](./braintrust-logo.svg)](https://www.braintrust.dev/)
+
 # braintrust-sdk-rust
 
 Rust SDK for [Braintrust](https://braintrust.dev) logging and tracing.
