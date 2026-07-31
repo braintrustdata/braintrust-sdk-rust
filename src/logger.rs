@@ -200,6 +200,8 @@ pub struct BraintrustClientBuilder {
     batch_max_bytes: Option<usize>,
     /// Maximum queue capacity (None = unlimited).
     queue_max_size: Option<usize>,
+    /// Whether the queue should enforce `queue_max_size`.
+    enforce_queue_size_limit: bool,
     environment: Option<SpanOriginEnvironment>,
     span_origin: Option<SpanOrigin>,
 }
@@ -227,6 +229,7 @@ impl BraintrustClientBuilder {
             batch_max_items: None,
             batch_max_bytes: None,
             queue_max_size: None,
+            enforce_queue_size_limit: false,
             environment: None,
             span_origin: None,
         }
@@ -257,6 +260,15 @@ impl BraintrustClientBuilder {
     /// Default: 15,000 (or `BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE` env var).
     pub fn with_queue_max_size(mut self, max_size: usize) -> Self {
         self.queue_max_size = Some(max_size);
+        self
+    }
+
+    /// Enable or disable enforcement of the queue size limit.
+    ///
+    /// When enabled, the queue drops newly arriving events once it reaches
+    /// `queue_max_size`. Defaults to false, leaving the queue unbounded.
+    pub fn enforce_queue_size_limit(mut self, enforce: bool) -> Self {
+        self.enforce_queue_size_limit = enforce;
         self
     }
 
@@ -357,6 +369,7 @@ impl BraintrustClientBuilder {
             .maybe_batch_max_items(self.batch_max_items)
             .maybe_batch_max_bytes(self.batch_max_bytes)
             .maybe_queue_max_size(self.queue_max_size)
+            .enforce_queue_size_limit(self.enforce_queue_size_limit)
             .build();
 
         // LogQueue owns the background worker. It is given the client-configured
@@ -1472,6 +1485,20 @@ mod tests {
         std::fs::remove_file(&path).expect("remove temp bundle");
 
         assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn builder_configures_queue_size_limit_enforcement() {
+        let client = BraintrustClient::builder()
+            .app_url("https://example.com")
+            .api_url("https://example.com")
+            .skip_login(true)
+            .enforce_queue_size_limit(true)
+            .build()
+            .await
+            .expect("client");
+
+        assert!(client.inner.queue.enforces_queue_size_limit());
     }
 
     #[tokio::test]
