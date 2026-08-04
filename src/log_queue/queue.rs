@@ -13,7 +13,7 @@ use crate::logger::LoginState;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use arc_swap::ArcSwap;
-use crossbeam::channel::{bounded, unbounded, Receiver, Sender, TrySendError};
+use crossbeam::channel::{unbounded, Receiver, Sender, TrySendError};
 use futures::future::join_all;
 use indexmap::IndexMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -56,14 +56,41 @@ struct SubmitCommand {
     parent_info: Option<ParentSpanInfo>,
 }
 
-type CmdChannel = (Sender<SubmitCommand>, Receiver<SubmitCommand>);
+struct CmdChannel {
+    sender: Sender<SubmitCommand>,
+    receiver: Receiver<SubmitCommand>,
+    queued_count: AtomicUsize,
+}
 
-/// Create a command channel (bounded or unbounded) based on the queue config.
-fn make_cmd_channel(config: &LogQueueConfig) -> CmdChannel {
-    if config.enforce_queue_size_limit() {
-        bounded(config.queue_max_size())
-    } else {
-        unbounded()
+fn make_cmd_channel() -> CmdChannel {
+    let (sender, receiver) = unbounded();
+    CmdChannel {
+        sender,
+        receiver,
+        queued_count: AtomicUsize::new(0),
+    }
+}
+
+fn reserve_queue_slot(
+    queued_count: &AtomicUsize,
+    queue_max_size: usize,
+    enforce_queue_size_limit: bool,
+) -> bool {
+    let mut current = queued_count.load(Ordering::Relaxed);
+    loop {
+        if enforce_queue_size_limit && current >= queue_max_size {
+            return false;
+        }
+
+        match queued_count.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
     }
 }
 
@@ -108,9 +135,9 @@ impl LogQueueCore {
         api_url: Url,
         app_url: Url,
     ) -> Arc<Self> {
-        let (cmd_sender, cmd_receiver) = make_cmd_channel(&config);
+        let channel = make_cmd_channel();
         Arc::new(Self {
-            channel: ArcSwap::from_pointee((cmd_sender, cmd_receiver)),
+            channel: ArcSwap::from_pointee(channel),
             dropped_count: AtomicUsize::new(0),
             last_drop_log_time: AtomicU64::new(0),
             queue_depth_warning_emitted: AtomicBool::new(false),
@@ -132,14 +159,22 @@ impl LogQueueCore {
     /// throttled warnings, and optional debug dumps.
     fn push(self: &Arc<Self>, cmd: SubmitCommand) {
         let channel = self.channel.load();
-        match channel.0.try_send(cmd) {
-            Ok(()) => self.log_queue_depth_warning(channel.1.len()),
-            Err(TrySendError::Full(cmd)) => {
-                self.dropped_count.fetch_add(1, Ordering::Relaxed);
-                self.log_drop_warning();
-                self.dump_dropped_row_if_configured(cmd);
-            }
+        if !reserve_queue_slot(
+            &channel.queued_count,
+            self.config.queue_max_size(),
+            self.config.enforce_queue_size_limit(),
+        ) {
+            self.dropped_count.fetch_add(1, Ordering::Relaxed);
+            self.log_drop_warning();
+            self.dump_dropped_row_if_configured(cmd);
+            return;
+        }
+
+        match channel.sender.try_send(cmd) {
+            Ok(()) => self.log_queue_depth_warning(channel.queued_count.load(Ordering::Relaxed)),
+            Err(TrySendError::Full(_)) => unreachable!("the log queue is unbounded"),
             Err(TrySendError::Disconnected(_)) => {
+                channel.queued_count.fetch_sub(1, Ordering::Relaxed);
                 self.dropped_count.fetch_add(1, Ordering::Relaxed);
                 self.log_drop_warning();
             }
@@ -685,10 +720,10 @@ impl LogQueueCore {
         // A new channel starts a new fill cycle, so it may emit the high-water warning.
         self.queue_depth_warning_emitted
             .store(false, Ordering::Relaxed);
-        let (new_sender, new_receiver) = make_cmd_channel(&self.config);
-        let old_channel = self.channel.swap(Arc::new((new_sender, new_receiver)));
+        let old_channel = self.channel.swap(Arc::new(make_cmd_channel()));
         let mut items = Vec::new();
-        while let Ok(item) = old_channel.1.try_recv() {
+        while let Ok(item) = old_channel.receiver.try_recv() {
+            old_channel.queued_count.fetch_sub(1, Ordering::Relaxed);
             items.push(item);
         }
         items
@@ -696,13 +731,13 @@ impl LogQueueCore {
 
     /// Check if the queue is approximately empty.
     pub fn is_empty(&self) -> bool {
-        self.channel.load().1.is_empty()
+        self.channel.load().receiver.is_empty()
     }
 
     /// Get the approximate number of items in the queue (tests only).
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.channel.load().1.len()
+        self.channel.load().receiver.len()
     }
 
     /// Get the total number of dropped items (tests only).
