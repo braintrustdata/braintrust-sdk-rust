@@ -148,26 +148,13 @@ impl SpanComponents {
         let mut hex_entries: Vec<Vec<u8>> = Vec::new();
         let mut json_obj = Map::new();
 
-        // Try to encode object_id as hex (UUID)
+        // Keep UUID fields in the JSON remainder for compatibility with the JS SDK.
         if let Some(ref object_id) = self.object_id {
-            if let Some(hex_bytes) = try_parse_uuid(object_id) {
-                let mut entry = vec![FieldId::ObjectId as u8];
-                entry.extend_from_slice(&hex_bytes);
-                hex_entries.push(entry);
-            } else {
-                json_obj.insert("object_id".to_string(), Value::String(object_id.clone()));
-            }
+            json_obj.insert("object_id".to_string(), Value::String(object_id.clone()));
         }
 
-        // Try to encode row_id as hex (UUID)
         if let Some(ref row_id) = self.row_id {
-            if let Some(hex_bytes) = try_parse_uuid(row_id) {
-                let mut entry = vec![FieldId::RowId as u8];
-                entry.extend_from_slice(&hex_bytes);
-                hex_entries.push(entry);
-            } else {
-                json_obj.insert("row_id".to_string(), Value::String(row_id.clone()));
-            }
+            json_obj.insert("row_id".to_string(), Value::String(row_id.clone()));
         }
 
         // Try to encode span_id as hex (8-byte, 16 hex chars)
@@ -604,26 +591,6 @@ impl std::str::FromStr for SpanComponents {
     }
 }
 
-/// Try to parse a UUID string into 16 bytes
-fn try_parse_uuid(s: &str) -> Option<Vec<u8>> {
-    // Remove hyphens if present
-    let clean = s.replace('-', "");
-
-    // UUID should be 32 hex characters (16 bytes)
-    if clean.len() != 32 {
-        return None;
-    }
-
-    let mut bytes = Vec::with_capacity(16);
-    for i in 0..16 {
-        let hex = &clean[i * 2..i * 2 + 2];
-        let byte = u8::from_str_radix(hex, 16).ok()?;
-        bytes.push(byte);
-    }
-
-    Some(bytes)
-}
-
 /// Try to parse an 8-byte span ID (16 hex characters)
 fn try_parse_hex_span_id(s: &str) -> Option<Vec<u8>> {
     if s.len() != 16 {
@@ -704,6 +671,52 @@ mod tests {
     }
 
     #[test]
+    fn test_v4_uuid_fields_use_json_encoding() {
+        let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+        components.object_id = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+        components.row_id = Some("123e4567-e89b-12d3-a456-426614174000".to_string());
+
+        let bytes = BASE64.decode(components.to_str()).unwrap();
+
+        assert_eq!(bytes[..3], [ENCODING_VERSION_V4, 2, 0]);
+        let json: Value = serde_json::from_slice(&bytes[3..]).unwrap();
+        assert_eq!(
+            json["object_id"],
+            Value::String("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+        assert_eq!(
+            json["row_id"],
+            Value::String("123e4567-e89b-12d3-a456-426614174000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_v4_binary_uuid_fields_for_backward_compatibility() {
+        let mut bytes = vec![
+            ENCODING_VERSION_V4,
+            SpanObjectType::ProjectLogs as u8,
+            2,
+            FieldId::ObjectId as u8,
+        ];
+        bytes.extend([0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4]);
+        bytes.extend([0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00]);
+        bytes.push(FieldId::RowId as u8);
+        bytes.extend([0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3]);
+        bytes.extend([0xa4, 0x56, 0x42, 0x66, 0x14, 0x17, 0x40, 0x00]);
+
+        let decoded = SpanComponents::parse(&BASE64.encode(bytes)).unwrap();
+
+        assert_eq!(
+            decoded.object_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            decoded.row_id.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+    }
+
+    #[test]
     fn test_span_components_with_propagated_event() {
         let mut components = SpanComponents::new(SpanObjectType::Experiment);
         components.object_id = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
@@ -736,10 +749,6 @@ mod tests {
         // 16-byte trace ID
         assert!(try_parse_hex_trace_id("0123456789abcdef0123456789abcdef").is_some());
         assert!(try_parse_hex_trace_id("0123456789abcdef").is_none()); // too short
-
-        // UUID
-        assert!(try_parse_uuid("550e8400-e29b-41d4-a716-446655440000").is_some());
-        assert!(try_parse_uuid("550e8400e29b41d4a716446655440000").is_some());
     }
 
     #[test]
