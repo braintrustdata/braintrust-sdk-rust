@@ -6,6 +6,21 @@ use serde_json::{json, Map, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+#[test]
+fn uploader_rejects_malformed_custom_ca_bundle() {
+    let error = Logs3BatchUploader::new_with_custom_ca_bundle_pem(
+        "https://example.com",
+        "test-key",
+        None,
+        "-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n",
+    )
+    .expect_err("malformed CA bundle should fail");
+
+    assert!(error
+        .to_string()
+        .contains("failed to parse PEM certificates"));
+}
+
 fn make_row(id: &str, payload_chars: usize) -> Map<String, Value> {
     let mut row = Map::new();
     row.insert("id".to_string(), Value::String(id.to_string()));

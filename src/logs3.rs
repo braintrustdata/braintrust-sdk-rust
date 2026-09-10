@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use tokio::time::sleep;
 
 use crate::error::{BraintrustError, Result};
+use crate::http::{build_http_client, CaBundleConfig};
 use crate::log_queue::batch_items;
 
 const DEFAULT_MAX_REQUEST_SIZE: usize = 6 * 1024 * 1024;
@@ -99,12 +100,40 @@ impl Logs3BatchUploader {
         api_key: impl Into<String>,
         org_name: Option<String>,
     ) -> Result<Self> {
+        Self::new_with_ca_bundle_config(
+            api_url,
+            api_key,
+            org_name,
+            CaBundleConfig::from_environment(),
+        )
+    }
+
+    /// Create an uploader with additional PEM certificates to trust.
+    ///
+    /// This overrides `BRAINTRUST_CUSTOM_CA_BUNDLE` for this uploader.
+    pub fn new_with_custom_ca_bundle_pem(
+        api_url: impl AsRef<str>,
+        api_key: impl Into<String>,
+        org_name: Option<String>,
+        pem: impl AsRef<[u8]>,
+    ) -> Result<Self> {
+        Self::new_with_ca_bundle_config(
+            api_url,
+            api_key,
+            org_name,
+            Some(CaBundleConfig::from_pem(pem, "custom CA bundle")),
+        )
+    }
+
+    fn new_with_ca_bundle_config(
+        api_url: impl AsRef<str>,
+        api_key: impl Into<String>,
+        org_name: Option<String>,
+        ca_bundle: Option<CaBundleConfig>,
+    ) -> Result<Self> {
         let api_url = Url::parse(api_url.as_ref())
             .map_err(|e| BraintrustError::InvalidConfig(format!("invalid api_url: {e}")))?;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| BraintrustError::InvalidConfig(format!("invalid HTTP client: {e}")))?;
+        let client = build_http_client(Duration::from_secs(30), ca_bundle.as_ref())?;
         Ok(Self {
             client,
             api_url,
@@ -520,5 +549,32 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn uploader_rejects_malformed_environment_ca_bundle() {
+        let _lock = crate::http::tests::ENV_LOCK.lock().await;
+        let original = std::env::var_os(crate::http::CUSTOM_CA_BUNDLE_ENV);
+        std::env::set_var(
+            crate::http::CUSTOM_CA_BUNDLE_ENV,
+            "-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n",
+        );
+
+        let result = Logs3BatchUploader::new("https://example.com", "test-key", None);
+
+        match original {
+            Some(value) => std::env::set_var(crate::http::CUSTOM_CA_BUNDLE_ENV, value),
+            None => std::env::remove_var(crate::http::CUSTOM_CA_BUNDLE_ENV),
+        }
+
+        let error = result.expect_err("malformed environment CA bundle should fail");
+        assert!(error
+            .to_string()
+            .contains(crate::http::CUSTOM_CA_BUNDLE_ENV));
     }
 }
