@@ -58,6 +58,19 @@ async fn main() -> anyhow::Result<()> {
 - **Async-first**: Built on Tokio for high-performance async operations
 - **Background submission**: Logs are submitted in the background to minimize latency
 
+## Private CA bundles
+
+When outbound HTTPS traffic passes through a TLS-inspecting proxy, set
+`BRAINTRUST_CUSTOM_CA_BUNDLE` to the PEM contents of the additional CA
+certificate bundle. The SDK appends these certificates to its normal public
+trust store and continues to use the standard `HTTP_PROXY`, `HTTPS_PROXY`, and
+`NO_PROXY` behavior.
+
+For programmatic configuration, use
+`BraintrustClient::builder().custom_ca_bundle_pem(pem)`. The existing
+`.ca_bundle(path)` method remains available when the PEM bundle is stored in a
+file.
+
 ## Extracting Usage Metrics
 
 The SDK includes helpers for extracting usage metrics from provider responses:

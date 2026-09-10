@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +18,7 @@ use crate::experiments::api::{
     ExperimentRegisterResponse, ExperimentRegistrar,
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
-use crate::http::build_http_client;
+use crate::http::{build_http_client, CaBundleConfig};
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
@@ -190,7 +189,7 @@ pub struct BraintrustClientBuilder {
     api_url: Option<String>,
     org_name: Option<String>,
     default_project: Option<String>,
-    ca_bundle: Option<PathBuf>,
+    ca_bundle: Option<CaBundleConfig>,
     queue_size: usize,
     blocking_login: bool,
     skip_login: bool,
@@ -215,6 +214,7 @@ impl BraintrustClientBuilder {
     /// - `BRAINTRUST_API_URL`: API endpoint URL (default: `https://api.braintrust.dev`; see [`DEFAULT_API_URL`])
     /// - `BRAINTRUST_ORG_NAME`: Organization name (default: first org from login)
     /// - `BRAINTRUST_DEFAULT_PROJECT`: Default project name
+    /// - `BRAINTRUST_CUSTOM_CA_BUNDLE`: Additional PEM certificates to trust
     pub fn new() -> Self {
         Self {
             api_key: std::env::var("BRAINTRUST_API_KEY").ok(),
@@ -222,7 +222,7 @@ impl BraintrustClientBuilder {
             api_url: std::env::var("BRAINTRUST_API_URL").ok(),
             org_name: std::env::var("BRAINTRUST_ORG_NAME").ok(),
             default_project: std::env::var("BRAINTRUST_DEFAULT_PROJECT").ok(),
-            ca_bundle: None,
+            ca_bundle: CaBundleConfig::from_environment(),
             queue_size: DEFAULT_QUEUE_SIZE,
             blocking_login: false,
             skip_login: false,
@@ -296,9 +296,17 @@ impl BraintrustClientBuilder {
         self
     }
 
-    /// Set a custom PEM CA bundle used for HTTPS requests made by the SDK client.
-    pub fn ca_bundle(mut self, path: impl Into<PathBuf>) -> Self {
-        self.ca_bundle = Some(path.into());
+    /// Set a path to a custom PEM CA bundle used for HTTPS requests made by the SDK client.
+    /// This overrides `BRAINTRUST_CUSTOM_CA_BUNDLE`.
+    pub fn ca_bundle(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.ca_bundle = Some(CaBundleConfig::File(path.into()));
+        self
+    }
+
+    /// Set additional PEM certificates to trust for HTTPS requests made by the SDK client.
+    /// This overrides `BRAINTRUST_CUSTOM_CA_BUNDLE`.
+    pub fn custom_ca_bundle_pem(mut self, pem: impl AsRef<[u8]>) -> Self {
+        self.ca_bundle = Some(CaBundleConfig::from_pem(pem, "custom CA bundle"));
         self
     }
 
@@ -359,7 +367,7 @@ impl BraintrustClientBuilder {
         let api_url = Url::parse(&api_url_str)
             .map_err(|e| BraintrustError::InvalidConfig(format!("invalid api_url: {}", e)))?;
 
-        let http_client = build_http_client(REQUEST_TIMEOUT, self.ca_bundle.as_deref())?;
+        let http_client = build_http_client(REQUEST_TIMEOUT, self.ca_bundle.as_ref())?;
 
         // Create login state (initially empty, populated by login)
         let login_state = LoginState::new();
@@ -1485,6 +1493,46 @@ mod tests {
         std::fs::remove_file(&path).expect("remove temp bundle");
 
         assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn builder_accepts_raw_custom_ca_bundle_when_login_is_skipped() {
+        let client = BraintrustClient::builder()
+            .app_url("https://example.com")
+            .api_url("https://example.com")
+            .custom_ca_bundle_pem(crate::http::tests::VALID_TEST_CERT_PEM)
+            .skip_login(true)
+            .build()
+            .await;
+
+        assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn builder_rejects_malformed_environment_ca_bundle() {
+        let _lock = crate::http::tests::ENV_LOCK.lock().await;
+        let original = std::env::var_os(crate::http::CUSTOM_CA_BUNDLE_ENV);
+        std::env::set_var(
+            crate::http::CUSTOM_CA_BUNDLE_ENV,
+            "-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n",
+        );
+
+        let result = BraintrustClient::builder()
+            .app_url("https://example.com")
+            .api_url("https://example.com")
+            .skip_login(true)
+            .build()
+            .await;
+
+        match original {
+            Some(value) => std::env::set_var(crate::http::CUSTOM_CA_BUNDLE_ENV, value),
+            None => std::env::remove_var(crate::http::CUSTOM_CA_BUNDLE_ENV),
+        }
+
+        let error = result.expect_err("malformed environment CA bundle should fail");
+        assert!(error
+            .to_string()
+            .contains(crate::http::CUSTOM_CA_BUNDLE_ENV));
     }
 
     #[tokio::test]
