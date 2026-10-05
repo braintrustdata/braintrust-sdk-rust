@@ -1,6 +1,5 @@
 use super::config::LogQueueConfig;
 use crate::types::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, Logs3Row, LOGS_API_VERSION};
-use tracing::warn;
 
 /// Generic batching function — matches TypeScript SDK's `batchItems()`.
 ///
@@ -63,28 +62,22 @@ pub(crate) fn batch_and_serialize_rows(
     rows: Vec<Logs3Row>,
     config: &LogQueueConfig,
     batch_max_bytes: usize,
-) -> Vec<SerializedBatch> {
+) -> Result<Vec<SerializedBatch>, anyhow::Error> {
     // Serialize each row once directly to bytes, extract overflow metadata from struct
     let prepared: Vec<(Vec<u8>, Logs3OverflowInputRow)> = rows
         .into_iter()
-        .filter_map(|row| {
+        .map(|row| {
             let overflow_row = build_overflow_row_from_logs3row(&row);
-            let row_bytes = match serde_json::to_vec(&row) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, "failed to serialize row, skipping");
-                    return None;
-                }
-            };
+            let row_bytes = serde_json::to_vec(&row)?;
             let overflow_row = Logs3OverflowInputRow {
                 input_row: Logs3OverflowInputRowMeta {
                     byte_size: row_bytes.len(),
                 },
                 ..overflow_row
             };
-            Some((row_bytes, overflow_row))
+            Ok((row_bytes, overflow_row))
         })
-        .collect();
+        .collect::<Result<_, serde_json::Error>>()?;
 
     // Split into batches using the shared batch_items logic.
     let batches = batch_items(
@@ -97,15 +90,9 @@ pub(crate) fn batch_and_serialize_rows(
     // Assemble each batch by concatenating the pre-serialized row bytes.
     batches
         .into_iter()
-        .filter_map(|batch| {
+        .map(|batch| {
             let (row_bytes, overflow_rows): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
-            match assemble_logs3_request(&row_bytes, overflow_rows) {
-                Ok(b) => Some(b),
-                Err(e) => {
-                    warn!(error = %e, "failed to assemble batch");
-                    None
-                }
-            }
+            assemble_logs3_request(&row_bytes, overflow_rows)
         })
         .collect()
 }
@@ -227,7 +214,7 @@ mod tests {
         // Create rows that will exceed byte limit
         let rows: Vec<Logs3Row> = (0..5).map(|i| make_row(&format!("row-{i}"), 50)).collect();
 
-        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes());
+        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes()).unwrap();
 
         // Should create multiple batches due to byte limit
         assert!(batches.len() > 1, "Should split into multiple batches");
@@ -249,7 +236,7 @@ mod tests {
             .build();
 
         let rows: Vec<Logs3Row> = (0..5).map(|i| make_row(&format!("row-{i}"), 10)).collect();
-        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes());
+        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes()).unwrap();
 
         // 5 rows / 2 per batch = 3 batches
         assert_eq!(batches.len(), 3);
@@ -259,7 +246,7 @@ mod tests {
     fn test_overflow_metadata_contains_object_ids() {
         let config = LogQueueConfig::default();
         let rows = vec![make_row("row-1", 10)];
-        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes());
+        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes()).unwrap();
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].overflow_rows.len(), 1);
@@ -274,7 +261,7 @@ mod tests {
     fn test_overflow_metadata_byte_size() {
         let config = LogQueueConfig::default();
         let rows = vec![make_row("row-1", 10)];
-        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes());
+        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes()).unwrap();
 
         let overflow_row = &batches[0].overflow_rows[0];
         assert!(overflow_row.input_row.byte_size > 0);
@@ -300,7 +287,8 @@ mod tests {
         let config = LogQueueConfig::default();
         let mut row = make_row("row-del", 10);
         row.object_delete = Some(true);
-        let batches = batch_and_serialize_rows(vec![row], &config, config.batch_max_bytes());
+        let batches =
+            batch_and_serialize_rows(vec![row], &config, config.batch_max_bytes()).unwrap();
 
         assert_eq!(batches.len(), 1);
         let overflow_row = &batches[0].overflow_rows[0];
@@ -315,7 +303,8 @@ mod tests {
     fn test_overflow_metadata_is_delete_none_when_not_set() {
         let config = LogQueueConfig::default();
         let row = make_row("row-1", 10); // object_delete is None
-        let batches = batch_and_serialize_rows(vec![row], &config, config.batch_max_bytes());
+        let batches =
+            batch_and_serialize_rows(vec![row], &config, config.batch_max_bytes()).unwrap();
 
         let overflow_row = &batches[0].overflow_rows[0];
         assert!(

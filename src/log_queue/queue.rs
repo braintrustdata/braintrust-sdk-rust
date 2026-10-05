@@ -209,10 +209,7 @@ impl LogQueueCore {
         };
 
         let core = self.clone();
-        let join_handle = runtime_handle.spawn(async move {
-            core.flush_internal().await;
-            Ok(())
-        });
+        let join_handle = runtime_handle.spawn(async move { core.flush_internal().await });
 
         *guard = Some(join_handle);
     }
@@ -285,11 +282,12 @@ impl LogQueueCore {
     /// registration, row building) before batching. Rows are then processed in
     /// sequential chunks of `min(batch_max_items, flush_chunk_size)`.
     /// Within each chunk, batches are sent concurrently.
-    async fn flush_internal(self: &Arc<Self>) {
+    async fn flush_internal(self: &Arc<Self>) -> std::result::Result<(), anyhow::Error> {
         let cmds = self.drain_all();
         if cmds.is_empty() {
-            return;
+            return Ok(());
         }
+        let mut first_error = None;
 
         // Resolve the data-plane URL. Prefer the shared login state (covers the
         // logged-in path, including an org-specific api_url returned by login) and
@@ -303,7 +301,11 @@ impl LogQueueCore {
             Ok(url) => url,
             Err(e) => {
                 warn!(error = %e, "Invalid API URL");
-                return;
+                return if self.config.checked_delivery() {
+                    Err(e.into())
+                } else {
+                    Ok(())
+                };
             }
         };
 
@@ -331,12 +333,19 @@ impl LogQueueCore {
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to prepare span, dropping");
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
                 }
             }
         }
 
         if groups.is_empty() {
-            return;
+            return if self.config.checked_delivery() {
+                first_error.map_or(Ok(()), Err)
+            } else {
+                Ok(())
+            };
         }
 
         // Version info reflects a server-wide limit, so it is fetched once and
@@ -387,11 +396,24 @@ impl LogQueueCore {
                     let rows: Vec<Logs3Row> = merged.into_values().collect();
                     batch_and_serialize_rows(rows, &config, effective_batch_bytes)
                 })
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "serialization task panicked, chunk dropped");
-                    vec![]
-                });
+                .await;
+                let batches = match batches {
+                    Ok(Ok(batches)) => batches,
+                    Ok(Err(error)) => {
+                        warn!(%error, "failed to serialize batch");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        vec![]
+                    }
+                    Err(error) => {
+                        warn!(%error, "serialization task panicked");
+                        if first_error.is_none() {
+                            first_error = Some(error.into());
+                        }
+                        vec![]
+                    }
+                };
 
                 // Send all batches in this chunk concurrently (matches TypeScript SDK's Promise.all).
                 // Each request uses THIS group's per-request token and org.
@@ -415,9 +437,17 @@ impl LogQueueCore {
                 for result in results {
                     if let Err(e) = result {
                         warn!(error = %e, "batch send failed");
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
                     }
                 }
             }
+        }
+        if self.config.checked_delivery() {
+            first_error.map_or(Ok(()), Err)
+        } else {
+            Ok(())
         }
     }
 
@@ -698,7 +728,11 @@ impl LogQueueCore {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("register project failed: [{status}] {text}");
+            return Err(BraintrustError::Api {
+                status: status.as_u16(),
+                message: text,
+            }
+            .into());
         }
 
         let register_response: ProjectRegisterResponse = response
@@ -1030,7 +1064,14 @@ impl LogQueue {
             .map_err(|_| BraintrustError::ChannelClosed)?;
         rx.await
             .map_err(|_| BraintrustError::ChannelClosed)?
-            .map_err(|e| BraintrustError::Background(e.to_string()))
+            .map_err(|error| {
+                error.downcast::<BraintrustError>().unwrap_or_else(|error| {
+                    error
+                        .downcast::<reqwest::Error>()
+                        .map(BraintrustError::Http)
+                        .unwrap_or_else(|error| BraintrustError::Background(error.to_string()))
+                })
+            })
     }
 
     /// Return true if the lock-free row queue is approximately empty.
