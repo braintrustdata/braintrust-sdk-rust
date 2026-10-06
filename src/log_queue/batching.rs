@@ -1,5 +1,6 @@
 use super::config::LogQueueConfig;
 use crate::types::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, Logs3Row, LOGS_API_VERSION};
+use tracing::warn;
 
 /// Generic batching function — matches TypeScript SDK's `batchItems()`.
 ///
@@ -68,7 +69,13 @@ pub(crate) fn batch_and_serialize_rows(
         .into_iter()
         .map(|row| {
             let overflow_row = build_overflow_row_from_logs3row(&row);
-            let row_bytes = serde_json::to_vec(&row)?;
+            let row_bytes = match serde_json::to_vec(&row) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    warn!(error = %error, "failed to serialize row");
+                    return Err(error);
+                }
+            };
             let overflow_row = Logs3OverflowInputRow {
                 input_row: Logs3OverflowInputRowMeta {
                     byte_size: row_bytes.len(),
@@ -92,7 +99,10 @@ pub(crate) fn batch_and_serialize_rows(
         .into_iter()
         .map(|batch| {
             let (row_bytes, overflow_rows): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
-            assemble_logs3_request(&row_bytes, overflow_rows)
+            assemble_logs3_request(&row_bytes, overflow_rows).map_err(|error| {
+                warn!(error = %error, "failed to assemble batch");
+                error
+            })
         })
         .collect()
 }
