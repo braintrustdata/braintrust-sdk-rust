@@ -58,6 +58,17 @@ async fn main() -> anyhow::Result<()> {
 - **Async-first**: Built on Tokio for high-performance async operations
 - **Background submission**: Logs are submitted in the background to minimize latency
 
+## Preserving existing span provenance
+
+For updates that must not replace an existing span's origin, build the update
+with `SpanLog::builder().skip_span_origin()`. This omits automatically generated
+`context.span_origin` fields, including configured SDK origin and environment
+overrides. Explicit or propagated context remains unchanged; callers preserving
+an existing origin should not supply a replacement in that context.
+
+When logged to a `SpanHandle`, the option remains enabled through subsequent
+logs and `end()`. It does not delete provenance already stored on the backend.
+
 ## Private CA bundles
 
 When outbound HTTPS traffic passes through a TLS-inspecting proxy, set
