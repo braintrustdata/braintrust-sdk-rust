@@ -688,11 +688,12 @@ impl BraintrustClient {
             tags: event.tags,
             context: merge_span_origin_context(
                 event.context,
-                self.inner.environment.clone(),
+                self.inner.environment.as_ref(),
                 event
                     .span_origin
                     .as_ref()
                     .or(self.inner.span_origin.as_ref()),
+                event.skip_span_origin,
             ),
             span_attributes: {
                 let extra = event.span_attributes_extra.unwrap_or_default();

@@ -74,6 +74,8 @@ pub struct SpanLog {
     pub(crate) context: Option<Value>,
     /// Override for the auto-injected `context.span_origin`.
     pub(crate) span_origin: Option<SpanOrigin>,
+    /// Disable automatically generated origin fields, including configured overrides.
+    pub(crate) skip_span_origin: bool,
     /// Arbitrary passthrough key/values for `span_attributes` (the `extra` map).
     pub(crate) span_attributes_extra: Option<HashMap<String, Value>>,
 }
@@ -199,6 +201,20 @@ impl SpanLogBuilder {
     /// `None` on the [`SpanOrigin`] keep their default value.
     pub fn span_origin(mut self, origin: SpanOrigin) -> Self {
         self.inner.span_origin = Some(origin);
+        self
+    }
+
+    /// Omit automatically generated `context.span_origin` fields.
+    ///
+    /// This disables SDK name, version, instrumentation, and environment fields,
+    /// including client, span-builder, and event-level origin overrides. Explicit
+    /// context (including any `span_origin`) is preserved without adding defaults.
+    /// If no context is supplied or propagated, the context field is omitted.
+    ///
+    /// When logged to a [`SpanHandle`], this option remains enabled for subsequent
+    /// logs and `end()`. It does not remove origin fields already uploaded.
+    pub fn skip_span_origin(mut self) -> Self {
+        self.inner.skip_span_origin = true;
         self
     }
 
@@ -727,6 +743,7 @@ fn apply_span_log_to_data(inner: &mut SpanData, event: SpanLog) {
     if let Some(span_origin) = event.span_origin {
         inner.span_origin = Some(span_origin);
     }
+    inner.skip_span_origin |= event.skip_span_origin;
 
     if let Some(span_attributes_extra) = event.span_attributes_extra {
         inner.span_attributes_extra.extend(span_attributes_extra);
@@ -768,6 +785,7 @@ struct SpanData {
     context: Option<Value>,
     environment: Option<SpanOriginEnvironment>,
     span_origin: Option<SpanOrigin>,
+    skip_span_origin: bool,
     span_attributes_extra: HashMap<String, Value>,
     start_time: Option<f64>,
     end_time: Option<f64>,
@@ -800,8 +818,9 @@ impl From<SpanData> for SpanPayload {
             tags: (!data.tags.is_empty()).then_some(data.tags),
             context: merge_span_origin_context(
                 data.context,
-                data.environment,
+                data.environment.as_ref(),
                 data.span_origin.as_ref(),
+                data.skip_span_origin,
             ),
             span_attributes: has_attributes.then_some(span_attributes),
             extra: HashMap::new(),
@@ -836,9 +855,14 @@ impl From<SpanData> for SpanPayload {
 
 pub(crate) fn merge_span_origin_context(
     context: Option<Value>,
-    environment: Option<SpanOriginEnvironment>,
+    environment: Option<&SpanOriginEnvironment>,
     origin: Option<&SpanOrigin>,
+    skip_span_origin: bool,
 ) -> Option<Value> {
+    if skip_span_origin {
+        return context;
+    }
+
     let mut base = context.unwrap_or_else(|| json!({}));
     let Some(obj) = base.as_object_mut() else {
         return Some(base);
@@ -875,16 +899,16 @@ pub(crate) fn merge_span_origin_context(
         .or_insert_with(|| json!({ "name": default_instrumentation }));
 
     // The `origin` environment override takes precedence over the builder-level environment.
-    let environment = origin.and_then(|o| o.environment.clone()).or(environment);
+    let environment = origin.and_then(|o| o.environment.as_ref()).or(environment);
 
     if !span_origin.contains_key("environment") {
         if let Some(environment) = environment {
             let mut env_obj = Map::new();
-            if let Some(environment_type) = environment.environment_type {
-                env_obj.insert("type".to_string(), Value::String(environment_type));
+            if let Some(environment_type) = &environment.environment_type {
+                env_obj.insert("type".to_string(), Value::String(environment_type.clone()));
             }
-            if let Some(name) = environment.name {
-                env_obj.insert("name".to_string(), Value::String(name));
+            if let Some(name) = &environment.name {
+                env_obj.insert("name".to_string(), Value::String(name.clone()));
             }
             span_origin.insert("environment".to_string(), Value::Object(env_obj));
         }
@@ -1161,11 +1185,12 @@ mod tests {
     fn span_origin_environment_preserves_name_without_type() {
         let context = merge_span_origin_context(
             Some(json!({})),
-            Some(SpanOriginEnvironment {
+            Some(&SpanOriginEnvironment {
                 environment_type: None,
                 name: Some("staging".to_string()),
             }),
             None,
+            false,
         );
 
         assert_eq!(

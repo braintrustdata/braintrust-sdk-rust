@@ -1,6 +1,6 @@
 use braintrust_sdk_rust::{
     extract_anthropic_usage, extract_openai_usage, BraintrustClient, ParentSpanInfo,
-    SpanComponents, SpanLog, SpanObjectType,
+    SpanComponents, SpanLog, SpanObjectType, SpanOrigin,
 };
 use serde_json::{json, Map, Value};
 use wiremock::matchers::{method, path};
@@ -132,6 +132,15 @@ async fn client_update_span_uses_exported_ids_for_project_logs() {
     assert_eq!(row["root_span_id"], "root-id");
     assert_eq!(row["_is_merge"], true);
     assert!(row.get("span_parents").is_none());
+    assert_eq!(row["context"]["span_origin"]["name"], "braintrust.sdk.rust");
+    assert_eq!(
+        row["context"]["span_origin"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(
+        row["context"]["span_origin"]["instrumentation"],
+        json!({"name": "braintrust-rust-sdk"})
+    );
 }
 
 #[tokio::test]
@@ -196,6 +205,166 @@ async fn client_update_span_with_credentials_works_without_priming_login_state()
     assert_eq!(row["span_id"], "span-id");
     assert_eq!(row["root_span_id"], "root-id");
     assert!(row.get("span_parents").is_none());
+}
+
+#[tokio::test]
+async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .environment("ci", Some("test"))
+        .span_origin(SpanOrigin::new().name("client-origin"))
+        .build()
+        .await
+        .expect("client");
+
+    let contexts = [
+        (None, None),
+        (Some(json!({"custom": {"nested": [1, true]}})), None),
+        (
+            Some(json!({"span_origin": {"name": "historical-plugin"}, "custom": 42})),
+            None,
+        ),
+        (Some(json!(null)), None),
+        (Some(json!("custom context")), None),
+        (Some(json!([1, "context"])), None),
+        (
+            None,
+            Some(json!({"span_origin": {"name": "propagated-plugin"}, "source": "parent"})),
+        ),
+    ];
+    for (index, (context, propagated_context)) in contexts.iter().enumerate() {
+        let exported = SpanComponents {
+            object_type: SpanObjectType::ProjectLogs,
+            object_id: Some("proj-id".to_string()),
+            compute_object_metadata_args: None,
+            row_id: Some(format!("row-{index}")),
+            span_id: Some(format!("span-{index}")),
+            root_span_id: Some(format!("span-{index}")),
+            span_parents: None,
+            propagated_event: propagated_context
+                .as_ref()
+                .map(|context| Map::from_iter([("context".to_string(), context.clone())])),
+        }
+        .to_str();
+        let mut event = SpanLog::builder()
+            .skip_span_origin()
+            .span_origin(SpanOrigin::new().name("event-origin"))
+            .output(json!({"status": "updated"}));
+        if let Some(context) = context {
+            event = event.context(context.clone());
+        }
+        client
+            .update_span_with_credentials(
+                "token",
+                "org-id",
+                &exported,
+                event.build().expect("build"),
+            )
+            .expect("update");
+        client.flush().await.expect("flush");
+    }
+
+    let requests = server.received_requests().await.expect("requests");
+    let logs_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .collect();
+    assert_eq!(logs_requests.len(), contexts.len());
+    for (request, (context, propagated_context)) in logs_requests.iter().zip(&contexts) {
+        let body: Value = serde_json::from_slice(&request.body).expect("json body");
+        let rows = body["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["_is_merge"], true);
+        assert_eq!(row["output"], json!({"status": "updated"}));
+        assert_eq!(
+            row.get("context"),
+            context.as_ref().or(propagated_context.as_ref())
+        );
+    }
+}
+
+#[tokio::test]
+async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .environment("ci", Some("test"))
+        .span_origin(SpanOrigin::new().name("client-origin"))
+        .build()
+        .await
+        .expect("client");
+    let contexts = [
+        None,
+        Some(json!({"span_origin": {"name": "historical-plugin"}, "custom": 42})),
+    ];
+    for context in &contexts {
+        let span = client
+            .span_builder_with_credentials("token", "org-id")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "proj-id".to_string(),
+            })
+            .span_origin(SpanOrigin::new().name("builder-origin"))
+            .build();
+        let mut event = SpanLog::builder()
+            .span_origin(SpanOrigin::new().name("event-origin"))
+            .skip_span_origin()
+            .input(json!("input"));
+        if let Some(context) = context {
+            event = event.context(context.clone());
+        }
+        span.log(event.build().expect("build"));
+        client.flush().await.expect("initial flush");
+        span.log(
+            SpanLog::builder()
+                .output(json!("output"))
+                .build()
+                .expect("build"),
+        );
+        client.flush().await.expect("update flush");
+        span.end();
+        client.flush().await.expect("end flush");
+    }
+
+    let requests = server.received_requests().await.expect("requests");
+    let logs_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .collect();
+    assert_eq!(logs_requests.len(), contexts.len() * 3);
+    for (requests, context) in logs_requests.chunks_exact(3).zip(&contexts) {
+        for (index, request) in requests.iter().enumerate() {
+            let body: Value = serde_json::from_slice(&request.body).expect("json body");
+            let rows = body["rows"].as_array().expect("rows");
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.get("context"), context.as_ref());
+            assert_eq!(row["input"], "input");
+            assert_eq!(
+                row.get("_is_merge").and_then(Value::as_bool),
+                (index != 0).then_some(true)
+            );
+            if index > 0 {
+                assert_eq!(row["output"], "output");
+            }
+            assert_eq!(row["metrics"].get("end").is_some(), index == 2);
+        }
+    }
 }
 
 #[tokio::test]
