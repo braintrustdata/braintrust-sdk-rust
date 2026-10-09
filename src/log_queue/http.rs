@@ -211,7 +211,11 @@ pub(crate) async fn send_batch_with_retry(
                     }
                     save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
                         .ok();
-                    anyhow::bail!("overflow ref send failed: [{status}] {body}");
+                    return Err(crate::error::BraintrustError::Api {
+                        status: status.as_u16(),
+                        message: body,
+                    }
+                    .into());
                 }
                 Err(e) => {
                     if attempt < config.num_retries() {
@@ -254,7 +258,11 @@ pub(crate) async fn send_batch_with_retry(
                     }
                     save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
                         .ok();
-                    anyhow::bail!("batch send failed: [{status}] {body}");
+                    return Err(crate::error::BraintrustError::Api {
+                        status: status.as_u16(),
+                        message: body,
+                    }
+                    .into());
                 }
                 Err(e) => {
                     if attempt < config.num_retries() {
@@ -301,7 +309,11 @@ pub(crate) async fn request_overflow_upload(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("overflow URL request failed: [{status}] {body}");
+        return Err(crate::error::BraintrustError::Api {
+            status: status.as_u16(),
+            message: body,
+        }
+        .into());
     }
 
     let upload: Logs3OverflowUpload = resp

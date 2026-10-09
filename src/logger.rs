@@ -201,6 +201,7 @@ pub struct BraintrustClientBuilder {
     queue_max_size: Option<usize>,
     /// Whether the queue should enforce `queue_max_size`.
     enforce_queue_size_limit: bool,
+    checked_delivery: bool,
     environment: Option<SpanOriginEnvironment>,
     span_origin: Option<SpanOrigin>,
 }
@@ -230,6 +231,7 @@ impl BraintrustClientBuilder {
             batch_max_bytes: None,
             queue_max_size: None,
             enforce_queue_size_limit: false,
+            checked_delivery: false,
             environment: None,
             span_origin: None,
         }
@@ -269,6 +271,13 @@ impl BraintrustClientBuilder {
     /// `queue_max_size`. Defaults to false, leaving the queue unbounded.
     pub fn enforce_queue_size_limit(mut self, enforce: bool) -> Self {
         self.enforce_queue_size_limit = enforce;
+        self
+    }
+
+    /// Make `flush` report preparation and HTTP delivery failures. Automatic
+    /// flushing is disabled so the explicit caller observes every result.
+    pub fn checked_delivery(mut self, checked: bool) -> Self {
+        self.checked_delivery = checked;
         self
     }
 
@@ -378,6 +387,8 @@ impl BraintrustClientBuilder {
             .maybe_batch_max_bytes(self.batch_max_bytes)
             .maybe_queue_max_size(self.queue_max_size)
             .enforce_queue_size_limit(self.enforce_queue_size_limit)
+            .checked_delivery(self.checked_delivery)
+            .maybe_sync_flush(self.checked_delivery.then_some(true))
             .build();
 
         // LogQueue owns the background worker. It is given the client-configured
