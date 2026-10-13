@@ -43,14 +43,22 @@ async fn submits_with_bearer_token() {
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");
 
-    let logs_calls = server
+    let logs_calls: Vec<_> = server
         .received_requests()
         .await
         .unwrap()
         .into_iter()
         .filter(|req| req.url.path() == "/logs3")
-        .count();
-    assert_eq!(logs_calls, 1);
+        .collect();
+    assert_eq!(logs_calls.len(), 1);
+    assert_eq!(
+        logs_calls[0]
+            .headers
+            .iter()
+            .find(|(name, _)| name.as_str() == "user-agent")
+            .map(|(_, values)| values.last().as_str()),
+        Some(concat!("braintrust-sdk-rust/", env!("CARGO_PKG_VERSION")))
+    );
 }
 
 #[tokio::test]
