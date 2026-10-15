@@ -43,10 +43,14 @@ async fn submits_with_bearer_token() {
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");
 
-    let logs_calls = server
-        .received_requests()
-        .await
-        .unwrap()
+    let requests = server.received_requests().await.unwrap();
+    let logs3 = requests
+        .iter()
+        .find(|request| request.url.path() == "/logs3")
+        .expect("logs3 request");
+    assert!(logs3.headers.iter().any(|(name, _)| name.as_str() == "user-agent"));
+
+    let logs_calls = requests
         .into_iter()
         .filter(|req| req.url.path() == "/logs3")
         .count();

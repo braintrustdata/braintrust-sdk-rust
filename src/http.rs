@@ -6,6 +6,7 @@ use reqwest::Client;
 use crate::error::{BraintrustError, Result};
 
 pub(crate) const CUSTOM_CA_BUNDLE_ENV: &str = "BRAINTRUST_CUSTOM_CA_BUNDLE";
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug)]
 pub(crate) enum CaBundleConfig {
@@ -56,7 +57,9 @@ pub(crate) fn build_http_client(
     timeout: std::time::Duration,
     ca_bundle: Option<&CaBundleConfig>,
 ) -> Result<Client> {
-    let mut builder = Client::builder().timeout(timeout);
+    let mut builder = Client::builder()
+        .timeout(timeout)
+        .user_agent(USER_AGENT);
 
     if let Some(ca_bundle) = ca_bundle {
         let (pem, source) = ca_bundle.load_pem()?;
