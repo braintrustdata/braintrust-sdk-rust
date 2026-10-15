@@ -133,7 +133,7 @@ impl Logs3BatchUploader {
     ) -> Result<Self> {
         let api_url = Url::parse(api_url.as_ref())
             .map_err(|e| BraintrustError::InvalidConfig(format!("invalid api_url: {e}")))?;
-        let client = build_http_client(Duration::from_secs(30), ca_bundle.as_ref())?;
+        let client = build_http_client(Duration::from_secs(30), ca_bundle.as_ref(), None)?;
         Ok(Self {
             client,
             api_url,

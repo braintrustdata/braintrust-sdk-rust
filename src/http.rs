@@ -6,6 +6,7 @@ use reqwest::Client;
 use crate::error::{BraintrustError, Result};
 
 pub(crate) const CUSTOM_CA_BUNDLE_ENV: &str = "BRAINTRUST_CUSTOM_CA_BUNDLE";
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug)]
 pub(crate) enum CaBundleConfig {
@@ -55,8 +56,11 @@ impl CaBundleConfig {
 pub(crate) fn build_http_client(
     timeout: std::time::Duration,
     ca_bundle: Option<&CaBundleConfig>,
+    user_agent: Option<&str>,
 ) -> Result<Client> {
-    let mut builder = Client::builder().timeout(timeout);
+    let mut builder = Client::builder()
+        .timeout(timeout)
+        .user_agent(user_agent.unwrap_or(USER_AGENT));
 
     if let Some(ca_bundle) = ca_bundle {
         let (pem, source) = ca_bundle.load_pem()?;
@@ -193,7 +197,7 @@ cb0bfZ7fHHs=
         ));
 
         let config = CaBundleConfig::File(path);
-        let err = build_http_client(Duration::from_secs(1), Some(&config)).unwrap_err();
+        let err = build_http_client(Duration::from_secs(1), Some(&config), None).unwrap_err();
 
         assert!(matches!(err, BraintrustError::InvalidConfig(_)));
         assert!(err.to_string().contains("failed to read CA bundle"));
@@ -204,7 +208,7 @@ cb0bfZ7fHHs=
         let path = write_temp_bundle("");
 
         let config = CaBundleConfig::File(path.clone());
-        let err = build_http_client(Duration::from_secs(1), Some(&config)).unwrap_err();
+        let err = build_http_client(Duration::from_secs(1), Some(&config), None).unwrap_err();
         std::fs::remove_file(&path).expect("remove temp bundle");
 
         assert!(matches!(err, BraintrustError::InvalidConfig(_)));
@@ -220,7 +224,7 @@ cb0bfZ7fHHs=
         );
 
         let config = CaBundleConfig::File(path.clone());
-        let err = build_http_client(Duration::from_secs(1), Some(&config)).unwrap_err();
+        let err = build_http_client(Duration::from_secs(1), Some(&config), None).unwrap_err();
         std::fs::remove_file(&path).expect("remove temp bundle");
 
         assert!(matches!(err, BraintrustError::InvalidConfig(_)));
@@ -234,7 +238,7 @@ cb0bfZ7fHHs=
             CUSTOM_CA_BUNDLE_ENV,
         );
 
-        let err = build_http_client(Duration::from_secs(1), Some(&config)).unwrap_err();
+        let err = build_http_client(Duration::from_secs(1), Some(&config), None).unwrap_err();
 
         assert!(matches!(err, BraintrustError::InvalidConfig(_)));
         assert!(err.to_string().contains(CUSTOM_CA_BUNDLE_ENV));
@@ -246,7 +250,7 @@ cb0bfZ7fHHs=
         let path = write_temp_bundle(VALID_TEST_CERT_PEM);
 
         let config = CaBundleConfig::File(path.clone());
-        let client = build_http_client(Duration::from_secs(1), Some(&config));
+        let client = build_http_client(Duration::from_secs(1), Some(&config), None);
         std::fs::remove_file(&path).expect("remove temp bundle");
 
         assert!(client.is_ok());
@@ -257,7 +261,7 @@ cb0bfZ7fHHs=
         let bundle = format!("{VALID_TEST_CERT_PEM}{VALID_TEST_CERT_PEM}");
         let config = CaBundleConfig::from_pem(bundle, "test bundle");
 
-        let client = build_http_client(Duration::from_secs(1), Some(&config));
+        let client = build_http_client(Duration::from_secs(1), Some(&config), None);
 
         assert!(client.is_ok());
     }
@@ -267,15 +271,15 @@ cb0bfZ7fHHs=
         let (url, certificate_pem, server) = start_tls_server(2).await;
 
         let default_client =
-            build_http_client(Duration::from_secs(1), None).expect("default client");
+            build_http_client(Duration::from_secs(1), None, None).expect("default client");
         assert!(default_client.get(&url).send().await.is_err());
 
         let unrelated_certificate = generate_simple_self_signed(vec!["unrelated.test".to_string()])
             .expect("generate unrelated test certificate");
         let bundle = format!("{}{certificate_pem}", unrelated_certificate.cert.pem());
         let config = CaBundleConfig::from_pem(bundle, "test bundle");
-        let custom_ca_client =
-            build_http_client(Duration::from_secs(1), Some(&config)).expect("custom CA client");
+        let custom_ca_client = build_http_client(Duration::from_secs(1), Some(&config), None)
+            .expect("custom CA client");
         let response = custom_ca_client
             .get(&url)
             .send()
@@ -294,8 +298,8 @@ cb0bfZ7fHHs=
         std::env::set_var(CUSTOM_CA_BUNDLE_ENV, certificate_pem);
 
         let config = CaBundleConfig::from_environment().expect("environment CA bundle");
-        let client =
-            build_http_client(Duration::from_secs(1), Some(&config)).expect("custom CA client");
+        let client = build_http_client(Duration::from_secs(1), Some(&config), None)
+            .expect("custom CA client");
         let response = client.get(&url).send().await.expect("custom CA request");
 
         match original {

@@ -203,6 +203,7 @@ pub struct BraintrustClientBuilder {
     enforce_queue_size_limit: bool,
     environment: Option<SpanOriginEnvironment>,
     span_origin: Option<SpanOrigin>,
+    user_agent: Option<String>,
 }
 
 impl BraintrustClientBuilder {
@@ -232,12 +233,22 @@ impl BraintrustClientBuilder {
             enforce_queue_size_limit: false,
             environment: None,
             span_origin: None,
+            user_agent: None,
         }
     }
 
     /// Set the API key (overrides `BRAINTRUST_API_KEY` env var).
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Set the HTTP User-Agent sent by this client's requests.
+    ///
+    /// Defaults to the Rust SDK crate name and version. Applications embedding
+    /// the SDK can set their own identity, for example `bt/0.20.0`.
+    pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
         self
     }
 
@@ -367,7 +378,11 @@ impl BraintrustClientBuilder {
         let api_url = Url::parse(&api_url_str)
             .map_err(|e| BraintrustError::InvalidConfig(format!("invalid api_url: {}", e)))?;
 
-        let http_client = build_http_client(REQUEST_TIMEOUT, self.ca_bundle.as_ref())?;
+        let http_client = build_http_client(
+            REQUEST_TIMEOUT,
+            self.ca_bundle.as_ref(),
+            self.user_agent.as_deref(),
+        )?;
 
         // Create login state (initially empty, populated by login)
         let login_state = LoginState::new();
