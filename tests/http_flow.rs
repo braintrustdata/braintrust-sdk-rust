@@ -24,6 +24,7 @@ async fn submits_with_bearer_token() {
 
     let client = BraintrustClient::builder()
         .api_key("test-key")
+        .user_agent("bt/0.20.0")
         .api_url(server.uri())
         .app_url(server.uri())
         .build()
@@ -48,7 +49,12 @@ async fn submits_with_bearer_token() {
         .iter()
         .find(|request| request.url.path() == "/logs3")
         .expect("logs3 request");
-    assert!(logs3.headers.iter().any(|(name, _)| name.as_str() == "user-agent"));
+    let has_expected_user_agent = logs3
+        .headers
+        .iter()
+        .find(|(name, _)| name.as_str() == "user-agent")
+        .is_some_and(|(_, values)| values.iter().any(|value| value.as_str() == "bt/0.20.0"));
+    assert!(has_expected_user_agent);
 
     let logs_calls = requests
         .into_iter()
