@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::sync::Notify;
 use url::Url;
@@ -29,40 +29,10 @@ use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_QUEUE_SIZE: usize = 256;
-pub const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
-pub const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
+pub use crate::api::{DEFAULT_API_URL, DEFAULT_APP_URL};
 
-/// Organization info returned from login.
-#[derive(Debug, Clone, Deserialize)]
-pub struct OrgInfo {
-    id: String,
-    name: String,
-    #[serde(default)]
-    api_url: Option<String>,
-}
-
-impl OrgInfo {
-    /// The organization's unique ID.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// The organization's name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The organization's API URL, if set.
-    pub fn api_url(&self) -> Option<&str> {
-        self.api_url.as_deref()
-    }
-}
-
-/// Response from the login endpoint.
-#[derive(Debug, Deserialize)]
-struct LoginResponse {
-    org_info: Vec<OrgInfo>,
-}
+use crate::api::login::LoginResponse;
+pub use crate::api::login::OrgInfo;
 
 /// Logged-in state containing API key and org info.
 /// Handles internal synchronization for the transition from not-logged-in to logged-in.
