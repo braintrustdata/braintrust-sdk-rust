@@ -1,3 +1,4 @@
+pub mod api;
 mod dataset;
 mod error;
 pub mod eval;
