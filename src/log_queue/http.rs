@@ -1,5 +1,6 @@
 use super::batching::SerializedBatch;
 use super::config::LogQueueConfig;
+use crate::internal::retry::{exponential, RetryExecutor};
 use crate::types::{Logs3OverflowReference, Logs3OverflowRequest, Logs3OverflowUpload};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -120,13 +121,12 @@ pub(crate) async fn send_batch_with_retry(
     // (matches TypeScript SDK's `overflowUpload` caching pattern).
     let mut overflow_upload: Option<Logs3OverflowUpload> = None;
 
-    // Total attempts = num_retries + 1 (matches TypeScript SDK: numTries = env + 1)
-    for attempt in 0..=config.num_retries() {
-        // Sleep before each retry (exponential backoff: 1s, 2s, 4s, ..., capped at 30s)
-        if attempt > 0 {
-            let delay_secs = 1u64.checked_shl((attempt - 1) as u32).unwrap_or(30).min(30);
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-        }
+    let mut retries = RetryExecutor::new(
+        config.num_retries(),
+        exponential(Duration::from_secs(1), Duration::from_secs(30)),
+    );
+    while let Some(attempt) = retries.next().await {
+        let attempt = attempt.index;
 
         if use_overflow {
             // Get or create the overflow upload (cached across retries)
@@ -435,6 +435,95 @@ mod tests {
         // Should not fail when dir is None
         let result = save_payload_debug(b"test", None, "prefix");
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn exhausted_queue_retries_send_exactly_the_configured_attempts() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let result = send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse(&server.uri()).unwrap(),
+            "token",
+            None,
+            make_batch(b"{}"),
+            &LogQueueConfig::builder().num_retries(2).build(),
+            usize::MAX,
+            false,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn overflow_reference_retry_reuses_the_successful_grant_and_object_upload() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3/overflow"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "method":"PUT", "signedUrl":format!("{}/object", server.uri()), "key":"saved-grant"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/object"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(503))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse(&server.uri()).unwrap(),
+            "token",
+            None,
+            make_batch(b"{}"),
+            &LogQueueConfig::builder().num_retries(1).build(),
+            1,
+            true,
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        let object = requests.iter().find(|r| r.url.path() == "/object").unwrap();
+        assert!(!object
+            .headers
+            .keys()
+            .any(|name| name.as_str().eq_ignore_ascii_case("authorization")));
+        for request in requests.iter().filter(|r| r.url.path() == "/logs3") {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["rows"]["key"], "saved-grant");
+        }
     }
 
     #[tokio::test]
