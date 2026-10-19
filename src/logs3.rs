@@ -1,16 +1,14 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use backoff::backoff::Backoff;
-use backoff::ExponentialBackoffBuilder;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{multipart, Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tokio::time::sleep;
 
 use crate::error::{BraintrustError, Result};
 use crate::http::{build_http_client, CaBundleConfig};
+use crate::internal::retry::{jittered_exponential, RetryExecutor};
 use crate::log_queue::batch_items;
 
 const DEFAULT_MAX_REQUEST_SIZE: usize = 6 * 1024 * 1024;
@@ -526,30 +524,17 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let mut attempts = 0usize;
-    let mut backoff = ExponentialBackoffBuilder::new()
-        .with_initial_interval(Duration::from_millis(BASE_BACKOFF_MS))
-        .with_multiplier(2.0)
-        .with_randomization_factor(0.2)
-        .with_max_interval(Duration::from_millis(MAX_BACKOFF_MS))
-        .with_max_elapsed_time(None)
-        .build();
-
-    loop {
-        attempts += 1;
-        match operation().await {
-            Ok(value) => return (Ok(value), attempts),
-            Err(err) => {
-                if !should_retry(&err) || attempts >= MAX_ATTEMPTS {
-                    return (Err(err), attempts);
-                }
-                match backoff.next_backoff() {
-                    Some(delay) => sleep(delay).await,
-                    None => return (Err(err), attempts),
-                }
-            }
-        }
-    }
+    let outcome = RetryExecutor::new(
+        MAX_ATTEMPTS - 1,
+        jittered_exponential(
+            Duration::from_millis(BASE_BACKOFF_MS),
+            Duration::from_millis(MAX_BACKOFF_MS),
+            0.2,
+        ),
+    )
+    .run(|_| operation(), should_retry, |_, _, _| {})
+    .await;
+    (outcome.result, outcome.attempts)
 }
 
 #[cfg(test)]

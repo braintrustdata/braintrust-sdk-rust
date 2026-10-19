@@ -19,6 +19,7 @@ use crate::experiments::api::{
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
 use crate::http::{build_http_client, CaBundleConfig};
+use crate::internal::retry::{exponential, RetryExecutor};
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
@@ -807,37 +808,33 @@ impl BraintrustClient {
     fn start_background_login(&self, api_key: String, org_name: Option<String>) {
         let client = self.clone();
         tokio::spawn(async move {
-            // Retry with exponential backoff up to a fixed maximum number of attempts.
-            const MAX_ATTEMPTS: u32 = 10;
-            let mut delay = Duration::from_millis(100);
-            let max_delay = Duration::from_secs(5);
-
-            for attempt in 1..=MAX_ATTEMPTS {
-                match client.perform_login(&api_key, org_name.as_deref()).await {
-                    Ok(()) => {
-                        tracing::debug!("Background login completed successfully");
-                        return;
-                    }
-                    Err(e) if attempt < MAX_ATTEMPTS => {
-                        tracing::warn!(
-                            attempt,
-                            max = MAX_ATTEMPTS,
-                            "Background login failed: {}, retrying in {:?}",
-                            e,
-                            delay
-                        );
-                        tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(max_delay);
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Background login failed after {} attempts: {}. \
-                             Spans will not be uploaded until the client is re-created.",
-                            MAX_ATTEMPTS,
-                            e
-                        );
-                    }
-                }
+            const MAX_ATTEMPTS: usize = 10;
+            let outcome = RetryExecutor::new(
+                MAX_ATTEMPTS - 1,
+                exponential(Duration::from_millis(100), Duration::from_secs(5)),
+            )
+            .run(
+                |_| client.perform_login(&api_key, org_name.as_deref()),
+                |_| true, // Preserve the existing background-login policy.
+                |attempt, error, delay| {
+                    tracing::warn!(
+                        attempt = attempt.index + 1,
+                        max = MAX_ATTEMPTS,
+                        "Background login failed: {}, retrying in {:?}",
+                        error,
+                        delay
+                    );
+                },
+            )
+            .await;
+            match outcome.result {
+                Ok(()) => tracing::debug!("Background login completed successfully"),
+                Err(error) => tracing::error!(
+                    "Background login failed after {} attempts: {}. \
+                     Spans will not be uploaded until the client is re-created.",
+                    outcome.attempts,
+                    error
+                ),
             }
         });
     }
