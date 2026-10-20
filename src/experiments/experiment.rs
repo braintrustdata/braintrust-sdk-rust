@@ -67,6 +67,10 @@ struct RecordingMode {
     selected: bool,
 }
 impl ExperimentState {
+    fn pending_start(self: &Arc<Self>) -> PendingSpanStart {
+        self.recording().pending_starts += 1;
+        PendingSpanStart(self.clone())
+    }
     fn recording(&self) -> std::sync::MutexGuard<'_, RecordingMode> {
         self.recording
             .lock()
@@ -157,8 +161,7 @@ impl Experiment {
     /// Rejected or failed starts release their pending mode reservation.
     pub fn start_span(&self) -> crate::Completion<ExperimentSpanBuilder, crate::BraintrustError> {
         self.execution.response_try(|| {
-            self.state.recording().pending_starts += 1;
-            let pending = PendingSpanStart(self.state.clone());
+            let pending = self.state.pending_start();
             let experiment = self.clone();
             Ok(async move {
                 // Capture the guard before spawning, including runtime loss
@@ -365,6 +368,10 @@ impl Experiment {
     /// Finalizes the span and flushes active work when the callback completes.
     /// Setup, final-write, and final-flush errors are returned. Individual writes expose their
     /// delivery results through the completion tokens returned inside the callback.
+    /// Submission is immediate. The owned callback runs on the selected runtime
+    /// even if its token is dropped. Its span and child builders can finish
+    /// dependent writes while shutdown drains accepted work; that permission
+    /// ends with the operation. Ordinary flush cutoffs remain fixed.
     ///
     /// # Example
     ///
@@ -374,20 +381,42 @@ impl Experiment {
     ///     compute_result()
     /// }).await;
     /// ```
-    pub async fn traced<F, Fut, R>(&self, callback: F) -> Result<R>
+    pub fn traced<F, Fut, R>(&self, callback: F) -> crate::Completion<R, crate::BraintrustError>
     where
-        F: FnOnce(SpanHandle) -> Fut,
-        Fut: std::future::Future<Output = R>,
+        F: FnOnce(SpanHandle) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = R> + Send + 'static,
+        R: Send + 'static,
     {
-        let span = self.start_span().await?.name("root").build();
-        let result = callback(span.clone()).await;
-        let end = span.end();
-        let flush = span.flush();
-        let ended = end.await;
-        let flushed = flush.await;
-        ended?;
-        flushed?;
-        Ok(result)
+        self.execution.response_try(|| {
+            let operation = self.submitter.operation()?;
+            let pending = self.state.pending_start();
+            let experiment = self.clone();
+            Ok(async move {
+                // Both guards are captured before first poll. Dropped observers
+                // do not affect them; cancellation/loss revokes write permission.
+                let operation = operation;
+                let pending = pending;
+                let metadata = experiment.register_metadata().await?;
+                experiment.state.recording().selected = true;
+                drop(pending);
+                let span = SpanBuilder::new(operation.submitter.clone(), experiment.scope.clone())
+                    .parent_info(ParentSpanInfo::Experiment {
+                        object_id: metadata.experiment_id.clone(),
+                    })
+                    .span_type(SpanType::Eval)
+                    .name("root")
+                    .build();
+                let result = callback(span.clone()).await;
+                let end = span.end();
+                let flush = span.flush();
+                let ended = end.await;
+                let flushed = flush.await;
+                ended?;
+                flushed?;
+                drop(operation);
+                Ok(result)
+            })
+        })
     }
 
     /// Update an existing span by ID, merging new data with existing data.

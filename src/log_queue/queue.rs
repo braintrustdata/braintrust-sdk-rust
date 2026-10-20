@@ -6,9 +6,9 @@ use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry}
 use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use crate::error::{BraintrustError, Result};
-use crate::internal::delivery::WriteService;
+use crate::internal::delivery::{WriteLease, WriteService};
 use crate::internal::execution::ExecutionBinding;
-use crate::internal::ports::{DeliveryControl, PreparedSpan, SpanSubmitter};
+use crate::internal::ports::{DeliveryControl, PreparedSpan, SpanOperation, SpanSubmitter};
 use crate::internal::session::CredentialScope;
 use crate::internal::shared_outcome::WriteOutcome;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
@@ -644,6 +644,7 @@ impl LogQueueCore {
 pub struct LogQueue {
     core: Arc<LogQueueCore>,
     writes: Arc<Mutex<QueueState>>,
+    lease: Option<WriteLease<SubmitCommand>>,
 }
 enum QueueState {
     Dormant,
@@ -660,6 +661,7 @@ impl LogQueue {
         Self {
             core: LogQueueCore::new(config, client, execution),
             writes: Arc::new(Mutex::new(QueueState::Dormant)),
+            lease: None,
         }
     }
     fn state(&self) -> MutexGuard<'_, QueueState> {
@@ -685,15 +687,10 @@ impl LogQueue {
         )
     }
 
-    fn submit_command(
-        &self,
-        command: SubmitCommand,
-        outcome: Option<WriteOutcome>,
-    ) -> Completion<DeliveryReceipt, WriteError> {
-        let mut state = self.state();
-        if matches!(*state, QueueState::Dormant) {
+    fn ensure_running(&self, state: &mut MutexGuard<'_, QueueState>) {
+        if matches!(**state, QueueState::Dormant) {
             let processor = self.core.clone();
-            *state = QueueState::Running(WriteService::new(
+            **state = QueueState::Running(WriteService::new(
                 self.core.config.queue_max_size(),
                 self.core.execution.clone(),
                 move |commands| {
@@ -702,12 +699,26 @@ impl LogQueue {
                 },
             ));
         }
+    }
+
+    fn submit_command(
+        &self,
+        command: SubmitCommand,
+        outcome: Option<WriteOutcome>,
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        let mut state = self.state();
+        self.ensure_running(&mut state);
         match &*state {
-            QueueState::Running(writes) => {
-                writes.enqueue_with_rejection(command, outcome, |command, error| {
+            QueueState::Running(writes) => match &self.lease {
+                Some(lease) => {
+                    writes.enqueue_with_lease(command, outcome, Some(lease), |command, error| {
+                        self.reject(command, error)
+                    })
+                }
+                None => writes.enqueue_with_rejection(command, outcome, |command, error| {
                     self.reject(command, error)
-                })
-            }
+                }),
+            },
             QueueState::Closed => {
                 let (sender, mut completion) = Completion::pair();
                 completion.record_issuance(Err(crate::EnqueueError::Closed.into()));
@@ -731,7 +742,10 @@ impl LogQueue {
 
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
         match &*self.state() {
-            QueueState::Running(writes) => writes.flush(),
+            QueueState::Running(writes) => match &self.lease {
+                Some(lease) => writes.flush_with_lease(Some(lease)),
+                None => writes.flush(),
+            },
             state => {
                 let (sender, mut completion) = Completion::pair();
                 if matches!(state, QueueState::Closed) {
@@ -802,6 +816,20 @@ impl DeliveryControl for LogQueue {
 }
 #[async_trait::async_trait]
 impl SpanSubmitter for LogQueue {
+    fn operation(&self) -> std::result::Result<SpanOperation, crate::EnqueueError> {
+        let lease = {
+            let mut state = self.state();
+            self.ensure_running(&mut state);
+            match &*state {
+                QueueState::Running(writes) => writes.lease()?,
+                _ => return Err(crate::EnqueueError::Closed),
+            }
+        };
+        let mut scoped = self.clone();
+        scoped.lease = Some(lease.clone());
+        Ok(SpanOperation::new(Arc::new(scoped), move || lease.revoke()))
+    }
+
     fn submit_deferred(
         &self,
         row_id: String,
