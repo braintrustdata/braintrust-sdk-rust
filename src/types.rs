@@ -97,6 +97,27 @@ pub(crate) struct SpanAttributes {
     pub extra: HashMap<String, Value>,
 }
 
+/// Dataset row provenance, independent of instrumentation span_origin context.
+#[derive(Debug, Clone)]
+pub(crate) struct DatasetRecordOrigin {
+    pub object_id: String,
+    pub id: String,
+    pub xact_id: String,
+    pub created: Option<String>,
+}
+impl DatasetRecordOrigin {
+    pub fn into_value(self) -> Value {
+        let mut value = serde_json::json!({
+            "object_type": "dataset", "object_id": self.object_id,
+            "id": self.id, "_xact_id": self.xact_id,
+        });
+        if let Some(created) = self.created {
+            value["created"] = Value::String(created);
+        }
+        value
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SpanEventData {
     pub input: Option<Value>,

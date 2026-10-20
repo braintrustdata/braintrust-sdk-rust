@@ -23,6 +23,9 @@ use std::pin::Pin;
 pub type SourceError = anyhow::Error;
 
 /// Dataset identity captured by a source and retained with its run result.
+/// Recorded runs also associate their experiment with this selection. Case row
+/// IDs and transactions identify individual origins; `version` selects the run's
+/// dataset snapshot and is omitted for live reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DatasetVersionRef {
     pub dataset_id: String,
@@ -35,11 +38,15 @@ pub struct DatasetVersionRef {
 #[async_trait]
 pub trait CaseSource<I, O>: Send {
     /// Resolve source identity before provenance is captured or cases are read.
+    /// The executor calls this once, before initializing recorded experiments.
     async fn prepare(&mut self) -> Result<(), SourceError> {
         Ok(())
     }
 
     async fn next(&mut self) -> Result<Option<Case<I, O>>, SourceError>;
+    /// The executor captures this once after preparation. A recorded run uses
+    /// it for experiment association and for case origins with nonempty `id`
+    /// and `xact_id`; ordinary case IDs alone never imply a dataset association.
     fn provenance(&self) -> Option<DatasetVersionRef> {
         None
     }

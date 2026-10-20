@@ -711,12 +711,15 @@ async fn experiment_is_resolved_before_source_reads_and_case_roots_keep_independ
     };
     let (client, server) = recording_client().await;
     let registered = Arc::new(AtomicBool::new(false));
+    let prepared = Arc::new(AtomicBool::new(false));
     Mock::given(method("POST")).and(path("/api/experiment/register"))
         .and(header("authorization", "Bearer test-key"))
         .and(header("x-bt-org-name", "org"))
         .respond_with({
             let registered = registered.clone();
+            let prepared = prepared.clone();
             move |_: &wiremock::Request| {
+                assert!(prepared.load(Ordering::SeqCst));
                 registered.store(true, Ordering::SeqCst);
                 ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"chosen-project","name":"chosen"},"experiment":{"id":"chosen-id","name":"resolved-name"}}))
             }
@@ -724,15 +727,26 @@ async fn experiment_is_resolved_before_source_reads_and_case_roots_keep_independ
     struct Source {
         cursor: Cell<usize>,
         registered: Arc<AtomicBool>,
+        prepared: Arc<AtomicBool>,
     }
     #[async_trait::async_trait]
     impl CaseSource<usize, usize> for Source {
+        async fn prepare(&mut self) -> anyhow::Result<()> {
+            assert!(
+                !self.prepared.swap(true, Ordering::SeqCst),
+                "prepare exactly once"
+            );
+            assert!(!self.registered.load(Ordering::SeqCst));
+            Ok(())
+        }
         async fn next(&mut self) -> anyhow::Result<Option<Case<usize, usize>>> {
             assert!(self.registered.load(Ordering::SeqCst));
             let index = self.cursor.get();
             self.cursor.set(index + 1);
             Ok((index < 2).then(|| Case {
                 input: index,
+                id: Some(format!("application-case-{index}")),
+                xact_id: Some("application-version".into()),
                 metadata: Some(json!({"collision":"case"}).as_object().unwrap().clone()),
                 tags: Some(vec!["shared".into(), "case".into()]),
                 ..Default::default()
@@ -767,6 +781,7 @@ async fn experiment_is_resolved_before_source_reads_and_case_roots_keep_independ
         .source(Box::new(Source {
             cursor: Cell::new(0),
             registered,
+            prepared,
         }))
         .definition(definition)
         .project_name("chosen".into())
@@ -808,6 +823,8 @@ async fn experiment_is_resolved_before_source_reads_and_case_roots_keep_independ
     assert_eq!(registration["project_name"], "chosen");
     assert_eq!(registration["experiment_name"], "requested-name");
     assert_eq!(registration["metadata"]["collision"], "run");
+    assert!(registration.get("dataset_id").is_none());
+    assert!(registration.get("dataset_version").is_none());
     let rows: Vec<serde_json::Value> = requests
         .iter()
         .filter(|request| request.url.path() == "/logs3")
@@ -824,6 +841,7 @@ async fn experiment_is_resolved_before_source_reads_and_case_roots_keep_independ
     assert!(rows
         .iter()
         .all(|row| row["span_attributes"]["name"] != "eval-named-eval"));
+    assert!(rows.iter().all(|row| row.get("origin").is_none()));
     let mut roots = std::collections::HashSet::new();
     for case in &summary.results {
         let id = case.span_id.as_ref().unwrap();
@@ -903,7 +921,7 @@ async fn registration_failure_reads_no_cases_and_a_later_run_can_record_normally
             source: BraintrustError::Api { status: 403, .. }
         }]
     ));
-    assert!(error.partial.is_none());
+    assert_eq!(error.partial.as_ref().unwrap().total_cases, 0);
     assert_eq!(reads.load(Ordering::SeqCst), 0);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(!server

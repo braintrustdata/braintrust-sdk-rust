@@ -54,6 +54,10 @@ impl<I, O> EvalPlan<I, O> {
 
 #[async_trait]
 pub(crate) trait EvalRecorder<I, O>: Send + Sync {
+    /// Initialize recording only after source identity is frozen, before reading cases.
+    async fn prepare(&mut self, _dataset: Option<&super::DatasetVersionRef>) -> Result<()> {
+        Ok(())
+    }
     fn target(&self) -> Option<super::EvalRecording> {
         None
     }
@@ -82,7 +86,7 @@ pub(crate) struct EvalExecutor;
 impl EvalExecutor {
     pub async fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
         mut plan: EvalPlan<I, O>,
-        recorder: Option<&dyn EvalRecorder<I, O>>,
+        mut recorder: Option<&mut dyn EvalRecorder<I, O>>,
         reporter: &mut impl EvalReporter<I, O>,
         binding: Option<&crate::internal::execution::ExecutionBinding>,
     ) -> std::result::Result<EvalSummary<I, O>, EvalRunError<I, O>> {
@@ -97,6 +101,17 @@ impl EvalExecutor {
                 source,
             });
         }
+        if failures.is_empty() {
+            if let Some(recorder) = recorder.as_deref_mut() {
+                if let Err(source) = recorder.prepare(dataset.as_ref()).await {
+                    failures.push(EvalRunFailure::Recording {
+                        case_index: None,
+                        source,
+                    });
+                }
+            }
+        }
+        let recorder = recorder.as_deref();
         let mut case_count = 0;
         let mut pending = FuturesUnordered::new();
         while failures.is_empty() {
@@ -446,7 +461,7 @@ mod tests {
     #[test]
     fn recorder_start_and_finish_errors_preserve_computation_and_finalize_run() {
         let finished = Arc::new(AtomicUsize::new(0));
-        let recorder = FailingRecorder {
+        let mut recorder = FailingRecorder {
             finished: finished.clone(),
         };
         let cases = (0..3)
@@ -475,7 +490,7 @@ mod tests {
         let mut reporter = Observed::default();
         let error = futures::executor::block_on(EvalExecutor::run(
             plan,
-            Some(&recorder),
+            Some(&mut recorder),
             &mut reporter,
             None,
         ))

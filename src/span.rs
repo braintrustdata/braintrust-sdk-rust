@@ -250,6 +250,7 @@ impl SpanLogBuilder {
 }
 
 pub struct SpanBuilder {
+    dataset_record_origin: Option<crate::types::DatasetRecordOrigin>,
     submitter: Arc<dyn SpanSubmitter>,
     scope: CredentialScope,
     project_name: Option<String>,
@@ -290,6 +291,7 @@ impl Clone for SpanBuilder {
             span_id_override: self.span_id_override.clone(),
             row_id_override: self.row_id_override.clone(),
             span_origin: self.span_origin.clone(),
+            dataset_record_origin: self.dataset_record_origin.clone(),
             span_attributes_extra: self.span_attributes_extra.clone(),
         }
     }
@@ -378,8 +380,17 @@ impl SpanBuilder {
             span_id_override: None,
             row_id_override: None,
             span_origin: None,
+            dataset_record_origin: None,
             span_attributes_extra: HashMap::new(),
         }
+    }
+
+    pub(crate) fn dataset_record_origin(
+        mut self,
+        origin: crate::types::DatasetRecordOrigin,
+    ) -> Self {
+        self.dataset_record_origin = Some(origin);
+        self
     }
 
     /// Set the span name before its first snapshot is submitted.
@@ -539,6 +550,7 @@ impl SpanBuilder {
                 name: self.name,
                 environment: self.environment,
                 span_origin: self.span_origin,
+                dataset_record_origin: self.dataset_record_origin,
                 span_attributes_extra: self.span_attributes_extra,
                 propagated_event,
                 ..Default::default()
@@ -807,6 +819,7 @@ fn current_span_payload(inner: &mut SpanData) -> SpanPayload {
 
 #[derive(Clone, Default)]
 struct SpanData {
+    dataset_record_origin: Option<crate::types::DatasetRecordOrigin>,
     row_id: String,
     span_id: String,
     has_flushed: bool,
@@ -871,6 +884,12 @@ impl From<SpanData> for SpanPayload {
 
         if let Some(propagated_event) = data.propagated_event {
             event_data.apply_propagated_event(&propagated_event);
+        }
+
+        if let Some(origin) = data.dataset_record_origin {
+            event_data
+                .extra
+                .insert("origin".into(), origin.into_value());
         }
 
         Self {
