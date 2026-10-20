@@ -42,7 +42,7 @@ pub struct LoginState {
     inner: Arc<std::sync::OnceLock<LoginStateInner>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct LoginStateInner {
     api_key: String,
     org_id: String,
@@ -119,13 +119,11 @@ impl LoginState {
 
 impl std::fmt::Debug for LoginState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.inner.get() {
-            Some(inner) => f.debug_struct("LoginState").field("inner", inner).finish(),
-            None => f
-                .debug_struct("LoginState")
-                .field("inner", &"<not logged in>")
-                .finish(),
-        }
+        f.debug_struct("LoginState")
+            .field("is_logged_in", &self.is_logged_in())
+            .field("org_id", &self.org_id())
+            .field("org_name", &self.org_name())
+            .finish_non_exhaustive()
     }
 }
 
@@ -550,6 +548,9 @@ impl BraintrustClient {
     ///
     /// This waits for login to complete if it hasn't already.
     pub async fn dataset_builder(&self) -> Result<DatasetBuilder<Self>> {
+        if self.inner.login_skipped {
+            return Err(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
+        }
         let state = self.wait_for_login_state().await?;
         let api_key = state
             .api_key()
@@ -562,6 +563,16 @@ impl BraintrustClient {
             api_key,
             org_name,
         ))
+    }
+
+    /// Create a dataset builder with immutable explicit credentials, without
+    /// logging in or changing the client's shared session.
+    pub fn dataset_builder_with_credentials(
+        &self,
+        token: impl Into<String>,
+        org_name: impl Into<String>,
+    ) -> DatasetBuilder<Self> {
+        DatasetBuilder::new(Arc::new(self.clone()), token, org_name)
     }
 
     /// Create a span builder with explicit token and org_id.
@@ -597,7 +608,7 @@ impl BraintrustClient {
             self.inner.login_state.clone()
         } else if self.inner.login_skipped {
             return Err(BraintrustError::InvalidConfig(
-                "update_span() requires credentials; call span_builder_with_credentials() or experiment_builder_with_credentials() first when skip_login is enabled".into(),
+                "update_span() requires a logged-in client; use update_span_with_credentials() when skip_login is enabled".into(),
             ));
         } else {
             self.wait_for_login_state().await?
@@ -893,8 +904,7 @@ impl BraintrustClient {
 
     /// Create an experiment builder with explicit credentials.
     ///
-    /// Note: This will be deprecated in favor of `experiment_builder()` once
-    /// the login-flow branch lands and credentials are stored in the client.
+    /// Credentials belong to this resource and never populate shared login state.
     ///
     /// # Example
     ///
@@ -912,15 +922,6 @@ impl BraintrustClient {
     ) -> ExperimentBuilder<Self> {
         let token = token.into();
         let org_id = org_id.into();
-
-        // Populate login state with explicit credentials so flush_internal() can send data.
-        let _ = self.inner.login_state.set(
-            token.clone(),
-            org_id.clone(),
-            String::new(), // org_name unknown without login
-            self.inner.api_url.to_string(),
-            self.inner.app_url.to_string(),
-        );
 
         let submitter = Arc::new(self.clone());
         ExperimentBuilder::new(submitter, token, org_id)
@@ -1404,6 +1405,23 @@ fn parse_string_array(value: Value) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn login_state_debug_never_exposes_tokens_or_unvalidated_endpoints() {
+        let state = super::LoginState::new();
+        state.set(
+            "private-token".into(),
+            "org".into(),
+            "tenant".into(),
+            "https://user:password@example.com/?api_key=secret".into(),
+            "https://example.com/?token=secret".into(),
+        );
+        let debug = format!("{state:?}");
+        assert!(debug.contains("tenant"));
+        for secret in ["private-token", "password", "secret"] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
     use super::*;
     use crate::span::SpanLog;
     use serde_json::Value;

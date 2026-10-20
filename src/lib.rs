@@ -21,7 +21,7 @@ mod types;
 
 pub use completion::{Completion, CompletionFuture};
 pub use dataset::{
-    DatasetBuilder, DatasetBuilderError, DatasetInsert, DatasetInsertBuilder,
+    Dataset, DatasetBuilder, DatasetBuilderError, DatasetInsert, DatasetInsertBuilder,
     DatasetInsertBuilderError, DatasetIterator, DatasetRecord, DatasetSummary,
 };
 pub use delivery::{

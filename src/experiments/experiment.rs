@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, OnceCell};
-use uuid::Uuid;
+use tokio::sync::OnceCell;
 
 use crate::error::Result;
 use crate::experiments::api::{
@@ -49,13 +48,16 @@ pub struct Experiment<S: SpanSubmitter> {
     pub(crate) public: Option<bool>,
     pub(crate) update: Option<bool>,
     pub(crate) repo_info: Option<RepoInfo>,
-    pub(crate) lazy_metadata: OnceCell<ExperimentMetadata>,
-    /// Last start time for sequential log() calls (stored as bits).
-    pub(crate) last_start_time: AtomicU64,
-    /// Whether start_span() has been called (prevents mixing with log()).
-    pub(crate) called_start_span: AtomicBool,
-    /// Pending span handles that need to be flushed.
-    pub(crate) pending_flushes: Arc<Mutex<Vec<SpanHandle<S>>>>,
+    pub(crate) state: Arc<ExperimentState>,
+}
+
+/// Registration and live experiment state have the same lifetime as the handle
+/// identity. Cloning a handle never resets initialization or recording state.
+#[derive(Default)]
+pub(crate) struct ExperimentState {
+    metadata: OnceCell<ExperimentMetadata>,
+    last_start_time: AtomicU64,
+    called_start_span: AtomicBool,
 }
 
 impl<S: SpanSubmitter> Clone for Experiment<S> {
@@ -73,10 +75,7 @@ impl<S: SpanSubmitter> Clone for Experiment<S> {
             repo_info: self.repo_info.clone(),
             metadata: self.metadata.clone(),
             public: self.public,
-            lazy_metadata: OnceCell::new(),
-            last_start_time: AtomicU64::new(self.last_start_time.load(Ordering::Acquire)),
-            called_start_span: AtomicBool::new(self.called_start_span.load(Ordering::Acquire)),
-            pending_flushes: Arc::clone(&self.pending_flushes),
+            state: self.state.clone(),
         }
     }
 }
@@ -94,23 +93,20 @@ impl<
     ///
     /// Returns the span ID which can be used with `log_feedback()`.
     ///
-    /// # Panics
-    ///
-    /// Panics if `start_span()` has already been called on this experiment,
-    /// as mixing `log()` and `start_span()` is not supported.
-    pub async fn log(&self, event: ExperimentLog) -> String {
-        if self.called_start_span.load(Ordering::Acquire) {
-            panic!(
-                "Cannot use log() after start_span() has been called. \
-                 Use start_span() consistently or log() consistently, but not both."
-            );
+    /// Returns an error if registration/delivery fails, or if start_span() has
+    /// already selected the span-recording interface for this experiment.
+    pub async fn log(&self, event: ExperimentLog) -> Result<String> {
+        if self.state.called_start_span.load(Ordering::Acquire) {
+            return Err(crate::BraintrustError::InvalidConfig(
+                "cannot use log() after start_span(); use the span to log events".into(),
+            ));
         }
 
         // Get or create experiment registration
-        let metadata = self.ensure_registered().await;
+        let metadata = self.ensure_registered().await?;
 
         // Create a span for this log event
-        let start_time = f64::from_bits(self.last_start_time.load(Ordering::Acquire));
+        let start_time = f64::from_bits(self.state.last_start_time.load(Ordering::Acquire));
         let start_time = if start_time == 0.0 {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -120,44 +116,46 @@ impl<
             start_time
         };
 
-        let span = self.create_internal_span(&metadata, start_time).await;
+        let span = self.create_internal_span(metadata, start_time);
 
         // Get the row_id before logging - it's stable from span creation
         let row_id = span.row_id().to_string();
 
-        // Convert ExperimentLog to SpanLog and log
-        let span_log = event.into_span_log();
-        span.log(span_log);
-
-        // Record end time for next log() call
         let end_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
+            .map(|duration| duration.as_secs_f64())
             .unwrap_or(0.0);
-        self.last_start_time
+        let mut span_log = event.into_span_log();
+        span_log
+            .metrics
+            .get_or_insert_with(HashMap::new)
+            .entry("end".into())
+            .or_insert(end_time);
+        // A single complete event snapshot owns the delivery obligation.
+        span.log(span_log).await?;
+
+        self.state
+            .last_start_time
             .store(end_time.to_bits(), Ordering::Release);
 
-        // Track for flush
-        self.pending_flushes.lock().await.push(span);
-
-        row_id
+        Ok(row_id)
     }
 
     /// Start a new root span for this experiment.
     ///
     /// Use this for more control over span lifecycle. Once called,
     /// you cannot use `log()` on this experiment.
-    pub async fn start_span(&self) -> ExperimentSpanBuilder<'_, S> {
-        self.called_start_span.store(true, Ordering::Release);
-        let metadata = self.ensure_registered().await;
-        ExperimentSpanBuilder::new(self, metadata)
+    pub async fn start_span(&self) -> Result<ExperimentSpanBuilder<'_, S>> {
+        let metadata = self.ensure_registered().await?;
+        self.state.called_start_span.store(true, Ordering::Release);
+        Ok(ExperimentSpanBuilder::new(self, metadata.clone()))
     }
 
     /// Log feedback on an existing span/record.
     ///
     /// Use this to add scores, comments, or other feedback after the initial log.
-    pub async fn log_feedback(&self, id: &str, feedback: Feedback) {
-        let metadata = self.ensure_registered().await;
+    pub async fn log_feedback(&self, id: &str, feedback: Feedback) -> Result<()> {
+        let metadata = self.ensure_registered().await?;
 
         // Create a merge payload for the existing span
         let mut scores = HashMap::new();
@@ -206,7 +204,9 @@ impl<
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info));
+            .submit(self.token.clone(), payload, Some(parent_info))
+            .await?;
+        Ok(())
     }
 
     /// Get a summary of the experiment's performance.
@@ -217,15 +217,10 @@ impl<
         // Flush all pending data first
         self.flush().await?;
 
-        let metadata = self.ensure_registered().await;
+        let metadata = self.ensure_registered().await?;
 
         // Try to get base experiment for comparison
-        let base_exp_id = self
-            .fetch_base_experiment()
-            .await
-            .ok()
-            .flatten()
-            .map(|b| b.id);
+        let base_exp_id = self.fetch_base_experiment().await?.map(|base| base.id);
 
         // Fetch comparison data from API
         let comparison = self
@@ -297,21 +292,19 @@ impl<
 
     /// Flush all pending experiment data to Braintrust.
     pub async fn flush(&self) -> Result<()> {
-        let mut pending = self.pending_flushes.lock().await;
-        for span in pending.drain(..) {
-            span.flush().await?;
-        }
+        self.submitter.flush().await?;
         Ok(())
     }
 
     /// Get the experiment ID (after registration).
     pub fn experiment_id(&self) -> Option<String> {
-        self.lazy_metadata.get().map(|m| m.experiment_id.clone())
+        self.state.metadata.get().map(|m| m.experiment_id.clone())
     }
 
     /// Get the experiment name (after registration).
     pub fn experiment_name(&self) -> String {
-        self.lazy_metadata
+        self.state
+            .metadata
             .get()
             .map(|m| m.experiment_name.clone())
             .unwrap_or_else(|| {
@@ -322,18 +315,19 @@ impl<
     }
 
     /// Get the project containing this experiment.
-    pub async fn project(&self) -> ProjectMetadata {
-        let metadata = self.ensure_registered().await;
-        ProjectMetadata {
+    pub async fn project(&self) -> Result<ProjectMetadata> {
+        let metadata = self.ensure_registered().await?;
+        Ok(ProjectMetadata {
             id: metadata.project_id.clone(),
             name: self.project_name.clone(),
-        }
+        })
     }
 
     /// Execute a callback within a traced span.
     ///
-    /// The span is automatically flushed when the callback completes (success or error).
-    /// This ensures all span data is sent to Braintrust before the method returns.
+    /// Finalizes the span and flushes active work when the callback completes.
+    /// Setup and final-flush errors are returned. Individual writes expose their
+    /// delivery results through the completion tokens returned inside the callback.
     ///
     /// # Example
     ///
@@ -343,24 +337,24 @@ impl<
     ///     compute_result()
     /// }).await;
     /// ```
-    pub async fn traced<F, Fut, R>(&self, callback: F) -> R
+    pub async fn traced<F, Fut, R>(&self, callback: F) -> Result<R>
     where
         F: FnOnce(SpanHandle<S>) -> Fut,
         Fut: std::future::Future<Output = R>,
     {
-        let span = self.start_span().await.name("root").build();
+        let span = self.start_span().await?.name("root").build();
         let result = callback(span.clone()).await;
-        // Flush span data - ignore errors since this is best-effort
-        let _ = span.flush().await;
-        result
+        span.end();
+        span.flush().await?;
+        Ok(result)
     }
 
     /// Update an existing span by ID, merging new data with existing data.
     ///
     /// This is useful for adding information to a span after it has been created,
     /// such as adding scores or metadata computed later.
-    pub async fn update_span(&self, id: &str, event: SpanLog) {
-        let metadata = self.ensure_registered().await;
+    pub async fn update_span(&self, id: &str, event: SpanLog) -> Result<()> {
+        let metadata = self.ensure_registered().await?;
 
         let payload = SpanPayload {
             row_id: id.to_string(),
@@ -393,14 +387,16 @@ impl<
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info));
+            .submit(self.token.clone(), payload, Some(parent_info))
+            .await?;
+        Ok(())
     }
 
     /// Fetch the base experiment used for comparison.
     ///
     /// Returns `None` if no base experiment has been configured or detected.
     pub async fn fetch_base_experiment(&self) -> Result<Option<BaseExperimentInfo>> {
-        let metadata = self.ensure_registered().await;
+        let metadata = self.ensure_registered().await?;
         self.submitter
             .fetch_base_experiment(&self.token, &metadata.experiment_id)
             .await
@@ -410,18 +406,19 @@ impl<
     ///
     /// Use this to pass experiment context to another process or service,
     /// allowing spans created there to be linked to this experiment.
-    pub async fn export(&self) -> ExportedExperiment {
-        let metadata = self.ensure_registered().await;
-        ExportedExperiment {
+    pub async fn export(&self) -> Result<ExportedExperiment> {
+        let metadata = self.ensure_registered().await?;
+        Ok(ExportedExperiment {
             object_type: "experiment".to_string(),
             object_id: metadata.experiment_id.clone(),
-        }
+        })
     }
 
     /// Ensure the experiment is registered, returning cached metadata.
-    pub(crate) async fn ensure_registered(&self) -> ExperimentMetadata {
-        self.lazy_metadata
-            .get_or_init(|| async {
+    pub(crate) async fn ensure_registered(&self) -> Result<&ExperimentMetadata> {
+        self.state
+            .metadata
+            .get_or_try_init(|| async {
                 let request = ExperimentRegisterRequest {
                     project_name: self.project_name.clone(),
                     org_id: self.org_id.clone(),
@@ -433,37 +430,21 @@ impl<
                     update: self.update,
                     repo_info: self.repo_info.clone(),
                 };
-
-                match self
+                let response = self
                     .submitter
                     .register_experiment(&self.token, request)
-                    .await
-                {
-                    Ok(response) => ExperimentMetadata {
-                        project_id: response.project.id,
-                        experiment_id: response.experiment.id,
-                        experiment_name: response.experiment.name,
-                    },
-                    Err(e) => {
-                        // Log error but return placeholder to avoid blocking
-                        tracing::warn!(error = %e, "experiment registration failed");
-                        ExperimentMetadata {
-                            project_id: String::new(),
-                            experiment_id: Uuid::new_v4().to_string(),
-                            experiment_name: self
-                                .experiment_name
-                                .clone()
-                                .unwrap_or_else(|| "unnamed".to_string()),
-                        }
-                    }
-                }
+                    .await?;
+                Ok(ExperimentMetadata {
+                    project_id: response.project.id,
+                    experiment_id: response.experiment.id,
+                    experiment_name: response.experiment.name,
+                })
             })
             .await
-            .clone()
     }
 
     /// Create an internal span for log() calls.
-    async fn create_internal_span(
+    fn create_internal_span(
         &self,
         metadata: &ExperimentMetadata,
         start_time: f64,
