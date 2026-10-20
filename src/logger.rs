@@ -12,6 +12,7 @@ use crate::error::{BraintrustError, Result};
 use crate::experiments::ExperimentBuilder;
 use crate::http::{build_http_client, CaBundleConfig};
 use crate::internal::retry::{exponential, RetryExecutor};
+use crate::internal::session::CredentialScope;
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
@@ -76,6 +77,25 @@ impl LoginState {
                 app_url,
             })
             .is_ok()
+    }
+
+    /// Capture the selected organization and routes together, without fallback.
+    fn scope(&self) -> Result<CredentialScope> {
+        let state = self
+            .inner
+            .get()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        let api_url = Url::parse(&state.api_url)
+            .map_err(|_| BraintrustError::InvalidConfig("invalid login API URL".into()))?;
+        let app_url = Url::parse(&state.app_url)
+            .map_err(|_| BraintrustError::InvalidConfig("invalid login app URL".into()))?;
+        Ok(CredentialScope::new(
+            state.api_key.clone(),
+            state.org_id.clone(),
+            Some(state.org_name.clone()),
+            api_url,
+            app_url,
+        ))
     }
 
     /// Check if logged in.
@@ -365,17 +385,8 @@ impl BraintrustClientBuilder {
             .checked_delivery(self.checked_delivery)
             .build();
 
-        // LogQueue owns the background worker. It is given the client-configured
-        // URLs so that flushes with per-request credentials work without relying on
-        // the shared (set-once) login state to hold URLs.
-        let queue = LogQueue::new(
-            log_config,
-            login_state.clone(),
-            http_client.clone(),
-            self.queue_size,
-            api_url.clone(),
-            app_url.clone(),
-        );
+        // Commands carry their own immutable scope; the worker has no session fallback.
+        let queue = LogQueue::new(log_config, http_client.clone(), self.queue_size);
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
@@ -449,20 +460,23 @@ impl std::fmt::Debug for ClientInner {
 }
 
 impl BraintrustClient {
-    /// Bind explicit credentials to the configured resource endpoints without login.
-    pub(crate) fn resource_api(
+    pub(crate) fn resource_api(&self, scope: &CredentialScope) -> Result<crate::api::Client> {
+        scope.api(&self.inner.http_client)
+    }
+
+    fn explicit_scope(
         &self,
-        token: &str,
-        org_name: Option<&str>,
-    ) -> Result<crate::api::Client> {
-        crate::api::Client::for_scope(
-            self.inner.http_client.clone(),
-            &self.inner.api_url,
-            &self.inner.app_url,
+        token: String,
+        org_id: String,
+        org_name: Option<String>,
+    ) -> CredentialScope {
+        CredentialScope::new(
             token,
+            org_id,
             org_name,
+            self.inner.api_url.clone(),
+            self.inner.app_url.clone(),
         )
-        .map_err(Into::into)
     }
 
     /// Create a new builder for configuring the client.
@@ -533,13 +547,7 @@ impl BraintrustClient {
             ));
         }
         let state = self.wait_for_login_state().await?;
-        let api_key = state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_id = state
-            .org_id()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let mut builder = crate::span::SpanBuilder::new(Arc::new(self.clone()), &api_key, &org_id);
+        let mut builder = crate::span::SpanBuilder::new(Arc::new(self.clone()), state.scope()?);
         if let Some(environment) = &self.inner.environment {
             builder = builder.span_origin_environment(environment.clone());
         }
@@ -560,17 +568,7 @@ impl BraintrustClient {
             return Err(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
         }
         let state = self.wait_for_login_state().await?;
-        let api_key = state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_name = state
-            .org_name()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        Ok(DatasetBuilder::new(
-            Arc::new(self.clone()),
-            api_key,
-            org_name,
-        ))
+        Ok(DatasetBuilder::new(Arc::new(self.clone()), state.scope()?))
     }
 
     /// Create a dataset builder with immutable explicit credentials, without
@@ -580,14 +578,17 @@ impl BraintrustClient {
         token: impl Into<String>,
         org_name: impl Into<String>,
     ) -> DatasetBuilder<Self> {
-        DatasetBuilder::new(Arc::new(self.clone()), token, org_name)
+        DatasetBuilder::new(
+            Arc::new(self.clone()),
+            self.explicit_scope(token.into(), String::new(), Some(org_name.into())),
+        )
     }
 
     /// Create a span builder with explicit token and org_id.
     ///
     /// Use this for per-session / multi-tenant logging: the supplied credentials
-    /// travel with each span through the upload pipeline and are NOT written into
-    /// the client's shared login state. Spans created from the same client with
+    /// and configured endpoint routes are captured by the builder and travel with
+    /// each span. They do not change the client's shared login state. Spans created from the same client with
     /// different `(token, org_id)` pairs each upload with their own credentials.
     pub fn span_builder_with_credentials(
         &self,
@@ -598,7 +599,8 @@ impl BraintrustClient {
         let org_id = org_id.into();
 
         let submitter = Arc::new(self.clone());
-        let mut builder = crate::span::SpanBuilder::new(submitter, token, org_id);
+        let mut builder =
+            crate::span::SpanBuilder::new(submitter, self.explicit_scope(token, org_id, None));
         if let Some(environment) = &self.inner.environment {
             builder = builder.span_origin_environment(environment.clone());
         }
@@ -622,13 +624,7 @@ impl BraintrustClient {
             self.wait_for_login_state().await?
         };
 
-        let api_key = login_state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_id = login_state
-            .org_id()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        self.update_span_internal(api_key, org_id, login_state.org_name(), exported, event)
+        self.update_span_internal(login_state.scope()?, exported, event)
             .map(|_| ())
     }
 
@@ -647,7 +643,7 @@ impl BraintrustClient {
         let token = token.into();
         let org_id = org_id.into();
 
-        self.update_span_internal(token, org_id, None, exported, event)
+        self.update_span_internal(self.explicit_scope(token, org_id, None), exported, event)
             .map(|_| ())
     }
 
@@ -662,14 +658,16 @@ impl BraintrustClient {
         exported: &str,
         event: crate::span::SpanLog,
     ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
-        self.update_span_internal(token.into(), org_id.into(), None, exported, event)
+        self.update_span_internal(
+            self.explicit_scope(token.into(), org_id.into(), None),
+            exported,
+            event,
+        )
     }
 
     fn update_span_internal(
         &self,
-        token: String,
-        org_id: String,
-        org_name: Option<String>,
+        scope: CredentialScope,
         exported: &str,
         event: crate::span::SpanLog,
     ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
@@ -749,8 +747,8 @@ impl BraintrustClient {
             span_id,
             is_merge: true,
             span_components: Some(components),
-            org_id,
-            org_name,
+            org_id: scope.org_id().to_owned(),
+            org_name: scope.org_name().map(str::to_owned),
             project_name: None,
             input: event_data.input,
             output: event_data.output,
@@ -765,7 +763,7 @@ impl BraintrustClient {
             extra: event_data.extra,
         };
 
-        let completion = self.submit_payload(token, payload, None);
+        let completion = self.submit_payload(scope, payload, None);
         if let Err(error) = completion.submission() {
             return Err(BraintrustError::Background(error.to_string()));
         }
@@ -932,17 +930,17 @@ impl BraintrustClient {
         let org_id = org_id.into();
 
         let submitter = Arc::new(self.clone());
-        ExperimentBuilder::new(submitter, token, org_id)
+        ExperimentBuilder::new(submitter, self.explicit_scope(token, org_id, None))
     }
 
     /// Submit immediately; the token observes admission and full batch delivery.
     pub(crate) fn submit_payload(
         &self,
-        token: impl Into<String>,
+        scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
-        self.inner.queue.submit(token, payload, parent_info)
+        self.inner.queue.submit(scope, payload, parent_info)
     }
 
     /// Stop accepting writes, drain accepted work and stop the delivery worker.
@@ -971,11 +969,11 @@ impl BraintrustClient {
 impl SpanSubmitter for BraintrustClient {
     fn submit(
         &self,
-        token: String,
+        scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
-        self.submit_payload(token, payload, parent_info)
+        self.submit_payload(scope, payload, parent_info)
     }
 
     fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {

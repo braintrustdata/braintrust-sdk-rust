@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::internal::session::CredentialScope;
 use crate::span_components::SpanComponents;
 use crate::types::{
     ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
@@ -252,7 +253,7 @@ pub(crate) trait SpanSubmitter: Send + Sync {
     /// Attempt admission immediately and observe the logical batch outcome.
     fn submit(
         &self,
-        token: String,
+        scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
@@ -268,9 +269,7 @@ pub(crate) trait SpanSubmitter: Send + Sync {
 #[allow(private_bounds)]
 pub struct SpanBuilder<S: SpanSubmitter> {
     submitter: Arc<S>,
-    token: String,
-    org_id: String,
-    org_name: Option<String>,
+    scope: CredentialScope,
     project_name: Option<String>,
     parent_info: Option<ParentSpanInfo>,
     span_type: SpanType,
@@ -287,9 +286,7 @@ impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
     fn clone(&self) -> Self {
         Self {
             submitter: Arc::clone(&self.submitter),
-            token: self.token.clone(),
-            org_id: self.org_id.clone(),
-            org_name: self.org_name.clone(),
+            scope: self.scope.clone(),
             project_name: self.project_name.clone(),
             parent_info: self.parent_info.clone(),
             span_type: self.span_type,
@@ -374,16 +371,10 @@ impl SpanOrigin {
 
 #[allow(private_bounds)]
 impl<S: SpanSubmitter> SpanBuilder<S> {
-    pub(crate) fn new(
-        submitter: Arc<S>,
-        token: impl Into<String>,
-        org_id: impl Into<String>,
-    ) -> Self {
+    pub(crate) fn new(submitter: Arc<S>, scope: CredentialScope) -> Self {
         Self {
             submitter,
-            token: token.into(),
-            org_id: org_id.into(),
-            org_name: None,
+            scope,
             project_name: None,
             parent_info: None,
             span_type: SpanType::default(),
@@ -450,7 +441,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
     }
 
     pub fn org_name(mut self, org_name: impl Into<String>) -> Self {
-        self.org_name = Some(org_name.into());
+        self.scope = self.scope.with_org_name(org_name.into());
         self
     }
 
@@ -521,15 +512,15 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
 
         SpanHandle {
             submitter: Arc::clone(&self.submitter),
-            token: self.token,
+            scope: self.scope.clone(),
             parent_info: self.parent_info,
             row_id: row_id.clone(),
             inner: Arc::new(Mutex::new(SpanData {
                 row_id,
                 span_id,
                 has_flushed: false,
-                org_id: self.org_id,
-                org_name: self.org_name,
+                org_id: self.scope.org_id().to_owned(),
+                org_name: self.scope.org_name().map(str::to_owned),
                 project_name: self.project_name,
                 start_time,
                 span_type: self.span_type,
@@ -547,7 +538,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
 #[allow(private_bounds)]
 pub struct SpanHandle<S: SpanSubmitter> {
     submitter: Arc<S>,
-    token: String,
+    scope: CredentialScope,
     parent_info: Option<ParentSpanInfo>,
     /// Stable identifier set at creation, accessible without locking.
     row_id: String,
@@ -558,7 +549,7 @@ impl<S: SpanSubmitter> Clone for SpanHandle<S> {
     fn clone(&self) -> Self {
         Self {
             submitter: Arc::clone(&self.submitter),
-            token: self.token.clone(),
+            scope: self.scope.clone(),
             parent_info: self.parent_info.clone(),
             row_id: self.row_id.clone(),
             inner: Arc::clone(&self.inner),
@@ -589,7 +580,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         let payload = current_span_payload(&mut inner);
         let completion =
             self.submitter
-                .submit(self.token.clone(), payload, self.parent_info.clone());
+                .submit(self.scope.clone(), payload, self.parent_info.clone());
         if completion.is_ok() {
             inner.has_flushed = true;
         }
@@ -629,7 +620,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         let payload = current_span_payload(&mut inner);
         let completion =
             self.submitter
-                .submit(self.token.clone(), payload, self.parent_info.clone());
+                .submit(self.scope.clone(), payload, self.parent_info.clone());
         if completion.is_ok() {
             inner.has_flushed = true;
             inner.end_submitted = true;
@@ -1081,7 +1072,7 @@ mod tests {
         impl SpanSubmitter for Submitter {
             fn submit(
                 &self,
-                _: String,
+                _: CredentialScope,
                 payload: SpanPayload,
                 _: Option<ParentSpanInfo>,
             ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
@@ -1107,7 +1098,8 @@ mod tests {
             reject: AtomicBool::new(true),
             accepted: Mutex::new(Vec::new()),
         });
-        let span = SpanBuilder::new(submitter.clone(), "token", "org").build();
+        let span =
+            SpanBuilder::new(submitter.clone(), CredentialScope::test("token", "org")).build();
         assert!(span.log(SpanLog::default()).is_err());
         submitter.reject.store(false, Ordering::Relaxed);
         assert!(span.log(SpanLog::default()).is_ok());

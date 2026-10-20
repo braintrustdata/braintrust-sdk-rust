@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::error::Result;
+use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle};
 use crate::types::{ParentSpanInfo, SpanPayload};
 
@@ -60,12 +61,12 @@ impl MockBraintrustClient {
 impl SpanSubmitter for MockBraintrustClient {
     fn submit(
         &self,
-        token: String,
+        scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         self.collector.push(CapturedSpan {
-            token,
+            token: scope.token().to_owned(),
             payload,
             parent: parent_info,
         });
@@ -88,7 +89,7 @@ impl SpanSubmitter for MockBraintrustClient {
 
 pub(crate) fn mock_span_builder() -> (SpanBuilder<MockBraintrustClient>, TestSpanCollector) {
     let (submitter, collector) = MockBraintrustClient::new();
-    let builder = SpanBuilder::new(submitter, "test-token", "org-id");
+    let builder = SpanBuilder::new(submitter, CredentialScope::test("test-token", "org-id"));
     (builder, collector)
 }
 

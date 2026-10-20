@@ -6,13 +6,14 @@ use crate::experiments::api::registration::{
     ExperimentRegisterRequest, ExperimentRegisterResponse,
 };
 use crate::experiments::metadata::BaseExperimentInfo;
+use crate::internal::session::CredentialScope;
 
 /// Trait for registering experiments with the Braintrust API.
 #[async_trait::async_trait]
 pub(crate) trait ExperimentRegistrar: Send + Sync {
     async fn register_experiment(
         &self,
-        token: &str,
+        scope: &CredentialScope,
         request: ExperimentRegisterRequest,
     ) -> Result<ExperimentRegisterResponse>;
 }
@@ -22,7 +23,7 @@ pub(crate) trait ExperimentRegistrar: Send + Sync {
 pub(crate) trait BaseExperimentFetcher: Send + Sync {
     async fn fetch_base_experiment(
         &self,
-        token: &str,
+        scope: &CredentialScope,
         experiment_id: &str,
     ) -> Result<Option<BaseExperimentInfo>>;
 }
@@ -32,7 +33,7 @@ pub(crate) trait BaseExperimentFetcher: Send + Sync {
 pub(crate) trait ExperimentComparisonFetcher: Send + Sync {
     async fn fetch_experiment_comparison(
         &self,
-        token: &str,
+        scope: &CredentialScope,
         experiment_id: &str,
         base_experiment_id: Option<&str>,
     ) -> Result<ExperimentComparisonResponse>;
