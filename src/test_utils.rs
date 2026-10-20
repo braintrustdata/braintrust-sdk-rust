@@ -1,7 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-
 use crate::error::Result;
 use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle};
@@ -58,7 +56,6 @@ impl MockBraintrustClient {
     }
 }
 
-#[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
     fn operation(
         &self,
@@ -112,17 +109,11 @@ impl SpanSubmitter for MockBraintrustClient {
     }
 }
 
-#[async_trait]
 impl DeliveryControl for MockBraintrustClient {
     fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         let (sender, completion) = crate::Completion::pair();
         let _ = sender.send(Ok(crate::FlushReport::default()));
         completion
-    }
-
-    async fn trigger_flush(&self) -> Result<()> {
-        // Mock: no-op for tests
-        Ok(())
     }
 }
 

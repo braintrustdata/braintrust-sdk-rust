@@ -638,7 +638,7 @@ impl LogQueueCore {
     }
 }
 
-/// Compatibility adapter connecting span preparation to the bounded write service.
+/// Span preparation and submission through the bounded write service.
 #[derive(Clone)]
 pub struct LogQueue {
     core: Arc<LogQueueCore>,
@@ -654,7 +654,6 @@ impl LogQueue {
     pub fn new(
         config: LogQueueConfig,
         client: reqwest::Client,
-        _worker_queue_size: usize,
         execution: ExecutionBinding,
     ) -> Self {
         Self {
@@ -795,25 +794,13 @@ impl LogQueue {
     pub(crate) fn is_started(&self) -> bool {
         matches!(*self.state(), QueueState::Running(_))
     }
-    pub async fn trigger_flush_command(&self) -> Result<()> {
-        let token = self.flush();
-        if let Err(error) = &*token {
-            return Err(error.clone().into());
-        }
-        Ok(())
-    }
 }
 
-#[async_trait::async_trait]
 impl DeliveryControl for LogQueue {
     fn flush(&self) -> Completion<FlushReport, FlushError> {
         LogQueue::flush(self)
     }
-    async fn trigger_flush(&self) -> Result<()> {
-        self.trigger_flush_command().await
-    }
 }
-#[async_trait::async_trait]
 impl SpanSubmitter for LogQueue {
     fn operation(&self) -> std::result::Result<SpanOperation, crate::EnqueueError> {
         let lease = {
@@ -884,7 +871,6 @@ mod tests {
         LogQueue::new(
             LogQueueConfig::builder().num_retries(0).build(),
             reqwest::Client::new(),
-            32,
             ExecutionBinding::external(tokio::runtime::Handle::current()),
         )
     }
@@ -918,7 +904,6 @@ mod tests {
                 .num_retries(0)
                 .build(),
             reqwest::Client::new(),
-            8,
             ExecutionBinding::external(tokio::runtime::Handle::current()),
         );
         assert!(!queue.is_started());
