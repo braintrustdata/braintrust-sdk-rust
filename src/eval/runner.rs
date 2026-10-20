@@ -8,11 +8,9 @@ use crate::{BraintrustClient, Result, SpanHandle};
 
 use super::{
     case_runner::CaseRunner,
-    scorer::Scorer,
     source::CaseSource,
-    task::Task,
     types::{Case, EvalResult, EvalSummary},
-    EvalConfigError, EvalRunError, EvalRunFailure,
+    EvalConfigError, EvalDefinition, EvalRunError, EvalRunFailure,
 };
 
 /// Options for running an evaluation
@@ -22,10 +20,8 @@ pub struct EvalOpts<I, O> {
     pub name: String,
     /// Owned source providing test cases
     pub source: Box<dyn CaseSource<I, O>>,
-    /// Task to execute on each input
-    pub task: Box<dyn Task<I, O>>,
-    /// Scorers to evaluate outputs
-    pub scorers: Vec<Box<dyn Scorer<I, O>>>,
+    /// Reusable task and ordered scorers
+    pub definition: EvalDefinition<I, O>,
     /// Braintrust project to log results to
     pub project_name: Option<String>,
     /// Optional experiment name for Braintrust logging
@@ -47,18 +43,6 @@ impl<I, O> EvalOpts<I, O> {
     pub fn validate(&self) -> std::result::Result<(), EvalConfigError> {
         if self.max_concurrency == 0 {
             return Err(EvalConfigError::ZeroConcurrency);
-        }
-        let mut names = std::collections::HashSet::new();
-        for (index, scorer) in self.scorers.iter().enumerate() {
-            let name = scorer.name();
-            if name.trim().is_empty() {
-                return Err(EvalConfigError::EmptyScorerName { index });
-            }
-            if !names.insert(name) {
-                return Err(EvalConfigError::DuplicateScorerName {
-                    name: name.to_owned(),
-                });
-            }
         }
         Ok(())
     }
@@ -158,20 +142,12 @@ where
             let index = case_count - 1;
             let client = Arc::clone(&self.client);
             let root_span = root_span.clone();
-            let task = &opts.task;
-            let scorers = &opts.scorers;
+            let definition = &opts.definition;
             let quiet = opts.quiet;
             futures.push(async move {
-                let result = Self::process_case(
-                    case,
-                    task.as_ref(),
-                    scorers,
-                    &root_span,
-                    &client,
-                    index + 1,
-                    quiet,
-                )
-                .await;
+                let result =
+                    Self::process_case(case, definition, &root_span, &client, index + 1, quiet)
+                        .await;
                 (index, result)
             });
             if futures.len() >= opts.max_concurrency {
@@ -255,8 +231,7 @@ where
     /// Process a single case
     async fn process_case(
         case: Case<I, O>,
-        task: &dyn Task<I, O>,
-        scorers: &[Box<dyn Scorer<I, O>>],
+        definition: &EvalDefinition<I, O>,
         _root_span: &SpanHandle,
         client: &BraintrustClient,
         case_num: usize,
@@ -290,7 +265,13 @@ where
         }
 
         let initial_write = case_span.log(log_builder.build().unwrap());
-        let mut result = CaseRunner::run(case, task, scorers, Some(&case_span)).await;
+        let mut result = CaseRunner::run(
+            case,
+            definition.task(),
+            definition.scorers(),
+            Some(&case_span),
+        )
+        .await;
         result.span_id = case_span.export()?.span_id;
 
         // Recording adapts the completed outcome; computation never waits on
@@ -378,7 +359,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{scorer::ExactMatch, source::VecCaseSource, task::SimpleFnTask, types::Case};
+    use crate::eval::{
+        scorer::ExactMatch, source::VecCaseSource, task::SimpleFnTask, types::Case, Scorer, Task,
+    };
 
     // Note: Full integration tests require a BraintrustClient setup
     // These tests verify type correctness and compilation
@@ -399,8 +382,7 @@ mod tests {
         let _opts = EvalOpts::builder()
             .name("test-eval".to_string())
             .source(dataset)
-            .task(task)
-            .scorers(scorers)
+            .definition(crate::eval::EvalDefinition::new(task, scorers).unwrap())
             .build();
     }
 }

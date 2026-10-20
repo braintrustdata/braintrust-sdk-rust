@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use braintrust_sdk_rust::{
     eval::{
-        scorer, task, Case, CaseSource, EvalConfigError, EvalOpts, Evaluator, ExactMatch, Score,
-        Scorer, ScorerArgs, Scores, SimpleFnTask, Task, TaskHooks,
+        scorer, task, Case, CaseSource, EvalConfigError, EvalDefinition, EvalOpts, Evaluator,
+        ExactMatch, Score, Scorer, ScorerArgs, Scores, SimpleFnTask, Task, TaskHooks,
     },
     BraintrustClient,
 };
@@ -180,13 +180,20 @@ async fn invalid_concurrency_and_names_fail_before_login_recording_or_source_acc
                     as Box<dyn Scorer<usize, usize>>
             })
             .collect();
+        let definition = EvalDefinition::new(
+            Box::new(SimpleFnTask::new(|input: &usize| Ok(*input))),
+            scorers,
+        );
+        if concurrency != 0 {
+            assert!(matches!(definition, Err(actual) if actual == expected));
+            continue;
+        }
         let opts =
             EvalOpts::builder()
                 .name("invalid".into())
                 .source(Box::new(UntouchedSource(accessed.clone()))
                     as Box<dyn CaseSource<usize, usize>>)
-                .task(Box::new(SimpleFnTask::new(|input: &usize| Ok(*input))))
-                .scorers(scorers)
+                .definition(definition.unwrap())
                 .max_concurrency(concurrency)
                 .quiet(true)
                 .build();
@@ -217,17 +224,12 @@ fn duplicate_names_are_rejected_across_custom_tuple_and_builtin_scorers() {
             Box::pin(async { Ok(vec![]) })
         })),
     ] {
-        let opts = EvalOpts::builder()
-            .name("duplicate".into())
-            .source(Vec::<Case<usize, usize>>::new().into())
-            .task(Box::new(SimpleFnTask::new(|input: &usize| Ok(*input))))
-            .scorers(vec![Box::new(ExactMatch::new()), callback])
-            .build();
-        assert_eq!(
-            opts.validate(),
-            Err(EvalConfigError::DuplicateScorerName {
-                name: "exact_match".into()
-            })
+        let definition = EvalDefinition::new(
+            Box::new(SimpleFnTask::new(|input: &usize| Ok(*input))),
+            vec![Box::new(ExactMatch::new()), callback],
+        );
+        assert!(
+            matches!(definition, Err(EvalConfigError::DuplicateScorerName { name }) if name == "exact_match")
         );
     }
 }

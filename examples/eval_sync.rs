@@ -39,12 +39,12 @@ fn main() -> anyhow::Result<()> {
     // Run evaluation synchronously
     println!("Starting synchronous evaluation...\n");
 
+    let definition = EvalDefinition::new(Box::new(task), scorers)?;
     let result = evaluator.run(
         EvalOpts::builder()
             .name("sync-uppercase-eval".to_string())
             .source(cases.into())
-            .task(Box::new(task))
-            .scorers(scorers)
+            .definition(definition.clone())
             .build(),
     )?;
 

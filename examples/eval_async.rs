@@ -1,5 +1,4 @@
 use braintrust_sdk_rust::eval::*;
-use braintrust_sdk_rust::*;
 
 /// Demonstrates using BtEvalRunner, which is compatible with the `bt eval` CLI.
 ///
@@ -10,7 +9,7 @@ use braintrust_sdk_rust::*;
 ///   - BT_EVAL_SSE_SOCK=...  — send SSE events over a Unix socket
 ///   - BT_EVAL_SSE_ADDR=...  — send SSE events over TCP
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     // BtEvalRunner reads BT_EVAL_* env vars automatically.
     // In non-list mode it creates a BraintrustClient from the environment.
     let mut runner = BtEvalRunner::from_env().await?;
@@ -39,30 +38,35 @@ async fn main() -> Result<()> {
         },
     ];
 
+    // Share callbacks across runs; each run supplies its own source and options.
+    let definition = EvalDefinition::new(
+        Box::new(task(|input: &String, _hooks| {
+            Box::pin(async move { Ok(input.to_uppercase()) })
+        })),
+        vec![
+            Box::new(ExactMatch::new()),
+            Box::new(LevenshteinScorer::new()),
+            Box::new(scorer(
+                "nonempty",
+                |args: ScorerArgs<'_, String, String>| {
+                    Box::pin(async move {
+                        Ok(vec![Score::new(
+                            "nonempty",
+                            if args.output.is_empty() { 0.0 } else { 1.0 },
+                        )])
+                    })
+                },
+            )),
+        ],
+    )?;
+
     runner
         .eval(
             "my-project",
             EvalOpts::builder()
                 .name("uppercase-eval".to_string())
                 .source(cases.into())
-                .task(Box::new(task(|input: &String, _hooks| {
-                    Box::pin(async move { Ok(input.to_uppercase()) })
-                })))
-                .scorers(vec![
-                    Box::new(ExactMatch::new()),
-                    Box::new(LevenshteinScorer::new()),
-                    Box::new(scorer(
-                        "nonempty",
-                        |args: ScorerArgs<'_, String, String>| {
-                            Box::pin(async move {
-                                Ok(vec![Score::new(
-                                    "nonempty",
-                                    if args.output.is_empty() { 0.0 } else { 1.0 },
-                                )])
-                            })
-                        },
-                    )),
-                ])
+                .definition(definition.clone())
                 .max_concurrency(2)
                 .build(),
         )

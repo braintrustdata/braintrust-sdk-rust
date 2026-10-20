@@ -81,8 +81,7 @@ async fn test_basic_eval_flow() {
             EvalOpts::builder()
                 .name("test-basic-eval".to_string())
                 .source(cases.into())
-                .task(Box::new(callback))
-                .scorers(scorers)
+                .definition(EvalDefinition::new(Box::new(callback), scorers).unwrap())
                 .quiet(true)
                 .build(),
         )
@@ -191,8 +190,7 @@ fn test_eval_opts_builder() {
     let _opts = EvalOpts::builder()
         .name("test-eval".to_string())
         .source(dataset)
-        .task(task)
-        .scorers(scorers)
+        .definition(EvalDefinition::new(task, scorers).unwrap())
         .max_concurrency(10)
         .quiet(true)
         .build();
@@ -221,10 +219,13 @@ async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
                     }]
                     .into(),
                 )
-                .task(Box::new(SimpleFnTask::new(|input: &String| {
-                    Ok(input.to_uppercase())
-                })))
-                .scorers(scorers)
+                .definition(
+                    EvalDefinition::new(
+                        Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()))),
+                        scorers,
+                    )
+                    .unwrap(),
+                )
                 .quiet(true)
                 .build(),
         )
@@ -347,8 +348,7 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
             started,
             failed: failed.clone(),
         }) as Box<dyn CaseSource<Input, Output>>)
-        .task(Box::new(callback))
-        .scorers(vec![])
+        .definition(EvalDefinition::new(Box::new(callback), vec![]).unwrap())
         .max_concurrency(3)
         .quiet(true)
         .build();
@@ -430,10 +430,15 @@ async fn failure_before_the_first_case_returns_an_empty_partial_run_and_finalize
         .source(
             Box::new(IterCaseSource::new(items.into_iter())) as Box<dyn CaseSource<String, String>>
         )
-        .task(Box::new(SimpleFnTask::new(
-            |_: &String| -> anyhow::Result<String> { panic!("no case was read") },
-        )))
-        .scorers(vec![])
+        .definition(
+            EvalDefinition::new(
+                Box::new(SimpleFnTask::new(|_: &String| -> anyhow::Result<String> {
+                    panic!("no case was read")
+                })),
+                vec![],
+            )
+            .unwrap(),
+        )
         .quiet(true)
         .build();
     let error = Evaluator::new(client).run(opts).await.unwrap_err();
@@ -514,8 +519,7 @@ async fn recording_failure_stops_new_cases_but_drains_already_scheduled_cases() 
                 .collect::<Vec<Case<usize, usize>>>()
                 .into(),
         )
-        .task(Box::new(callback))
-        .scorers(vec![])
+        .definition(EvalDefinition::new(Box::new(callback), vec![]).unwrap())
         .max_concurrency(2)
         .quiet(true)
         .build();
@@ -552,4 +556,61 @@ async fn recording_failure_stops_new_cases_but_drains_already_scheduled_cases() 
     assert_eq!(partial.total_cases, 2);
     assert_eq!(partial.failed_cases, 2);
     assert_eq!(partial.successful_cases, 0);
+}
+
+#[tokio::test]
+async fn reusable_definition_keeps_recorded_runs_and_sources_independent() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let (client, _server) = recording_client().await;
+    let evaluator = Evaluator::new(client);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let definition = EvalDefinition::new(
+        Box::new(task({
+            let calls = calls.clone();
+            move |input: &usize, hooks| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                hooks.add_tag(format!("input-{input}"));
+                Box::pin(async move { Ok(*input * 2) })
+            }
+        })),
+        vec![Box::new(ExactMatch::new())],
+    )
+    .unwrap();
+    let options = |name: &str, input, expected| {
+        EvalOpts::builder()
+            .name(name.into())
+            .source(
+                vec![Case {
+                    input,
+                    expected: Some(expected),
+                    ..Default::default()
+                }]
+                .into(),
+            )
+            .definition(definition.clone())
+            .quiet(true)
+            .build()
+    };
+    let (first, second) = tokio::join!(
+        evaluator.run(options("first", 2, 4)),
+        evaluator.run(options("second", 3, 100)),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.name, "first");
+    assert_eq!(second.name, "second");
+    assert_eq!(first.results[0].output, Some(4));
+    assert_eq!(second.results[0].output, Some(6));
+    assert_eq!(first.results[0].scores[0].score, 1.0);
+    assert_eq!(second.results[0].scores[0].score, 0.0);
+    assert_eq!(first.results[0].tags, Some(vec!["input-2".into()]));
+    assert_eq!(second.results[0].tags, Some(vec!["input-3".into()]));
+    assert_ne!(first.results[0].span_id, second.results[0].span_id);
+    let later = evaluator.run(options("later", 5, 10)).await.unwrap();
+    assert_eq!(later.total_cases, 1);
+    assert_eq!(later.results[0].output, Some(10));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
