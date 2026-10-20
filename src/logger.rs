@@ -389,11 +389,7 @@ impl BraintrustClientBuilder {
                 let context = binding.clone();
                 binding.response(async move { self.initialize(context).await })
             }
-            Err(error) => {
-                let (_, mut completion) = crate::Completion::pair();
-                completion.record_issuance(Err(error));
-                completion
-            }
+            Err(error) => crate::Completion::rejected(error),
         }
     }
 
@@ -553,31 +549,37 @@ impl BraintrustClient {
         BraintrustClientBuilder::new()
     }
 
-    /// Check if the client is logged in.
-    pub async fn is_logged_in(&self) -> bool {
+    /// Check local login state immediately, without scheduling work.
+    pub fn is_logged_in(&self) -> bool {
         self.inner.login_state.is_logged_in()
     }
 
     /// Wait for login to complete (useful if using background login).
     ///
-    /// Returns the login state once available, or an error if login times out.
-    pub async fn wait_for_login(&self) -> Result<LoginState> {
+    /// Submits the wait immediately on the selected runtime. Awaiting observes
+    /// the login state or a timeout; dropping the token does not cancel the wait.
+    /// Login-dependent methods reject issuance when login was skipped.
+    pub fn wait_for_login(&self) -> crate::Completion<LoginState, BraintrustError> {
         if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+            return crate::Completion::rejected(BraintrustError::InvalidConfig(
                 "wait_for_login() not available when skip_login is enabled".into(),
             ));
         }
-        self.wait_for_login_state().await
+        let client = self.clone();
+        self.inner
+            .execution
+            .response(async move { client.wait_for_login_state().await })
     }
 
-    /// Get the current login state.
-    pub async fn login_state(&self) -> LoginState {
+    /// Get a shared view of local login state without scheduling work.
+    pub fn login_state(&self) -> LoginState {
         self.inner.login_state.clone()
     }
 
     /// Create a span builder using the logged-in state and default project.
     ///
-    /// This waits for login to complete if it hasn't already.
+    /// Submits immediately, waiting for login on the selected runtime if needed.
+    /// Dropping the returned completion does not cancel accepted work.
     ///
     /// # Example
     ///
@@ -595,12 +597,19 @@ impl BraintrustClient {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder> {
+    pub fn span_builder(&self) -> crate::Completion<crate::span::SpanBuilder, BraintrustError> {
         if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+            return crate::Completion::rejected(BraintrustError::InvalidConfig(
                 "span_builder() requires login; use span_builder_with_credentials() when skip_login is enabled".into(),
             ));
         }
+        let client = self.clone();
+        self.inner
+            .execution
+            .response(async move { client.span_builder_inner().await })
+    }
+
+    async fn span_builder_inner(&self) -> Result<crate::span::SpanBuilder> {
         let state = self.wait_for_login_state().await?;
         let mut builder = crate::span::SpanBuilder::new(self.span_submitter(), state.scope()?);
         if let Some(environment) = &self.inner.environment {
@@ -617,11 +626,19 @@ impl BraintrustClient {
 
     /// Create a dataset builder using the logged-in state.
     ///
-    /// This waits for login to complete if it hasn't already.
-    pub async fn dataset_builder(&self) -> Result<DatasetBuilder> {
+    /// Submits immediately, waiting for login on the selected runtime if needed.
+    /// Dropping the returned completion does not cancel accepted work.
+    pub fn dataset_builder(&self) -> crate::Completion<DatasetBuilder, BraintrustError> {
         if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
+            return crate::Completion::rejected(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
         }
+        let client = self.clone();
+        self.inner
+            .execution
+            .response(async move { client.dataset_builder_inner().await })
+    }
+
+    async fn dataset_builder_inner(&self) -> Result<DatasetBuilder> {
         let state = self.wait_for_login_state().await?;
         Ok(DatasetBuilder::new(
             self.resource_transport(),
@@ -1701,7 +1718,7 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await;
+        let login_state = client.login_state();
         assert!(login_state.is_logged_in(), "should be logged in");
         assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
         assert_eq!(login_state.org_name().as_deref(), Some("First Org"));
@@ -1731,7 +1748,7 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await;
+        let login_state = client.login_state();
         assert!(login_state.is_logged_in(), "should be logged in");
         assert_eq!(login_state.org_id().as_deref(), Some("org-2"));
         assert_eq!(login_state.org_name().as_deref(), Some("Second Org"));
@@ -1824,7 +1841,7 @@ mod tests {
             .expect("client");
 
         // Initially should not be logged in (background login hasn't completed)
-        let is_logged_in = client.is_logged_in().await;
+        let is_logged_in = client.is_logged_in();
         assert!(!is_logged_in);
     }
 
@@ -1849,7 +1866,7 @@ mod tests {
         // Wait for background login to complete
         let login_state = client.wait_for_login().await.expect("login should succeed");
         assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
-        assert!(client.is_logged_in().await);
+        assert!(client.is_logged_in());
     }
 
     #[tokio::test]
@@ -2018,7 +2035,7 @@ mod tests {
 
         // No credential leak into shared global state.
         assert!(
-            !client.is_logged_in().await,
+            !client.is_logged_in(),
             "per-request credentials must not populate the shared login state"
         );
 

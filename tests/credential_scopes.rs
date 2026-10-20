@@ -43,7 +43,7 @@ async fn explicit_handles_keep_their_routes_after_shared_login_state_is_populate
     let builder = client
         .span_builder_with_credentials("explicit", "org")
         .project_name("p");
-    assert!(client.login_state().await.set(
+    assert!(client.login_state().set(
         "session-secret".into(),
         "other-org".into(),
         "other".into(),
@@ -335,7 +335,7 @@ async fn experiment_clones_and_child_spans_preserve_the_explicit_scope() {
     let span = experiment.start_span().await.unwrap().build();
     span.log(SpanLog::default()).await.unwrap();
     experiment.clone().summarize().await.unwrap();
-    assert!(!client.is_logged_in().await);
+    assert!(!client.is_logged_in());
 }
 
 #[tokio::test]
