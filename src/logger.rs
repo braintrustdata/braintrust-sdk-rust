@@ -7,17 +7,9 @@ use serde_json::{Map, Value};
 use tokio::sync::Notify;
 use url::Url;
 
-use crate::dataset::{
-    BTQLQuery, BTQLResponse, DatasetBuilder, DatasetFetcher, DatasetRegisterRequest,
-    DatasetRegisterResponse, DatasetRegistrar, DatasetSummarizer, DatasetSummaryResponse,
-};
+use crate::dataset::DatasetBuilder;
 use crate::error::{BraintrustError, Result};
-use crate::experiments::api::{
-    BaseExperimentFetcher, BaseExperimentRequest, BaseExperimentResponse,
-    ExperimentComparisonFetcher, ExperimentComparisonResponse, ExperimentRegisterRequest,
-    ExperimentRegisterResponse, ExperimentRegistrar,
-};
-use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
+use crate::experiments::ExperimentBuilder;
 use crate::http::{build_http_client, CaBundleConfig};
 use crate::internal::retry::{exponential, RetryExecutor};
 use crate::log_queue::{LogQueue, LogQueueConfig};
@@ -457,6 +449,22 @@ impl std::fmt::Debug for ClientInner {
 }
 
 impl BraintrustClient {
+    /// Bind explicit credentials to the configured resource endpoints without login.
+    pub(crate) fn resource_api(
+        &self,
+        token: &str,
+        org_name: Option<&str>,
+    ) -> Result<crate::api::Client> {
+        crate::api::Client::for_scope(
+            self.inner.http_client.clone(),
+            &self.inner.api_url,
+            &self.inner.app_url,
+            token,
+            org_name,
+        )
+        .map_err(Into::into)
+    }
+
     /// Create a new builder for configuring the client.
     ///
     /// # Example
@@ -976,278 +984,6 @@ impl SpanSubmitter for BraintrustClient {
 
     async fn trigger_flush(&self) -> Result<()> {
         BraintrustClient::trigger_flush(self).await
-    }
-}
-
-// Experiment trait implementations for BraintrustClient
-#[async_trait::async_trait]
-impl ExperimentRegistrar for BraintrustClient {
-    async fn register_experiment(
-        &self,
-        token: &str,
-        request: ExperimentRegisterRequest,
-    ) -> Result<ExperimentRegisterResponse> {
-        let url = self
-            .inner
-            .app_url
-            .join("api/experiment/register")
-            .map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid experiment register url: {e}"))
-            })?;
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: format!("register experiment failed: {text}"),
-            });
-        }
-
-        let register_response: ExperimentRegisterResponse = response.json().await.map_err(|e| {
-            BraintrustError::Background(format!(
-                "failed to parse experiment registration response: {e}"
-            ))
-        })?;
-
-        Ok(register_response)
-    }
-}
-
-#[async_trait::async_trait]
-impl BaseExperimentFetcher for BraintrustClient {
-    async fn fetch_base_experiment(
-        &self,
-        token: &str,
-        experiment_id: &str,
-    ) -> Result<Option<BaseExperimentInfo>> {
-        let url = self
-            .inner
-            .app_url
-            .join("api/base_experiment/get_id")
-            .map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid base experiment url: {e}"))
-            })?;
-
-        let request = BaseExperimentRequest {
-            id: experiment_id.to_string(),
-        };
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-
-        let status = response.status();
-
-        // 400 means no base experiment - return None
-        if status.as_u16() == 400 {
-            return Ok(None);
-        }
-
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: format!("fetch base experiment failed: {text}"),
-            });
-        }
-
-        let base_response: BaseExperimentResponse = response.json().await.map_err(|e| {
-            BraintrustError::Background(format!("failed to parse base experiment response: {e}"))
-        })?;
-
-        match (base_response.base_exp_id, base_response.base_exp_name) {
-            (Some(id), Some(name)) => Ok(Some(BaseExperimentInfo { id, name })),
-            _ => Ok(None),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ExperimentComparisonFetcher for BraintrustClient {
-    async fn fetch_experiment_comparison(
-        &self,
-        token: &str,
-        experiment_id: &str,
-        base_experiment_id: Option<&str>,
-    ) -> Result<ExperimentComparisonResponse> {
-        let mut url = self
-            .inner
-            .app_url
-            .join("experiment-comparison2")
-            .map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid experiment comparison url: {e}"))
-            })?;
-
-        url.query_pairs_mut()
-            .append_pair("experiment_id", experiment_id);
-
-        if let Some(base_id) = base_experiment_id {
-            url.query_pairs_mut()
-                .append_pair("base_experiment_id", base_id);
-        }
-
-        let response = self
-            .inner
-            .http_client
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: format!("fetch experiment comparison failed: {text}"),
-            });
-        }
-
-        let comparison: ExperimentComparisonResponse = response.json().await.map_err(|e| {
-            BraintrustError::Background(format!(
-                "failed to parse experiment comparison response: {e}"
-            ))
-        })?;
-
-        Ok(comparison)
-    }
-}
-
-// Dataset trait implementations for BraintrustClient
-#[async_trait::async_trait]
-impl DatasetRegistrar for BraintrustClient {
-    async fn register_dataset(
-        &self,
-        token: &str,
-        request: DatasetRegisterRequest,
-    ) -> Result<DatasetRegisterResponse> {
-        let url = self
-            .inner
-            .app_url
-            .join("api/dataset/register")
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| BraintrustError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        response
-            .json::<DatasetRegisterResponse>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("Failed to parse dataset register response: {}", e),
-            })
-    }
-}
-
-#[async_trait::async_trait]
-impl DatasetFetcher for BraintrustClient {
-    async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse> {
-        let url = self
-            .inner
-            .api_url
-            .join("btql")
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&query)
-            .send()
-            .await
-            .map_err(|e| BraintrustError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        response
-            .json::<BTQLResponse>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("Failed to parse BTQL response: {}", e),
-            })
-    }
-}
-
-#[async_trait::async_trait]
-impl DatasetSummarizer for BraintrustClient {
-    async fn fetch_dataset_summary(
-        &self,
-        token: &str,
-        dataset_id: &str,
-    ) -> Result<DatasetSummaryResponse> {
-        let mut url = self
-            .inner
-            .api_url
-            .join("dataset-summary")
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
-        url.query_pairs_mut().append_pair("dataset_id", dataset_id);
-
-        let response = self
-            .inner
-            .http_client
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| BraintrustError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        response
-            .json::<DatasetSummaryResponse>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("Failed to parse dataset summary response: {}", e),
-            })
     }
 }
 

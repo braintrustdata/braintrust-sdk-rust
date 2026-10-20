@@ -62,19 +62,21 @@ impl Client {
         })
     }
     /// Reuse the SDK's configured transport without copying session state into
-    /// the API layer. This scope is immutable and used only for ingestion.
-    pub(crate) fn for_ingestion(
+    /// the API layer. Credentials and endpoint routes stay immutable.
+    pub(crate) fn for_scope(
         http: reqwest::Client,
         api_url: &Url,
+        app_url: &Url,
         token: &str,
         org_name: Option<&str>,
     ) -> Result<Self, Error> {
         let api_url = base_url(api_url.as_str())?;
+        let app_url = base_url(app_url.as_str())?;
         let headers = scoped_headers(token, org_name)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 http,
-                app_url: api_url.clone(),
+                app_url,
                 api_url,
                 headers,
             }),

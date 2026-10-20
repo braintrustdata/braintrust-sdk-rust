@@ -51,3 +51,24 @@ impl From<crate::WriteError> for BraintrustError {
         Self::Background(error.to_string())
     }
 }
+
+impl From<crate::api::Error> for BraintrustError {
+    fn from(error: crate::api::Error) -> Self {
+        match error {
+            crate::api::Error::Config(message) => BraintrustError::InvalidConfig(message),
+            crate::api::Error::Transport { source, .. } => BraintrustError::Http(source),
+            crate::api::Error::Http { status, body, .. } => BraintrustError::Api {
+                status,
+                message: body,
+            },
+            crate::api::Error::Decode {
+                operation,
+                status,
+                source,
+            } => BraintrustError::Api {
+                status,
+                message: format!("{operation}: invalid response: {source}"),
+            },
+        }
+    }
+}
