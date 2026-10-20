@@ -2047,12 +2047,13 @@ mod tests {
         for request in requests.iter().filter(|r| r.url.path() == "/logs3") {
             let auth = request
                 .headers
-                .get(
-                    &"authorization"
-                        .parse::<wiremock::http::HeaderName>()
-                        .unwrap(),
-                )
-                .map(|values| values.to_string())
+                .get("authorization")
+                .map(|value| {
+                    value
+                        .to_str()
+                        .expect("valid authorization header")
+                        .to_owned()
+                })
                 .expect("authorization header");
             let body: Value = serde_json::from_slice(&request.body).expect("json");
             let rows = body.get("rows").and_then(|r| r.as_array()).expect("rows");
