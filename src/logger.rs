@@ -625,6 +625,7 @@ impl BraintrustClient {
         let state = self.wait_for_login_state().await?;
         Ok(DatasetBuilder::new(
             self.resource_transport(),
+            self.inner.execution.clone(),
             Arc::new(self.inner.queue.clone()),
             state.scope()?,
         ))
@@ -639,6 +640,7 @@ impl BraintrustClient {
     ) -> DatasetBuilder {
         DatasetBuilder::new(
             self.resource_transport(),
+            self.inner.execution.clone(),
             Arc::new(self.inner.queue.clone()),
             self.explicit_scope(token.into(), String::new(), Some(org_name.into())),
         )

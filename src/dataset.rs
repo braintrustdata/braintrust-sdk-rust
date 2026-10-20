@@ -27,15 +27,18 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
+use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::api::datasets::{DatasetFields, DatasetWrite};
-use crate::error::Result;
+use crate::error::{BraintrustError, Result};
+use crate::internal::execution::ExecutionBinding;
 use crate::internal::ports::{DatasetApi, DeliveryControl};
 use crate::internal::session::CredentialScope;
+use crate::Completion;
 
 // ============================================================================
 // Dataset Insert Types
@@ -275,6 +278,7 @@ impl std::error::Error for DatasetBuilderError {}
 /// Builder for creating datasets with lazy registration.
 pub struct DatasetBuilder {
     api: Arc<dyn DatasetApi>,
+    execution: ExecutionBinding,
     lifecycle: Arc<dyn DeliveryControl>,
     scope: CredentialScope,
     project_name: Option<String>,
@@ -287,6 +291,7 @@ impl Clone for DatasetBuilder {
     fn clone(&self) -> Self {
         Self {
             api: self.api.clone(),
+            execution: self.execution.clone(),
             lifecycle: self.lifecycle.clone(),
             scope: self.scope.clone(),
             project_name: self.project_name.clone(),
@@ -301,11 +306,13 @@ impl DatasetBuilder {
     /// Create a new DatasetBuilder (internal use).
     pub(crate) fn new(
         api: Arc<dyn DatasetApi>,
+        execution: ExecutionBinding,
         lifecycle: Arc<dyn DeliveryControl>,
         scope: CredentialScope,
     ) -> Self {
         Self {
             api,
+            execution,
             lifecycle,
             scope,
             project_name: None,
@@ -358,6 +365,7 @@ impl DatasetBuilder {
 
         Ok(Dataset {
             api: self.api,
+            execution: self.execution,
             lifecycle: self.lifecycle,
             scope: self.scope,
             project_name,
@@ -375,9 +383,12 @@ impl DatasetBuilder {
 
 /// A dataset for storing test/evaluation data.
 ///
-/// Datasets are lazily registered with the API on first use.
+/// Datasets are lazily registered with the API on first use. Operations submit
+/// immediately to the client’s selected runtime and return completion tokens.
+/// Awaiting observes accepted work; dropping a token does not cancel it.
 pub struct Dataset {
     api: Arc<dyn DatasetApi>,
+    execution: ExecutionBinding,
     lifecycle: Arc<dyn DeliveryControl>,
     scope: CredentialScope,
     project_name: String,
@@ -391,6 +402,7 @@ impl Clone for Dataset {
     fn clone(&self) -> Self {
         Self {
             api: self.api.clone(),
+            execution: self.execution.clone(),
             lifecycle: self.lifecycle.clone(),
             scope: self.scope.clone(),
             project_name: self.project_name.clone(),
@@ -434,7 +446,13 @@ impl Dataset {
     }
 
     /// Get the dataset ID (triggers registration if needed).
-    pub async fn dataset_id(&self) -> Result<String> {
+    pub fn dataset_id(&self) -> Completion<String, BraintrustError> {
+        let dataset = self.clone();
+        self.execution
+            .response(async move { dataset.dataset_id_inner().await })
+    }
+
+    async fn dataset_id_inner(&self) -> Result<String> {
         Ok(self.ensure_registered().await?.dataset_id.clone())
     }
 
@@ -449,7 +467,13 @@ impl Dataset {
     }
 
     /// Insert a record and return its generated ID after the API acknowledges it.
-    pub async fn insert(&self, record: DatasetInsert) -> Result<String> {
+    pub fn insert(&self, record: DatasetInsert) -> Completion<String, BraintrustError> {
+        let dataset = self.clone();
+        self.execution
+            .response(async move { dataset.insert_inner(record).await })
+    }
+
+    async fn insert_inner(&self, record: DatasetInsert) -> Result<String> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         let id = Uuid::new_v4().to_string();
         self.api
@@ -466,7 +490,14 @@ impl Dataset {
     }
 
     /// Merge supplied fields into a record, returning after API acknowledgement.
-    pub async fn update(&self, id: &str, record: DatasetInsert) -> Result<()> {
+    pub fn update(&self, id: &str, record: DatasetInsert) -> Completion<(), BraintrustError> {
+        let dataset = self.clone();
+        let id = id.to_owned();
+        self.execution
+            .response(async move { dataset.update_inner(&id, record).await })
+    }
+
+    async fn update_inner(&self, id: &str, record: DatasetInsert) -> Result<()> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         self.api
             .write_dataset_record(
@@ -481,7 +512,14 @@ impl Dataset {
     }
 
     /// Delete a record, returning after API acknowledgement.
-    pub async fn delete(&self, id: &str) -> Result<()> {
+    pub fn delete(&self, id: &str) -> Completion<(), BraintrustError> {
+        let dataset = self.clone();
+        let id = id.to_owned();
+        self.execution
+            .response(async move { dataset.delete_inner(&id).await })
+    }
+
+    async fn delete_inner(&self, id: &str) -> Result<()> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         self.api
             .write_dataset_record(
@@ -497,10 +535,17 @@ impl Dataset {
     /// Fetch records with pagination.
     ///
     /// Returns an iterator that fetches records in batches.
-    pub async fn fetch(&self, batch_size: Option<usize>) -> Result<DatasetIterator> {
+    pub fn fetch(&self, batch_size: Option<usize>) -> Completion<DatasetIterator, BraintrustError> {
+        let dataset = self.clone();
+        self.execution
+            .response(async move { dataset.fetch_inner(batch_size).await })
+    }
+
+    async fn fetch_inner(&self, batch_size: Option<usize>) -> Result<DatasetIterator> {
         let metadata = self.ensure_registered().await?;
         Ok(DatasetIterator::new(
             self.api.clone(),
+            self.execution.clone(),
             self.scope.clone(),
             metadata.dataset_id.clone(),
             batch_size.unwrap_or(1000).max(1),
@@ -508,7 +553,13 @@ impl Dataset {
     }
 
     /// Get dataset summary statistics.
-    pub async fn summarize(&self) -> Result<DatasetSummary> {
+    pub fn summarize(&self) -> Completion<DatasetSummary, BraintrustError> {
+        let dataset = self.clone();
+        self.execution
+            .response(async move { dataset.summarize_inner().await })
+    }
+
+    async fn summarize_inner(&self) -> Result<DatasetSummary> {
         let metadata = self.ensure_registered().await?;
 
         // Fetch summary from API
@@ -539,6 +590,16 @@ impl Dataset {
 // DatasetIterator
 // ============================================================================
 
+struct DatasetCursor {
+    fetcher: Arc<dyn DatasetApi>,
+    scope: CredentialScope,
+    dataset_id: String,
+    batch_size: usize,
+    cursor: Option<String>,
+    buffer: VecDeque<DatasetRecord>,
+    done: bool,
+}
+
 /// Iterator for fetching dataset records with pagination.
 ///
 /// ```no_run
@@ -552,35 +613,86 @@ impl Dataset {
 /// # }
 /// ```
 pub struct DatasetIterator {
-    fetcher: Arc<dyn DatasetApi>,
-    scope: CredentialScope,
-    dataset_id: String,
-    batch_size: usize,
-    cursor: Option<String>,
-    buffer: VecDeque<DatasetRecord>,
-    done: bool,
+    execution: ExecutionBinding,
+    cursor: Arc<tokio::sync::Mutex<DatasetCursor>>,
+    tail: futures::future::Shared<BoxFuture<'static, ()>>,
 }
 
 impl DatasetIterator {
     fn new(
         fetcher: Arc<dyn DatasetApi>,
+        execution: ExecutionBinding,
         scope: CredentialScope,
         dataset_id: String,
         batch_size: usize,
     ) -> Self {
         Self {
-            fetcher,
-            scope,
-            dataset_id,
-            batch_size,
-            cursor: None,
-            buffer: VecDeque::new(),
-            done: false,
+            execution,
+            tail: futures::future::ready(()).boxed().shared(),
+            cursor: Arc::new(tokio::sync::Mutex::new(DatasetCursor {
+                fetcher,
+                scope,
+                dataset_id,
+                batch_size,
+                cursor: None,
+                buffer: VecDeque::new(),
+                done: false,
+            })),
         }
     }
 
+    /// Submit a request for the next record, fetching a page if needed.
+    /// Accepted cursor operations run in issuance order; dropping a token still consumes
+    /// its record. An API error preserves the cursor for a later retry.
+    #[allow(clippy::should_implement_trait)] // Observation is async, unlike Iterator::next.
+    pub fn next(&mut self) -> Completion<Option<DatasetRecord>, BraintrustError> {
+        self.submit(|mut cursor| async move { cursor.next().await })
+    }
+
+    /// Submit collection of all remaining records. Dropping the returned token
+    /// does not cancel collection; page failures remain operation errors.
+    pub fn collect(mut self) -> Completion<Vec<DatasetRecord>, BraintrustError> {
+        self.submit(|mut cursor| async move {
+            let mut records = Vec::new();
+            while let Some(record) = cursor.next().await? {
+                records.push(record);
+            }
+            Ok(records)
+        })
+    }
+
+    fn submit<T, F, Fut>(&mut self, work: F) -> Completion<T, BraintrustError>
+    where
+        T: Send + 'static,
+        F: FnOnce(tokio::sync::OwnedMutexGuard<DatasetCursor>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        let cursor = self.cursor.clone();
+        let previous = self.tail.clone();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let completion = self.execution.response(async move {
+            // Holding the sender across the whole operation preserves issuance
+            // order even if runtime task polling is reordered. Drop releases
+            // the next operation on success, error, panic or cancellation.
+            let _release = release;
+            previous.await;
+            work(cursor.lock_owned().await).await
+        });
+        if completion.is_ok() {
+            self.tail = async move {
+                let _ = released.await;
+            }
+            .boxed()
+            .shared();
+        }
+        // Rejected work leaves the existing chain and cursor untouched.
+        completion
+    }
+}
+
+impl DatasetCursor {
     /// Get the next record, fetching a new batch if needed.
-    pub async fn next(&mut self) -> Result<Option<DatasetRecord>> {
+    async fn next(&mut self) -> Result<Option<DatasetRecord>> {
         loop {
             if let Some(record) = self.buffer.pop_front() {
                 return Ok(Some(record));
@@ -611,15 +723,6 @@ impl DatasetIterator {
             self.buffer.extend(response.data);
             // Empty pages with a continuation are not end-of-data.
         }
-    }
-
-    /// Collect all remaining records, preserving any page failure as an error.
-    pub async fn collect(mut self) -> Result<Vec<DatasetRecord>> {
-        let mut records = Vec::new();
-        while let Some(record) = self.next().await? {
-            records.push(record);
-        }
-        Ok(records)
     }
 }
 
