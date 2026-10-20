@@ -2052,7 +2052,12 @@ mod tests {
                         .parse::<wiremock::http::HeaderName>()
                         .unwrap(),
                 )
-                .map(|value| value.to_str().expect("valid authorization header").to_owned())
+                .map(|value| {
+                    value
+                        .to_str()
+                        .expect("valid authorization header")
+                        .to_owned()
+                })
                 .expect("authorization header");
             let body: Value = serde_json::from_slice(&request.body).expect("json");
             let rows = body.get("rows").and_then(|r| r.as_array()).expect("rows");
