@@ -992,6 +992,7 @@ impl BraintrustClient {
         let submitter = self.span_submitter();
         ExperimentBuilder::new(
             self.resource_transport(),
+            self.inner.execution.clone(),
             submitter,
             self.explicit_scope(token, org_id, None),
         )

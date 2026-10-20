@@ -182,26 +182,36 @@ struct Inner<C> {
 }
 impl<C> Inner<C> {
     fn stop(&self, error: ExecutionError) {
-        let mut state = lock(&self.state);
-        state.accepting = false;
-        if state.terminal.is_some() {
-            return;
-        }
-        state.terminal = Some(error);
-        for accepted in state.pending.drain(..) {
+        let (pending, active, ready, barriers) = {
+            let mut state = lock(&self.state);
+            state.accepting = false;
+            if state.terminal.is_some() {
+                return;
+            }
+            state.terminal = Some(error);
+            state.outstanding = 0;
+            (
+                std::mem::take(&mut state.pending),
+                state.active.take(),
+                std::mem::take(&mut state.ready),
+                std::mem::take(&mut state.barriers),
+            )
+        };
+        // Deferred commands can own producers of this same service. Destroying
+        // them, or waking completion observers, must happen outside its lock.
+        for accepted in pending {
             let _ = accepted.sender.send(Err(error.into()));
         }
         let result = Err(BatchError::Execution(error));
-        if let Some(active) = state.active.take() {
+        if let Some(active) = active {
             active.finish(&result);
         }
-        for batch in state.ready.drain(..) {
+        for batch in ready {
             batch.completion.finish(&result);
         }
-        for mut barrier in state.barriers.drain(..) {
+        for mut barrier in barriers {
             barrier.record(0, &result);
         }
-        state.outstanding = 0;
         self.wake.notify_one();
     }
     fn close(&self) {
@@ -493,6 +503,53 @@ mod tests {
             },
         );
         (service, receiver, gate)
+    }
+
+    #[test]
+    fn cancel_drops_pending_and_sealed_commands_outside_the_state_lock() {
+        struct Reenter(Box<dyn Fn() + Send>);
+        impl Drop for Reenter {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+        let (done, completed) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let service = WriteService::new(
+                4,
+                ExecutionBinding::external(runtime.handle().clone()),
+                |_| Box::pin(async { Ok(()) }),
+            );
+            let mut receipts = Vec::new();
+            for _ in 0..2 {
+                let inner = Arc::downgrade(&service.inner);
+                let done = done.clone();
+                receipts.push(service.enqueue(Reenter(Box::new(move || {
+                    inner.upgrade().unwrap().close();
+                    done.send(()).unwrap();
+                }))));
+                if receipts.len() == 1 {
+                    drop(service.flush());
+                }
+            }
+            service.cancel(ExecutionError::TimedOut);
+            for receipt in receipts {
+                assert!(matches!(
+                    futures::executor::block_on(receipt.into_future()),
+                    Err(WriteError::Execution(ExecutionError::TimedOut))
+                ));
+            }
+        });
+        for _ in 0..2 {
+            completed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("command destruction must not deadlock while reentering the service");
+        }
+        thread.join().unwrap();
     }
 
     #[tokio::test]

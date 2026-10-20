@@ -39,15 +39,13 @@ impl ExperimentApi for ResourceTransport {
         scope: &CredentialScope,
         request: ExperimentRegisterRequest,
     ) -> Result<ExperimentRegisterResponse> {
-        let api = self.resource_api(scope)?;
-        self.execution
-            .response(async move {
-                api.experiments()
-                    .register(request)
-                    .await
-                    .map_err(BraintrustError::from)
-            })
+        // Registration is part of admitted event preparation or an explicitly
+        // bound metadata operation; it must remain valid during queue drain.
+        self.resource_api(scope)?
+            .experiments()
+            .register(request)
             .await
+            .map_err(BraintrustError::from)
     }
 
     async fn fetch_base_experiment(

@@ -60,6 +60,29 @@ impl MockBraintrustClient {
 
 #[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
+    fn submit_resolving_parent(
+        &self,
+        scope: CredentialScope,
+        payload: SpanPayload,
+        resolve: futures::future::BoxFuture<'static, Result<ParentSpanInfo>>,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+        let collector = self.collector.clone();
+        crate::internal::execution::ExecutionBinding::external(tokio::runtime::Handle::current())
+            .response(async move {
+                let parent = resolve.await.map_err(|source| {
+                    crate::WriteError::Delivery(Arc::new(crate::DeliveryError {
+                        source: source.into(),
+                    }))
+                })?;
+                collector.push(CapturedSpan {
+                    token: scope.token().to_owned(),
+                    payload,
+                    parent: Some(parent),
+                });
+                Ok(crate::DeliveryReceipt)
+            })
+    }
+
     fn submit(
         &self,
         scope: CredentialScope,
