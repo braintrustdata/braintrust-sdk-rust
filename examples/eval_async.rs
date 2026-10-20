@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
             "my-project",
             EvalOpts::builder()
                 .name("uppercase-eval".to_string())
-                .dataset(cases.into())
+                .source(cases.into())
                 .task(Box::new(task(|input: &String, _hooks| {
                     Box::pin(async move { Ok(input.to_uppercase()) })
                 })))

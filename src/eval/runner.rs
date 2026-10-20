@@ -1,19 +1,18 @@
 use futures::stream::{FuturesUnordered, StreamExt};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 use crate::{BraintrustClient, Result, SpanHandle};
 
 use super::{
     case_runner::CaseRunner,
-    dataset::Dataset,
     scorer::Scorer,
+    source::CaseSource,
     task::Task,
     types::{Case, EvalResult, EvalSummary},
-    EvalConfigError,
+    EvalConfigError, EvalRunError, EvalRunFailure,
 };
 
 /// Options for running an evaluation
@@ -21,8 +20,8 @@ use super::{
 pub struct EvalOpts<I, O> {
     /// Name of the evaluation
     pub name: String,
-    /// Dataset providing test cases
-    pub dataset: Box<dyn Dataset<I, O>>,
+    /// Owned source providing test cases
+    pub source: Box<dyn CaseSource<I, O>>,
     /// Task to execute on each input
     pub task: Box<dyn Task<I, O>>,
     /// Scorers to evaluate outputs
@@ -73,8 +72,8 @@ pub struct Evaluator<I, O> {
 
 impl<I, O> Evaluator<I, O>
 where
-    I: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
-    O: Serialize + DeserializeOwned + Send + Sync + PartialEq + Clone + 'static,
+    I: Serialize + Send + Sync + 'static,
+    O: Serialize + Send + Sync + 'static,
 {
     /// Create a new evaluator
     pub fn new(client: BraintrustClient) -> Self {
@@ -93,9 +92,11 @@ where
     }
 
     /// Run the evaluation
-    pub async fn run(&self, mut opts: EvalOpts<I, O>) -> Result<EvalSummary<I, O>> {
-        opts.validate()
-            .map_err(|error| crate::BraintrustError::InvalidConfig(error.to_string()))?;
+    pub async fn run(
+        &self,
+        mut opts: EvalOpts<I, O>,
+    ) -> std::result::Result<EvalSummary<I, O>, EvalRunError<I, O>> {
+        opts.validate()?;
         if !opts.quiet {
             println!("Running evaluation: {}", opts.name);
         }
@@ -118,83 +119,90 @@ where
             log_builder = log_builder.tags(tags.clone());
         }
 
-        root_span.log(log_builder.build().unwrap());
+        let root_write = root_span.log(log_builder.build().unwrap());
 
-        // Get dataset ID if available
-        let dataset_id = opts.dataset.id();
-
-        // Collect all results
+        let dataset = opts.source.provenance();
         let mut results = Vec::new();
+        let mut failures = Vec::new();
         let mut case_count = 0;
-
-        // Create semaphore for concurrency control
-        let semaphore = Arc::new(Semaphore::new(opts.max_concurrency));
-
-        // Process cases with controlled concurrency
         let mut futures = FuturesUnordered::new();
 
         loop {
-            // Try to get next case
-            let case = match opts.dataset.next().await {
+            // Retain the next-read future while polling active cases. A source
+            // may wait for prior computation, and need not be cancellation-safe.
+            let mut next = Box::pin(opts.source.next());
+            let next_case = loop {
+                if futures.is_empty() {
+                    break next.await;
+                }
+                tokio::select! {
+                    next_case = next.as_mut() => break next_case,
+                    Some((index, result)) = futures.next() => {
+                        Self::collect_case_result(index, result, &mut results, &mut failures);
+                        if !failures.is_empty() { break Ok(None); }
+                    }
+                }
+            };
+            let case = match next_case {
                 Ok(Some(case)) => case,
                 Ok(None) => break,
-                Err(e) => {
-                    eprintln!("Error fetching case: {}", e);
+                Err(source) => {
+                    failures.push(EvalRunFailure::Source {
+                        case_index: case_count,
+                        source,
+                    });
                     break;
                 }
             };
-
             case_count += 1;
-
-            // Clone what we need for the async task
+            let index = case_count - 1;
             let client = Arc::clone(&self.client);
             let root_span = root_span.clone();
             let task = &opts.task;
             let scorers = &opts.scorers;
-            let semaphore = Arc::clone(&semaphore);
             let quiet = opts.quiet;
-
-            // Acquire permit before spawning
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-
-            // Process this case
-            let future = async move {
+            futures.push(async move {
                 let result = Self::process_case(
                     case,
                     task.as_ref(),
                     scorers,
                     &root_span,
                     &client,
-                    case_count,
+                    index + 1,
                     quiet,
                 )
                 .await;
-                drop(permit); // Release permit
-                result
-            };
-
-            futures.push(future);
-
-            // Collect completed futures if we have many pending
-            while futures.len() >= opts.max_concurrency {
-                if let Some(result) = futures.next().await {
-                    results.push(result?);
+                (index, result)
+            });
+            if futures.len() >= opts.max_concurrency {
+                if let Some((index, result)) = futures.next().await {
+                    Self::collect_case_result(index, result, &mut results, &mut failures);
+                }
+                if !failures.is_empty() {
+                    break;
                 }
             }
         }
-
-        // Collect remaining futures
-        while let Some(result) = futures.next().await {
-            results.push(result?);
+        // Source/recording failure does not abandon already scheduled cases.
+        while let Some((index, result)) = futures.next().await {
+            Self::collect_case_result(index, result, &mut results, &mut failures);
         }
-
-        // End root span
-        root_span.end().await?;
+        let end = root_span.end();
+        for result in [root_write.await, end.await] {
+            if let Err(error) = result {
+                failures.push(EvalRunFailure::Recording {
+                    case_index: None,
+                    source: error.into(),
+                });
+            }
+        }
+        results.sort_unstable_by_key(|(index, _)| *index);
+        let results: Vec<_> = results.into_iter().map(|(_, result)| result).collect();
 
         // Compute statistics
         let score_stats = EvalSummary::<I, O>::compute_stats(&results);
         let successful = results.iter().filter(|r| r.errors.is_empty()).count();
-        let failed = results.len() - successful;
+        let failed = case_count - successful;
 
         if !opts.quiet {
             println!("\nEvaluation complete!");
@@ -210,15 +218,38 @@ where
             }
         }
 
-        Ok(EvalSummary {
+        let summary = EvalSummary {
             name: opts.name,
             results,
             score_stats,
             total_cases: case_count,
             successful_cases: successful,
             failed_cases: failed,
-            dataset_id,
-        })
+            dataset,
+        };
+        if failures.is_empty() {
+            Ok(summary)
+        } else {
+            Err(EvalRunError {
+                failures,
+                partial: Some(Box::new(summary)),
+            })
+        }
+    }
+
+    fn collect_case_result(
+        index: usize,
+        result: Result<EvalResult<I, O>>,
+        results: &mut Vec<(usize, EvalResult<I, O>)>,
+        failures: &mut Vec<EvalRunFailure>,
+    ) {
+        match result {
+            Ok(result) => results.push((index, result)),
+            Err(source) => failures.push(EvalRunFailure::Recording {
+                case_index: Some(index),
+                source,
+            }),
+        }
     }
 
     /// Process a single case
@@ -322,8 +353,8 @@ pub struct SyncEvaluator<I, O> {
 
 impl<I, O> SyncEvaluator<I, O>
 where
-    I: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
-    O: Serialize + DeserializeOwned + Send + Sync + PartialEq + Clone + 'static,
+    I: Serialize + Send + Sync + 'static,
+    O: Serialize + Send + Sync + 'static,
 {
     /// Create a new sync evaluator
     pub fn new(client: BraintrustClient) -> Result<Self> {
@@ -336,7 +367,10 @@ where
     }
 
     /// Run the evaluation synchronously
-    pub fn run(&self, opts: EvalOpts<I, O>) -> Result<EvalSummary<I, O>> {
+    pub fn run(
+        &self,
+        opts: EvalOpts<I, O>,
+    ) -> std::result::Result<EvalSummary<I, O>, EvalRunError<I, O>> {
         self.runtime.block_on(self.evaluator.run(opts))
     }
 }
@@ -344,7 +378,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{dataset::VecDataset, scorer::ExactMatch, task::SimpleFnTask, types::Case};
+    use crate::eval::{scorer::ExactMatch, source::VecCaseSource, task::SimpleFnTask, types::Case};
 
     // Note: Full integration tests require a BraintrustClient setup
     // These tests verify type correctness and compilation
@@ -357,14 +391,14 @@ mod tests {
             ..Default::default()
         }];
 
-        let dataset: Box<dyn Dataset<String, String>> = Box::new(VecDataset::new(cases));
+        let dataset: Box<dyn CaseSource<String, String>> = Box::new(VecCaseSource::new(cases));
         let task: Box<dyn Task<String, String>> =
             Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase())));
         let scorers: Vec<Box<dyn Scorer<String, String>>> = vec![Box::new(ExactMatch::new())];
 
         let _opts = EvalOpts::builder()
             .name("test-eval".to_string())
-            .dataset(dataset)
+            .source(dataset)
             .task(task)
             .scorers(scorers)
             .build();

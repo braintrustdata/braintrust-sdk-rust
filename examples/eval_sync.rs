@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
     let result = evaluator.run(
         EvalOpts::builder()
             .name("sync-uppercase-eval".to_string())
-            .dataset(cases.into())
+            .source(cases.into())
             .task(Box::new(task))
             .scorers(scorers)
             .build(),

@@ -1,4 +1,4 @@
-use braintrust_sdk_rust::eval::Dataset;
+use braintrust_sdk_rust::eval::CaseSource;
 use braintrust_sdk_rust::eval::*;
 use braintrust_sdk_rust::*;
 
@@ -80,7 +80,7 @@ async fn test_basic_eval_flow() {
         .run(
             EvalOpts::builder()
                 .name("test-basic-eval".to_string())
-                .dataset(cases.into())
+                .source(cases.into())
                 .task(Box::new(callback))
                 .scorers(scorers)
                 .quiet(true)
@@ -110,7 +110,7 @@ fn test_eval_types_compile() {
         ..Default::default()
     }];
 
-    let _dataset: Box<dyn Dataset<String, String>> = cases.into();
+    let _dataset: Box<dyn CaseSource<String, String>> = cases.into();
     let _task: Box<dyn Task<String, String>> =
         Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase())));
     let _scorers: Vec<Box<dyn Scorer<String, String>>> = vec![Box::new(ExactMatch::new())];
@@ -183,14 +183,14 @@ fn test_eval_opts_builder() {
         ..Default::default()
     }];
 
-    let dataset: Box<dyn Dataset<String, String>> = cases.into();
+    let dataset: Box<dyn CaseSource<String, String>> = cases.into();
     let task: Box<dyn Task<String, String>> =
         Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase())));
     let scorers: Vec<Box<dyn Scorer<String, String>>> = vec![Box::new(ExactMatch::new())];
 
     let _opts = EvalOpts::builder()
         .name("test-eval".to_string())
-        .dataset(dataset)
+        .source(dataset)
         .task(task)
         .scorers(scorers)
         .max_concurrency(10)
@@ -212,7 +212,7 @@ async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
         .run(
             EvalOpts::builder()
                 .name("failed-scorer".into())
-                .dataset(
+                .source(
                     vec![Case {
                         input: "a".to_owned(),
                         expected: Some("A".to_owned()),
@@ -257,4 +257,299 @@ async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
         .iter()
         .any(|row| row["span_id"].as_str() == case.span_id.as_deref()
             && row["metrics"]["end"].is_number()));
+}
+
+#[tokio::test]
+async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_recording() {
+    use async_trait::async_trait;
+    use std::{
+        cell::Cell,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+    use tokio::sync::{Notify, Semaphore};
+    #[derive(serde::Serialize)]
+    struct Input(usize);
+    #[derive(serde::Serialize)]
+    struct Output(usize);
+    #[derive(Debug, thiserror::Error)]
+    #[error("source read failed")]
+    struct ReadFailure;
+    struct Source {
+        reads: Cell<usize>,
+        started: Arc<Notify>,
+        failed: Arc<Notify>,
+    }
+    #[async_trait]
+    impl CaseSource<Input, Output> for Source {
+        async fn next(&mut self) -> anyhow::Result<Option<Case<Input, Output>>> {
+            let index = self.reads.get();
+            self.reads.set(index + 1);
+            if index == 1 {
+                self.started.notified().await;
+            }
+            if index == 2 {
+                self.failed.notify_one();
+                return Err(ReadFailure.into());
+            }
+            Ok(Some(Case {
+                input: Input(index),
+                expected: None,
+                metadata: None,
+                tags: None,
+                id: Some(format!("case-{index}")),
+                xact_id: Some(format!("row-version-{index}")),
+                created: None,
+            }))
+        }
+        fn provenance(&self) -> Option<DatasetVersionRef> {
+            Some(DatasetVersionRef {
+                dataset_id: "source-dataset".into(),
+                version: Some(format!("version-{}", self.reads.get())),
+            })
+        }
+    }
+    let (client, server) = recording_client().await;
+    let started = Arc::new(Notify::new());
+    let failed = Arc::new(Notify::new());
+    let second_done = Arc::new(Notify::new());
+    let gates = Arc::new([Semaphore::new(0), Semaphore::new(0)]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback = {
+        let started = started.clone();
+        let second_done = second_done.clone();
+        let gates = gates.clone();
+        let calls = calls.clone();
+        task(move |input: &Input, _hooks| {
+            let started = started.clone();
+            let second_done = second_done.clone();
+            let gates = gates.clone();
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if input.0 == 0 {
+                    started.notify_one();
+                }
+                gates[input.0].acquire().await.unwrap().forget();
+                if input.0 == 1 {
+                    second_done.notify_one();
+                }
+                Ok(Output(input.0 * 2))
+            })
+        })
+    };
+    let opts = EvalOpts::builder()
+        .name("source-failure".into())
+        .source(Box::new(Source {
+            reads: Cell::new(0),
+            started,
+            failed: failed.clone(),
+        }) as Box<dyn CaseSource<Input, Output>>)
+        .task(Box::new(callback))
+        .scorers(vec![])
+        .max_concurrency(3)
+        .quiet(true)
+        .build();
+    let run = tokio::spawn(async move { Evaluator::new(client).run(opts).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), failed.notified())
+        .await
+        .expect("pending source reads must allow active task progress");
+    gates[1].add_permits(1);
+    second_done.notified().await;
+    assert!(
+        !run.is_finished(),
+        "source failure must still wait for the other scheduled case"
+    );
+    gates[0].add_permits(1);
+    let error = match tokio::time::timeout(std::time::Duration::from_secs(3), run)
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        Err(error) => error,
+        Ok(_) => panic!("source failure must not become a successful summary"),
+    };
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let [EvalRunFailure::Source { case_index, source }] = error.failures.as_slice() else {
+        panic!("expected a typed source failure")
+    };
+    assert_eq!(*case_index, 2);
+    assert!(source.downcast_ref::<ReadFailure>().is_some());
+    let partial = error.partial.unwrap();
+    assert_eq!(partial.total_cases, 2);
+    assert_eq!(partial.successful_cases, 2);
+    assert_eq!(partial.failed_cases, 0);
+    let dataset = partial.dataset.unwrap();
+    assert_eq!(dataset.dataset_id, "source-dataset");
+    assert_eq!(dataset.version.as_deref(), Some("version-0"));
+    assert_eq!(
+        partial
+            .results
+            .iter()
+            .map(|case| case.input.0)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(partial.results[1].case_id.as_deref(), Some("case-1"));
+    assert_eq!(partial.results[1].xact_id.as_deref(), Some("row-version-1"));
+    assert_eq!(partial.results[1].output.as_ref().unwrap().0, 2);
+    let rows: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .flat_map(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    let ended: std::collections::HashSet<_> = rows
+        .iter()
+        .filter(|row| row["metrics"]["end"].is_number())
+        .map(|row| row["span_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ended.len(),
+        3,
+        "both cases and the run span must finish before returning partial results"
+    );
+}
+
+#[tokio::test]
+async fn failure_before_the_first_case_returns_an_empty_partial_run_and_finalizes_root() {
+    let (client, server) = recording_client().await;
+    let items: Vec<anyhow::Result<Case<String, String>>> =
+        vec![Err(anyhow::anyhow!("source unavailable"))];
+    let opts = EvalOpts::builder()
+        .name("empty-failure".into())
+        .source(
+            Box::new(IterCaseSource::new(items.into_iter())) as Box<dyn CaseSource<String, String>>
+        )
+        .task(Box::new(SimpleFnTask::new(
+            |_: &String| -> anyhow::Result<String> { panic!("no case was read") },
+        )))
+        .scorers(vec![])
+        .quiet(true)
+        .build();
+    let error = Evaluator::new(client).run(opts).await.unwrap_err();
+    assert!(
+        matches!(&error.failures[0],EvalRunFailure::Source {case_index:0,source} if source.to_string()=="source unavailable")
+    );
+    let partial = error.partial.unwrap();
+    assert_eq!(partial.total_cases, 0);
+    assert_eq!(partial.successful_cases, 0);
+    assert_eq!(partial.failed_cases, 0);
+    assert!(partial.results.is_empty());
+    assert!(partial.dataset.is_none());
+    let ended = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/logs3")
+        .any(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["metrics"]["end"].is_number())
+        });
+    assert!(
+        ended,
+        "the run span must finish even when source failure precedes all cases"
+    );
+}
+
+#[tokio::test]
+async fn recording_failure_stops_new_cases_but_drains_already_scheduled_cases() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::{Notify, Semaphore};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, ResponseTemplate,
+    };
+    let (client, server) = recording_client().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let gate = Arc::new(Semaphore::new(0));
+    let callback = {
+        let calls = calls.clone();
+        let entered = entered.clone();
+        let gate = gate.clone();
+        task(move |input: &usize, _hooks| {
+            let calls = calls.clone();
+            let entered = entered.clone();
+            let gate = gate.clone();
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    entered.notify_one();
+                }
+                gate.acquire().await.unwrap().forget();
+                Ok(*input)
+            })
+        })
+    };
+    let opts = EvalOpts::builder()
+        .name("record-failure".into())
+        .source(
+            (0..3)
+                .map(|input| Case {
+                    input,
+                    ..Default::default()
+                })
+                .collect::<Vec<Case<usize, usize>>>()
+                .into(),
+        )
+        .task(Box::new(callback))
+        .scorers(vec![])
+        .max_concurrency(2)
+        .quiet(true)
+        .build();
+    let run = tokio::spawn(async move { Evaluator::new(client).run(opts).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    gate.add_permits(2);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(3), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the third case must remain unread after recording failure"
+    );
+    assert!(error.failures.iter().any(|failure| matches!(
+        failure,
+        EvalRunFailure::Recording {
+            case_index: Some(0),
+            ..
+        }
+    )));
+    assert!(error.failures.iter().any(|failure| matches!(
+        failure,
+        EvalRunFailure::Recording {
+            case_index: Some(1),
+            ..
+        }
+    )));
+    let partial = error.partial.unwrap();
+    assert_eq!(partial.total_cases, 2);
+    assert_eq!(partial.failed_cases, 2);
+    assert_eq!(partial.successful_cases, 0);
 }
