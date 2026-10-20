@@ -1,14 +1,14 @@
 use async_trait::async_trait;
 use std::marker::PhantomData;
 
-use crate::Result;
+use anyhow::Result;
 
 use super::types::{Score, ScorerArgs, Scores};
 
 /// Scorer trait for evaluating task outputs
 ///
 /// Scorers compare the task output against expected values and produce numeric scores.
-/// Only async version is needed - SyncEvaluator uses this via Runtime::block_on().
+/// Callback errors use `anyhow::Result` to preserve application error causes.
 #[async_trait]
 pub trait Scorer<I, O>: Send + Sync {
     /// Name of this scorer (used in results)
