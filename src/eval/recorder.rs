@@ -1,7 +1,7 @@
 //! Braintrust serialization and write completions, outside the run engine.
 use super::{
     executor::{CaseRecording, EvalRecorder},
-    Case, EvalResult,
+    Case, EvalRecording, EvalResult,
 };
 use crate::{
     BraintrustClient, BraintrustError, Completion, DeliveryReceipt, Result, SpanHandle, SpanLog,
@@ -15,38 +15,43 @@ use std::sync::Arc;
 type Write = Completion<DeliveryReceipt, WriteError>;
 
 pub(crate) struct BraintrustRecorder {
-    client: BraintrustClient,
-    submitter: Arc<dyn crate::internal::ports::SpanSubmitter>,
-    root: SpanHandle,
-    root_write: tokio::sync::Mutex<Option<Write>>,
+    template: crate::span::SpanBuilder,
+    target: EvalRecording,
 }
 impl BraintrustRecorder {
     pub async fn new(
         client: BraintrustClient,
         submitter: Arc<dyn crate::internal::ports::SpanSubmitter>,
-        name: String,
+        project_name: Option<String>,
+        experiment_name: String,
         metadata: Option<Map<String, Value>>,
-        tags: Option<Vec<String>>,
     ) -> Result<Self> {
-        let root = client
-            .span_builder_for_operation(submitter.clone())
+        let mut builder = client
+            .experiment_builder_for_operation(submitter.clone(), project_name)
             .await?
-            .span_type(crate::SpanType::Eval)
-            .build();
-        let mut log = SpanLog::builder().name(format!("eval-{name}"));
+            .experiment_name(experiment_name);
         if let Some(metadata) = metadata {
-            log = log.metadata(metadata);
+            builder = builder.metadata(metadata);
         }
-        if let Some(tags) = tags {
-            log = log.tags(tags);
-        }
-        let root_write = tokio::sync::Mutex::new(Some(root.log(log.build().unwrap())));
-        Ok(Self {
-            client,
-            submitter,
-            root,
-            root_write,
-        })
+        let experiment = builder
+            .build()
+            .map_err(|error| BraintrustError::InvalidConfig(error.to_string()))?;
+        let resolved = experiment.register_metadata().await?;
+        let target = EvalRecording {
+            project_id: resolved.project_id.clone(),
+            experiment_id: resolved.experiment_id.clone(),
+            experiment_name: resolved.experiment_name.clone(),
+        };
+        let template = client
+            .span_builder_for_operation(
+                submitter,
+                Some(crate::types::ParentSpanInfo::Experiment {
+                    object_id: target.experiment_id.clone(),
+                }),
+            )
+            .await?
+            .span_type(crate::SpanType::Eval);
+        Ok(Self { template, target })
     }
 }
 
@@ -76,10 +81,9 @@ impl<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static>
 {
     async fn start(&self, index: usize, case: &Case<I, O>) -> Result<Box<dyn CaseRecording<I, O>>> {
         let span = self
-            .client
-            .span_builder_for_operation(self.submitter.clone())
-            .await?
-            .span_type(crate::SpanType::Eval)
+            .template
+            .clone()
+            .name(format!("case-{}", index + 1))
             .build();
         let mut failures = Vec::new();
         let mut log = SpanLog::builder().name(format!("case-{}", index + 1));
@@ -104,18 +108,14 @@ impl<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static>
             failures,
         }))
     }
+    fn target(&self) -> Option<EvalRecording> {
+        Some(self.target.clone())
+    }
+
     async fn finish(&self) -> Vec<BraintrustError> {
-        let end = self.root.end();
-        let mut failures = Vec::new();
-        if let Some(write) = self.root_write.lock().await.take() {
-            if let Err(error) = write.await {
-                failures.push(error.into());
-            }
-        }
-        if let Err(error) = end.await {
-            failures.push(error.into());
-        }
-        failures
+        // Every owned case write and end has been observed before the executor
+        // finalizes this recorder. The run summary is not a trace span.
+        Vec::new()
     }
 }
 #[async_trait]

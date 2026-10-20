@@ -144,6 +144,14 @@ pub struct ScoreStats {
     pub count: usize,
 }
 
+/// Experiment identity captured before a recorded run reads cases.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalRecording {
+    pub project_id: String,
+    pub experiment_id: String,
+    pub experiment_name: String,
+}
+
 /// Summary of evaluation results
 #[derive(Debug, Serialize)]
 pub struct EvalSummary<I, O> {
@@ -162,6 +170,9 @@ pub struct EvalSummary<I, O> {
     /// Full dataset provenance captured before source consumption.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset: Option<DatasetVersionRef>,
+    /// Resolved recording target; absent for local runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording: Option<EvalRecording>,
 }
 
 impl<I, O> EvalSummary<I, O> {

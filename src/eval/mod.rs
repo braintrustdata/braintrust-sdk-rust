@@ -76,4 +76,6 @@ pub use source::{
     CaseSource, DatasetVersionRef, IterCaseSource, SourceError, StreamCaseSource, VecCaseSource,
 };
 pub use task::{task, SimpleFnTask, SyncFnTask, Task};
-pub use types::{Case, EvalResult, EvalSummary, Score, ScoreStats, ScorerArgs, Scores, TaskHooks};
+pub use types::{
+    Case, EvalRecording, EvalResult, EvalSummary, Score, ScoreStats, ScorerArgs, Scores, TaskHooks,
+};
