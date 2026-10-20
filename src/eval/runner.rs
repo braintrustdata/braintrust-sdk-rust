@@ -1,16 +1,12 @@
-use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::{BraintrustClient, Result, SpanHandle};
+use crate::{BraintrustClient, Result};
 
 use super::{
-    case_runner::CaseRunner,
-    source::CaseSource,
-    types::{Case, EvalResult, EvalSummary},
-    EvalConfigError, EvalDefinition, EvalRunError, EvalRunFailure,
+    source::CaseSource, types::EvalSummary, EvalConfigError, EvalDefinition, EvalRunError,
 };
 
 /// Options for running an evaluation
@@ -78,251 +74,17 @@ where
     /// Run the evaluation
     pub async fn run(
         &self,
-        mut opts: EvalOpts<I, O>,
+        opts: EvalOpts<I, O>,
     ) -> std::result::Result<EvalSummary<I, O>, EvalRunError<I, O>> {
-        opts.validate()?;
-        if !opts.quiet {
-            println!("Running evaluation: {}", opts.name);
-        }
-
-        // Create root span for the evaluation
-        let root_span = self
-            .client
-            .span_builder()
-            .await?
-            .span_type(crate::SpanType::Eval)
-            .build();
-
-        // Set name and metadata on the span
-        let mut log_builder = crate::SpanLog::builder().name(format!("eval-{}", opts.name));
-
-        if let Some(metadata) = &opts.metadata {
-            log_builder = log_builder.metadata(metadata.clone());
-        }
-        if let Some(tags) = &opts.tags {
-            log_builder = log_builder.tags(tags.clone());
-        }
-
-        let root_write = root_span.log(log_builder.build().unwrap());
-
-        let dataset = opts.source.provenance();
-        let mut results = Vec::new();
-        let mut failures = Vec::new();
-        let mut case_count = 0;
-        let mut futures = FuturesUnordered::new();
-
-        loop {
-            // Retain the next-read future while polling active cases. A source
-            // may wait for prior computation, and need not be cancellation-safe.
-            let mut next = Box::pin(opts.source.next());
-            let next_case = loop {
-                if futures.is_empty() {
-                    break next.await;
-                }
-                tokio::select! {
-                    next_case = next.as_mut() => break next_case,
-                    Some((index, result)) = futures.next() => {
-                        Self::collect_case_result(index, result, &mut results, &mut failures);
-                        if !failures.is_empty() { break Ok(None); }
-                    }
-                }
-            };
-            let case = match next_case {
-                Ok(Some(case)) => case,
-                Ok(None) => break,
-                Err(source) => {
-                    failures.push(EvalRunFailure::Source {
-                        case_index: case_count,
-                        source,
-                    });
-                    break;
-                }
-            };
-            case_count += 1;
-            let index = case_count - 1;
-            let client = Arc::clone(&self.client);
-            let root_span = root_span.clone();
-            let definition = &opts.definition;
-            let quiet = opts.quiet;
-            futures.push(async move {
-                let result =
-                    Self::process_case(case, definition, &root_span, &client, index + 1, quiet)
-                        .await;
-                (index, result)
-            });
-            if futures.len() >= opts.max_concurrency {
-                if let Some((index, result)) = futures.next().await {
-                    Self::collect_case_result(index, result, &mut results, &mut failures);
-                }
-                if !failures.is_empty() {
-                    break;
-                }
-            }
-        }
-        // Source/recording failure does not abandon already scheduled cases.
-        while let Some((index, result)) = futures.next().await {
-            Self::collect_case_result(index, result, &mut results, &mut failures);
-        }
-        let end = root_span.end();
-        for result in [root_write.await, end.await] {
-            if let Err(error) = result {
-                failures.push(EvalRunFailure::Recording {
-                    case_index: None,
-                    source: error.into(),
-                });
-            }
-        }
-        results.sort_unstable_by_key(|(index, _)| *index);
-        let results: Vec<_> = results.into_iter().map(|(_, result)| result).collect();
-
-        // Compute statistics
-        let score_stats = EvalSummary::<I, O>::compute_stats(&results);
-        let successful = results.iter().filter(|r| r.errors.is_empty()).count();
-        let failed = case_count - successful;
-
-        if !opts.quiet {
-            println!("\nEvaluation complete!");
-            println!("Total cases: {}", results.len());
-            println!("Successful: {}", successful);
-            println!("Failed: {}", failed);
-            println!("\nScore summary:");
-            for stat in &score_stats {
-                println!(
-                    "  {}: mean={:.3}, min={:.3}, max={:.3}, count={}",
-                    stat.name, stat.mean, stat.min, stat.max, stat.count
-                );
-            }
-        }
-
-        let summary = EvalSummary {
-            name: opts.name,
-            results,
-            score_stats,
-            total_cases: case_count,
-            successful_cases: successful,
-            failed_cases: failed,
-            dataset,
-        };
-        if failures.is_empty() {
-            Ok(summary)
-        } else {
-            Err(EvalRunError {
-                failures,
-                partial: Some(Box::new(summary)),
-            })
-        }
-    }
-
-    fn collect_case_result(
-        index: usize,
-        result: Result<EvalResult<I, O>>,
-        results: &mut Vec<(usize, EvalResult<I, O>)>,
-        failures: &mut Vec<EvalRunFailure>,
-    ) {
-        match result {
-            Ok(result) => results.push((index, result)),
-            Err(source) => failures.push(EvalRunFailure::Recording {
-                case_index: Some(index),
-                source,
-            }),
-        }
-    }
-
-    /// Process a single case
-    async fn process_case(
-        case: Case<I, O>,
-        definition: &EvalDefinition<I, O>,
-        _root_span: &SpanHandle,
-        client: &BraintrustClient,
-        case_num: usize,
-        quiet: bool,
-    ) -> Result<EvalResult<I, O>> {
-        let case_span = client
-            .span_builder()
-            .await?
-            .span_type(crate::SpanType::Eval)
-            .build();
-
-        // Build initial span log with name, input, and expected
-        let mut log_builder = crate::SpanLog::builder().name(format!("case-{}", case_num));
-
-        if let Ok(input_json) = serde_json::to_value(&case.input) {
-            log_builder = log_builder.input(input_json);
-        }
-
-        if let Some(expected) = &case.expected {
-            if let Ok(expected_json) = serde_json::to_value(expected) {
-                log_builder = log_builder.expected(expected_json);
-            }
-        }
-
-        // Add case metadata and tags
-        if let Some(metadata) = &case.metadata {
-            log_builder = log_builder.metadata(metadata.clone());
-        }
-        if let Some(tags) = &case.tags {
-            log_builder = log_builder.tags(tags.clone());
-        }
-
-        let initial_write = case_span.log(log_builder.build().unwrap());
-        let mut result = CaseRunner::run(
-            case,
-            definition.task(),
-            definition.scorers(),
-            Some(&case_span),
-        )
-        .await;
-        result.span_id = case_span.export()?.span_id;
-
-        // Recording adapts the completed outcome; computation never waits on
-        // HTTP or emits console messages. Observe every accepted write before
-        // reporting recording success, including writes that failed earlier.
-        let mut final_log = crate::SpanLog::builder().scores(
-            result
-                .scores
-                .iter()
-                .map(|score| (score.name.clone(), score.score))
-                .collect(),
-        );
-        if let Some(output) = &result.output {
-            if let Ok(output) = serde_json::to_value(output) {
-                final_log = final_log.output(output);
-            }
-        }
-        if let Some(metadata) = &result.metadata {
-            final_log = final_log.metadata(metadata.clone());
-        }
-        if let Some(tags) = &result.tags {
-            final_log = final_log.tags(tags.clone());
-        }
-        if !result.errors.is_empty() {
-            final_log = final_log.error(
-                serde_json::to_value(&result.errors)
-                    .map_err(|error| crate::BraintrustError::Background(error.to_string()))?,
-            );
-        }
-        let final_write = case_span.log(final_log.build().unwrap());
-        let end = case_span.end();
-        let initial_result = initial_write.await;
-        let final_result = final_write.await;
-        let end_result = end.await;
-        initial_result?;
-        final_result?;
-        end_result?;
-
-        if !quiet {
-            let score_str = result
-                .scores
-                .iter()
-                .map(|s| format!("{}={:.3}", s.name, s.score))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("Case {}: {}", case_num, score_str);
-            for error in &result.errors {
-                eprintln!("Case {}: {}", case_num, error);
-            }
-        }
-        Ok(result)
+        let name = opts.name.clone();
+        let metadata = opts.metadata.clone();
+        let tags = opts.tags.clone();
+        let mut reporter = super::reporter::TerminalReporter { quiet: opts.quiet };
+        let plan = super::executor::EvalPlan::new(opts)?;
+        let recorder =
+            super::recorder::BraintrustRecorder::new(self.client.clone(), name, metadata, tags)
+                .await?;
+        super::executor::EvalExecutor::run(plan, Some(&recorder), &mut reporter).await
     }
 }
 

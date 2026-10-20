@@ -155,9 +155,9 @@ pub struct EvalSummary<I, O> {
     pub score_stats: Vec<ScoreStats>,
     /// Total number of cases evaluated
     pub total_cases: usize,
-    /// Number of successful evaluations
+    /// Cases without task/scorer errors, independently of recording status.
     pub successful_cases: usize,
-    /// Number of failed evaluations
+    /// Cases with task/scorer errors, independently of recording status.
     pub failed_cases: usize,
     /// Full dataset provenance captured before source consumption.
     #[serde(skip_serializing_if = "Option::is_none")]

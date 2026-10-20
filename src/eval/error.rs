@@ -75,6 +75,7 @@ pub enum EvalRunFailure {
 
 /// An incomplete run preserves finished case results and every run-level failure.
 /// Case computation errors remain in those results rather than aborting the run.
+/// Recording failures do not discard computed results or change their success counts.
 pub struct EvalRunError<I, O> {
     pub failures: Vec<EvalRunFailure>,
     pub partial: Option<Box<super::EvalSummary<I, O>>>,

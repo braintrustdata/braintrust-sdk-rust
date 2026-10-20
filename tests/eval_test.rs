@@ -554,8 +554,21 @@ async fn recording_failure_stops_new_cases_but_drains_already_scheduled_cases() 
     )));
     let partial = error.partial.unwrap();
     assert_eq!(partial.total_cases, 2);
-    assert_eq!(partial.failed_cases, 2);
-    assert_eq!(partial.successful_cases, 0);
+    assert_eq!(partial.failed_cases, 0);
+    assert_eq!(partial.successful_cases, 2);
+    assert_eq!(partial.results.len(), 2);
+    assert_eq!(
+        partial
+            .results
+            .iter()
+            .map(|result| result.output)
+            .collect::<Vec<_>>(),
+        [Some(0), Some(1)]
+    );
+    assert!(partial
+        .results
+        .iter()
+        .all(|result| result.errors.is_empty() && result.span_id.is_some()));
 }
 
 #[tokio::test]
@@ -613,4 +626,77 @@ async fn reusable_definition_keeps_recorded_runs_and_sources_independent() {
     assert_eq!(later.total_cases, 1);
     assert_eq!(later.results[0].output, Some(10));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn serialization_failures_keep_outputs_and_finalize_recording() {
+    #[derive(Debug)]
+    struct Value(usize);
+    impl serde::Serialize for Value {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> std::result::Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom(
+                "application serialization failed",
+            ))
+        }
+    }
+    let (client, server) = recording_client().await;
+    let options = EvalOpts::builder()
+        .name("serialization-failure".into())
+        .source(
+            vec![Case {
+                input: Value(7),
+                expected: Some(Value(14)),
+                metadata: None,
+                tags: None,
+                id: None,
+                xact_id: None,
+                created: None,
+            }]
+            .into(),
+        )
+        .definition(
+            EvalDefinition::new(
+                Box::new(SimpleFnTask::new(|input: &Value| Ok(Value(input.0 * 2)))),
+                vec![],
+            )
+            .unwrap(),
+        )
+        .quiet(true)
+        .build();
+    let error = Evaluator::new(client).run(options).await.unwrap_err();
+    let fields = error
+        .failures
+        .iter()
+        .map(|failure| match failure {
+            EvalRunFailure::Recording {
+                case_index: Some(0),
+                source,
+            } => source.to_string(),
+            other => panic!("unexpected failure: {other}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fields.len(), 3);
+    for (field, message) in ["input", "expected", "output"].into_iter().zip(fields) {
+        assert!(message.contains(field));
+        assert!(message.contains("application serialization failed"));
+    }
+    let summary = error.partial.unwrap();
+    assert_eq!(summary.successful_cases, 1);
+    assert_eq!(summary.failed_cases, 0);
+    assert_eq!(summary.results[0].output.as_ref().unwrap().0, 14);
+    assert!(summary.results[0].span_id.is_some());
+    let requests = server.received_requests().await.unwrap();
+    let ended: std::collections::HashSet<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .flat_map(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .filter(|row| row["metrics"]["end"].is_number())
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ended.len(), 2, "both case and run recording must finalize");
 }
