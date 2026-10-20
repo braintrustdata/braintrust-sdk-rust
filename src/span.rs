@@ -249,13 +249,16 @@ impl SpanLogBuilder {
 
 #[async_trait]
 pub(crate) trait SpanSubmitter: Send + Sync {
-    /// Submit a span payload for queuing (fire-and-forget).
-    /// The payload is queued internally and processed by a background worker.
-    /// Dropping is handled internally if the queue is full.
-    fn submit(&self, token: String, payload: SpanPayload, parent_info: Option<ParentSpanInfo>);
+    /// Attempt admission immediately and observe the logical batch outcome.
+    fn submit(
+        &self,
+        token: String,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
 
     /// Flush all queued span data through to the server.
-    async fn flush(&self) -> Result<()>;
+    fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError>;
 
     /// Trigger a non-blocking background flush.
     async fn trigger_flush(&self) -> Result<()>;
@@ -572,19 +575,25 @@ impl<S: SpanSubmitter> SpanHandle<S> {
 
     /// Log event data to this span. All fields are optional.
     /// Multiple calls will merge data (later values overwrite earlier ones).
-    /// Each call synchronously queues the current span snapshot for background processing.
-    pub fn log(&self, event: SpanLog) {
-        let payload = {
-            let mut inner = self
-                .inner
-                .lock()
-                .expect("span mutex should not be poisoned");
-            apply_span_log_to_data(&mut inner, event);
-            current_span_payload(&mut inner)
-        };
-
-        self.submitter
-            .submit(self.token.clone(), payload, self.parent_info.clone());
+    /// Each call attempts admission immediately. Await the returned token for full
+    /// delivery; ignoring it leaves accepted work running automatically.
+    pub fn log(
+        &self,
+        event: SpanLog,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("span mutex should not be poisoned");
+        apply_span_log_to_data(&mut inner, event);
+        let payload = current_span_payload(&mut inner);
+        let completion =
+            self.submitter
+                .submit(self.token.clone(), payload, self.parent_info.clone());
+        if completion.is_ok() {
+            inner.has_flushed = true;
+        }
+        completion
     }
 
     /// Flush all queued span data through to Braintrust.
@@ -592,8 +601,8 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     /// This does not create a new queued span update. Call [`SpanHandle::log`] or
     /// [`SpanHandle::end`] first to submit changes, then call `flush()` when you need
     /// to ensure the background queue has been processed.
-    pub async fn flush(&self) -> Result<()> {
-        self.submitter.flush().await
+    pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+        self.submitter.flush()
     }
 
     /// Mark the span as ended with the current timestamp.
@@ -609,21 +618,23 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     /// Calling this multiple times is idempotent: once an end time is set,
     /// subsequent calls return the previously-set value.
     pub fn end_with_time(&self, end_time: f64) -> f64 {
-        let (end_time, payload) = {
-            let mut inner = self
-                .inner
-                .lock()
-                .expect("span mutex should not be poisoned");
-            if let Some(existing) = inner.end_time {
-                return existing;
-            }
-            inner.end_time = Some(end_time);
-            (end_time, current_span_payload(&mut inner))
-        };
-
-        self.submitter
-            .submit(self.token.clone(), payload, self.parent_info.clone());
-        end_time
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("span mutex should not be poisoned");
+        let chosen_time = *inner.end_time.get_or_insert(end_time);
+        if inner.end_submitted {
+            return chosen_time;
+        }
+        let payload = current_span_payload(&mut inner);
+        let completion =
+            self.submitter
+                .submit(self.token.clone(), payload, self.parent_info.clone());
+        if completion.is_ok() {
+            inner.has_flushed = true;
+            inner.end_submitted = true;
+        }
+        chosen_time
     }
 
     /// Trigger a non-blocking background flush.
@@ -758,9 +769,7 @@ fn current_span_payload(inner: &mut SpanData) -> SpanPayload {
         inner.metrics.insert("end".to_string(), end);
     }
 
-    let payload: SpanPayload = inner.clone().into();
-    inner.has_flushed = true;
-    payload
+    inner.clone().into()
 }
 
 #[derive(Clone, Default)]
@@ -768,6 +777,7 @@ struct SpanData {
     row_id: String,
     span_id: String,
     has_flushed: bool,
+    end_submitted: bool,
     org_id: String,
     org_name: Option<String>,
     project_name: Option<String>,
@@ -1059,6 +1069,62 @@ mod tests {
     use crate::types::{usage_metrics_to_map, UsageMetrics};
     use crate::ProjectLogsIdentifier;
     use serde_json::json;
+
+    #[test]
+    fn rejected_admission_preserves_first_write_and_retryable_final_timestamp() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Submitter {
+            reject: AtomicBool,
+            accepted: Mutex<Vec<SpanPayload>>,
+        }
+        #[async_trait]
+        impl SpanSubmitter for Submitter {
+            fn submit(
+                &self,
+                _: String,
+                payload: SpanPayload,
+                _: Option<ParentSpanInfo>,
+            ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+                let (sender, mut completion) = crate::Completion::pair();
+                if self.reject.load(Ordering::Relaxed) {
+                    completion.record_issuance(Err(crate::EnqueueError::Full.into()));
+                } else {
+                    self.accepted.lock().unwrap().push(payload);
+                    let _ = sender.send(Ok(crate::DeliveryReceipt));
+                }
+                completion
+            }
+            fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+                let (sender, completion) = crate::Completion::pair();
+                let _ = sender.send(Ok(crate::FlushReport::default()));
+                completion
+            }
+            async fn trigger_flush(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let submitter = Arc::new(Submitter {
+            reject: AtomicBool::new(true),
+            accepted: Mutex::new(Vec::new()),
+        });
+        let span = SpanBuilder::new(submitter.clone(), "token", "org").build();
+        assert!(span.log(SpanLog::default()).is_err());
+        submitter.reject.store(false, Ordering::Relaxed);
+        assert!(span.log(SpanLog::default()).is_ok());
+        assert!(
+            !submitter.accepted.lock().unwrap()[0].is_merge,
+            "rejected writes do not count as a first admission"
+        );
+        submitter.reject.store(true, Ordering::Relaxed);
+        assert_eq!(span.end_with_time(10.0), 10.0);
+        assert_eq!(submitter.accepted.lock().unwrap().len(), 1);
+        submitter.reject.store(false, Ordering::Relaxed);
+        assert_eq!(span.end_with_time(20.0), 10.0);
+        assert_eq!(span.end_with_time(30.0), 10.0);
+        let accepted = submitter.accepted.lock().unwrap();
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(accepted[1].metrics.as_ref().unwrap()["end"], 10.0);
+    }
 
     #[tokio::test]
     async fn span_logs_input_and_output() {
