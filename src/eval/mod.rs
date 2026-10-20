@@ -69,6 +69,9 @@ pub use error::{CaseError, EvalConfigError, EvalRunError, EvalRunFailure};
 
 // Re-export public API
 pub use bt_runner::{summary_to_value, BtEvalRunner};
+pub use reporter::{
+    EvalReporter, JsonlReporter, ReportError, ReportStage, SilentReporter, TerminalReporter,
+};
 pub use run::{run, EvalRequest};
 pub use runner::{EvalOpts, Evaluator};
 pub use scorer::{scorer, ExactMatch, LevenshteinScorer, NumericDiffScorer, Scorer, SyncFnScorer};

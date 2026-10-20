@@ -71,6 +71,13 @@ pub enum EvalRunFailure {
         #[source]
         source: crate::BraintrustError,
     },
+    #[error("reporting failed at {stage:?} for case {case_index:?}: {source}")]
+    Reporting {
+        stage: super::ReportStage,
+        case_index: Option<usize>,
+        #[source]
+        source: super::ReportError,
+    },
     #[error(transparent)]
     Execution(#[from] crate::ExecutionError),
     #[error(transparent)]
@@ -79,7 +86,7 @@ pub enum EvalRunFailure {
 
 /// An incomplete run preserves finished case results and every run-level failure.
 /// Case computation errors remain in those results rather than aborting the run.
-/// Recording failures do not discard computed results or change their success counts.
+/// Recording and reporting failures preserve computed results and their success counts.
 pub struct EvalRunError<I, O> {
     pub failures: Vec<EvalRunFailure>,
     pub partial: Option<Box<super::EvalSummary<I, O>>>,

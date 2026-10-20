@@ -859,7 +859,7 @@ async fn experiment_is_resolved_before_source_reads_and_case_roots_keep_independ
     }
     assert_eq!(roots.len(), 2);
     assert_eq!(
-        summary_to_value(&summary)["recording"]["experiment_id"],
+        summary_to_value(&summary).unwrap()["recording"]["experiment_id"],
         "chosen-id"
     );
 }
