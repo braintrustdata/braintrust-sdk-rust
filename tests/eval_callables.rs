@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use braintrust_sdk_rust::{
     eval::{
-        scorer, task, Case, Dataset, EvalConfigError, EvalOpts, Evaluator, ExactMatch, Score,
+        scorer, task, Case, CaseSource, EvalConfigError, EvalOpts, Evaluator, ExactMatch, Score,
         Scorer, ScorerArgs, Scores, SimpleFnTask, Task, TaskHooks,
     },
-    BraintrustClient, BraintrustError,
+    BraintrustClient,
 };
 use futures::future::BoxFuture;
 use std::sync::{
@@ -139,8 +139,8 @@ async fn scorer_helpers_accept_borrowed_and_owned_names_and_captured_state() {
 
 struct UntouchedSource(Arc<AtomicBool>);
 #[async_trait]
-impl Dataset<usize, usize> for UntouchedSource {
-    async fn next(&mut self) -> braintrust_sdk_rust::Result<Option<Case<usize, usize>>> {
+impl CaseSource<usize, usize> for UntouchedSource {
+    async fn next(&mut self) -> anyhow::Result<Option<Case<usize, usize>>> {
         self.0.store(true, Ordering::SeqCst);
         panic!("invalid plans must not read their source");
     }
@@ -180,17 +180,19 @@ async fn invalid_concurrency_and_names_fail_before_login_recording_or_source_acc
                     as Box<dyn Scorer<usize, usize>>
             })
             .collect();
-        let opts = EvalOpts::builder()
-            .name("invalid".into())
-            .dataset(Box::new(UntouchedSource(accessed.clone())) as Box<dyn Dataset<usize, usize>>)
-            .task(Box::new(SimpleFnTask::new(|input: &usize| Ok(*input))))
-            .scorers(scorers)
-            .max_concurrency(concurrency)
-            .quiet(true)
-            .build();
+        let opts =
+            EvalOpts::builder()
+                .name("invalid".into())
+                .source(Box::new(UntouchedSource(accessed.clone()))
+                    as Box<dyn CaseSource<usize, usize>>)
+                .task(Box::new(SimpleFnTask::new(|input: &usize| Ok(*input))))
+                .scorers(scorers)
+                .max_concurrency(concurrency)
+                .quiet(true)
+                .build();
         assert_eq!(opts.validate(), Err(expected.clone()));
         assert!(
-            matches!(evaluator.run(opts).await, Err(BraintrustError::InvalidConfig(message)) if message == expected.to_string())
+            matches!(evaluator.run(opts).await, Err(error) if matches!(&error.failures[0], braintrust_sdk_rust::eval::EvalRunFailure::Config(actual) if actual == &expected) && error.partial.is_none())
         );
     }
     assert!(!accessed.load(Ordering::SeqCst));
@@ -217,7 +219,7 @@ fn duplicate_names_are_rejected_across_custom_tuple_and_builtin_scorers() {
     ] {
         let opts = EvalOpts::builder()
             .name("duplicate".into())
-            .dataset(Vec::<Case<usize, usize>>::new().into())
+            .source(Vec::<Case<usize, usize>>::new().into())
             .task(Box::new(SimpleFnTask::new(|input: &usize| Ok(*input))))
             .scorers(vec![Box::new(ExactMatch::new()), callback])
             .build();

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::{Arc, Mutex};
 
-use super::CaseError;
+use super::{CaseError, DatasetVersionRef};
 use crate::SpanHandle;
 
 /// A single test case for evaluation
@@ -159,9 +159,9 @@ pub struct EvalSummary<I, O> {
     pub successful_cases: usize,
     /// Number of failed evaluations
     pub failed_cases: usize,
-    /// Dataset ID (if using Braintrust dataset)
+    /// Full dataset provenance captured before source consumption.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dataset_id: Option<String>,
+    pub dataset: Option<DatasetVersionRef>,
 }
 
 impl<I, O> EvalSummary<I, O> {

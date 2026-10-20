@@ -13,7 +13,7 @@
 //! use braintrust_sdk_rust::*;
 //! use braintrust_sdk_rust::eval::*;
 //!
-//! # async fn example() -> Result<()> {
+//! # async fn example() -> anyhow::Result<()> {
 //! let client = BraintrustClient::builder()
 //!     .api_key("sk-...")
 //!     .build()
@@ -33,7 +33,7 @@
 //!     .run(
 //!         EvalOpts::builder()
 //!             .name("uppercase-eval".to_string())
-//!             .dataset(cases.into())
+//!             .source(cases.into())
 //!             .task(Box::new(task(|input: &String, _hooks| Box::pin(async move {
 //!                 Ok(input.to_uppercase())
 //!             }))))
@@ -49,19 +49,21 @@
 
 mod bt_runner;
 mod case_runner;
-mod dataset;
 mod error;
 mod runner;
 mod scorer;
+mod source;
 mod task;
 mod types;
 
-pub use error::{CaseError, EvalConfigError};
+pub use error::{CaseError, EvalConfigError, EvalRunError, EvalRunFailure};
 
 // Re-export public API
 pub use bt_runner::{summary_to_value, BtEvalRunner};
-pub use dataset::{Dataset, IterDataset, StreamDataset, VecDataset};
 pub use runner::{EvalOpts, Evaluator, SyncEvaluator};
 pub use scorer::{scorer, ExactMatch, LevenshteinScorer, NumericDiffScorer, Scorer, SyncFnScorer};
+pub use source::{
+    CaseSource, DatasetVersionRef, IterCaseSource, SourceError, StreamCaseSource, VecCaseSource,
+};
 pub use task::{task, SimpleFnTask, SyncFnTask, Task};
 pub use types::{Case, EvalResult, EvalSummary, Score, ScoreStats, ScorerArgs, Scores, TaskHooks};
