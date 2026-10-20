@@ -15,19 +15,21 @@ use std::sync::Arc;
 type Write = Completion<DeliveryReceipt, WriteError>;
 
 pub(crate) struct BraintrustRecorder {
-    client: Arc<BraintrustClient>,
+    client: BraintrustClient,
+    submitter: Arc<dyn crate::internal::ports::SpanSubmitter>,
     root: SpanHandle,
     root_write: tokio::sync::Mutex<Option<Write>>,
 }
 impl BraintrustRecorder {
     pub async fn new(
-        client: Arc<BraintrustClient>,
+        client: BraintrustClient,
+        submitter: Arc<dyn crate::internal::ports::SpanSubmitter>,
         name: String,
         metadata: Option<Map<String, Value>>,
         tags: Option<Vec<String>>,
     ) -> Result<Self> {
         let root = client
-            .span_builder()
+            .span_builder_for_operation(submitter.clone())
             .await?
             .span_type(crate::SpanType::Eval)
             .build();
@@ -41,6 +43,7 @@ impl BraintrustRecorder {
         let root_write = tokio::sync::Mutex::new(Some(root.log(log.build().unwrap())));
         Ok(Self {
             client,
+            submitter,
             root,
             root_write,
         })
@@ -74,7 +77,7 @@ impl<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static>
     async fn start(&self, index: usize, case: &Case<I, O>) -> Result<Box<dyn CaseRecording<I, O>>> {
         let span = self
             .client
-            .span_builder()
+            .span_builder_for_operation(self.submitter.clone())
             .await?
             .span_type(crate::SpanType::Eval)
             .build();
