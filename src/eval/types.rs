@@ -241,6 +241,20 @@ impl<'a, I, O> TaskHooks<'a, I, O> {
         }
     }
 
+    pub(crate) fn rebind<'b>(
+        &self,
+        span: Option<&'b SpanHandle>,
+        expected: Option<&'b O>,
+    ) -> TaskHooks<'b, I, O> {
+        TaskHooks {
+            span,
+            expected,
+            metadata: self.metadata.clone(),
+            tags: self.tags.clone(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
     /// Add metadata key-value pair
     pub fn add_metadata(&self, key: impl Into<String>, value: Value) {
         if let Ok(mut metadata) = self.metadata.lock() {

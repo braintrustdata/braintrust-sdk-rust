@@ -391,3 +391,128 @@ async fn shutdown_deadline_cancels_pending_run_and_revokes_escaped_permission() 
         Err(WriteError::Admission(EnqueueError::Closed))
     ));
 }
+
+#[tokio::test]
+async fn running_blocking_callback_keeps_owned_data_after_timeout_but_loses_write_permission() {
+    #[derive(serde::Serialize)]
+    struct OwnedInput {
+        value: usize,
+        #[serde(skip)]
+        drops: Arc<AtomicUsize>,
+        #[serde(skip)]
+        dropped: Arc<tokio::sync::Notify>,
+    }
+    impl Drop for OwnedInput {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            self.dropped.notify_one();
+        }
+    }
+    let server = MockServer::start().await;
+    let client = client(&server).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(tokio::sync::Notify::new());
+    let (release, waiting) = std::sync::mpsc::channel();
+    let waiting = Mutex::new(waiting);
+    let (report, observed) = tokio::sync::oneshot::channel();
+    let report = Mutex::new(Some(report));
+    let callback = SyncFnTask::new({
+        let entered = entered.clone();
+        move |input: &OwnedInput, hooks: &TaskHooks<'_, OwnedInput, usize>| {
+            entered.notify_one();
+            waiting
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))?;
+            let rejected = hooks.span.unwrap().log(SpanLog::default()).is_err();
+            report
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send((input.value, rejected))
+                .unwrap();
+            Ok(input.value)
+        }
+    });
+    let opts = options(
+        EvalDefinition::new(Box::new(callback), vec![]).unwrap(),
+        vec![Case {
+            input: OwnedInput {
+                value: 17,
+                drops: drops.clone(),
+                dropped: dropped.clone(),
+            },
+            expected: None,
+            metadata: None,
+            tags: None,
+            id: None,
+            xact_id: None,
+            created: None,
+        }],
+    );
+    let token = run(EvalRequest::recorded(opts, client.clone()));
+    entered.notified().await;
+    assert!(client.shutdown(Duration::from_millis(20)).await.is_err());
+    assert!(matches!(
+        token
+            .await
+            .err()
+            .expect("run must time out")
+            .failures
+            .as_slice(),
+        [EvalRunFailure::Execution(ExecutionError::TimedOut)]
+    ));
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "running callback still owns the input"
+    );
+    release.send(()).unwrap();
+    assert_eq!(observed.await.unwrap(), (17, true));
+    dropped.notified().await;
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn synchronous_callback_can_wait_for_recording_without_blocking_delivery() {
+    let server = MockServer::start().await;
+    let client = client(&server).await;
+    let worker = std::thread::current().id();
+    let callback = SyncFnTask::new(move |input: &usize, hooks: &TaskHooks<'_, usize, usize>| {
+        assert_ne!(std::thread::current().id(), worker);
+        futures::executor::block_on(
+            hooks
+                .span
+                .unwrap()
+                .log(
+                    SpanLog::builder()
+                        .metadata(
+                            serde_json::json!({"sync_write": true})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        )
+                        .build()
+                        .unwrap(),
+                )
+                .into_future(),
+        )?;
+        Ok(*input)
+    });
+    let token = run(EvalRequest::recorded(
+        options(
+            EvalDefinition::new(Box::new(callback), vec![]).unwrap(),
+            vec![Case {
+                input: 9,
+                ..Default::default()
+            }],
+        ),
+        client.clone(),
+    ));
+    let shutdown = client.shutdown(Duration::from_secs(5));
+    let (result, shutdown) = tokio::join!(token, shutdown);
+    assert_eq!(result.unwrap().results[0].output, Some(9));
+    shutdown.unwrap();
+}

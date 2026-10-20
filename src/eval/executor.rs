@@ -55,10 +55,11 @@ struct CaseOutcome<I, O> {
 
 pub(crate) struct EvalExecutor;
 impl EvalExecutor {
-    pub async fn run<I: Send + Sync, O: Send + Sync>(
+    pub async fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
         mut plan: EvalPlan<I, O>,
         recorder: Option<&dyn EvalRecorder<I, O>>,
         reporter: &mut impl EvalReporter<I, O>,
+        binding: Option<&crate::internal::execution::ExecutionBinding>,
     ) -> std::result::Result<EvalSummary<I, O>, EvalRunError<I, O>> {
         reporter.started(&plan.name);
         let dataset = plan.source.provenance();
@@ -102,7 +103,7 @@ impl EvalExecutor {
             pending.push(async move {
                 (
                     index,
-                    Self::run_case(case, definition, recorder, index).await,
+                    Self::run_case(case, definition, recorder, index, binding).await,
                 )
             });
             if pending.len() >= plan.concurrency {
@@ -153,11 +154,12 @@ impl EvalExecutor {
         }
     }
 
-    async fn run_case<I: Send + Sync, O: Send + Sync>(
+    async fn run_case<I: Send + Sync + 'static, O: Send + Sync + 'static>(
         case: Case<I, O>,
         definition: &EvalDefinition<I, O>,
         recorder: Option<&dyn EvalRecorder<I, O>>,
         index: usize,
+        binding: Option<&crate::internal::execution::ExecutionBinding>,
     ) -> CaseOutcome<I, O> {
         let mut failures = Vec::new();
         let recording = if let Some(recorder) = recorder {
@@ -172,7 +174,7 @@ impl EvalExecutor {
             None
         };
         let span = recording.as_ref().and_then(|recording| recording.span());
-        let mut result = CaseRunner::run(case, definition.task(), definition.scorers(), span).await;
+        let mut result = CaseRunner::run(case, definition, span, binding).await;
         if let Some(recording) = recording {
             failures.extend(recording.finish(&mut result).await);
         }
@@ -203,7 +205,7 @@ impl EvalExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{task, CaseSource, SimpleFnTask, SourceError};
+    use crate::eval::{task, CaseSource, SourceError};
     use std::{
         cell::Cell,
         sync::{
@@ -290,7 +292,7 @@ mod tests {
         )
         .unwrap();
         let mut reporter = Observed::default();
-        let error = futures::executor::block_on(EvalExecutor::run(plan, None, &mut reporter))
+        let error = futures::executor::block_on(EvalExecutor::run(plan, None, &mut reporter, None))
             .err()
             .expect("source should fail");
         assert!(
@@ -356,8 +358,9 @@ mod tests {
             )
             .unwrap();
             let mut reporter = Observed::default();
-            let summary = futures::executor::block_on(EvalExecutor::run(plan, None, &mut reporter))
-                .expect("local computation should succeed");
+            let summary =
+                futures::executor::block_on(EvalExecutor::run(plan, None, &mut reporter, None))
+                    .expect("local computation should succeed");
             assert_eq!(summary.total_cases, count);
             assert_eq!(summary.successful_cases, count);
             assert_eq!(
@@ -422,7 +425,9 @@ mod tests {
                 .source(cases.into())
                 .definition(
                     EvalDefinition::new(
-                        Box::new(SimpleFnTask::new(|input: &usize| Ok(input + 10))),
+                        Box::new(task(|input: &usize, _hooks| {
+                            Box::pin(async move { Ok(input + 10) })
+                        })),
                         vec![],
                     )
                     .unwrap(),
@@ -432,9 +437,13 @@ mod tests {
         )
         .unwrap();
         let mut reporter = Observed::default();
-        let error =
-            futures::executor::block_on(EvalExecutor::run(plan, Some(&recorder), &mut reporter))
-                .unwrap_err();
+        let error = futures::executor::block_on(EvalExecutor::run(
+            plan,
+            Some(&recorder),
+            &mut reporter,
+            None,
+        ))
+        .unwrap_err();
         assert_eq!(error.failures.len(), 3);
         assert!(matches!(
             &error.failures[0],

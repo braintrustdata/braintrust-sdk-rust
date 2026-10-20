@@ -1,29 +1,40 @@
-//! One case's computation, independent of scheduling, recording and reporting.
-use super::{Case, CaseError, EvalResult, Scorer, ScorerArgs, Task, TaskHooks};
-use crate::SpanHandle;
+//! One case's computation, independent of recording and reporting.
+use super::{Case, CaseError, EvalDefinition, EvalResult, ScorerArgs, TaskHooks};
+use crate::{internal::execution::ExecutionBinding, SpanHandle};
 use futures::{stream::FuturesOrdered, StreamExt};
+use std::sync::Arc;
 
 pub(crate) struct CaseRunner;
 impl CaseRunner {
-    pub async fn run<I, O>(
+    pub async fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
         case: Case<I, O>,
-        task: &dyn Task<I, O>,
-        scorers: &[Box<dyn Scorer<I, O>>],
+        definition: &EvalDefinition<I, O>,
         span: Option<&SpanHandle>,
-    ) -> EvalResult<I, O>
-    where
-        I: Send + Sync,
-        O: Send + Sync,
-    {
+        binding: Option<&ExecutionBinding>,
+    ) -> EvalResult<I, O> {
+        let case = Arc::new(case);
         let hooks = TaskHooks::for_case(
             span,
             case.expected.as_ref(),
             case.metadata.clone(),
             case.tags.clone(),
         );
+        let task = definition.task();
+        let computed = if task.is_blocking() {
+            let case = case.clone();
+            let state = hooks.rebind(None, None);
+            let span = span.cloned();
+            super::blocking::invoke(binding, move || {
+                let hooks = state.rebind(span.as_ref(), case.expected.as_ref());
+                task.run_blocking(&case.input, &hooks)
+            })
+            .await
+        } else {
+            task.run(&case.input, &hooks).await
+        };
         let mut errors = Vec::new();
-        let output = match task.run(&case.input, &hooks).await {
-            Ok(output) => Some(output),
+        let output = match computed {
+            Ok(output) => Some(Arc::new(output)),
             Err(source) => {
                 errors.push(CaseError::Task { source });
                 None
@@ -31,24 +42,34 @@ impl CaseRunner {
         };
         let mut scores = Vec::new();
         if let Some(output) = &output {
-            // Drive scorers concurrently while keeping definition order in the
-            // outcome, regardless of their relative completion times.
             let mut pending = FuturesOrdered::new();
-            for scorer in scorers {
-                let args = ScorerArgs {
-                    input: &case.input,
-                    output,
-                    expected: case.expected.as_ref(),
-                    metadata: case.metadata.as_ref(),
-                };
+            for scorer in definition.scorers() {
+                let case = case.clone();
+                let output = output.clone();
+                let scorer = scorer.clone();
                 pending.push_back(async move {
-                    scorer
-                        .score(args)
-                        .await
-                        .map_err(|source| CaseError::Scorer {
-                            name: scorer.name().to_owned(),
-                            source,
+                    let name = scorer.name().to_owned();
+                    let result = if scorer.is_blocking() {
+                        super::blocking::invoke(binding, move || {
+                            scorer.score_blocking(ScorerArgs {
+                                input: &case.input,
+                                output: &output,
+                                expected: case.expected.as_ref(),
+                                metadata: case.metadata.as_ref(),
+                            })
                         })
+                        .await
+                    } else {
+                        scorer
+                            .score(ScorerArgs {
+                                input: &case.input,
+                                output: &output,
+                                expected: case.expected.as_ref(),
+                                metadata: case.metadata.as_ref(),
+                            })
+                            .await
+                    };
+                    result.map_err(|source| CaseError::Scorer { name, source })
                 });
             }
             while let Some(result) = pending.next().await {
@@ -61,6 +82,13 @@ impl CaseRunner {
         let metadata = hooks.get_metadata();
         let tags = hooks.get_tags();
         drop(hooks);
+        // All owned invocations have joined. Borrowed callback arguments cannot
+        // escape, so no input/output clones are required to return ownership.
+        let case =
+            Arc::try_unwrap(case).unwrap_or_else(|_| unreachable!("case invocations joined"));
+        let output = output.map(|output| {
+            Arc::try_unwrap(output).unwrap_or_else(|_| unreachable!("scorers joined"))
+        });
         EvalResult {
             input: case.input,
             output,
@@ -80,7 +108,7 @@ impl CaseRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{Score, Scores, SimpleFnTask};
+    use crate::eval::{Score, Scorer, Scores, Task};
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::{
@@ -123,7 +151,12 @@ mod tests {
             xact_id: Some("version".into()),
             created: Some("timestamp".into()),
         };
-        let result = futures::executor::block_on(CaseRunner::run(case, &LocalTask, &[], None));
+        let result = futures::executor::block_on(CaseRunner::run(
+            case,
+            &EvalDefinition::new(Box::new(LocalTask), vec![]).unwrap(),
+            None,
+            None,
+        ));
         assert_eq!(result.output.unwrap().0, 6);
         assert_eq!(result.case_id.as_deref(), Some("case"));
         assert_eq!(result.xact_id.as_deref(), Some("version"));
@@ -174,8 +207,8 @@ mod tests {
                 input: 1,
                 ..Default::default()
             },
-            &FailTask,
-            &scorers,
+            &EvalDefinition::new(Box::new(FailTask), scorers).unwrap(),
+            None,
             None,
         )
         .await;
@@ -233,8 +266,14 @@ mod tests {
                     input: 1,
                     ..Default::default()
                 },
-                &SimpleFnTask::new(|input: &usize| Ok(*input)),
-                &scorers,
+                &EvalDefinition::new(
+                    Box::new(crate::eval::task(|input: &usize, _hooks| {
+                        Box::pin(async move { Ok(*input) })
+                    })),
+                    scorers,
+                )
+                .unwrap(),
+                None,
                 None,
             ),
         )

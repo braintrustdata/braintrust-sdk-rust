@@ -15,8 +15,8 @@ pub struct EvalDefinition<I, O> {
 }
 
 struct DefinitionInner<I, O> {
-    task: Box<dyn Task<I, O>>,
-    scorers: Vec<Box<dyn Scorer<I, O>>>,
+    task: Arc<dyn Task<I, O>>,
+    scorers: Vec<Arc<dyn Scorer<I, O>>>,
 }
 
 impl<I, O> Clone for EvalDefinition<I, O> {
@@ -37,7 +37,7 @@ impl<I: Send + Sync + 'static, O: Send + Sync + 'static> EvalDefinition<I, O> {
         scorers: Vec<Box<dyn Scorer<I, O>>>,
     ) -> Result<Self, EvalConfigError> {
         let mut names = std::collections::HashSet::new();
-        let mut validated: Vec<Box<dyn Scorer<I, O>>> = Vec::with_capacity(scorers.len());
+        let mut validated: Vec<Arc<dyn Scorer<I, O>>> = Vec::with_capacity(scorers.len());
         for (index, scorer) in scorers.into_iter().enumerate() {
             let name = scorer.name().to_owned();
             if name.trim().is_empty() {
@@ -46,11 +46,11 @@ impl<I: Send + Sync + 'static, O: Send + Sync + 'static> EvalDefinition<I, O> {
             if !names.insert(name.clone()) {
                 return Err(EvalConfigError::DuplicateScorerName { name });
             }
-            validated.push(Box::new(NamedScorer { name, scorer }));
+            validated.push(Arc::new(NamedScorer { name, scorer }));
         }
         Ok(Self {
             inner: Arc::new(DefinitionInner {
-                task,
+                task: Arc::from(task),
                 scorers: validated,
             }),
         })
@@ -63,11 +63,11 @@ impl<I, O> EvalDefinition<I, O> {
         self.inner.scorers.iter().map(|scorer| scorer.name())
     }
 
-    pub(crate) fn task(&self) -> &dyn Task<I, O> {
-        self.inner.task.as_ref()
+    pub(crate) fn task(&self) -> Arc<dyn Task<I, O>> {
+        self.inner.task.clone()
     }
 
-    pub(crate) fn scorers(&self) -> &[Box<dyn Scorer<I, O>>] {
+    pub(crate) fn scorers(&self) -> &[Arc<dyn Scorer<I, O>>] {
         &self.inner.scorers
     }
 }
@@ -79,8 +79,16 @@ struct NamedScorer<I, O> {
 
 #[async_trait]
 impl<I: Send + Sync, O: Send + Sync> Scorer<I, O> for NamedScorer<I, O> {
+    fn is_blocking(&self) -> bool {
+        self.scorer.is_blocking()
+    }
+
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn score_blocking(&self, args: ScorerArgs<'_, I, O>) -> anyhow::Result<Scores> {
+        self.scorer.score_blocking(args)
     }
 
     async fn score(&self, args: ScorerArgs<'_, I, O>) -> anyhow::Result<Scores> {
@@ -91,7 +99,7 @@ impl<I: Send + Sync, O: Send + Sync> Scorer<I, O> for NamedScorer<I, O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{case_runner::CaseRunner, task, Case, CaseError, SimpleFnTask};
+    use crate::eval::{case_runner::CaseRunner, task, Case, CaseError};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // No Clone, Serialize, equality or runtime is needed for computation.
@@ -133,8 +141,8 @@ mod tests {
         };
         let (one, two) = futures::executor::block_on(async {
             futures::join!(
-                CaseRunner::run(case(1, 10), first.task(), first.scorers(), None),
-                CaseRunner::run(case(2, 20), other.task(), other.scorers(), None),
+                CaseRunner::run(case(1, 10), &first, None, None),
+                CaseRunner::run(case(2, 20), &other, None, None),
             )
         });
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -145,8 +153,8 @@ mod tests {
         // Reuse the same callbacks after both prior invocations have completed.
         let (one, two) = futures::executor::block_on(async {
             futures::join!(
-                CaseRunner::run(case(3, 30), first.task(), first.scorers(), None),
-                CaseRunner::run(case(4, 40), other.task(), other.scorers(), None),
+                CaseRunner::run(case(3, 30), &first, None, None),
+                CaseRunner::run(case(4, 40), &other, None, None),
             )
         });
         assert_eq!(one.output.unwrap().0, 33);
@@ -173,7 +181,9 @@ mod tests {
     fn scorer_identity_is_captured_once_for_every_run() {
         let changed = Arc::new(AtomicBool::new(false));
         let definition = EvalDefinition::new(
-            Box::new(SimpleFnTask::new(|input: &usize| Ok(*input))),
+            Box::new(task(|input: &usize, _hooks| {
+                Box::pin(async move { Ok(*input) })
+            })),
             vec![Box::new(ChangingName(changed.clone()))],
         )
         .unwrap();
@@ -185,8 +195,8 @@ mod tests {
                     input: 1,
                     ..Default::default()
                 },
-                definition.task(),
-                definition.scorers(),
+                &definition,
+                None,
                 None,
             ));
             assert!(
