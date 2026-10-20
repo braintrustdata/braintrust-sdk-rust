@@ -19,7 +19,7 @@ use tokio::{
 use tracing::warn;
 
 use crate::internal::execution::ExecutionBinding;
-use crate::internal::write_outcome::{WriteOutcome, WriteResponder};
+use crate::internal::shared_outcome::{WriteOutcome, WriteResponder};
 type WriteSender = WriteResponder;
 type FlushSender = oneshot::Sender<Result<FlushReport, FlushError>>;
 #[derive(Clone)]
@@ -392,6 +392,13 @@ impl<C: Send + 'static> WriteService<C> {
             let _ = sender.send(result);
         });
         completion
+    }
+
+    pub fn cancel(&self, error: ExecutionError) {
+        self.inner.stop(error);
+        if let Some(abort) = lock(&self.inner.abort).as_ref() {
+            abort.abort();
+        }
     }
 
     #[cfg(test)]

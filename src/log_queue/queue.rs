@@ -10,7 +10,7 @@ use crate::internal::delivery::WriteService;
 use crate::internal::execution::ExecutionBinding;
 use crate::internal::ports::{DeliveryControl, SpanSubmitter};
 use crate::internal::session::CredentialScope;
-use crate::internal::write_outcome::WriteOutcome;
+use crate::internal::shared_outcome::WriteOutcome;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use crate::{
@@ -684,7 +684,7 @@ impl LogQueue {
             QueueState::Closed => {
                 let (sender, mut completion) = Completion::pair();
                 completion.record_issuance(Err(crate::EnqueueError::Closed.into()));
-                let _ = crate::internal::write_outcome::WriteResponder::new(sender, outcome)
+                let _ = crate::internal::shared_outcome::WriteResponder::new(sender, outcome)
                     .send(Err(crate::EnqueueError::Closed.into()));
                 self.reject(command, crate::EnqueueError::Closed);
                 completion
@@ -729,6 +729,15 @@ impl LogQueue {
         let _ = sender.send(Ok(ShutdownReport::default()));
         completion
     }
+    pub fn cancel(&self, error: crate::ExecutionError) {
+        let mut state = self.state();
+        if let QueueState::Running(writes) = &*state {
+            writes.cancel(error);
+        } else {
+            *state = QueueState::Closed;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         match &*self.state() {

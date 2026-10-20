@@ -13,7 +13,7 @@ use crate::api::{
 use crate::error::Result;
 use crate::experiments::BaseExperimentInfo;
 use crate::internal::session::CredentialScope;
-use crate::internal::write_outcome::WriteOutcome;
+use crate::internal::shared_outcome::WriteOutcome;
 use crate::types::{ParentSpanInfo, SpanPayload};
 
 /// Shared delivery lifecycle, independent of resource HTTP operations.
