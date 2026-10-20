@@ -520,3 +520,51 @@ async fn clones_share_the_selected_span_recording_interface() {
         Err(braintrust_sdk_rust::BraintrustError::InvalidConfig(_))
     ));
 }
+
+#[tokio::test]
+async fn experiment_resource_adapters_use_the_control_plane_and_preserve_no_base_policy() {
+    use wiremock::matchers::{body_json, header, query_param};
+    let control = MockServer::start().await;
+    let data = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/control/api/experiment/register"))
+        .and(header("authorization", "Bearer explicit"))
+        .respond_with(registered_experiment())
+        .expect(1)
+        .mount(&control)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/control/api/base_experiment/get_id"))
+        .and(body_json(json!({"id":"experiment"})))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(1)
+        .mount(&control)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/control/experiment-comparison2"))
+        .and(query_param("experiment_id", "experiment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"scores":{},"metrics":{}})))
+        .expect(1)
+        .mount(&control)
+        .await;
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .app_url(format!("{}/control", control.uri()))
+        .api_url(format!("{}/data", data.uri()))
+        .build()
+        .await
+        .unwrap();
+    let experiment = client
+        .experiment_builder_with_credentials("explicit", "org")
+        .project_name("project")
+        .build()
+        .unwrap();
+    experiment.summarize().await.unwrap();
+    let requests = control.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2]
+        .url
+        .query_pairs()
+        .all(|(key, _)| key != "base_experiment_id"));
+    assert!(data.received_requests().await.unwrap().is_empty());
+}

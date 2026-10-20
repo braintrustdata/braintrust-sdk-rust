@@ -20,25 +20,22 @@
 //!         .input(json!({"question": "What is 2+2?"}))
 //!         .expected(json!({"answer": "4"}))
 //!         .build()?
-//! ).await;
-//!
-//! dataset.flush().await?;
+//! ).await?;
 //! ```
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+use crate::api::datasets::{DatasetFields, DatasetWrite};
 use crate::error::Result;
 use crate::span::SpanSubmitter;
-use crate::types::{ParentSpanInfo, SpanPayload};
 
 // ============================================================================
 // Dataset Insert Types
@@ -76,6 +73,17 @@ impl DatasetInsert {
     /// Create a new DatasetInsert builder.
     pub fn builder() -> DatasetInsertBuilder {
         DatasetInsertBuilder::new()
+    }
+}
+
+impl From<DatasetInsert> for DatasetFields {
+    fn from(record: DatasetInsert) -> Self {
+        Self {
+            input: record.input,
+            expected: record.expected,
+            metadata: record.metadata,
+            tags: record.tags,
+        }
     }
 }
 
@@ -252,7 +260,12 @@ pub(crate) trait DatasetRegistrar: Send + Sync {
 #[async_trait]
 pub(crate) trait DatasetFetcher: Send + Sync {
     /// Fetch dataset records via BTQL query.
-    async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse>;
+    async fn fetch_dataset_records(
+        &self,
+        token: &str,
+        org_name: &str,
+        query: BTQLQuery,
+    ) -> Result<BTQLResponse>;
 }
 
 /// Trait for fetching dataset summary.
@@ -262,8 +275,20 @@ pub(crate) trait DatasetSummarizer: Send + Sync {
     async fn fetch_dataset_summary(
         &self,
         token: &str,
+        org_name: &str,
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse>;
+}
+
+/// Direct dataset mutation port; writes are acknowledged by the endpoint.
+#[async_trait]
+pub(crate) trait DatasetWriter: Send + Sync {
+    async fn write_dataset_record(
+        &self,
+        token: &str,
+        org_name: &str,
+        row: DatasetWrite,
+    ) -> Result<()>;
 }
 
 // ============================================================================
@@ -301,8 +326,9 @@ impl std::error::Error for DatasetBuilderError {}
 
 /// Builder for creating datasets with lazy registration.
 #[allow(private_bounds)]
-pub struct DatasetBuilder<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer>
-{
+pub struct DatasetBuilder<
+    S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter,
+> {
     submitter: Arc<S>,
     token: String,
     org_name: String,
@@ -312,7 +338,7 @@ pub struct DatasetBuilder<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher +
     metadata: Option<Map<String, Value>>,
 }
 
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> Clone
+impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter> Clone
     for DatasetBuilder<S>
 {
     fn clone(&self) -> Self {
@@ -329,8 +355,14 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> C
 }
 
 #[allow(private_bounds)]
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 'static>
-    DatasetBuilder<S>
+impl<
+        S: SpanSubmitter
+            + DatasetRegistrar
+            + DatasetFetcher
+            + DatasetSummarizer
+            + DatasetWriter
+            + 'static,
+    > DatasetBuilder<S>
 {
     /// Create a new DatasetBuilder (internal use).
     pub(crate) fn new(
@@ -399,7 +431,6 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             description: self.description,
             metadata: self.metadata,
             lazy_metadata: Arc::new(OnceCell::new()),
-            pending_rows: Arc::new(Mutex::new(Vec::new())),
         })
     }
 }
@@ -412,7 +443,9 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 ///
 /// Datasets are lazily registered with the API on first use.
 #[allow(private_bounds)]
-pub struct Dataset<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> {
+pub struct Dataset<
+    S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter,
+> {
     submitter: Arc<S>,
     token: String,
     org_name: String,
@@ -421,10 +454,9 @@ pub struct Dataset<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + Datase
     description: Option<String>,
     metadata: Option<Map<String, Value>>,
     lazy_metadata: Arc<OnceCell<DatasetMetadata>>,
-    pending_rows: Arc<Mutex<Vec<PendingDatasetRow>>>,
 }
 
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> Clone
+impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter> Clone
     for Dataset<S>
 {
     fn clone(&self) -> Self {
@@ -437,13 +469,12 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> C
             description: self.description.clone(),
             metadata: self.metadata.clone(),
             lazy_metadata: self.lazy_metadata.clone(),
-            pending_rows: self.pending_rows.clone(),
         }
     }
 }
 
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> fmt::Debug
-    for Dataset<S>
+impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter>
+    fmt::Debug for Dataset<S>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Dataset")
@@ -454,20 +485,15 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> f
     }
 }
 
-/// A pending dataset row waiting to be submitted.
-struct PendingDatasetRow {
-    id: String,
-    input: Option<Value>,
-    expected: Option<Value>,
-    metadata: Option<Map<String, Value>>,
-    tags: Option<Vec<String>>,
-    is_merge: bool,
-    is_delete: bool,
-}
-
 #[allow(private_bounds)]
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 'static>
-    Dataset<S>
+impl<
+        S: SpanSubmitter
+            + DatasetRegistrar
+            + DatasetFetcher
+            + DatasetSummarizer
+            + DatasetWriter
+            + 'static,
+    > Dataset<S>
 {
     /// Ensure the dataset is registered, returning cached metadata.
     async fn ensure_registered(&self) -> Result<&DatasetMetadata> {
@@ -507,56 +533,53 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         &self.project_name
     }
 
-    /// Insert a new record into the dataset.
-    ///
-    /// Returns the auto-generated record ID.
-    pub async fn insert(&self, record: DatasetInsert) -> String {
+    /// Insert a record and return its generated ID after the API acknowledges it.
+    pub async fn insert(&self, record: DatasetInsert) -> Result<String> {
+        let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         let id = Uuid::new_v4().to_string();
-
-        let row = PendingDatasetRow {
-            id: id.clone(),
-            input: record.input,
-            expected: record.expected,
-            metadata: record.metadata,
-            tags: record.tags,
-            is_merge: false,
-            is_delete: false,
-        };
-
-        self.pending_rows.lock().await.push(row);
-        id
+        self.submitter
+            .write_dataset_record(
+                &self.token,
+                &self.org_name,
+                DatasetWrite::Insert {
+                    dataset_id,
+                    id: id.clone(),
+                    fields: record.into(),
+                },
+            )
+            .await?;
+        Ok(id)
     }
 
-    /// Update an existing record by ID (merge semantics).
-    ///
-    /// Unspecified fields are preserved.
-    pub async fn update(&self, id: &str, record: DatasetInsert) {
-        let row = PendingDatasetRow {
-            id: id.to_string(),
-            input: record.input,
-            expected: record.expected,
-            metadata: record.metadata,
-            tags: record.tags,
-            is_merge: true,
-            is_delete: false,
-        };
-
-        self.pending_rows.lock().await.push(row);
+    /// Merge supplied fields into a record, returning after API acknowledgement.
+    pub async fn update(&self, id: &str, record: DatasetInsert) -> Result<()> {
+        let dataset_id = self.ensure_registered().await?.dataset_id.clone();
+        self.submitter
+            .write_dataset_record(
+                &self.token,
+                &self.org_name,
+                DatasetWrite::Update {
+                    dataset_id,
+                    id: id.to_owned(),
+                    fields: record.into(),
+                },
+            )
+            .await
     }
 
-    /// Delete a record by ID.
-    pub async fn delete(&self, id: &str) {
-        let row = PendingDatasetRow {
-            id: id.to_string(),
-            input: None,
-            expected: None,
-            metadata: None,
-            tags: None,
-            is_merge: false,
-            is_delete: true,
-        };
-
-        self.pending_rows.lock().await.push(row);
+    /// Delete a record, returning after API acknowledgement.
+    pub async fn delete(&self, id: &str) -> Result<()> {
+        let dataset_id = self.ensure_registered().await?.dataset_id.clone();
+        self.submitter
+            .write_dataset_record(
+                &self.token,
+                &self.org_name,
+                DatasetWrite::Delete {
+                    dataset_id,
+                    id: id.to_owned(),
+                },
+            )
+            .await
     }
 
     /// Fetch records with pagination.
@@ -567,6 +590,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         Ok(DatasetIterator::new(
             Arc::clone(&self.submitter),
             self.token.clone(),
+            self.org_name.clone(),
             metadata.dataset_id.clone(),
             batch_size.unwrap_or(1000).max(1),
         ))
@@ -574,15 +598,12 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 
     /// Get dataset summary statistics.
     pub async fn summarize(&self) -> Result<DatasetSummary> {
-        // Flush pending operations first
-        self.flush().await?;
-
         let metadata = self.ensure_registered().await?;
 
         // Fetch summary from API
         let response = self
             .submitter
-            .fetch_dataset_summary(&self.token, &metadata.dataset_id)
+            .fetch_dataset_summary(&self.token, &self.org_name, &metadata.dataset_id)
             .await?;
 
         Ok(DatasetSummary {
@@ -596,70 +617,10 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         })
     }
 
-    /// Flush all pending operations.
-    pub async fn flush(&self) -> Result<()> {
-        let metadata = self.ensure_registered().await?;
-        let rows = {
-            let mut pending = self.pending_rows.lock().await;
-            std::mem::take(&mut *pending)
-        };
-
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        // Submit each row
-        for row in rows {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-
-            let payload = SpanPayload {
-                row_id: row.id.clone(),
-                span_id: row.id,
-                is_merge: row.is_merge,
-                span_components: None,
-                org_id: String::new(),
-                org_name: Some(self.org_name.clone()),
-                project_name: Some(self.project_name.clone()),
-                input: row.input,
-                output: None,
-                expected: row.expected,
-                error: None,
-                scores: None,
-                metadata: row.metadata,
-                metrics: None,
-                tags: row.tags,
-                context: Some(serde_json::json!({
-                    "calendar_time": now,
-                })),
-                span_attributes: if row.is_delete {
-                    Some(crate::types::SpanAttributes {
-                        name: None,
-                        span_type: None,
-                        purpose: None,
-                        extra: {
-                            let mut map = std::collections::HashMap::new();
-                            map.insert("_object_delete".to_string(), Value::Bool(true));
-                            map
-                        },
-                    })
-                } else {
-                    None
-                },
-                extra: std::collections::HashMap::new(),
-            };
-
-            let parent_info = ParentSpanInfo::Dataset {
-                object_id: metadata.dataset_id.clone(),
-            };
-
-            self.submitter
-                .submit(self.token.clone(), payload, Some(parent_info));
-        }
-
-        Ok(())
+    /// Flush the client's shared trace queue. Dataset mutations are already
+    /// acknowledged when their individual operation completes.
+    pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+        self.submitter.flush()
     }
 }
 
@@ -683,6 +644,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 pub struct DatasetIterator<S: DatasetFetcher> {
     fetcher: Arc<S>,
     token: String,
+    org_name: String,
     dataset_id: String,
     batch_size: usize,
     cursor: Option<String>,
@@ -692,10 +654,17 @@ pub struct DatasetIterator<S: DatasetFetcher> {
 
 #[allow(private_bounds)]
 impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
-    fn new(fetcher: Arc<S>, token: String, dataset_id: String, batch_size: usize) -> Self {
+    fn new(
+        fetcher: Arc<S>,
+        token: String,
+        org_name: String,
+        dataset_id: String,
+        batch_size: usize,
+    ) -> Self {
         Self {
             fetcher,
             token,
+            org_name,
             dataset_id,
             batch_size,
             cursor: None,
@@ -724,7 +693,7 @@ impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
             // A failed request leaves the cursor and EOF state untouched.
             let response = self
                 .fetcher
-                .fetch_dataset_records(&self.token, query)
+                .fetch_dataset_records(&self.token, &self.org_name, query)
                 .await?;
             if response.cursor.is_some() && response.cursor == previous_cursor {
                 return Err(crate::BraintrustError::Background(

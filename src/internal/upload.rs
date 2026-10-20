@@ -72,24 +72,6 @@ fn retryable(error: &BraintrustError) -> bool {
         _ => false,
     }
 }
-pub(crate) fn api_error(error: api::Error) -> BraintrustError {
-    match error {
-        api::Error::Config(message) => BraintrustError::InvalidConfig(message),
-        api::Error::Transport { source, .. } => BraintrustError::Http(source),
-        api::Error::Http { status, body, .. } => BraintrustError::Api {
-            status,
-            message: body,
-        },
-        api::Error::Decode {
-            operation,
-            status,
-            source,
-        } => BraintrustError::Api {
-            status,
-            message: format!("{operation}: invalid response: {source}"),
-        },
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct UploadResult {
@@ -111,8 +93,8 @@ impl UploadCoordinator {
         org_name: Option<&str>,
         policy: UploadPolicy,
     ) -> Result<Self> {
-        let logs = api::Client::for_ingestion(http.clone(), api_url, token, org_name)
-            .map_err(api_error)?
+        let logs = api::Client::for_scope(http.clone(), api_url, api_url, token, org_name)
+            .map_err(BraintrustError::from)?
             .logs3();
         Ok(Self {
             logs,
@@ -170,7 +152,7 @@ impl UploadCoordinator {
                             self.logs
                                 .post_raw(batch.data.to_vec())
                                 .await
-                                .map_err(api_error)
+                                .map_err(BraintrustError::from)
                         })
                         .await
                     {
@@ -205,7 +187,7 @@ impl UploadCoordinator {
                         rows: batch.overflow_rows.clone(),
                     })
                     .await
-                    .map_err(api_error)
+                    .map_err(BraintrustError::from)
             })
             .await?;
         budget
@@ -222,7 +204,7 @@ impl UploadCoordinator {
                         api_version: LOGS_API_VERSION,
                     })
                     .await
-                    .map_err(api_error)
+                    .map_err(BraintrustError::from)
             })
             .await
     }
