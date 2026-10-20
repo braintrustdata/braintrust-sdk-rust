@@ -19,7 +19,8 @@ use tokio::{
 };
 use tracing::warn;
 
-type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
+use crate::internal::write_outcome::{WriteOutcome, WriteResponder};
+type WriteSender = WriteResponder;
 type FlushSender = oneshot::Sender<Result<FlushReport, FlushError>>;
 #[derive(Clone)]
 enum BatchError {
@@ -285,15 +286,17 @@ impl<C: Send + 'static> WriteService<C> {
 
     #[cfg(test)]
     pub fn enqueue(&self, command: C) -> Completion<DeliveryReceipt, WriteError> {
-        self.enqueue_with_rejection(command, |_, _| {})
+        self.enqueue_with_rejection(command, None, |_, _| {})
     }
 
     pub fn enqueue_with_rejection(
         &self,
         command: C,
+        outcome: Option<WriteOutcome>,
         rejected: impl FnOnce(C, EnqueueError),
     ) -> Completion<DeliveryReceipt, WriteError> {
         let (sender, mut completion) = Completion::pair();
+        let sender = WriteResponder::new(sender, outcome);
         let mut state = lock(&self.inner.state);
         let error = if !state.accepting {
             Some(EnqueueError::Closed)
@@ -304,6 +307,7 @@ impl<C: Send + 'static> WriteService<C> {
         };
         if let Some(error) = error {
             completion.record_issuance(Err(error.into()));
+            let _ = sender.send(Err(error.into()));
             drop(state);
             rejected(command, error);
         } else {
@@ -729,11 +733,13 @@ mod tests {
     #[tokio::test]
     async fn worker_cancellation_before_first_poll_completes_every_accepted_sender() {
         let (service, _, _) = gated(4);
-        let first = service.enqueue(1);
+        let outcome = WriteOutcome::default();
+        let first = service.enqueue_with_rejection(1, Some(outcome.clone()), |_, _| {});
+        let repeated_end = outcome.observe();
         let second = service.enqueue(2);
         let flush = service.flush();
         lock(&service.inner.abort).as_ref().unwrap().abort();
-        for completion in [first, second] {
+        for completion in [first, second, repeated_end] {
             assert!(matches!(
                 completion.await,
                 Err(WriteError::Execution(ExecutionError::WorkerLost))
@@ -742,6 +748,10 @@ mod tests {
         assert!(matches!(
             flush.await,
             Err(FlushError::Execution(ExecutionError::WorkerLost))
+        ));
+        assert!(matches!(
+            outcome.observe().await,
+            Err(WriteError::Execution(ExecutionError::WorkerLost))
         ));
         assert!(service.is_empty());
         assert!(matches!(

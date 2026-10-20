@@ -13,6 +13,7 @@ use crate::api::{
 use crate::error::Result;
 use crate::experiments::BaseExperimentInfo;
 use crate::internal::session::CredentialScope;
+use crate::internal::write_outcome::WriteOutcome;
 use crate::types::{ParentSpanInfo, SpanPayload};
 
 /// Shared delivery lifecycle, independent of resource HTTP operations.
@@ -29,6 +30,7 @@ pub(crate) trait SpanSubmitter: DeliveryControl {
         scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
+        outcome: Option<WriteOutcome>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
 }
 

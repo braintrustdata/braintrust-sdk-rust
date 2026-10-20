@@ -38,7 +38,8 @@ pub enum WriteError {
     #[error(transparent)]
     Delivery(Arc<DeliveryError>),
 }
-/// Acknowledgment that the logical batch containing this write succeeded.
+/// Acknowledgment that an operation completed successfully.
+/// For admitted writes, the entire logical batch succeeded.
 /// Backend query visibility is separate from delivery acknowledgment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeliveryReceipt;

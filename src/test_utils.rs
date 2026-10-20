@@ -8,6 +8,7 @@ use crate::span::{SpanBuilder, SpanHandle};
 use crate::types::{ParentSpanInfo, SpanPayload};
 
 use crate::internal::ports::{DeliveryControl, SpanSubmitter};
+use crate::internal::write_outcome::{WriteOutcome, WriteResponder};
 
 #[derive(Clone, Default)]
 pub(crate) struct TestSpanCollector {
@@ -64,6 +65,7 @@ impl SpanSubmitter for MockBraintrustClient {
         scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
+        outcome: Option<WriteOutcome>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         self.collector.push(CapturedSpan {
             token: scope.token().to_owned(),
@@ -71,7 +73,7 @@ impl SpanSubmitter for MockBraintrustClient {
             parent: parent_info,
         });
         let (sender, completion) = crate::Completion::pair();
-        let _ = sender.send(Ok(crate::DeliveryReceipt));
+        let _ = WriteResponder::new(sender, outcome).send(Ok(crate::DeliveryReceipt));
         completion
     }
 }

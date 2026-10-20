@@ -935,7 +935,7 @@ impl BraintrustClient {
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
-        self.inner.queue.submit(scope, payload, parent_info)
+        self.inner.queue.submit(scope, payload, parent_info, None)
     }
 
     /// Stop accepting writes, drain accepted work and stop the delivery worker.

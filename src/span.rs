@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::internal::ports::SpanSubmitter;
 use crate::internal::session::CredentialScope;
+use crate::internal::write_outcome::WriteOutcome;
 use crate::span_components::SpanComponents;
 use crate::types::{
     ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
@@ -257,6 +258,7 @@ pub struct SpanBuilder {
     parent_info: Option<ParentSpanInfo>,
     span_type: SpanType,
     purpose: Option<String>,
+    name: Option<String>,
     start_time_override: Option<f64>,
     environment: Option<SpanOriginEnvironment>,
     span_id_override: Option<String>,
@@ -284,6 +286,7 @@ impl Clone for SpanBuilder {
             parent_info: self.parent_info.clone(),
             span_type: self.span_type,
             purpose: self.purpose.clone(),
+            name: self.name.clone(),
             start_time_override: self.start_time_override,
             environment: self.environment.clone(),
             span_id_override: self.span_id_override.clone(),
@@ -371,6 +374,7 @@ impl SpanBuilder {
             parent_info: None,
             span_type: SpanType::default(),
             purpose: None,
+            name: None,
             start_time_override: None,
             environment: detected_environment(),
             span_id_override: None,
@@ -378,6 +382,12 @@ impl SpanBuilder {
             span_origin: None,
             span_attributes_extra: HashMap::new(),
         }
+    }
+
+    /// Set the span name before its first snapshot is submitted.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
     }
 
     pub fn start_time(mut self, start_time: f64) -> Self {
@@ -517,6 +527,7 @@ impl SpanBuilder {
                 start_time,
                 span_type: self.span_type,
                 purpose: self.purpose,
+                name: self.name,
                 environment: self.environment,
                 span_origin: self.span_origin,
                 span_attributes_extra: self.span_attributes_extra,
@@ -557,7 +568,9 @@ impl SpanHandle {
     /// Log event data to this span. All fields are optional.
     /// Multiple calls will merge data (later values overwrite earlier ones).
     /// Each call attempts admission immediately. Await the returned token for full
-    /// delivery; ignoring it leaves accepted work running automatically.
+    /// delivery; ignoring it leaves accepted work running automatically. After
+    /// end is called, later mutations are ignored with a diagnostic and return
+    /// an immediately successful completion without submitting a write.
     pub fn log(
         &self,
         event: SpanLog,
@@ -566,11 +579,17 @@ impl SpanHandle {
             .inner
             .lock()
             .expect("span mutex should not be poisoned");
+        if inner.end_time.is_some() {
+            tracing::warn!(row_id = %self.row_id, "ignoring mutation of a finished span");
+            let (sender, completion) = crate::Completion::pair();
+            let _ = sender.send(Ok(crate::DeliveryReceipt));
+            return completion;
+        }
         apply_span_log_to_data(&mut inner, event);
         let payload = current_span_payload(&mut inner);
         let completion =
             self.submitter
-                .submit(self.scope.clone(), payload, self.parent_info.clone());
+                .submit(self.scope.clone(), payload, self.parent_info.clone(), None);
         if completion.is_ok() {
             inner.has_flushed = true;
         }
@@ -586,36 +605,50 @@ impl SpanHandle {
         self.submitter.flush()
     }
 
-    /// Mark the span as ended with the current timestamp.
-    ///
-    /// Calling `end()` multiple times is idempotent: once an end time is set,
-    /// subsequent calls return the same value without overwriting it.
-    pub fn end(&self) -> f64 {
+    /// Finish this span and observe delivery of its final snapshot.
+    /// Repeated calls observe the same admitted write, without resubmission.
+    /// Pending observers are bounded; admission can be full while the existing
+    /// final write continues. Completed outcomes remain observable on this handle.
+    pub fn end(&self) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         self.end_with_time(epoch_secs())
     }
 
-    /// Mark the span as ended with an explicit timestamp (seconds since Unix epoch).
-    ///
-    /// Calling this multiple times is idempotent: once an end time is set,
-    /// subsequent calls return the previously-set value.
-    pub fn end_with_time(&self, end_time: f64) -> f64 {
+    /// Finish with a timestamp chosen once (seconds since Unix epoch).
+    /// If admission is rejected, a later end call retries the same final snapshot
+    /// and timestamp. An accepted write's terminal failure is never replayed.
+    pub fn end_with_time(
+        &self,
+        end_time: f64,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         let mut inner = self
             .inner
             .lock()
             .expect("span mutex should not be poisoned");
-        let chosen_time = *inner.end_time.get_or_insert(end_time);
-        if inner.end_submitted {
-            return chosen_time;
+        inner.end_time.get_or_insert(end_time);
+        if let Some(outcome) = &inner.end_outcome {
+            return outcome.observe();
         }
+        let outcome = WriteOutcome::default();
         let payload = current_span_payload(&mut inner);
-        let completion =
-            self.submitter
-                .submit(self.scope.clone(), payload, self.parent_info.clone());
+        let completion = self.submitter.submit(
+            self.scope.clone(),
+            payload,
+            self.parent_info.clone(),
+            Some(outcome.clone()),
+        );
         if completion.is_ok() {
             inner.has_flushed = true;
-            inner.end_submitted = true;
+            inner.end_outcome = Some(outcome);
         }
-        chosen_time
+        completion
+    }
+
+    /// The chosen end timestamp, including when final admission needs retrying.
+    pub fn end_time(&self) -> Option<f64> {
+        self.inner
+            .lock()
+            .expect("span mutex should not be poisoned")
+            .end_time
     }
 
     /// Trigger a non-blocking background flush.
@@ -758,7 +791,7 @@ struct SpanData {
     row_id: String,
     span_id: String,
     has_flushed: bool,
-    end_submitted: bool,
+    end_outcome: Option<WriteOutcome>,
     org_id: String,
     org_name: Option<String>,
     project_name: Option<String>,
@@ -1065,8 +1098,10 @@ mod tests {
                 _: CredentialScope,
                 payload: SpanPayload,
                 _: Option<ParentSpanInfo>,
+                outcome: Option<WriteOutcome>,
             ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
                 let (sender, mut completion) = crate::Completion::pair();
+                let sender = crate::internal::write_outcome::WriteResponder::new(sender, outcome);
                 if self.reject.load(Ordering::Relaxed) {
                     completion.record_issuance(Err(crate::EnqueueError::Full.into()));
                 } else {
@@ -1101,14 +1136,83 @@ mod tests {
             "rejected writes do not count as a first admission"
         );
         submitter.reject.store(true, Ordering::Relaxed);
-        assert_eq!(span.end_with_time(10.0), 10.0);
+        assert!(span.end_with_time(10.0).is_err());
+        assert_eq!(span.end_time(), Some(10.0));
         assert_eq!(submitter.accepted.lock().unwrap().len(), 1);
+        assert!(span
+            .log(SpanLog::builder().input(json!("too late")).build().unwrap())
+            .is_ok());
         submitter.reject.store(false, Ordering::Relaxed);
-        assert_eq!(span.end_with_time(20.0), 10.0);
-        assert_eq!(span.end_with_time(30.0), 10.0);
+        assert!(span.end_with_time(20.0).is_ok());
+        assert!(span.end_with_time(30.0).is_ok());
+        assert_eq!(span.end_time(), Some(10.0));
         let accepted = submitter.accepted.lock().unwrap();
         assert_eq!(accepted.len(), 2);
         assert_eq!(accepted[1].metrics.as_ref().unwrap()["end"], 10.0);
+        assert!(accepted[1].input.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_ends_share_one_snapshot_and_one_delivery_result() {
+        use crate::internal::write_outcome::WriteResponder;
+        struct Submitter(Mutex<Vec<(SpanPayload, WriteResponder)>>);
+        #[async_trait]
+        impl crate::internal::ports::DeliveryControl for Submitter {
+            fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+                let (sender, completion) = crate::Completion::pair();
+                let _ = sender.send(Ok(crate::FlushReport::default()));
+                completion
+            }
+            async fn trigger_flush(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        #[async_trait]
+        impl SpanSubmitter for Submitter {
+            fn submit(
+                &self,
+                _: CredentialScope,
+                payload: SpanPayload,
+                _: Option<ParentSpanInfo>,
+                outcome: Option<WriteOutcome>,
+            ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+                let (sender, completion) = crate::Completion::pair();
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((payload, WriteResponder::new(sender, outcome)));
+                completion
+            }
+        }
+        let submitter = Arc::new(Submitter(Mutex::new(Vec::new())));
+        let span =
+            SpanBuilder::new(submitter.clone(), CredentialScope::test("token", "org")).build();
+        drop(span.end_with_time(123.0)); // Dropping the first observer does not cancel the write.
+        let observers = std::thread::scope(|threads| {
+            (0..32)
+                .map(|_| {
+                    let span = span.clone();
+                    threads.spawn(move || span.end_with_time(456.0))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(observers.iter().all(|observer| observer.is_ok()));
+        let (payload, response) = {
+            let mut submitted = submitter.0.lock().unwrap();
+            assert_eq!(submitted.len(), 1);
+            submitted.pop().unwrap()
+        };
+        assert_eq!(payload.metrics.unwrap()["end"], 123.0);
+        let _ = response.send(Ok(crate::DeliveryReceipt));
+        for observer in observers {
+            observer.await.unwrap();
+        }
+        span.end_with_time(999.0).await.unwrap();
+        assert_eq!(span.end_time(), Some(123.0));
+        assert!(submitter.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1307,8 +1411,9 @@ mod tests {
         let (span, _collector) = build_test_span();
         let first = span.end_with_time(123.0);
         let second = span.end_with_time(456.0);
-        assert_eq!(first, 123.0);
-        assert_eq!(second, 123.0);
+        first.await.unwrap();
+        second.await.unwrap();
+        assert_eq!(span.end_time(), Some(123.0));
     }
 
     #[tokio::test]

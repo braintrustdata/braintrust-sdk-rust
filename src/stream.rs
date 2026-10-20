@@ -1191,9 +1191,13 @@ async fn finalize_span(span: SpanHandle, aggregator: Arc<Mutex<BraintrustStream>
             }
         }
     }
-    span.end();
+    let end = span.end();
+    let flush = span.flush();
+    if let Err(error) = end.await {
+        tracing::warn!("Failed to deliver final span: {}", error);
+    }
     // Flush span with aggregated output
-    if let Err(e) = span.flush().await {
+    if let Err(e) = flush.await {
         tracing::warn!("Failed to flush span: {}", e);
     }
 }
