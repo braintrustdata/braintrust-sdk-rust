@@ -1,5 +1,6 @@
 use super::batching::SerializedBatch;
 use super::config::LogQueueConfig;
+use crate::internal::ingest::{UploadPlan, UploadPlanner};
 use crate::internal::retry::{exponential, RetryExecutor};
 use crate::types::{Logs3OverflowReference, Logs3OverflowRequest, Logs3OverflowUpload};
 use std::path::PathBuf;
@@ -105,17 +106,60 @@ pub(crate) async fn send_batch_with_retry(
     max_request_size: usize,
     can_use_overflow: bool,
 ) -> Result<(), anyhow::Error> {
-    let json_bytes = batch.data;
-    let overflow_rows = batch.overflow_rows;
+    let planner = UploadPlanner {
+        max_request_bytes: max_request_size,
+        overflow: can_use_overflow,
+    };
+    let mut pending = vec![planner.plan(batch)?];
+    while let Some(plan) = pending.pop() {
+        match plan {
+            UploadPlan::Split(left, right) => {
+                pending.push(planner.plan(right)?);
+                pending.push(planner.plan(left)?);
+            }
+            UploadPlan::Direct(batch) => {
+                let result =
+                    send_planned_batch(client, api_url, token, org_name, &batch, config, false)
+                        .await;
+                match result {
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<crate::error::BraintrustError>(),
+                            Some(crate::error::BraintrustError::Api { status: 413, .. })
+                        ) =>
+                    {
+                        pending.push(planner.rejected(batch)?);
+                    }
+                    result => result?,
+                }
+            }
+            UploadPlan::Overflow(batch) => {
+                send_planned_batch(client, api_url, token, org_name, &batch, config, true).await?
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_planned_batch(
+    client: &reqwest::Client,
+    api_url: &Url,
+    token: &str,
+    org_name: Option<&str>,
+    batch: &SerializedBatch,
+    config: &LogQueueConfig,
+    use_overflow: bool,
+) -> Result<(), anyhow::Error> {
+    let json_bytes = &batch.data;
+    let overflow_rows = &batch.overflow_rows;
 
     // Save to debug directories if configured
-    save_payload_debug(&json_bytes, config.all_publish_payloads_dir(), "all").ok();
+    save_payload_debug(json_bytes, config.all_publish_payloads_dir(), "all").ok();
 
     let logs_url = api_url
         .join("logs3")
         .map_err(|e| anyhow::anyhow!("invalid logs url: {e}"))?;
-
-    let use_overflow = can_use_overflow && json_bytes.len() > max_request_size;
 
     // If overflow is needed, the signed URL is requested once and reused across retries
     // (matches TypeScript SDK's `overflowUpload` caching pattern).
@@ -132,12 +176,12 @@ pub(crate) async fn send_batch_with_retry(
             // Get or create the overflow upload (cached across retries)
             if overflow_upload.is_none() {
                 let upload_result =
-                    request_overflow_upload(client, api_url, token, &json_bytes, &overflow_rows)
+                    request_overflow_upload(client, api_url, token, json_bytes, overflow_rows)
                         .await;
 
                 match upload_result {
                     Ok(upload) => {
-                        match upload_overflow_payload(client, &upload, &json_bytes).await {
+                        match upload_overflow_payload(client, &upload, json_bytes).await {
                             Ok(()) => overflow_upload = Some(upload),
                             Err(e) => {
                                 if attempt < config.num_retries() {
@@ -145,7 +189,7 @@ pub(crate) async fn send_batch_with_retry(
                                     continue;
                                 }
                                 save_payload_debug(
-                                    &json_bytes,
+                                    json_bytes,
                                     config.failed_publish_payloads_dir(),
                                     "failed",
                                 )
@@ -160,7 +204,7 @@ pub(crate) async fn send_batch_with_retry(
                             continue;
                         }
                         save_payload_debug(
-                            &json_bytes,
+                            json_bytes,
                             config.failed_publish_payloads_dir(),
                             "failed",
                         )
@@ -209,7 +253,7 @@ pub(crate) async fn send_batch_with_retry(
                         warn!(status = %status, attempt, "overflow ref send failed, retrying");
                         continue;
                     }
-                    save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
+                    save_payload_debug(json_bytes, config.failed_publish_payloads_dir(), "failed")
                         .ok();
                     return Err(crate::error::BraintrustError::Api {
                         status: status.as_u16(),
@@ -222,7 +266,7 @@ pub(crate) async fn send_batch_with_retry(
                         warn!(error = %e, attempt, "overflow ref send network error, retrying");
                         continue;
                     }
-                    save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
+                    save_payload_debug(json_bytes, config.failed_publish_payloads_dir(), "failed")
                         .ok();
                     return Err(e.into());
                 }
@@ -256,7 +300,7 @@ pub(crate) async fn send_batch_with_retry(
                         warn!(status = %status, attempt, "batch send failed with retryable error, retrying");
                         continue;
                     }
-                    save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
+                    save_payload_debug(json_bytes, config.failed_publish_payloads_dir(), "failed")
                         .ok();
                     return Err(crate::error::BraintrustError::Api {
                         status: status.as_u16(),
@@ -269,7 +313,7 @@ pub(crate) async fn send_batch_with_retry(
                         warn!(error = %e, attempt, "batch send network error, retrying");
                         continue;
                     }
-                    save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
+                    save_payload_debug(json_bytes, config.failed_publish_payloads_dir(), "failed")
                         .ok();
                     return Err(e.into());
                 }
@@ -395,11 +439,14 @@ mod tests {
     use super::*;
     use crate::log_queue::config::LogQueueConfig;
 
-    fn make_batch(data: &[u8]) -> SerializedBatch {
-        SerializedBatch {
-            data: data.to_vec(),
-            overflow_rows: vec![],
-        }
+    fn make_batch() -> SerializedBatch {
+        SerializedBatch::partition(
+            vec![crate::internal::ingest::EncodedRow::from_map(&serde_json::Map::new()).unwrap()],
+            1,
+            usize::MAX,
+        )
+        .pop()
+        .unwrap()
     }
 
     #[test]
@@ -438,6 +485,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_direct_batch_splits_in_order_without_retrying_identical_bytes() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                ResponseTemplate::new(if body["rows"].as_array().unwrap().len() > 1 {
+                    413
+                } else {
+                    200
+                })
+            })
+            .expect(5)
+            .mount(&server)
+            .await;
+        let rows = ["first", "second", "third"]
+            .into_iter()
+            .map(|id| {
+                crate::internal::ingest::EncodedRow::from_map(
+                    serde_json::json!({"id":id}).as_object().unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let batch = SerializedBatch::partition(rows, 100, usize::MAX)
+            .pop()
+            .unwrap();
+        send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse(&server.uri()).unwrap(),
+            "token",
+            None,
+            batch,
+            &LogQueueConfig::builder().num_retries(2).build(),
+            usize::MAX,
+            false,
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let delivered: Vec<_> = requests
+            .iter()
+            .filter_map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let rows = body["rows"].as_array().unwrap();
+                (rows.len() == 1).then(|| rows[0]["id"].clone())
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![
+                serde_json::json!("first"),
+                serde_json::json!("second"),
+                serde_json::json!("third")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_singleton_uses_overflow_once_when_supported() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(413))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).and(path("/logs3/overflow"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"method":"PUT","signedUrl":format!("{}/object",server.uri()),"key":"key"})))
+            .expect(1).mount(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/object"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse(&server.uri()).unwrap(),
+            "token",
+            None,
+            make_batch(),
+            &LogQueueConfig::builder().num_retries(0).build(),
+            usize::MAX,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn exhausted_queue_retries_send_exactly_the_configured_attempts() {
         use wiremock::{
             matchers::{method, path},
@@ -455,7 +610,7 @@ mod tests {
             &Url::parse(&server.uri()).unwrap(),
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &LogQueueConfig::builder().num_retries(2).build(),
             usize::MAX,
             false,
@@ -506,7 +661,7 @@ mod tests {
             &Url::parse(&server.uri()).unwrap(),
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &LogQueueConfig::builder().num_retries(1).build(),
             1,
             true,
@@ -545,7 +700,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
@@ -581,7 +736,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
@@ -616,7 +771,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
@@ -645,7 +800,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
@@ -675,7 +830,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
@@ -710,7 +865,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
