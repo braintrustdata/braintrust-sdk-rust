@@ -37,3 +37,14 @@ impl Serialize for CaseError {
         state.end()
     }
 }
+
+/// Invalid evaluation definitions are rejected before source access or recording.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EvalConfigError {
+    #[error("evaluation concurrency must be greater than zero")]
+    ZeroConcurrency,
+    #[error("scorer at index {index} must have a nonblank name")]
+    EmptyScorerName { index: usize },
+    #[error("duplicate scorer name: {name}")]
+    DuplicateScorerName { name: String },
+}

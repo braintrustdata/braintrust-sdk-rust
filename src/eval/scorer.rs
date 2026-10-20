@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use std::marker::PhantomData;
 
 use anyhow::Result;
@@ -16,6 +17,33 @@ pub trait Scorer<I, O>: Send + Sync {
 
     /// Score the output
     async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores>;
+}
+
+/// Supply type context for a named async scoring closure. The returned tuple
+/// directly implements [`Scorer`]; names may be borrowed or owned strings.
+pub fn scorer<I, O, N, F>(name: N, callback: F) -> (N, F)
+where
+    N: AsRef<str> + Send + Sync,
+    F: for<'a> Fn(ScorerArgs<'a, I, O>) -> BoxFuture<'a, Result<Scores>> + Send + Sync,
+{
+    (name, callback)
+}
+
+#[async_trait]
+impl<I, O, N, F> Scorer<I, O> for (N, F)
+where
+    N: AsRef<str> + Send + Sync,
+    F: for<'a> Fn(ScorerArgs<'a, I, O>) -> BoxFuture<'a, Result<Scores>> + Send + Sync,
+    I: Send + Sync,
+    O: Send + Sync,
+{
+    fn name(&self) -> &str {
+        self.0.as_ref()
+    }
+
+    async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
+        (self.1)(args).await
+    }
 }
 
 /// Wrapper for sync scoring functions
@@ -276,10 +304,11 @@ mod tests {
     async fn test_exact_match() {
         let scorer = ExactMatch::new();
 
+        let expected = String::from("HELLO");
         let args = ScorerArgs {
             input: &"hello".to_string(),
             output: &"HELLO".to_string(),
-            expected: Some(&"HELLO".to_string()),
+            expected: Some(&expected),
             metadata: None,
         };
 
@@ -287,10 +316,11 @@ mod tests {
         assert_eq!(scores.len(), 1);
         assert_eq!(scores[0].score, 1.0);
 
+        let expected = String::from("hello");
         let args = ScorerArgs {
             input: &"hello".to_string(),
             output: &"HELLO".to_string(),
-            expected: Some(&"hello".to_string()),
+            expected: Some(&expected),
             metadata: None,
         };
 
@@ -302,10 +332,11 @@ mod tests {
     async fn test_levenshtein() {
         let scorer = LevenshteinScorer::new();
 
+        let expected = String::from("hallo");
         let args = ScorerArgs {
             input: &"test".to_string(),
             output: &"hello".to_string(),
-            expected: Some(&"hallo".to_string()),
+            expected: Some(&expected),
             metadata: None,
         };
 

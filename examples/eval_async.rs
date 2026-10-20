@@ -45,12 +45,23 @@ async fn main() -> Result<()> {
             EvalOpts::builder()
                 .name("uppercase-eval".to_string())
                 .dataset(cases.into())
-                .task(Box::new(SimpleFnTask::new(|input: &String| {
-                    Ok(input.to_uppercase())
+                .task(Box::new(task(|input: &String, _hooks| {
+                    Box::pin(async move { Ok(input.to_uppercase()) })
                 })))
                 .scorers(vec![
                     Box::new(ExactMatch::new()),
                     Box::new(LevenshteinScorer::new()),
+                    Box::new(scorer(
+                        "nonempty",
+                        |args: ScorerArgs<'_, String, String>| {
+                            Box::pin(async move {
+                                Ok(vec![Score::new(
+                                    "nonempty",
+                                    if args.output.is_empty() { 0.0 } else { 1.0 },
+                                )])
+                            })
+                        },
+                    )),
                 ])
                 .max_concurrency(2)
                 .build(),

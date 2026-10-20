@@ -13,6 +13,7 @@ use super::{
     scorer::Scorer,
     task::Task,
     types::{Case, EvalResult, EvalSummary},
+    EvalConfigError,
 };
 
 /// Options for running an evaluation
@@ -40,6 +41,28 @@ pub struct EvalOpts<I, O> {
     /// Suppress progress output (default: false)
     #[builder(default = false)]
     pub quiet: bool,
+}
+
+impl<I, O> EvalOpts<I, O> {
+    /// Validate execution options without reading cases or creating recording work.
+    pub fn validate(&self) -> std::result::Result<(), EvalConfigError> {
+        if self.max_concurrency == 0 {
+            return Err(EvalConfigError::ZeroConcurrency);
+        }
+        let mut names = std::collections::HashSet::new();
+        for (index, scorer) in self.scorers.iter().enumerate() {
+            let name = scorer.name();
+            if name.trim().is_empty() {
+                return Err(EvalConfigError::EmptyScorerName { index });
+            }
+            if !names.insert(name) {
+                return Err(EvalConfigError::DuplicateScorerName {
+                    name: name.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Async evaluator for running evaluations
@@ -71,6 +94,8 @@ where
 
     /// Run the evaluation
     pub async fn run(&self, mut opts: EvalOpts<I, O>) -> Result<EvalSummary<I, O>> {
+        opts.validate()
+            .map_err(|error| crate::BraintrustError::InvalidConfig(error.to_string()))?;
         if !opts.quiet {
             println!("Running evaluation: {}", opts.name);
         }
