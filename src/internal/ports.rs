@@ -16,6 +16,14 @@ use crate::internal::session::CredentialScope;
 use crate::internal::shared_outcome::WriteOutcome;
 use crate::types::{ParentSpanInfo, SpanPayload};
 
+/// Fully scoped input to row preparation. Unresolved identity stays in the
+/// preparation future rather than being represented by placeholder credentials.
+pub(crate) struct PreparedSpan {
+    pub scope: CredentialScope,
+    pub payload: SpanPayload,
+    pub parent_info: Option<ParentSpanInfo>,
+}
+
 /// Shared delivery lifecycle, independent of resource HTTP operations.
 #[async_trait]
 pub(crate) trait DeliveryControl: Send + Sync {
@@ -25,13 +33,12 @@ pub(crate) trait DeliveryControl: Send + Sync {
 
 #[async_trait]
 pub(crate) trait SpanSubmitter: DeliveryControl {
-    /// Queue the write now, resolving its destination during preparation.
-    /// Rejected work must drop the resolver without polling it.
-    fn submit_resolving_parent(
+    /// Queue the write now and resolve its immutable scope/destination during
+    /// preparation. Rejected work drops the future without polling it.
+    fn submit_deferred(
         &self,
-        scope: CredentialScope,
-        payload: SpanPayload,
-        resolve: futures::future::BoxFuture<'static, Result<ParentSpanInfo>>,
+        row_id: String,
+        prepare: futures::future::BoxFuture<'static, Result<PreparedSpan>>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
 
     fn submit(

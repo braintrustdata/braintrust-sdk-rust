@@ -109,6 +109,7 @@ async fn client_update_span_uses_exported_ids_for_project_logs() {
                 .build()
                 .expect("build"),
         )
+        .await
         .expect("update");
     client.flush().await.expect("flush");
 
@@ -183,6 +184,7 @@ async fn client_update_span_with_credentials_works_without_priming_login_state()
                 .build()
                 .expect("build"),
         )
+        .await
         .expect("update");
     client.flush().await.expect("flush");
 
@@ -268,6 +270,7 @@ async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
                 &exported,
                 event.build().expect("build"),
             )
+            .await
             .expect("update");
         client.flush().await.expect("flush");
     }
@@ -406,6 +409,7 @@ async fn client_update_span_includes_exported_span_parents() {
                 .build()
                 .expect("build"),
         )
+        .await
         .expect("update");
     client.flush().await.expect("flush");
 
@@ -466,6 +470,7 @@ async fn client_update_span_with_credentials_includes_exported_span_parents() {
                 .build()
                 .expect("build"),
         )
+        .await
         .expect("update");
     client.flush().await.expect("flush");
 
@@ -559,6 +564,7 @@ async fn client_update_span_with_credentials_inherits_exported_propagated_event(
                     .build()
                     .expect("build"),
             )
+            .await
             .expect("update");
         client.flush().await.expect("flush");
     }
@@ -773,6 +779,7 @@ async fn client_update_span_resolves_project_name_from_exported_compute_metadata
                 .build()
                 .expect("build"),
         )
+        .await
         .expect("update");
     client.flush().await.expect("flush");
 

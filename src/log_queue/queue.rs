@@ -8,7 +8,7 @@ use super::row_key::RowKey;
 use crate::error::{BraintrustError, Result};
 use crate::internal::delivery::WriteService;
 use crate::internal::execution::ExecutionBinding;
-use crate::internal::ports::{DeliveryControl, SpanSubmitter};
+use crate::internal::ports::{DeliveryControl, PreparedSpan, SpanSubmitter};
 use crate::internal::session::CredentialScope;
 use crate::internal::shared_outcome::WriteOutcome;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
@@ -40,14 +40,12 @@ fn cache_insert<K: Eq + std::hash::Hash, V>(cache: &mut IndexMap<K, V>, key: K, 
 ///
 /// Fields are private — construction and destructuring happen only within this
 /// module. `worker.rs` never touches the fields directly.
-struct SubmitCommand {
-    scope: CredentialScope,
-    payload: SpanPayload,
-    parent_info: ParentResolution,
-}
-enum ParentResolution {
-    Ready(Option<ParentSpanInfo>),
-    Deferred(BoxFuture<'static, Result<ParentSpanInfo>>),
+enum SubmitCommand {
+    Ready(Box<PreparedSpan>),
+    Deferred {
+        row_id: String,
+        prepare: BoxFuture<'static, Result<PreparedSpan>>,
+    },
 }
 
 /// Preparation and protocol orchestration, independent of admission/lifecycle.
@@ -112,21 +110,21 @@ impl LogQueueCore {
         // exact scope captured by each producer when its handle was created.
         let mut groups: IndexMap<CredentialScope, Vec<Logs3Row>> = IndexMap::new();
         for cmd in cmds {
-            let SubmitCommand {
-                scope,
-                payload,
-                parent_info,
-            } = cmd;
             let prepared = async {
-                let parent = match parent_info {
-                    ParentResolution::Ready(parent) => parent,
-                    ParentResolution::Deferred(resolve) => Some(resolve.await?),
+                let PreparedSpan {
+                    scope,
+                    payload,
+                    parent_info,
+                } = match cmd {
+                    SubmitCommand::Ready(span) => *span,
+                    SubmitCommand::Deferred { prepare, .. } => prepare.await?,
                 };
-                self.prepare_row(&scope, payload, parent).await
+                let row = self.prepare_row(&scope, payload, parent_info).await?;
+                Ok::<_, anyhow::Error>((scope, row))
             }
             .await;
             match prepared {
-                Ok(row) => {
+                Ok((scope, row)) => {
                     groups.entry(scope).or_default().push(row);
                 }
                 Err(e) => {
@@ -512,16 +510,18 @@ impl LogQueueCore {
             return;
         }
         self.execution.spawn(async move {
-            let SubmitCommand {
+            let PreparedSpan {
                 scope: _,
                 payload,
                 parent_info,
-            } = cmd;
-
-            let ParentResolution::Ready(parent_info) = parent_info else {
-                // Rejection must not trigger registration just for a debug dump.
-                warn!(row_id = %payload.row_id, "cannot dump rejected row with unresolved destination");
-                return;
+            } = match cmd {
+                SubmitCommand::Ready(span) => *span,
+                SubmitCommand::Deferred { row_id, .. } => {
+                    // Rejection must not initiate login or registration merely
+                    // to serialize a concrete wire row for a debug dump.
+                    warn!(%row_id, "cannot dump rejected row with unresolved scope or destination");
+                    return;
+                }
             };
             let span_components = payload.span_components.clone();
 
@@ -676,11 +676,11 @@ impl LogQueue {
         outcome: Option<WriteOutcome>,
     ) -> Completion<DeliveryReceipt, WriteError> {
         self.submit_command(
-            SubmitCommand {
+            SubmitCommand::Ready(Box::new(PreparedSpan {
                 scope,
                 payload,
-                parent_info: ParentResolution::Ready(parent_info),
-            },
+                parent_info,
+            })),
             outcome,
         )
     }
@@ -802,20 +802,12 @@ impl DeliveryControl for LogQueue {
 }
 #[async_trait::async_trait]
 impl SpanSubmitter for LogQueue {
-    fn submit_resolving_parent(
+    fn submit_deferred(
         &self,
-        scope: CredentialScope,
-        payload: SpanPayload,
-        resolve: BoxFuture<'static, Result<ParentSpanInfo>>,
+        row_id: String,
+        prepare: BoxFuture<'static, Result<PreparedSpan>>,
     ) -> Completion<DeliveryReceipt, WriteError> {
-        self.submit_command(
-            SubmitCommand {
-                scope,
-                payload,
-                parent_info: ParentResolution::Deferred(resolve),
-            },
-            None,
-        )
+        self.submit_command(SubmitCommand::Deferred { row_id, prepare }, None)
     }
 
     fn submit(
