@@ -8,7 +8,7 @@ use crate::span::{SpanBuilder, SpanHandle};
 use crate::types::{ParentSpanInfo, SpanPayload};
 
 use crate::internal::ports::{DeliveryControl, SpanSubmitter};
-use crate::internal::write_outcome::{WriteOutcome, WriteResponder};
+use crate::internal::shared_outcome::{WriteOutcome, WriteResponder};
 
 #[derive(Clone, Default)]
 pub(crate) struct TestSpanCollector {

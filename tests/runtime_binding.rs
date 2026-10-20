@@ -98,10 +98,18 @@ fn explicit_current_thread_runtime_must_be_driven_and_observation_does_not_move_
         tokio::task::yield_now().await;
     });
     let client = observer.block_on(initialization).unwrap();
-    let shutdown = client.shutdown(std::time::Duration::from_secs(1));
+    let mut shutdown = Box::pin(
+        client
+            .shutdown(std::time::Duration::from_secs(1))
+            .into_future(),
+    );
     observer.block_on(async {
-        shutdown.await.unwrap();
+        assert!(futures::poll!(shutdown.as_mut()).is_pending());
     });
+    selected.block_on(async {
+        tokio::task::yield_now().await;
+    });
+    observer.block_on(shutdown).unwrap();
     drop(client);
     // SDK shutdown did not stop the caller-owned runtime.
     assert_eq!(selected.block_on(async { 42 }), 42);
