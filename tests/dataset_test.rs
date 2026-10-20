@@ -83,7 +83,7 @@ async fn dataset_builder_requires_dataset_name() {
 }
 
 #[tokio::test]
-async fn dataset_insert_flushes_to_logs_endpoint() {
+async fn dataset_insert_is_acknowledged_without_flush() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -99,14 +99,6 @@ async fn dataset_insert_flushes_to_logs_endpoint() {
             "dataset": { "id": "ds-456", "name": "test-dataset" }
         })))
         .expect(1)
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/project/register"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "project": { "id": "proj-123" }
-        })))
         .mount(&server)
         .await;
 
@@ -144,16 +136,24 @@ async fn dataset_insert_flushes_to_logs_endpoint() {
                 .build()
                 .expect("record"),
         )
-        .await;
+        .await
+        .expect("insert");
 
     assert!(!record_id.is_empty());
 
-    // Flush to send to API
-    dataset.flush().await.expect("flush");
-    client.flush().await.expect("client flush");
-
-    // Give the background worker time to process
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let requests = server.received_requests().await.unwrap();
+    let writes: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&writes[0].body).unwrap(),
+        json!({
+            "api_version": 2, "rows": [{"id":record_id, "dataset_id":"ds-456",
+            "input":{"question":"What is 2+2?"}, "expected":{"answer":"4"}}]
+        })
+    );
 }
 
 #[tokio::test]
@@ -522,4 +522,238 @@ async fn a_non_advancing_cursor_is_reported_and_does_not_poison_a_later_retry() 
     );
     assert_eq!(iterator.next().await.unwrap().unwrap().id, "second");
     assert!(iterator.next().await.unwrap().is_none());
+}
+
+fn record(value: i32) -> DatasetInsert {
+    DatasetInsert::builder()
+        .input(json!(value))
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn mutations_have_dataset_wire_shapes_and_share_registration_across_clones() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/dataset/register"))
+        .respond_with(registration())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let client = isolated_client(&server).await;
+    let dataset = dataset(&client);
+    let id = dataset
+        .insert(
+            DatasetInsert::builder()
+                .input(json!(1))
+                .expected(json!(2))
+                .metadata_entry("source", "test")
+                .tag("sample")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    dataset.clone().update(&id, record(3)).await.unwrap();
+    dataset.delete(&id).await.unwrap();
+    // Neither barrier registers or replays dataset work.
+    dataset.flush().await.unwrap();
+    client.flush().await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let bodies: Vec<serde_json::Value> = requests
+        .iter()
+        .filter(|r| r.url.path() == "/logs3")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![
+            json!({"api_version":2,"rows":[{"dataset_id":"dataset","id":id,"input":1,"expected":2,"metadata":{"source":"test"},"tags":["sample"]}]}),
+            json!({"api_version":2,"rows":[{"dataset_id":"dataset","id":id,"input":3,"_is_merge":true}]}),
+            json!({"api_version":2,"rows":[{"dataset_id":"dataset","id":id,"_object_delete":true}]}),
+        ]
+    );
+    for request in requests {
+        assert_eq!(request_header(&request, "authorization"), "Bearer token");
+        assert_eq!(request_header(&request, "x-bt-org-name"), "tenant");
+    }
+}
+
+#[tokio::test]
+async fn mutation_errors_are_direct_and_do_not_replay_or_poison_later_operations() {
+    for status in [401, 413, 429, 503] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/dataset/register"))
+            .respond_with(registration())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("rejected"))
+            .with_priority(1)
+            .up_to_n_times(3)
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(204))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = isolated_client(&server).await;
+        let dataset = dataset(&client);
+        let insert = dataset.insert(record(1)).await.map(|_| ());
+        let update = dataset.update("old", record(2)).await;
+        let delete = dataset.delete("old").await;
+        for result in [insert, update, delete] {
+            match result {
+                Err(braintrust_sdk_rust::BraintrustError::Api {
+                    status: actual,
+                    message,
+                }) => {
+                    assert_eq!(actual, status);
+                    assert_eq!(message, "rejected");
+                }
+                other => panic!("expected API error, got {other:?}"),
+            }
+        }
+        dataset.flush().await.unwrap();
+        let id = dataset.insert(record(4)).await.unwrap();
+        dataset.flush().await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 5); // One registration and four one-attempt writes.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[4].body).unwrap()["rows"][0]
+                ["id"],
+            id
+        );
+    }
+}
+
+#[tokio::test]
+async fn registration_failure_prevents_mutation_and_flush_does_not_register_a_dataset() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/dataset/register"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let client = isolated_client(&server).await;
+    let dataset = dataset(&client);
+    dataset.flush().await.unwrap();
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(dataset.insert(record(1)).await.is_err());
+    assert!(dataset.update("old", record(2)).await.is_err());
+    assert!(dataset.delete("old").await.is_err());
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.url.path() == "/api/dataset/register"));
+}
+
+#[tokio::test]
+async fn resource_operations_preserve_configured_planes_prefixes_and_transport_headers() {
+    use wiremock::matchers::{header, query_param};
+    let control = MockServer::start().await;
+    let data = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/control/api/dataset/register"))
+        .and(header("authorization", "Bearer token"))
+        .and(header("x-bt-org-name", "tenant"))
+        .respond_with(registration())
+        .expect(1)
+        .mount(&control)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/data/logs3"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&data)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/data/btql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"record"}]})))
+        .expect(1)
+        .mount(&data)
+        .await;
+    Mock::given(method("GET")).and(path("/data/dataset-summary"))
+        .and(query_param("dataset_id", "dataset"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "project_name":"project","dataset_name":"dataset","project_id":"project","dataset_id":"dataset"
+        }))).expect(1).mount(&data).await;
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .app_url(format!("{}/control", control.uri()))
+        .api_url(format!("{}/data", data.uri()))
+        .user_agent("resource-client/1")
+        .build()
+        .await
+        .unwrap();
+    let dataset = dataset(&client);
+    dataset.insert(record(1)).await.unwrap();
+    assert_eq!(
+        dataset.fetch(None).await.unwrap().collect().await.unwrap()[0].id,
+        "record"
+    );
+    dataset.summarize().await.unwrap();
+    let requests = data.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in requests {
+        assert_eq!(request_header(&request, "authorization"), "Bearer token");
+        assert_eq!(request_header(&request, "x-bt-org-name"), "tenant");
+        assert_eq!(request_header(&request, "user-agent"), "resource-client/1");
+    }
+    assert_eq!(control.received_requests().await.unwrap().len(), 1);
+}
+
+fn request_header<'a>(request: &'a wiremock::Request, name: &str) -> &'a str {
+    request
+        .headers
+        .iter()
+        .find(|(key, _)| key.as_str() == name)
+        .unwrap()
+        .1[0]
+        .as_str()
+}
+
+#[tokio::test]
+async fn dataset_flush_observes_the_shared_trace_queue_and_retires_its_failure() {
+    use braintrust_sdk_rust::{FlushError, ParentSpanInfo, SpanLog};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = isolated_client(&server).await;
+    let dataset = dataset(&client);
+    let span = client
+        .span_builder_with_credentials("token", "org")
+        .parent_info(ParentSpanInfo::Experiment {
+            object_id: "experiment".into(),
+        })
+        .build();
+    let write = span.log(SpanLog::builder().input(json!(1)).build().unwrap());
+    let flush = dataset.flush();
+    assert!(matches!(flush.await, Err(FlushError::Delivery(failure)) if failure.failed == 1));
+    assert!(write.await.is_err());
+    assert_eq!(dataset.flush().await.unwrap().delivered, 0);
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests
+        .iter()
+        .all(|r| r.url.path() != "/api/dataset/register"));
 }
