@@ -1,5 +1,4 @@
 //! Resource ports adapt SDK policy to the shared one-attempt API contracts.
-use crate::internal::execution::ExecutionBinding;
 use crate::internal::session::CredentialScope;
 use async_trait::async_trait;
 
@@ -17,15 +16,14 @@ use crate::error::{BraintrustError, Result};
 use crate::experiments::BaseExperimentInfo;
 use crate::internal::ports::{DatasetApi, ExperimentApi};
 
-/// Shared HTTP pool and execution lease without client/session/delivery state.
+/// Shared HTTP pool without execution, client, session or delivery state.
 #[derive(Clone)]
 pub(crate) struct ResourceTransport {
     http: reqwest::Client,
-    execution: ExecutionBinding,
 }
 impl ResourceTransport {
-    pub fn new(http: reqwest::Client, execution: ExecutionBinding) -> Self {
-        Self { http, execution }
+    pub fn new(http: reqwest::Client) -> Self {
+        Self { http }
     }
     fn resource_api(&self, scope: &CredentialScope) -> Result<crate::api::Client> {
         scope.api(&self.http)
@@ -57,19 +55,15 @@ impl ExperimentApi for ResourceTransport {
         let request = BaseExperimentRequest {
             id: experiment_id.to_owned(),
         };
-        self.execution
-            .response(async move {
-                let response = match api.experiments().base(request).await {
-                    // The SDK interprets 400 as no base; the API layer preserves the status.
-                    Err(crate::api::Error::Http { status: 400, .. }) => return Ok(None),
-                    result => result.map_err(BraintrustError::from)?,
-                };
-                Ok(match (response.base_exp_id, response.base_exp_name) {
-                    (Some(id), Some(name)) => Some(BaseExperimentInfo { id, name }),
-                    _ => None,
-                })
-            })
-            .await
+        let response = match api.experiments().base(request).await {
+            // The SDK interprets 400 as no base; the API layer preserves the status.
+            Err(crate::api::Error::Http { status: 400, .. }) => return Ok(None),
+            result => result.map_err(BraintrustError::from)?,
+        };
+        Ok(match (response.base_exp_id, response.base_exp_name) {
+            (Some(id), Some(name)) => Some(BaseExperimentInfo { id, name }),
+            _ => None,
+        })
     }
 
     async fn fetch_experiment_comparison(
@@ -78,17 +72,11 @@ impl ExperimentApi for ResourceTransport {
         experiment_id: &str,
         base_experiment_id: Option<&str>,
     ) -> Result<ExperimentComparisonResponse> {
-        let api = self.resource_api(scope)?;
-        let experiment_id = experiment_id.to_owned();
-        let base_experiment_id = base_experiment_id.map(str::to_owned);
-        self.execution
-            .response(async move {
-                api.experiments()
-                    .compare(&experiment_id, base_experiment_id.as_deref())
-                    .await
-                    .map_err(BraintrustError::from)
-            })
+        self.resource_api(scope)?
+            .experiments()
+            .compare(experiment_id, base_experiment_id)
             .await
+            .map_err(BraintrustError::from)
     }
 }
 

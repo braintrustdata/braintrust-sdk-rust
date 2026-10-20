@@ -28,6 +28,11 @@ pub type Result<T> = std::result::Result<T, BraintrustError>;
 // public operation surfaces migrate to typed completion errors.
 impl From<crate::FlushError> for BraintrustError {
     fn from(error: crate::FlushError) -> Self {
+        match &error {
+            crate::FlushError::Admission(error) => return Self::Admission(*error),
+            crate::FlushError::Execution(error) => return Self::Execution(*error),
+            crate::FlushError::Delivery(_) => {}
+        }
         if let crate::FlushError::Delivery(failure) = &error {
             if let Some(Self::Api { status, message }) =
                 failure.cause.cause().downcast_ref::<Self>()

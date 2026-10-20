@@ -1,7 +1,7 @@
 //! Main Experiment type and implementation.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +34,8 @@ pub(crate) struct ExperimentMetadata {
 /// Handle to a Braintrust experiment.
 ///
 /// Use this to log evaluation events, create spans, log feedback, and get summaries.
+/// Scheduled methods submit immediately on the selected runtime. Awaiting only
+/// observes their completion; dropping a token does not cancel accepted work.
 pub struct Experiment {
     pub(crate) api: Arc<dyn ExperimentApi>,
     pub(crate) execution: ExecutionBinding,
@@ -56,7 +58,27 @@ pub struct Experiment {
 pub(crate) struct ExperimentState {
     metadata: OnceCell<ExperimentMetadata>,
     last_start_time: AtomicU64,
-    called_start_span: AtomicBool,
+    recording: std::sync::Mutex<RecordingMode>,
+}
+
+#[derive(Default)]
+struct RecordingMode {
+    pending_starts: usize,
+    selected: bool,
+}
+impl ExperimentState {
+    fn recording(&self) -> std::sync::MutexGuard<'_, RecordingMode> {
+        self.recording
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+/// A rejected/failed/lost start must not permanently select span recording.
+struct PendingSpanStart(Arc<ExperimentState>);
+impl Drop for PendingSpanStart {
+    fn drop(&mut self) {
+        self.0.recording().pending_starts -= 1;
+    }
 }
 
 impl Clone for Experiment {
@@ -90,7 +112,11 @@ impl Experiment {
     /// does not cancel the write; awaiting includes full batch delivery.
     pub fn log(&self, event: ExperimentLog) -> crate::Completion<String, crate::BraintrustError> {
         self.execution.response_try(|| {
-            if self.state.called_start_span.load(Ordering::Acquire) {
+            let span_recording = {
+                let mode = self.state.recording();
+                mode.selected || mode.pending_starts > 0
+            };
+            if span_recording {
                 return Err(crate::BraintrustError::InvalidConfig(
                     "cannot use log() after start_span(); use the span to log events".into(),
                 ));
@@ -126,12 +152,23 @@ impl Experiment {
 
     /// Start a new root span for this experiment.
     ///
-    /// Use this for more control over span lifecycle. Once called,
-    /// you cannot use `log()` on this experiment.
-    pub async fn start_span(&self) -> Result<ExperimentSpanBuilder> {
-        let metadata = self.ensure_registered().await?;
-        self.state.called_start_span.store(true, Ordering::Release);
-        Ok(ExperimentSpanBuilder::new(self, metadata.clone()))
+    /// Use this for more control over span lifecycle. Pending and successful
+    /// starts prevent `log()` on this experiment.
+    /// Rejected or failed starts release their pending mode reservation.
+    pub fn start_span(&self) -> crate::Completion<ExperimentSpanBuilder, crate::BraintrustError> {
+        self.execution.response_try(|| {
+            self.state.recording().pending_starts += 1;
+            let pending = PendingSpanStart(self.state.clone());
+            let experiment = self.clone();
+            Ok(async move {
+                // Capture the guard before spawning, including runtime loss
+                // before first poll. Only successful registration commits mode.
+                let _pending = pending;
+                let metadata = experiment.register_metadata().await?;
+                experiment.state.recording().selected = true;
+                Ok(ExperimentSpanBuilder::new(&experiment, metadata.clone()))
+            })
+        })
     }
 
     /// Log feedback on an existing span/record.
@@ -193,14 +230,29 @@ impl Experiment {
     ///
     /// This flushes pending data and fetches aggregated scores from the API.
     /// If a base experiment is configured, comparison data will be included.
-    pub async fn summarize(&self) -> Result<ExperimentSummary> {
-        // Flush all pending data first
-        self.flush().await?;
+    /// The flush cutoff is captured at issuance, before the returned token is polled.
+    pub fn summarize(&self) -> crate::Completion<ExperimentSummary, crate::BraintrustError> {
+        self.execution.response_try(|| {
+            let flush = self.flush();
+            if let Err(error) = &*flush {
+                return Err(error.clone().into());
+            }
+            let experiment = self.clone();
+            Ok(async move {
+                flush.await?;
+                experiment.summarize_inner().await
+            })
+        })
+    }
 
-        let metadata = self.ensure_registered().await?;
+    async fn summarize_inner(&self) -> Result<ExperimentSummary> {
+        let metadata = self.register_metadata().await?;
 
         // Try to get base experiment for comparison
-        let base_exp_id = self.fetch_base_experiment().await?.map(|base| base.id);
+        let base_exp_id = self
+            .fetch_base_experiment_inner()
+            .await?
+            .map(|base| base.id);
 
         // Fetch comparison data from API
         let comparison = self
@@ -294,8 +346,14 @@ impl Experiment {
     }
 
     /// Get the project containing this experiment.
-    pub async fn project(&self) -> Result<ProjectMetadata> {
-        let metadata = self.ensure_registered().await?;
+    pub fn project(&self) -> crate::Completion<ProjectMetadata, crate::BraintrustError> {
+        let experiment = self.clone();
+        self.execution
+            .response(async move { experiment.project_inner().await })
+    }
+
+    async fn project_inner(&self) -> Result<ProjectMetadata> {
+        let metadata = self.register_metadata().await?;
         Ok(ProjectMetadata {
             id: metadata.project_id.clone(),
             name: self.project_name.clone(),
@@ -419,8 +477,16 @@ impl Experiment {
     /// Fetch the base experiment used for comparison.
     ///
     /// Returns `None` if no base experiment has been configured or detected.
-    pub async fn fetch_base_experiment(&self) -> Result<Option<BaseExperimentInfo>> {
-        let metadata = self.ensure_registered().await?;
+    pub fn fetch_base_experiment(
+        &self,
+    ) -> crate::Completion<Option<BaseExperimentInfo>, crate::BraintrustError> {
+        let experiment = self.clone();
+        self.execution
+            .response(async move { experiment.fetch_base_experiment_inner().await })
+    }
+
+    async fn fetch_base_experiment_inner(&self) -> Result<Option<BaseExperimentInfo>> {
+        let metadata = self.register_metadata().await?;
         self.api
             .fetch_base_experiment(&self.scope, &metadata.experiment_id)
             .await
@@ -430,23 +496,18 @@ impl Experiment {
     ///
     /// Use this to pass experiment context to another process or service,
     /// allowing spans created there to be linked to this experiment.
-    pub async fn export(&self) -> Result<ExportedExperiment> {
-        let metadata = self.ensure_registered().await?;
+    pub fn export(&self) -> crate::Completion<ExportedExperiment, crate::BraintrustError> {
+        let experiment = self.clone();
+        self.execution
+            .response(async move { experiment.export_inner().await })
+    }
+
+    async fn export_inner(&self) -> Result<ExportedExperiment> {
+        let metadata = self.register_metadata().await?;
         Ok(ExportedExperiment {
             object_type: "experiment".to_string(),
             object_id: metadata.experiment_id.clone(),
         })
-    }
-
-    /// Ensure the experiment is registered, returning cached metadata.
-    pub(crate) async fn ensure_registered(&self) -> Result<ExperimentMetadata> {
-        if let Some(metadata) = self.state.metadata.get() {
-            return Ok(metadata.clone());
-        }
-        let experiment = self.clone();
-        self.execution
-            .response(async move { experiment.register_metadata().await.cloned() })
-            .await
     }
 
     /// Polled only on the selected context, by preparation or a bound operation.

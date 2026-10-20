@@ -505,10 +505,7 @@ impl std::fmt::Debug for ClientInner {
 
 impl BraintrustClient {
     fn resource_transport(&self) -> Arc<ResourceTransport> {
-        Arc::new(ResourceTransport::new(
-            self.inner.http_client.clone(),
-            self.inner.execution.clone(),
-        ))
+        Arc::new(ResourceTransport::new(self.inner.http_client.clone()))
     }
 
     fn span_submitter(&self) -> Arc<dyn SpanSubmitter> {

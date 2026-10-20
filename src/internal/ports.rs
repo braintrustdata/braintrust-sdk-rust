@@ -65,6 +65,8 @@ pub(crate) trait DatasetApi: Send + Sync {
     async fn write_dataset_record(&self, scope: &CredentialScope, row: DatasetWrite) -> Result<()>;
 }
 
+/// One-attempt experiment I/O, polled inside admitted preparation or a bound
+/// resource operation. HTTP subrequests do not reserve additional task slots.
 #[async_trait]
 pub(crate) trait ExperimentApi: Send + Sync {
     async fn register_experiment(
