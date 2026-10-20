@@ -25,7 +25,7 @@ impl ResourceTransport {
     pub fn new(http: reqwest::Client) -> Self {
         Self { http }
     }
-    fn resource_api(&self, scope: &CredentialScope) -> Result<crate::api::Client> {
+    fn resource_api(&self, scope: &CredentialScope) -> Result<crate::api::Transport> {
         scope.api(&self.http)
     }
 }
@@ -40,8 +40,7 @@ impl ExperimentApi for ResourceTransport {
         // Registration is part of admitted event preparation or an explicitly
         // bound metadata operation; it must remain valid during queue drain.
         self.resource_api(scope)?
-            .experiments()
-            .register(request)
+            .register_experiment(request)
             .await
             .map_err(BraintrustError::from)
     }
@@ -55,7 +54,7 @@ impl ExperimentApi for ResourceTransport {
         let request = BaseExperimentRequest {
             id: experiment_id.to_owned(),
         };
-        let response = match api.experiments().base(request).await {
+        let response = match api.base_experiment(request).await {
             // The SDK interprets 400 as no base; the API layer preserves the status.
             Err(crate::api::Error::Http { status: 400, .. }) => return Ok(None),
             result => result.map_err(BraintrustError::from)?,
@@ -73,8 +72,7 @@ impl ExperimentApi for ResourceTransport {
         base_experiment_id: Option<&str>,
     ) -> Result<ExperimentComparisonResponse> {
         self.resource_api(scope)?
-            .experiments()
-            .compare(experiment_id, base_experiment_id)
+            .compare_experiments(experiment_id, base_experiment_id)
             .await
             .map_err(BraintrustError::from)
     }
@@ -91,8 +89,7 @@ impl DatasetApi for ResourceTransport {
         request: DatasetRegisterRequest,
     ) -> Result<DatasetRegisterResponse> {
         self.resource_api(scope)?
-            .datasets()
-            .register(request)
+            .register_dataset(request)
             .await
             .map_err(BraintrustError::from)
     }
@@ -103,7 +100,6 @@ impl DatasetApi for ResourceTransport {
         query: BTQLQuery,
     ) -> Result<BTQLResponse> {
         self.resource_api(scope)?
-            .btql()
             .query_dataset_records(query)
             .await
             .map_err(BraintrustError::from)
@@ -115,16 +111,14 @@ impl DatasetApi for ResourceTransport {
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse> {
         self.resource_api(scope)?
-            .datasets()
-            .summarize(dataset_id)
+            .summarize_dataset(dataset_id)
             .await
             .map_err(BraintrustError::from)
     }
 
     async fn write_dataset_record(&self, scope: &CredentialScope, row: DatasetWrite) -> Result<()> {
         self.resource_api(scope)?
-            .datasets()
-            .write(&[row])
+            .write_dataset(&[row])
             .await
             .map_err(BraintrustError::from)
     }

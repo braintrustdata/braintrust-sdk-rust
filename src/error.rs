@@ -69,6 +69,8 @@ impl From<crate::WriteError> for BraintrustError {
 impl From<crate::api::Error> for BraintrustError {
     fn from(error: crate::api::Error) -> Self {
         match error {
+            crate::api::Error::Admission(error) => Self::Admission(error),
+            crate::api::Error::Execution(error) => Self::Execution(error),
             crate::api::Error::Config(message) => BraintrustError::InvalidConfig(message),
             crate::api::Error::Transport { source, .. } => BraintrustError::Http(source),
             crate::api::Error::Http { status, body, .. } => BraintrustError::Api {

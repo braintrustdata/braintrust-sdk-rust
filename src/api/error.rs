@@ -4,6 +4,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    #[error(transparent)]
+    Admission(#[from] crate::EnqueueError),
+    #[error(transparent)]
+    Execution(#[from] crate::ExecutionError),
     #[error("invalid API configuration: {0}")]
     Config(String),
     #[error("{operation}: transport failed")]

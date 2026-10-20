@@ -1,5 +1,5 @@
 //! Existing project registration endpoint.
-use super::{Client, Error, Plane};
+use super::{Client, Error, Plane, Transport};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
@@ -25,12 +25,23 @@ pub struct Projects {
     pub(crate) client: Client,
 }
 impl Projects {
-    pub async fn register(
+    /// Register one project on the control plane.
+    /// Submission is immediate; dropping the token does not cancel accepted work.
+    pub fn register(
+        &self,
+        request: ProjectRegisterRequest,
+    ) -> crate::Completion<ProjectRegisterResponse, Error> {
+        self.client
+            .submit(move |transport| async move { transport.register_project(request).await })
+    }
+}
+
+impl Transport {
+    pub(crate) async fn register_project(
         &self,
         request: ProjectRegisterRequest,
     ) -> Result<ProjectRegisterResponse, Error> {
-        self.client
-            .post_json(Plane::Control, "api/project/register", &request)
+        self.post_json(Plane::Control, "api/project/register", &request)
             .await
     }
 }

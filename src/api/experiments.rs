@@ -1,5 +1,5 @@
 //! Existing experiment registration, base and comparison endpoint contracts.
-use super::{Client, Error, Plane};
+use super::{Client, Error, Plane, Transport};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -121,24 +121,60 @@ pub struct Experiments {
     pub(crate) client: Client,
 }
 impl Experiments {
-    pub async fn register(
+    /// Register one experiment on the control plane.
+    /// Submission is immediate; dropping the token does not cancel accepted work.
+    pub fn register(
+        &self,
+        request: ExperimentRegisterRequest,
+    ) -> crate::Completion<ExperimentRegisterResponse, Error> {
+        self.client
+            .submit(move |transport| async move { transport.register_experiment(request).await })
+    }
+    /// Fetch the base experiment, preserving all endpoint errors including HTTP 400.
+    /// Submission is immediate; dropping the token does not cancel accepted work.
+    pub fn base(
+        &self,
+        request: BaseExperimentRequest,
+    ) -> crate::Completion<BaseExperimentResponse, Error> {
+        self.client
+            .submit(move |transport| async move { transport.base_experiment(request).await })
+    }
+    /// Fetch one experiment comparison.
+    /// Submission is immediate; dropping the token does not cancel accepted work.
+    pub fn compare(
+        &self,
+        experiment_id: &str,
+        base_experiment_id: Option<&str>,
+    ) -> crate::Completion<ExperimentComparisonResponse, Error> {
+        self.client.submit(move |transport| {
+            let experiment_id = experiment_id.to_owned();
+            let base_experiment_id = base_experiment_id.map(str::to_owned);
+            async move {
+                transport
+                    .compare_experiments(&experiment_id, base_experiment_id.as_deref())
+                    .await
+            }
+        })
+    }
+}
+
+impl Transport {
+    pub(crate) async fn register_experiment(
         &self,
         request: ExperimentRegisterRequest,
     ) -> Result<ExperimentRegisterResponse, Error> {
-        self.client
-            .post_json(Plane::Control, "api/experiment/register", &request)
+        self.post_json(Plane::Control, "api/experiment/register", &request)
             .await
     }
     /// Return the actual endpoint result, including a 400 response; SDK interpretation belongs above this layer.
-    pub async fn base(
+    pub(crate) async fn base_experiment(
         &self,
         request: BaseExperimentRequest,
     ) -> Result<BaseExperimentResponse, Error> {
-        self.client
-            .post_json(Plane::Control, "api/base_experiment/get_id", &request)
+        self.post_json(Plane::Control, "api/base_experiment/get_id", &request)
             .await
     }
-    pub async fn compare(
+    pub(crate) async fn compare_experiments(
         &self,
         experiment_id: &str,
         base_experiment_id: Option<&str>,
@@ -147,8 +183,7 @@ impl Experiments {
         if let Some(base) = base_experiment_id {
             query.push(("base_experiment_id", base));
         }
-        self.client
-            .get_json(Plane::Control, "experiment-comparison2", &query)
+        self.get_json(Plane::Control, "experiment-comparison2", &query)
             .await
     }
 }
