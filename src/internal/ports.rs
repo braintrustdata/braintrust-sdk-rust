@@ -48,13 +48,10 @@ impl Drop for SpanOperation {
 }
 
 /// Shared delivery lifecycle, independent of resource HTTP operations.
-#[async_trait]
 pub(crate) trait DeliveryControl: Send + Sync {
     fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError>;
-    async fn trigger_flush(&self) -> Result<()>;
 }
 
-#[async_trait]
 pub(crate) trait SpanSubmitter: DeliveryControl {
     fn operation(&self) -> std::result::Result<SpanOperation, crate::EnqueueError>;
 
