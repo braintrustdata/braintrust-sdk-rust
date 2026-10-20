@@ -94,6 +94,9 @@ impl ExperimentApi for ResourceTransport {
     }
 }
 
+// Dataset operations already own one response-task admission for their entire
+// registration/request sequence. Subrequests must not reenter admission: they
+// remain valid when shutdown closes the public boundary while draining them.
 #[async_trait]
 impl DatasetApi for ResourceTransport {
     async fn register_dataset(
@@ -101,15 +104,11 @@ impl DatasetApi for ResourceTransport {
         scope: &CredentialScope,
         request: DatasetRegisterRequest,
     ) -> Result<DatasetRegisterResponse> {
-        let api = self.resource_api(scope)?;
-        self.execution
-            .response(async move {
-                api.datasets()
-                    .register(request)
-                    .await
-                    .map_err(BraintrustError::from)
-            })
+        self.resource_api(scope)?
+            .datasets()
+            .register(request)
             .await
+            .map_err(BraintrustError::from)
     }
 
     async fn fetch_dataset_records(
@@ -117,15 +116,11 @@ impl DatasetApi for ResourceTransport {
         scope: &CredentialScope,
         query: BTQLQuery,
     ) -> Result<BTQLResponse> {
-        let api = self.resource_api(scope)?;
-        self.execution
-            .response(async move {
-                api.btql()
-                    .query_dataset_records(query)
-                    .await
-                    .map_err(BraintrustError::from)
-            })
+        self.resource_api(scope)?
+            .btql()
+            .query_dataset_records(query)
             .await
+            .map_err(BraintrustError::from)
     }
 
     async fn fetch_dataset_summary(
@@ -133,27 +128,18 @@ impl DatasetApi for ResourceTransport {
         scope: &CredentialScope,
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse> {
-        let api = self.resource_api(scope)?;
-        let dataset_id = dataset_id.to_owned();
-        self.execution
-            .response(async move {
-                api.datasets()
-                    .summarize(&dataset_id)
-                    .await
-                    .map_err(BraintrustError::from)
-            })
+        self.resource_api(scope)?
+            .datasets()
+            .summarize(dataset_id)
             .await
+            .map_err(BraintrustError::from)
     }
 
     async fn write_dataset_record(&self, scope: &CredentialScope, row: DatasetWrite) -> Result<()> {
-        let api = self.resource_api(scope)?;
-        self.execution
-            .response(async move {
-                api.datasets()
-                    .write(&[row])
-                    .await
-                    .map_err(BraintrustError::from)
-            })
+        self.resource_api(scope)?
+            .datasets()
+            .write(&[row])
             .await
+            .map_err(BraintrustError::from)
     }
 }

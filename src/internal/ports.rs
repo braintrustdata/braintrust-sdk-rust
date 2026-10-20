@@ -34,6 +34,8 @@ pub(crate) trait SpanSubmitter: DeliveryControl {
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
 }
 
+/// One-attempt dataset I/O, polled inside an already admitted resource operation
+/// on its execution binding. Subrequests do not reserve additional task slots.
 #[async_trait]
 pub(crate) trait DatasetApi: Send + Sync {
     async fn register_dataset(
