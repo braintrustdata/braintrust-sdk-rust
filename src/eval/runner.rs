@@ -3,7 +3,7 @@ use serde_json::{Map, Value};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::{BraintrustClient, Result};
+use crate::BraintrustClient;
 
 use super::{
     source::CaseSource, types::EvalSummary, EvalConfigError, EvalDefinition, EvalRunError,
@@ -32,6 +32,8 @@ pub struct EvalOpts<I, O> {
     /// Suppress progress output (default: false)
     #[builder(default = false)]
     pub quiet: bool,
+    /// Explicit runtime for local runs. Recorded runs inherit their client binding.
+    pub runtime: Option<tokio::runtime::Handle>,
 }
 
 impl<I, O> EvalOpts<I, O> {
@@ -44,7 +46,7 @@ impl<I, O> EvalOpts<I, O> {
     }
 }
 
-/// Async evaluator for running evaluations
+/// Client-bound convenience facade for recorded evaluations.
 pub struct Evaluator<I, O> {
     client: Arc<BraintrustClient>,
     _phantom: PhantomData<(I, O)>,
@@ -71,50 +73,16 @@ where
         }
     }
 
-    /// Run the evaluation
-    pub async fn run(
-        &self,
-        opts: EvalOpts<I, O>,
-    ) -> std::result::Result<EvalSummary<I, O>, EvalRunError<I, O>> {
-        let name = opts.name.clone();
-        let metadata = opts.metadata.clone();
-        let tags = opts.tags.clone();
-        let mut reporter = super::reporter::TerminalReporter { quiet: opts.quiet };
-        let plan = super::executor::EvalPlan::new(opts)?;
-        let recorder =
-            super::recorder::BraintrustRecorder::new(self.client.clone(), name, metadata, tags)
-                .await?;
-        super::executor::EvalExecutor::run(plan, Some(&recorder), &mut reporter).await
-    }
-}
-
-/// Sync evaluator (wraps async evaluator with Runtime::block_on)
-pub struct SyncEvaluator<I, O> {
-    evaluator: Evaluator<I, O>,
-    runtime: tokio::runtime::Runtime,
-}
-
-impl<I, O> SyncEvaluator<I, O>
-where
-    I: Serialize + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-{
-    /// Create a new sync evaluator
-    pub fn new(client: BraintrustClient) -> Result<Self> {
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| crate::BraintrustError::Background(e.to_string()))?;
-        Ok(Self {
-            evaluator: Evaluator::new(client),
-            runtime,
-        })
-    }
-
-    /// Run the evaluation synchronously
+    /// Submit a recorded run immediately on the client binding.
+    /// Dropping the completion does not cancel accepted work.
     pub fn run(
         &self,
         opts: EvalOpts<I, O>,
-    ) -> std::result::Result<EvalSummary<I, O>, EvalRunError<I, O>> {
-        self.runtime.block_on(self.evaluator.run(opts))
+    ) -> crate::Completion<EvalSummary<I, O>, EvalRunError<I, O>> {
+        super::run(super::EvalRequest::recorded(
+            opts,
+            self.client.as_ref().clone(),
+        ))
     }
 }
 

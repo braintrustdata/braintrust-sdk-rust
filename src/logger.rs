@@ -611,9 +611,31 @@ impl BraintrustClient {
             .response(async move { client.span_builder_inner().await })
     }
 
+    pub(crate) fn execution_binding(&self) -> ExecutionBinding {
+        self.inner.execution.clone()
+    }
+
+    pub(crate) fn span_operation(
+        &self,
+    ) -> std::result::Result<crate::internal::ports::SpanOperation, crate::EnqueueError> {
+        self.span_submitter().operation()
+    }
+
     async fn span_builder_inner(&self) -> Result<crate::span::SpanBuilder> {
+        self.span_builder_for_operation(self.span_submitter()).await
+    }
+
+    pub(crate) async fn span_builder_for_operation(
+        &self,
+        submitter: Arc<dyn SpanSubmitter>,
+    ) -> Result<crate::span::SpanBuilder> {
+        if self.inner.login_skipped {
+            return Err(BraintrustError::InvalidConfig(
+                "recording requires login".into(),
+            ));
+        }
         let state = self.wait_for_login_state().await?;
-        let mut builder = crate::span::SpanBuilder::new(self.span_submitter(), state.scope()?);
+        let mut builder = crate::span::SpanBuilder::new(submitter, state.scope()?);
         if let Some(environment) = &self.inner.environment {
             builder = builder.span_origin_environment(environment.clone());
         }

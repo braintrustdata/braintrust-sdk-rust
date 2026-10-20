@@ -43,6 +43,8 @@ impl Serialize for CaseError {
 pub enum EvalConfigError {
     #[error("evaluation concurrency must be greater than zero")]
     ZeroConcurrency,
+    #[error("recorded evaluations inherit their client runtime; omit the run runtime override")]
+    RecordedRuntime,
     #[error("scorer at index {index} must have a nonblank name")]
     EmptyScorerName { index: usize },
     #[error("duplicate scorer name: {name}")]
@@ -53,6 +55,8 @@ pub enum EvalConfigError {
 /// Case indices are zero-based; None denotes run-level recording work.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalRunFailure {
+    #[error("failed to initialize evaluation runtime: {0}")]
+    Runtime(#[source] crate::BraintrustError),
     #[error(transparent)]
     Config(#[from] EvalConfigError),
     #[error("case source failed at index {case_index}: {source}")]
@@ -81,7 +85,7 @@ pub struct EvalRunError<I, O> {
     pub partial: Option<Box<super::EvalSummary<I, O>>>,
 }
 impl<I, O> EvalRunError<I, O> {
-    fn new(failure: EvalRunFailure) -> Self {
+    pub(crate) fn new(failure: EvalRunFailure) -> Self {
         Self {
             failures: vec![failure],
             partial: None,
