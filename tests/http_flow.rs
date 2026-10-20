@@ -51,9 +51,8 @@ async fn submits_with_bearer_token() {
         .expect("logs3 request");
     let has_expected_user_agent = logs3
         .headers
-        .iter()
-        .find(|(name, _)| name.as_str() == "user-agent")
-        .is_some_and(|(_, values)| values.iter().any(|value| value.as_str() == "bt/0.20.0"));
+        .get("user-agent")
+        .is_some_and(|value| value.to_str().is_ok_and(|value| value == "bt/0.20.0"));
     assert!(has_expected_user_agent);
 
     let logs_calls = requests
