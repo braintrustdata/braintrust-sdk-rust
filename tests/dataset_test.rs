@@ -298,7 +298,7 @@ async fn isolated_client(server: &MockServer) -> BraintrustClient {
 fn registration() -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"project","name":"project"},"dataset":{"id":"dataset","name":"dataset"}}))
 }
-fn dataset(client: &BraintrustClient) -> braintrust_sdk_rust::Dataset<BraintrustClient> {
+fn dataset(client: &BraintrustClient) -> braintrust_sdk_rust::Dataset {
     client
         .dataset_builder_with_credentials("token", "tenant")
         .project_name("project")

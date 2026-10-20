@@ -1,3 +1,5 @@
+#![deny(private_bounds, private_interfaces)]
+
 pub mod api;
 mod completion;
 mod dataset;

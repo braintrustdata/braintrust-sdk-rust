@@ -12,16 +12,26 @@ use crate::api::{
         ExperimentRegisterResponse,
     },
 };
-use crate::dataset::{DatasetFetcher, DatasetRegistrar, DatasetSummarizer, DatasetWriter};
 use crate::error::{BraintrustError, Result};
-use crate::experiments::api::{
-    BaseExperimentFetcher, ExperimentComparisonFetcher, ExperimentRegistrar,
-};
 use crate::experiments::BaseExperimentInfo;
-use crate::BraintrustClient;
+use crate::internal::ports::{DatasetApi, ExperimentApi};
+
+/// Shared HTTP pool without retaining client/session/delivery state.
+#[derive(Clone)]
+pub(crate) struct ResourceTransport {
+    http: reqwest::Client,
+}
+impl ResourceTransport {
+    pub fn new(http: reqwest::Client) -> Self {
+        Self { http }
+    }
+    fn resource_api(&self, scope: &CredentialScope) -> Result<crate::api::Client> {
+        scope.api(&self.http)
+    }
+}
 
 #[async_trait]
-impl ExperimentRegistrar for BraintrustClient {
+impl ExperimentApi for ResourceTransport {
     async fn register_experiment(
         &self,
         scope: &CredentialScope,
@@ -33,10 +43,7 @@ impl ExperimentRegistrar for BraintrustClient {
             .await
             .map_err(Into::into)
     }
-}
 
-#[async_trait]
-impl BaseExperimentFetcher for BraintrustClient {
     async fn fetch_base_experiment(
         &self,
         scope: &CredentialScope,
@@ -59,10 +66,7 @@ impl BaseExperimentFetcher for BraintrustClient {
             _ => None,
         })
     }
-}
 
-#[async_trait]
-impl ExperimentComparisonFetcher for BraintrustClient {
     async fn fetch_experiment_comparison(
         &self,
         scope: &CredentialScope,
@@ -78,7 +82,7 @@ impl ExperimentComparisonFetcher for BraintrustClient {
 }
 
 #[async_trait]
-impl DatasetRegistrar for BraintrustClient {
+impl DatasetApi for ResourceTransport {
     async fn register_dataset(
         &self,
         scope: &CredentialScope,
@@ -90,10 +94,7 @@ impl DatasetRegistrar for BraintrustClient {
             .await
             .map_err(Into::into)
     }
-}
 
-#[async_trait]
-impl DatasetFetcher for BraintrustClient {
     async fn fetch_dataset_records(
         &self,
         scope: &CredentialScope,
@@ -105,10 +106,7 @@ impl DatasetFetcher for BraintrustClient {
             .await
             .map_err(Into::into)
     }
-}
 
-#[async_trait]
-impl DatasetSummarizer for BraintrustClient {
     async fn fetch_dataset_summary(
         &self,
         scope: &CredentialScope,
@@ -120,10 +118,7 @@ impl DatasetSummarizer for BraintrustClient {
             .await
             .map_err(Into::into)
     }
-}
 
-#[async_trait]
-impl DatasetWriter for BraintrustClient {
     async fn write_dataset_record(&self, scope: &CredentialScope, row: DatasetWrite) -> Result<()> {
         self.resource_api(scope)?
             .datasets()
