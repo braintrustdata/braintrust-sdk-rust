@@ -24,6 +24,29 @@ pub(crate) struct PreparedSpan {
     pub parent_info: Option<ParentSpanInfo>,
 }
 
+pub(crate) struct SpanOperation {
+    pub submitter: std::sync::Arc<dyn SpanSubmitter>,
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+impl SpanOperation {
+    pub fn new(
+        submitter: std::sync::Arc<dyn SpanSubmitter>,
+        release: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            submitter,
+            release: Some(Box::new(release)),
+        }
+    }
+}
+impl Drop for SpanOperation {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
 /// Shared delivery lifecycle, independent of resource HTTP operations.
 #[async_trait]
 pub(crate) trait DeliveryControl: Send + Sync {
@@ -33,6 +56,8 @@ pub(crate) trait DeliveryControl: Send + Sync {
 
 #[async_trait]
 pub(crate) trait SpanSubmitter: DeliveryControl {
+    fn operation(&self) -> std::result::Result<SpanOperation, crate::EnqueueError>;
+
     /// Queue the write now and resolve its immutable scope/destination during
     /// preparation. Rejected work drops the future without polling it.
     fn submit_deferred(

@@ -361,11 +361,12 @@ async fn every_registration_dependent_operation_returns_the_real_failure() {
     );
     assert_api_error(experiment.fetch_base_experiment().await, 400);
     assert_api_error(experiment.summarize().await, 400);
-    let called = std::sync::atomic::AtomicBool::new(false);
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = called.clone();
     assert_api_error(
         experiment
-            .traced(|_| async {
-                called.store(true, std::sync::atomic::Ordering::Relaxed);
+            .traced(move |_| async move {
+                observed.store(true, std::sync::atomic::Ordering::Relaxed);
                 42
             })
             .await,

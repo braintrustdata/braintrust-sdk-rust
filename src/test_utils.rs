@@ -60,6 +60,14 @@ impl MockBraintrustClient {
 
 #[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
+    fn operation(
+        &self,
+    ) -> std::result::Result<crate::internal::ports::SpanOperation, crate::EnqueueError> {
+        Ok(crate::internal::ports::SpanOperation::new(
+            Arc::new(self.clone()),
+            || {},
+        ))
+    }
     fn submit_deferred(
         &self,
         _: String,

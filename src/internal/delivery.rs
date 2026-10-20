@@ -8,7 +8,7 @@ use futures::{
     FutureExt,
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -59,13 +59,13 @@ impl BatchCompletion {
     }
 }
 /// One bounded summary per active flush, rather than cloning every covered
-/// batch into each observer. Its cutoff is the last batch present at admission.
+/// batch into each observer. Flushes capture a cutoff; shutdown also covers
+/// dependent writes admitted through live operation leases.
 struct Barrier {
-    through: Arc<BatchCompletion>,
+    through: Option<Arc<BatchCompletion>>,
     sender: Option<FlushSender>,
     delivered: u64,
     failure: Option<FlushFailure>,
-    shutdown: bool,
 }
 impl Barrier {
     fn record(&mut self, count: u64, result: &Result<(), BatchError>) {
@@ -108,6 +108,8 @@ struct State<C> {
     accepting: bool,
     terminal: Option<ExecutionError>,
     depth_warned: bool,
+    leases: HashSet<u64>,
+    next_lease: u64,
 }
 impl<C> State<C> {
     fn seal(&mut self) {
@@ -129,21 +131,35 @@ impl<C> State<C> {
     }
     fn barrier(&mut self, sender: FlushSender, shutdown: bool) {
         self.seal();
-        if let Some(through) = self
-            .ready
-            .back()
-            .map(|batch| batch.completion.clone())
-            .or_else(|| self.active.clone())
-        {
+        let through = if shutdown {
+            None
+        } else {
+            self.ready
+                .back()
+                .map(|batch| batch.completion.clone())
+                .or_else(|| self.active.clone())
+        };
+        if through.is_some() || (shutdown && (self.outstanding > 0 || !self.leases.is_empty())) {
             self.barriers.push(Barrier {
                 through,
                 sender: Some(sender),
                 delivered: 0,
                 failure: None,
-                shutdown,
             });
         } else {
             let _ = sender.send(Ok(FlushReport::default()));
+        }
+    }
+    fn finish_shutdowns(&mut self) {
+        if self.outstanding == 0 && self.leases.is_empty() {
+            self.barriers.retain_mut(|barrier| {
+                if barrier.through.is_none() {
+                    barrier.finish();
+                    false
+                } else {
+                    true
+                }
+            });
         }
     }
     fn finish(&mut self, batch: &Arc<BatchCompletion>, result: Result<(), BatchError>) {
@@ -162,13 +178,18 @@ impl<C> State<C> {
             // are removed here, before admitting any subsequent flush.
             self.barriers.retain_mut(|barrier| {
                 barrier.record(batch.count as u64, &result);
-                if Arc::ptr_eq(&barrier.through, batch) {
+                if barrier
+                    .through
+                    .as_ref()
+                    .is_some_and(|through| Arc::ptr_eq(through, batch))
+                {
                     barrier.finish();
                     false
                 } else {
                     true
                 }
             });
+            self.finish_shutdowns();
         }
     }
 }
@@ -190,6 +211,7 @@ impl<C> Inner<C> {
             }
             state.terminal = Some(error);
             state.outstanding = 0;
+            state.leases.clear();
             (
                 std::mem::take(&mut state.pending),
                 state.active.take(),
@@ -238,6 +260,39 @@ impl<C> Clone for WriteService<C> {
         }
     }
 }
+/// Permission for dependent writes from one already admitted operation.
+/// Explicit revocation is independent of handles retaining cloned permissions.
+pub(crate) struct WriteLease<C>(Arc<Lease<C>>);
+struct Lease<C> {
+    inner: Arc<Inner<C>>,
+    id: u64,
+}
+impl<C> Clone for WriteLease<C> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<C> WriteLease<C> {
+    pub fn revoke(&self) {
+        self.0.revoke();
+    }
+}
+impl<C> Lease<C> {
+    fn revoke(&self) {
+        let mut state = lock(&self.inner.state);
+        if state.leases.remove(&self.id) {
+            state.finish_shutdowns();
+        }
+        drop(state);
+        self.inner.wake.notify_one();
+    }
+}
+impl<C> Drop for Lease<C> {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
+
 struct ProducerOwner<C> {
     inner: std::sync::Weak<Inner<C>>,
 }
@@ -264,6 +319,8 @@ impl<C: Send + 'static> WriteService<C> {
                 accepting: true,
                 terminal: None,
                 depth_warned: false,
+                leases: HashSet::new(),
+                next_lease: 0,
             }),
             wake: Notify::new(),
             capacity,
@@ -294,6 +351,31 @@ impl<C: Send + 'static> WriteService<C> {
         }
     }
 
+    pub fn lease(&self) -> Result<WriteLease<C>, EnqueueError> {
+        let mut state = lock(&self.inner.state);
+        if !state.accepting || state.terminal.is_some() {
+            return Err(EnqueueError::Closed);
+        }
+        if state.leases.len() >= self.inner.control_limit {
+            return Err(EnqueueError::Full);
+        }
+        let id = state.next_lease;
+        state.next_lease = id.checked_add(1).ok_or(EnqueueError::Full)?;
+        state.leases.insert(id);
+        Ok(WriteLease(Arc::new(Lease {
+            inner: self.inner.clone(),
+            id,
+        })))
+    }
+
+    fn accepts(&self, state: &State<C>, lease: Option<&WriteLease<C>>) -> bool {
+        state.terminal.is_none()
+            && (state.accepting
+                || lease.is_some_and(|lease| {
+                    Arc::ptr_eq(&lease.0.inner, &self.inner) && state.leases.contains(&lease.0.id)
+                }))
+    }
+
     #[cfg(test)]
     pub fn enqueue(&self, command: C) -> Completion<DeliveryReceipt, WriteError> {
         self.enqueue_with_rejection(command, None, |_, _| {})
@@ -305,10 +387,20 @@ impl<C: Send + 'static> WriteService<C> {
         outcome: Option<WriteOutcome>,
         rejected: impl FnOnce(C, EnqueueError),
     ) -> Completion<DeliveryReceipt, WriteError> {
+        self.enqueue_with_lease(command, outcome, None, rejected)
+    }
+
+    pub fn enqueue_with_lease(
+        &self,
+        command: C,
+        outcome: Option<WriteOutcome>,
+        lease: Option<&WriteLease<C>>,
+        rejected: impl FnOnce(C, EnqueueError),
+    ) -> Completion<DeliveryReceipt, WriteError> {
         let (sender, mut completion) = Completion::pair();
         let sender = WriteResponder::new(sender, outcome);
         let mut state = lock(&self.inner.state);
-        let error = if !state.accepting {
+        let error = if !self.accepts(&state, lease) {
             Some(EnqueueError::Closed)
         } else if state.outstanding >= self.inner.capacity {
             Some(EnqueueError::Full)
@@ -340,14 +432,21 @@ impl<C: Send + 'static> WriteService<C> {
     }
 
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
+        self.flush_with_lease(None)
+    }
+
+    pub fn flush_with_lease(
+        &self,
+        lease: Option<&WriteLease<C>>,
+    ) -> Completion<FlushReport, FlushError> {
         let (sender, mut completion) = Completion::pair();
         let mut state = lock(&self.inner.state);
-        if !state.accepting {
+        if !self.accepts(&state, lease) {
             completion.record_issuance(Err(EnqueueError::Closed.into()));
         } else if state
             .barriers
             .iter()
-            .filter(|barrier| !barrier.shutdown)
+            .filter(|barrier| barrier.through.is_some())
             .count()
             >= self.inner.control_limit
         {
@@ -450,7 +549,7 @@ where
                     state.active = Some(batch.completion.clone());
                     Some(batch)
                 }
-                None if !state.accepting => break,
+                None if !state.accepting && state.leases.is_empty() => break,
                 None => None,
             }
         };
@@ -503,6 +602,106 @@ mod tests {
             },
         );
         (service, receiver, gate)
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_leases_and_their_later_writes_but_flush_does_not() {
+        let (service, mut entered, gate) = gated(4);
+        let lease = service.lease().unwrap();
+        let escaped = lease.clone();
+        assert_eq!(service.flush().await.unwrap().delivered, 0);
+        let mut shutdown = Box::pin(service.shutdown(Duration::from_secs(5)).into_future());
+        assert!(matches!(
+            service.enqueue(0).await,
+            Err(WriteError::Admission(EnqueueError::Closed))
+        ));
+        assert!(futures::poll!(shutdown.as_mut()).is_pending());
+        let write = service.enqueue_with_lease(1, None, Some(&lease), |_, _| {});
+        let flush = service.flush_with_lease(Some(&lease));
+        assert_eq!(entered.recv().await.unwrap(), vec![1]);
+        gate.add_permits(1);
+        write.await.unwrap();
+        assert_eq!(flush.await.unwrap().delivered, 1);
+        assert!(futures::poll!(shutdown.as_mut()).is_pending());
+        lease.revoke();
+        lease.revoke();
+        assert_eq!(shutdown.await.unwrap().delivered, 1);
+        assert!(matches!(
+            service
+                .enqueue_with_lease(2, None, Some(&escaped), |_, _| {})
+                .await,
+            Err(WriteError::Admission(EnqueueError::Closed))
+        ));
+        assert!(matches!(
+            service.flush_with_lease(Some(&escaped)).await,
+            Err(FlushError::Admission(EnqueueError::Closed))
+        ));
+    }
+
+    #[tokio::test]
+    async fn leases_are_bounded_service_specific_and_revoked_on_cancellation() {
+        let (service, _, _) = gated(1);
+        let lease = service.lease().unwrap();
+        assert!(matches!(service.lease(), Err(EnqueueError::Full)));
+        lease.revoke();
+        let replacement = service.lease().unwrap();
+        let (other, _, _) = gated(1);
+        let foreign = other.lease().unwrap();
+        service.inner.close();
+        assert!(matches!(
+            service
+                .enqueue_with_lease(1, None, Some(&foreign), |_, _| {})
+                .await,
+            Err(WriteError::Admission(EnqueueError::Closed))
+        ));
+        service.cancel(ExecutionError::TimedOut);
+        assert!(lock(&service.inner.state).leases.is_empty());
+        assert!(matches!(
+            service
+                .enqueue_with_lease(2, None, Some(&replacement), |_, _| {})
+                .await,
+            Err(WriteError::Admission(EnqueueError::Closed))
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_counts_terminal_failures_from_later_leased_writes_without_replay() {
+        let service = WriteService::new(
+            2,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
+            |commands: Vec<usize>| {
+                Box::pin(async move {
+                    if commands == [1] {
+                        anyhow::bail!("terminal batch");
+                    }
+                    Ok(())
+                })
+            },
+        );
+        let lease = service.lease().unwrap();
+        let shutdown = service.shutdown(Duration::from_secs(5));
+        let failed = service.enqueue_with_lease(1, None, Some(&lease), |_, _| {});
+        assert!(matches!(failed.await, Err(WriteError::Delivery(_))));
+        assert!(service.is_empty());
+        assert_eq!(
+            service
+                .flush_with_lease(Some(&lease))
+                .await
+                .unwrap()
+                .delivered,
+            0
+        );
+        service
+            .enqueue_with_lease(2, None, Some(&lease), |_, _| {})
+            .await
+            .unwrap();
+        lease.revoke();
+        let Err(ShutdownError::Delivery(failure)) = shutdown.await else {
+            panic!("shutdown must report its covered failed batch");
+        };
+        assert_eq!(failure.failed, 1);
+        assert!(service.is_empty());
+        assert!(lock(&service.inner.state).barriers.is_empty());
     }
 
     #[test]
