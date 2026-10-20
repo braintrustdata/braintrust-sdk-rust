@@ -2047,11 +2047,7 @@ mod tests {
         for request in requests.iter().filter(|r| r.url.path() == "/logs3") {
             let auth = request
                 .headers
-                .get(
-                    &"authorization"
-                        .parse::<wiremock::http::HeaderName>()
-                        .unwrap(),
-                )
+                .get("authorization")
                 .map(|value| {
                     value
                         .to_str()
