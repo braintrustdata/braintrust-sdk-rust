@@ -37,3 +37,17 @@ impl From<crate::FlushError> for BraintrustError {
         Self::Background(error.to_string())
     }
 }
+
+impl From<crate::WriteError> for BraintrustError {
+    fn from(error: crate::WriteError) -> Self {
+        if let crate::WriteError::Delivery(cause) = &error {
+            if let Some(Self::Api { status, message }) = cause.cause().downcast_ref::<Self>() {
+                return Self::Api {
+                    status: *status,
+                    message: message.clone(),
+                };
+            }
+        }
+        Self::Background(error.to_string())
+    }
+}
