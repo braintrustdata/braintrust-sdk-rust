@@ -34,18 +34,7 @@ impl Client {
         if config.api_key.trim().is_empty() {
             return Err(Error::Config("api_key must not be empty".into()));
         }
-        let mut headers = HeaderMap::new();
-        let mut token = HeaderValue::from_str(&format!("Bearer {}", config.api_key))
-            .map_err(|_| Error::Config("invalid api_key header".into()))?;
-        token.set_sensitive(true);
-        headers.insert(AUTHORIZATION, token);
-        if let Some(org) = config.org_name {
-            headers.insert(
-                "x-bt-org-name",
-                HeaderValue::from_str(&org)
-                    .map_err(|_| Error::Config("invalid organization header".into()))?,
-            );
-        }
+        let headers = scoped_headers(&config.api_key, config.org_name.as_deref())?;
         let ca = match (config.custom_ca_bundle_path, config.custom_ca_bundle_pem) {
             (Some(_), Some(_)) => {
                 return Err(Error::Config(
@@ -72,6 +61,26 @@ impl Client {
             }),
         })
     }
+    /// Reuse the SDK's configured transport without copying session state into
+    /// the API layer. This scope is immutable and used only for ingestion.
+    pub(crate) fn for_ingestion(
+        http: reqwest::Client,
+        api_url: &Url,
+        token: &str,
+        org_name: Option<&str>,
+    ) -> Result<Self, Error> {
+        let api_url = base_url(api_url.as_str())?;
+        let headers = scoped_headers(token, org_name)?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                http,
+                app_url: api_url.clone(),
+                api_url,
+                headers,
+            }),
+        })
+    }
+
     pub fn logs3(&self) -> super::logs3::Logs3 {
         super::logs3::Logs3 {
             client: self.clone(),
@@ -199,6 +208,22 @@ impl Client {
         Ok(())
     }
 }
+fn scoped_headers(token: &str, org_name: Option<&str>) -> Result<HeaderMap, Error> {
+    let mut headers = HeaderMap::new();
+    let mut token = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| Error::Config("invalid api_key header".into()))?;
+    token.set_sensitive(true);
+    headers.insert(AUTHORIZATION, token);
+    if let Some(org) = org_name {
+        headers.insert(
+            "x-bt-org-name",
+            HeaderValue::from_str(org)
+                .map_err(|_| Error::Config("invalid organization header".into()))?,
+        );
+    }
+    Ok(headers)
+}
+
 fn base_url(value: &str) -> Result<Url, Error> {
     let mut url = Url::parse(value).map_err(|_| Error::Config("invalid endpoint URL".into()))?;
     if !matches!(url.scheme(), "http" | "https")

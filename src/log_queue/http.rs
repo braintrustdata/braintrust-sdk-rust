@@ -1,10 +1,8 @@
 use super::batching::SerializedBatch;
 use super::config::LogQueueConfig;
-use crate::internal::ingest::{UploadPlan, UploadPlanner};
-use crate::internal::retry::{exponential, RetryExecutor};
-use crate::types::{Logs3OverflowReference, Logs3OverflowRequest, Logs3OverflowUpload};
+use crate::internal::upload::{Capabilities, UploadCoordinator, UploadPolicy};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use url::Url;
 
@@ -28,73 +26,32 @@ pub(crate) fn save_payload_debug(
     Ok(())
 }
 
-/// Fetch version info from the server and return (max_request_size, can_use_overflow).
-///
-/// `can_use_overflow` is true when the server returns a positive `logs3_payload_max_bytes`,
-/// indicating that the overflow upload path is supported.
+/// Compatibility adapter for the queue; protocol behavior lives in one coordinator.
 pub(crate) async fn fetch_version_info(
     client: &reqwest::Client,
     api_url: &Url,
     token: &str,
     org_name: Option<&str>,
 ) -> (usize, bool) {
-    let version_url = match api_url.join("version") {
-        Ok(url) => url,
-        Err(e) => {
-            warn!(error = %e, "Invalid API URL for version fetch");
-            return (crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2, false);
+    let fallback = crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2;
+    match UploadCoordinator::new(
+        client.clone(),
+        api_url,
+        token,
+        org_name,
+        UploadPolicy::Queue { retries: 0 },
+    ) {
+        Ok(coordinator) => {
+            let capabilities = coordinator.capabilities(fallback, None).await;
+            (capabilities.max_request_size, capabilities.overflow)
         }
-    };
-
-    let mut request = client.get(version_url).bearer_auth(token);
-    if let Some(org) = org_name {
-        request = request.header("x-bt-org-name", org);
-    }
-    let response = request.send().await;
-
-    match response {
-        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-            Ok(json) => {
-                let server_limit = json
-                    .get("logs3_payload_max_bytes")
-                    .and_then(|v| v.as_u64())
-                    .filter(|&v| v > 0)
-                    .map(|v| v as usize);
-
-                match server_limit {
-                    Some(limit) => (limit, true),
-                    None => (crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2, false),
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to parse version response");
-                (crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2, false)
-            }
-        },
-        Ok(resp) => {
-            warn!(status = %resp.status(), "Version fetch returned non-success status");
-            (crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2, false)
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to fetch version info");
-            (crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2, false)
+        Err(error) => {
+            warn!(%error, "invalid ingestion scope");
+            (fallback, false)
         }
     }
 }
 
-/// Send a batch with retry logic (matching TypeScript SDK behavior).
-///
-/// If the batch exceeds `max_request_size` and `can_use_overflow` is true,
-/// uses the overflow upload path (POST logs3/overflow → signed URL → POST logs3).
-///
-/// Retry semantics match the TypeScript SDK:
-/// - `config.num_retries()` is the number of *retries* (not total attempts)
-/// - Total attempts = num_retries + 1
-/// - Retry delay starts at 1 second, doubles each attempt: `1s * 2^attempt`
-///
-/// Note: the TypeScript SDK retries on all errors including 4xx. This implementation
-/// intentionally diverges: only 429 and 5xx are retried since retrying on 400 Bad
-/// Request (malformed payload) cannot succeed and wastes time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_batch_with_retry(
     client: &reqwest::Client,
@@ -106,332 +63,30 @@ pub(crate) async fn send_batch_with_retry(
     max_request_size: usize,
     can_use_overflow: bool,
 ) -> Result<(), anyhow::Error> {
-    let planner = UploadPlanner {
-        max_request_bytes: max_request_size,
-        overflow: can_use_overflow,
-    };
-    let mut pending = vec![planner.plan(batch)?];
-    while let Some(plan) = pending.pop() {
-        match plan {
-            UploadPlan::Split(left, right) => {
-                pending.push(planner.plan(right)?);
-                pending.push(planner.plan(left)?);
-            }
-            UploadPlan::Direct(batch) => {
-                let result =
-                    send_planned_batch(client, api_url, token, org_name, &batch, config, false)
-                        .await;
-                match result {
-                    Err(error)
-                        if matches!(
-                            error.downcast_ref::<crate::error::BraintrustError>(),
-                            Some(crate::error::BraintrustError::Api { status: 413, .. })
-                        ) =>
-                    {
-                        pending.push(planner.rejected(batch)?);
-                    }
-                    result => result?,
-                }
-            }
-            UploadPlan::Overflow(batch) => {
-                send_planned_batch(client, api_url, token, org_name, &batch, config, true).await?
-            }
-        }
+    save_payload_debug(&batch.data, config.all_publish_payloads_dir(), "all").ok();
+    let data = batch.data.clone();
+    let coordinator = UploadCoordinator::new(
+        client.clone(),
+        api_url,
+        token,
+        org_name,
+        UploadPolicy::Queue {
+            retries: config.num_retries(),
+        },
+    )?;
+    let result = coordinator
+        .upload(
+            batch,
+            Capabilities {
+                max_request_size,
+                overflow: can_use_overflow,
+            },
+        )
+        .await;
+    if result.is_err() {
+        save_payload_debug(&data, config.failed_publish_payloads_dir(), "failed").ok();
     }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn send_planned_batch(
-    client: &reqwest::Client,
-    api_url: &Url,
-    token: &str,
-    org_name: Option<&str>,
-    batch: &SerializedBatch,
-    config: &LogQueueConfig,
-    use_overflow: bool,
-) -> Result<(), anyhow::Error> {
-    let json_bytes = &batch.data;
-    let overflow_rows = &batch.overflow_rows;
-
-    // Save to debug directories if configured
-    save_payload_debug(json_bytes, config.all_publish_payloads_dir(), "all").ok();
-
-    let logs_url = api_url
-        .join("logs3")
-        .map_err(|e| anyhow::anyhow!("invalid logs url: {e}"))?;
-
-    // If overflow is needed, the signed URL is requested once and reused across retries
-    // (matches TypeScript SDK's `overflowUpload` caching pattern).
-    let mut overflow_upload: Option<Logs3OverflowUpload> = None;
-
-    let mut retries = RetryExecutor::new(
-        config.num_retries(),
-        exponential(Duration::from_secs(1), Duration::from_secs(30)),
-    );
-    while let Some(attempt) = retries.next().await {
-        let attempt = attempt.index;
-
-        if use_overflow {
-            // Get or create the overflow upload (cached across retries)
-            if overflow_upload.is_none() {
-                let upload_result =
-                    request_overflow_upload(client, api_url, token, json_bytes, overflow_rows)
-                        .await;
-
-                match upload_result {
-                    Ok(upload) => {
-                        match upload_overflow_payload(client, &upload, json_bytes).await {
-                            Ok(()) => overflow_upload = Some(upload),
-                            Err(e) => {
-                                if attempt < config.num_retries() {
-                                    warn!(error = %e, attempt, "overflow upload failed, retrying");
-                                    continue;
-                                }
-                                save_payload_debug(
-                                    json_bytes,
-                                    config.failed_publish_payloads_dir(),
-                                    "failed",
-                                )
-                                .ok();
-                                return Err(e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if attempt < config.num_retries() {
-                            warn!(error = %e, attempt, "overflow URL request failed, retrying");
-                            continue;
-                        }
-                        save_payload_debug(
-                            json_bytes,
-                            config.failed_publish_payloads_dir(),
-                            "failed",
-                        )
-                        .ok();
-                        return Err(e);
-                    }
-                }
-            }
-
-            // Send the overflow reference to logs3
-            let key = overflow_upload.as_ref().unwrap().key.clone();
-            let overflow_ref = Logs3OverflowRequest {
-                rows: Logs3OverflowReference {
-                    reference_type: "logs3_overflow",
-                    key,
-                },
-                api_version: crate::types::LOGS_API_VERSION,
-            };
-            let overflow_bytes = serde_json::to_vec(&overflow_ref)
-                .map_err(|e| anyhow::anyhow!("failed to serialize overflow ref: {e}"))?;
-
-            let mut overflow_req = client
-                .post(logs_url.clone())
-                .bearer_auth(token)
-                .header("content-type", "application/json")
-                .body(overflow_bytes);
-            if let Some(org) = org_name {
-                overflow_req = overflow_req.header("x-bt-org-name", org);
-            }
-            let req_start = Instant::now();
-            match overflow_req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::debug!(
-                        bytes = json_bytes.len(),
-                        elapsed_ms = req_start.elapsed().as_millis(),
-                        "overflow batch sent"
-                    );
-                    return Ok(());
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    let is_retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status.is_server_error();
-                    if is_retryable && attempt < config.num_retries() {
-                        warn!(status = %status, attempt, "overflow ref send failed, retrying");
-                        continue;
-                    }
-                    save_payload_debug(json_bytes, config.failed_publish_payloads_dir(), "failed")
-                        .ok();
-                    return Err(crate::error::BraintrustError::Api {
-                        status: status.as_u16(),
-                        message: body,
-                    }
-                    .into());
-                }
-                Err(e) => {
-                    if attempt < config.num_retries() {
-                        warn!(error = %e, attempt, "overflow ref send network error, retrying");
-                        continue;
-                    }
-                    save_payload_debug(json_bytes, config.failed_publish_payloads_dir(), "failed")
-                        .ok();
-                    return Err(e.into());
-                }
-            }
-        } else {
-            // Normal path: POST directly to logs3
-            let mut normal_req = client
-                .post(logs_url.clone())
-                .bearer_auth(token)
-                .header("content-type", "application/json")
-                .body(json_bytes.clone());
-            if let Some(org) = org_name {
-                normal_req = normal_req.header("x-bt-org-name", org);
-            }
-            let req_start = Instant::now();
-            match normal_req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::debug!(
-                        bytes = json_bytes.len(),
-                        elapsed_ms = req_start.elapsed().as_millis(),
-                        "batch sent"
-                    );
-                    return Ok(());
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    let is_retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status.is_server_error();
-                    if is_retryable && attempt < config.num_retries() {
-                        warn!(status = %status, attempt, "batch send failed with retryable error, retrying");
-                        continue;
-                    }
-                    save_payload_debug(json_bytes, config.failed_publish_payloads_dir(), "failed")
-                        .ok();
-                    return Err(crate::error::BraintrustError::Api {
-                        status: status.as_u16(),
-                        message: body,
-                    }
-                    .into());
-                }
-                Err(e) => {
-                    if attempt < config.num_retries() {
-                        warn!(error = %e, attempt, "batch send network error, retrying");
-                        continue;
-                    }
-                    save_payload_debug(json_bytes, config.failed_publish_payloads_dir(), "failed")
-                        .ok();
-                    return Err(e.into());
-                }
-            }
-        }
-    }
-
-    unreachable!("retry loop should always return or continue")
-}
-
-/// Request an overflow upload URL from the server.
-pub(crate) async fn request_overflow_upload(
-    client: &reqwest::Client,
-    api_url: &Url,
-    token: &str,
-    json_bytes: &[u8],
-    overflow_rows: &[crate::types::Logs3OverflowInputRow],
-) -> Result<Logs3OverflowUpload, anyhow::Error> {
-    let overflow_url = api_url
-        .join("logs3/overflow")
-        .map_err(|e| anyhow::anyhow!("invalid overflow url: {e}"))?;
-
-    let request_body = serde_json::json!({
-        "content_type": "application/json",
-        "size_bytes": json_bytes.len(),
-        "rows": overflow_rows,
-    });
-
-    let resp = client
-        .post(overflow_url)
-        .bearer_auth(token)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("overflow URL request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(crate::error::BraintrustError::Api {
-            status: status.as_u16(),
-            message: body,
-        }
-        .into());
-    }
-
-    let upload: Logs3OverflowUpload = resp
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to parse overflow response: {e}"))?;
-
-    Ok(upload)
-}
-
-/// Upload the payload to the signed URL provided by the overflow response.
-pub(crate) async fn upload_overflow_payload(
-    client: &reqwest::Client,
-    upload: &Logs3OverflowUpload,
-    payload: &[u8],
-) -> Result<(), anyhow::Error> {
-    let resp = if upload.method.eq_ignore_ascii_case("POST") {
-        // Multipart POST (e.g. S3)
-        let fields = upload
-            .fields
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("overflow POST upload missing fields"))?;
-
-        let mut form = reqwest::multipart::Form::new();
-        for (key, value) in fields {
-            form = form.text(key.clone(), value.clone());
-        }
-        let content_type = fields
-            .get("Content-Type")
-            .map(|s| s.as_str())
-            .unwrap_or("application/json");
-        let part = reqwest::multipart::Part::bytes(payload.to_vec())
-            .mime_str(content_type)
-            .map_err(|e| anyhow::anyhow!("invalid content-type: {e}"))?;
-        form = form.part("file", part);
-
-        let mut req = client.post(&upload.signed_url).multipart(form);
-        if let Some(headers) = &upload.headers {
-            for (key, value) in headers {
-                if key.to_lowercase() != "content-type" {
-                    req = req.header(key, value);
-                }
-            }
-        }
-        req.send().await
-    } else {
-        // PUT (e.g. Azure, GCS)
-        let mut req = client
-            .put(&upload.signed_url)
-            .header("content-type", "application/json")
-            .body(payload.to_vec());
-        if let Some(headers) = &upload.headers {
-            for (key, value) in headers {
-                req = req.header(key, value);
-            }
-        }
-        // Azure Blob Storage requires `x-ms-blob-type: BlockBlob` on SAS-URL PUT
-        // requests; without it the server returns 400. The TypeScript SDK uses the
-        // same hostname-based check (`addAzureBlobHeaders`). A more robust signal
-        // would be an `upload_type` field in the server's overflow response, but
-        // that is a server-side change outside this SDK's scope for now.
-        if upload.signed_url.contains("blob.core.windows.net") {
-            req = req.header("x-ms-blob-type", "BlockBlob");
-        }
-        req.send().await
-    };
-
-    let resp = resp.map_err(|e| anyhow::anyhow!("overflow upload failed: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("overflow upload failed: [{status}] {body}");
-    }
-    Ok(())
+    result.map(|_| ()).map_err(Into::into)
 }
 
 #[cfg(test)]

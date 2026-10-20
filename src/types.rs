@@ -340,10 +340,7 @@ impl LogDestination {
     }
 }
 
-pub(crate) use crate::api::logs3::{
-    Logs3OverflowInputRow, Logs3OverflowInputRowMeta, Logs3OverflowReference, Logs3OverflowRequest,
-    Logs3OverflowUpload,
-};
+pub(crate) use crate::api::logs3::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta};
 
 /// The object ID keys that identify a row's destination, used for overflow metadata.
 /// Matches the TypeScript SDK's OBJECT_ID_KEYS.
