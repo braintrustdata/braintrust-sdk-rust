@@ -52,36 +52,25 @@ where
     }
 }
 
-/// Wrapper for async task functions that return BoxFuture
-pub struct AsyncFnTask<I, O, F>
+/// Supply type context for a reusable async task closure without wrapping it.
+/// The returned callable directly implements [`Task`]. Its future may borrow
+/// this invocation's input and hooks across await points.
+pub fn task<I, O, F>(callback: F) -> F
 where
     F: for<'a> Fn(&'a I, &'a TaskHooks<'a, I, O>) -> BoxFuture<'a, Result<O>> + Send + Sync,
 {
-    func: F,
-    _phantom: PhantomData<(I, O)>,
-}
-
-impl<I, O, F> AsyncFnTask<I, O, F>
-where
-    F: for<'a> Fn(&'a I, &'a TaskHooks<'a, I, O>) -> BoxFuture<'a, Result<O>> + Send + Sync,
-{
-    pub fn new(func: F) -> Self {
-        Self {
-            func,
-            _phantom: PhantomData,
-        }
-    }
+    callback
 }
 
 #[async_trait]
-impl<I, O, F> Task<I, O> for AsyncFnTask<I, O, F>
+impl<I, O, F> Task<I, O> for F
 where
     F: for<'a> Fn(&'a I, &'a TaskHooks<'a, I, O>) -> BoxFuture<'a, Result<O>> + Send + Sync,
     I: Send + Sync,
     O: Send + Sync,
 {
     async fn run(&self, input: &I, hooks: &TaskHooks<'_, I, O>) -> Result<O> {
-        (self.func)(input, hooks).await
+        self(input, hooks).await
     }
 }
 
@@ -118,39 +107,6 @@ where
     }
 }
 
-/// Simple async task wrapper
-pub struct SimpleAsyncFnTask<I, O, F>
-where
-    F: for<'a> Fn(&'a I) -> BoxFuture<'a, Result<O>> + Send + Sync,
-{
-    func: F,
-    _phantom: PhantomData<(I, O)>,
-}
-
-impl<I, O, F> SimpleAsyncFnTask<I, O, F>
-where
-    F: for<'a> Fn(&'a I) -> BoxFuture<'a, Result<O>> + Send + Sync,
-{
-    pub fn new(func: F) -> Self {
-        Self {
-            func,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-#[async_trait]
-impl<I, O, F> Task<I, O> for SimpleAsyncFnTask<I, O, F>
-where
-    F: for<'a> Fn(&'a I) -> BoxFuture<'a, Result<O>> + Send + Sync,
-    I: Send + Sync,
-    O: Send + Sync,
-{
-    async fn run(&self, input: &I, _hooks: &TaskHooks<'_, I, O>) -> Result<O> {
-        (self.func)(input).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,7 +115,9 @@ mod tests {
     async fn test_simple_fn_task() {
         let task = SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()));
 
-        // We can't test with hooks yet without a full setup, but we can verify the type compiles
-        let _: Box<dyn Task<String, String>> = Box::new(task);
+        let task: Box<dyn Task<String, String>> = Box::new(task);
+        let input = String::from("hello");
+        let hooks = TaskHooks::local(None);
+        assert_eq!(task.run(&input, &hooks).await.unwrap(), "HELLO");
     }
 }

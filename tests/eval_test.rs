@@ -59,15 +59,29 @@ async fn test_basic_eval_flow() {
         },
     ];
 
-    let task = SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()));
-    let scorers: Vec<Box<dyn Scorer<String, String>>> = vec![Box::new(ExactMatch::new())];
+    let callback = task(|input: &String, _hooks| Box::pin(async move { Ok(input.to_uppercase()) }));
+    let scorers: Vec<Box<dyn Scorer<String, String>>> = vec![Box::new(scorer(
+        "match",
+        |args: ScorerArgs<'_, String, String>| {
+            Box::pin(async move {
+                Ok(vec![Score::new(
+                    "match",
+                    if args.expected == Some(args.output) {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                )])
+            })
+        },
+    ))];
 
     let result = evaluator
         .run(
             EvalOpts::builder()
                 .name("test-basic-eval".to_string())
                 .dataset(cases.into())
-                .task(Box::new(task))
+                .task(Box::new(callback))
                 .scorers(scorers)
                 .quiet(true)
                 .build(),
@@ -126,10 +140,11 @@ async fn test_scorers() {
 
     // ExactMatch
     let scorer = ExactMatch::new();
+    let expected = String::from("TEST");
     let args = ScorerArgs {
         input: &"test".to_string(),
         output: &"TEST".to_string(),
-        expected: Some(&"TEST".to_string()),
+        expected: Some(&expected),
         metadata: None,
     };
     let scores = scorer.score(args).await.unwrap();
@@ -137,10 +152,11 @@ async fn test_scorers() {
 
     // Levenshtein
     let scorer = LevenshteinScorer::new();
+    let expected = String::from("hallo");
     let args = ScorerArgs {
         input: &"test".to_string(),
         output: &"hello".to_string(),
-        expected: Some(&"hallo".to_string()),
+        expected: Some(&expected),
         metadata: None,
     };
     let scores = scorer.score(args).await.unwrap();

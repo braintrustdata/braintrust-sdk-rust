@@ -34,9 +34,9 @@
 //!         EvalOpts::builder()
 //!             .name("uppercase-eval".to_string())
 //!             .dataset(cases.into())
-//!             .task(Box::new(SimpleFnTask::new(|input: &String| {
+//!             .task(Box::new(task(|input: &String, _hooks| Box::pin(async move {
 //!                 Ok(input.to_uppercase())
-//!             })))
+//!             }))))
 //!             .scorers(vec![Box::new(ExactMatch::new())])
 //!             .build(),
 //!     )
@@ -56,12 +56,12 @@ mod scorer;
 mod task;
 mod types;
 
-pub use error::CaseError;
+pub use error::{CaseError, EvalConfigError};
 
 // Re-export public API
 pub use bt_runner::{summary_to_value, BtEvalRunner};
 pub use dataset::{Dataset, IterDataset, StreamDataset, VecDataset};
 pub use runner::{EvalOpts, Evaluator, SyncEvaluator};
-pub use scorer::{ExactMatch, LevenshteinScorer, NumericDiffScorer, Scorer, SyncFnScorer};
-pub use task::{AsyncFnTask, SimpleAsyncFnTask, SimpleFnTask, SyncFnTask, Task};
+pub use scorer::{scorer, ExactMatch, LevenshteinScorer, NumericDiffScorer, Scorer, SyncFnScorer};
+pub use task::{task, SimpleFnTask, SyncFnTask, Task};
 pub use types::{Case, EvalResult, EvalSummary, Score, ScoreStats, ScorerArgs, Scores, TaskHooks};
