@@ -46,17 +46,12 @@ impl<'a, S: SpanSubmitter + 'static> ExperimentSpanBuilder<'a, S> {
 
         // Note: When using ParentSpanInfo::Experiment, we don't need project_name
         // because the destination is determined by the experiment_id.
-        let mut builder = SpanBuilder::new(
+        let builder = SpanBuilder::new(
             Arc::clone(&self.experiment.submitter),
-            self.experiment.token.clone(),
-            self.experiment.org_id.clone(),
+            self.experiment.scope.clone(),
         )
         .parent_info(parent_info)
         .span_type(self.span_type);
-
-        if let Some(org_name) = &self.experiment.org_name {
-            builder = builder.org_name(org_name.clone());
-        }
 
         builder.build()
     }

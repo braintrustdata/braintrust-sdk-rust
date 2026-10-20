@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 use crate::api::datasets::{DatasetFields, DatasetWrite};
 use crate::error::Result;
+use crate::internal::session::CredentialScope;
 use crate::span::SpanSubmitter;
 
 // ============================================================================
@@ -251,7 +252,7 @@ pub(crate) trait DatasetRegistrar: Send + Sync {
     /// Register a dataset with the API.
     async fn register_dataset(
         &self,
-        token: &str,
+        scope: &CredentialScope,
         request: DatasetRegisterRequest,
     ) -> Result<DatasetRegisterResponse>;
 }
@@ -262,8 +263,7 @@ pub(crate) trait DatasetFetcher: Send + Sync {
     /// Fetch dataset records via BTQL query.
     async fn fetch_dataset_records(
         &self,
-        token: &str,
-        org_name: &str,
+        scope: &CredentialScope,
         query: BTQLQuery,
     ) -> Result<BTQLResponse>;
 }
@@ -274,8 +274,7 @@ pub(crate) trait DatasetSummarizer: Send + Sync {
     /// Fetch dataset summary.
     async fn fetch_dataset_summary(
         &self,
-        token: &str,
-        org_name: &str,
+        scope: &CredentialScope,
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse>;
 }
@@ -283,12 +282,7 @@ pub(crate) trait DatasetSummarizer: Send + Sync {
 /// Direct dataset mutation port; writes are acknowledged by the endpoint.
 #[async_trait]
 pub(crate) trait DatasetWriter: Send + Sync {
-    async fn write_dataset_record(
-        &self,
-        token: &str,
-        org_name: &str,
-        row: DatasetWrite,
-    ) -> Result<()>;
+    async fn write_dataset_record(&self, scope: &CredentialScope, row: DatasetWrite) -> Result<()>;
 }
 
 // ============================================================================
@@ -330,8 +324,7 @@ pub struct DatasetBuilder<
     S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter,
 > {
     submitter: Arc<S>,
-    token: String,
-    org_name: String,
+    scope: CredentialScope,
     project_name: Option<String>,
     dataset_name: Option<String>,
     description: Option<String>,
@@ -344,8 +337,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     fn clone(&self) -> Self {
         Self {
             submitter: Arc::clone(&self.submitter),
-            token: self.token.clone(),
-            org_name: self.org_name.clone(),
+            scope: self.scope.clone(),
             project_name: self.project_name.clone(),
             dataset_name: self.dataset_name.clone(),
             description: self.description.clone(),
@@ -365,15 +357,10 @@ impl<
     > DatasetBuilder<S>
 {
     /// Create a new DatasetBuilder (internal use).
-    pub(crate) fn new(
-        submitter: Arc<S>,
-        token: impl Into<String>,
-        org_name: impl Into<String>,
-    ) -> Self {
+    pub(crate) fn new(submitter: Arc<S>, scope: CredentialScope) -> Self {
         Self {
             submitter,
-            token: token.into(),
-            org_name: org_name.into(),
+            scope,
             project_name: None,
             dataset_name: None,
             description: None,
@@ -424,8 +411,7 @@ impl<
 
         Ok(Dataset {
             submitter: self.submitter,
-            token: self.token,
-            org_name: self.org_name,
+            scope: self.scope,
             project_name,
             dataset_name,
             description: self.description,
@@ -447,8 +433,7 @@ pub struct Dataset<
     S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter,
 > {
     submitter: Arc<S>,
-    token: String,
-    org_name: String,
+    scope: CredentialScope,
     project_name: String,
     dataset_name: String,
     description: Option<String>,
@@ -462,8 +447,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     fn clone(&self) -> Self {
         Self {
             submitter: self.submitter.clone(),
-            token: self.token.clone(),
-            org_name: self.org_name.clone(),
+            scope: self.scope.clone(),
             project_name: self.project_name.clone(),
             dataset_name: self.dataset_name.clone(),
             description: self.description.clone(),
@@ -501,14 +485,14 @@ impl<
             .get_or_try_init(|| async {
                 let request = DatasetRegisterRequest {
                     project_name: self.project_name.clone(),
-                    org_name: self.org_name.clone(),
+                    org_name: self.scope.org_name().unwrap_or_default().to_owned(),
                     dataset_name: self.dataset_name.clone(),
                     description: self.description.clone(),
                     metadata: self.metadata.clone(),
                 };
                 let response = self
                     .submitter
-                    .register_dataset(&self.token, request)
+                    .register_dataset(&self.scope, request)
                     .await?;
                 Ok(DatasetMetadata {
                     dataset_id: response.dataset.id,
@@ -539,8 +523,7 @@ impl<
         let id = Uuid::new_v4().to_string();
         self.submitter
             .write_dataset_record(
-                &self.token,
-                &self.org_name,
+                &self.scope,
                 DatasetWrite::Insert {
                     dataset_id,
                     id: id.clone(),
@@ -556,8 +539,7 @@ impl<
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         self.submitter
             .write_dataset_record(
-                &self.token,
-                &self.org_name,
+                &self.scope,
                 DatasetWrite::Update {
                     dataset_id,
                     id: id.to_owned(),
@@ -572,8 +554,7 @@ impl<
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         self.submitter
             .write_dataset_record(
-                &self.token,
-                &self.org_name,
+                &self.scope,
                 DatasetWrite::Delete {
                     dataset_id,
                     id: id.to_owned(),
@@ -589,8 +570,7 @@ impl<
         let metadata = self.ensure_registered().await?;
         Ok(DatasetIterator::new(
             Arc::clone(&self.submitter),
-            self.token.clone(),
-            self.org_name.clone(),
+            self.scope.clone(),
             metadata.dataset_id.clone(),
             batch_size.unwrap_or(1000).max(1),
         ))
@@ -603,7 +583,7 @@ impl<
         // Fetch summary from API
         let response = self
             .submitter
-            .fetch_dataset_summary(&self.token, &self.org_name, &metadata.dataset_id)
+            .fetch_dataset_summary(&self.scope, &metadata.dataset_id)
             .await?;
 
         Ok(DatasetSummary {
@@ -643,8 +623,7 @@ impl<
 #[allow(private_bounds)]
 pub struct DatasetIterator<S: DatasetFetcher> {
     fetcher: Arc<S>,
-    token: String,
-    org_name: String,
+    scope: CredentialScope,
     dataset_id: String,
     batch_size: usize,
     cursor: Option<String>,
@@ -654,17 +633,10 @@ pub struct DatasetIterator<S: DatasetFetcher> {
 
 #[allow(private_bounds)]
 impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
-    fn new(
-        fetcher: Arc<S>,
-        token: String,
-        org_name: String,
-        dataset_id: String,
-        batch_size: usize,
-    ) -> Self {
+    fn new(fetcher: Arc<S>, scope: CredentialScope, dataset_id: String, batch_size: usize) -> Self {
         Self {
             fetcher,
-            token,
-            org_name,
+            scope,
             dataset_id,
             batch_size,
             cursor: None,
@@ -693,7 +665,7 @@ impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
             // A failed request leaves the cursor and EOF state untouched.
             let response = self
                 .fetcher
-                .fetch_dataset_records(&self.token, &self.org_name, query)
+                .fetch_dataset_records(&self.scope, query)
                 .await?;
             if response.cursor.is_some() && response.cursor == previous_cursor {
                 return Err(crate::BraintrustError::Background(

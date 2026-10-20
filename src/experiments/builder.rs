@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::experiments::experiment::{Experiment, ExperimentState};
 use crate::experiments::metadata::RepoInfo;
+use crate::internal::session::CredentialScope;
 use crate::span::SpanSubmitter;
 
 /// Error type for ExperimentBuilder validation.
@@ -36,9 +37,7 @@ impl std::error::Error for ExperimentBuilderError {}
 #[allow(private_bounds)]
 pub struct ExperimentBuilder<S: SpanSubmitter> {
     submitter: Arc<S>,
-    token: String,
-    org_id: String,
-    org_name: Option<String>,
+    scope: CredentialScope,
     project_name: Option<String>,
     experiment_name: Option<String>,
     description: Option<String>,
@@ -53,9 +52,7 @@ impl<S: SpanSubmitter> Clone for ExperimentBuilder<S> {
     fn clone(&self) -> Self {
         Self {
             submitter: Arc::clone(&self.submitter),
-            token: self.token.clone(),
-            org_id: self.org_id.clone(),
-            org_name: self.org_name.clone(),
+            scope: self.scope.clone(),
             project_name: self.project_name.clone(),
             experiment_name: self.experiment_name.clone(),
             description: self.description.clone(),
@@ -71,16 +68,10 @@ impl<S: SpanSubmitter> Clone for ExperimentBuilder<S> {
 #[allow(private_bounds)]
 impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
     /// Create a new ExperimentBuilder (internal use).
-    pub(crate) fn new(
-        submitter: Arc<S>,
-        token: impl Into<String>,
-        org_id: impl Into<String>,
-    ) -> Self {
+    pub(crate) fn new(submitter: Arc<S>, scope: CredentialScope) -> Self {
         Self {
             submitter,
-            token: token.into(),
-            org_id: org_id.into(),
-            org_name: None,
+            scope,
             project_name: None,
             experiment_name: None,
             description: None,
@@ -94,7 +85,7 @@ impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
 
     /// Set the organization name.
     pub fn org_name(mut self, org_name: impl Into<String>) -> Self {
-        self.org_name = Some(org_name.into());
+        self.scope = self.scope.with_org_name(org_name.into());
         self
     }
 
@@ -168,9 +159,7 @@ impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
 
         Ok(Experiment {
             submitter: self.submitter,
-            token: self.token,
-            org_id: self.org_id,
-            org_name: self.org_name,
+            scope: self.scope,
             project_name,
             experiment_name: self.experiment_name,
             description: self.description,
