@@ -120,9 +120,12 @@ fn recorded<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + '
             let recorder = BraintrustRecorder::new(
                 client,
                 operation.submitter.clone(),
-                options.name.clone(),
+                options.project_name.clone(),
+                options
+                    .experiment_name
+                    .clone()
+                    .unwrap_or_else(|| options.name.clone()),
                 options.metadata.clone(),
-                options.tags.clone(),
             )
             .await?;
             let result = EvalExecutor::run(

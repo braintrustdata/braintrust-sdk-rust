@@ -15,6 +15,10 @@ async fn recording_client() -> (BraintrustClient, wiremock::MockServer) {
             json!({"org_info":[{"id":"org","name":"org"}]}),
         ),
         ("/api/project/register", json!({"project":{"id":"project"}})),
+        (
+            "/api/experiment/register",
+            json!({"project":{"id":"project","name":"project"},"experiment":{"id":"experiment","name":"experiment"}}),
+        ),
         ("/logs3", json!({})),
     ] {
         Mock::given(method("POST"))
@@ -415,13 +419,13 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
         .collect();
     assert_eq!(
         ended.len(),
-        3,
-        "both cases and the run span must finish before returning partial results"
+        2,
+        "both case roots must finish before returning partial results"
     );
 }
 
 #[tokio::test]
-async fn failure_before_the_first_case_returns_an_empty_partial_run_and_finalizes_root() {
+async fn failure_before_the_first_case_returns_the_resolved_target_without_trace_rows() {
     let (client, server) = recording_client().await;
     let items: Vec<anyhow::Result<Case<String, String>>> =
         vec![Err(anyhow::anyhow!("source unavailable"))];
@@ -451,23 +455,13 @@ async fn failure_before_the_first_case_returns_an_empty_partial_run_and_finalize
     assert_eq!(partial.failed_cases, 0);
     assert!(partial.results.is_empty());
     assert!(partial.dataset.is_none());
-    let ended = server
+    assert_eq!(partial.recording.unwrap().experiment_id, "experiment");
+    assert!(!server
         .received_requests()
         .await
         .unwrap()
         .iter()
-        .filter(|r| r.url.path() == "/logs3")
-        .any(|request| {
-            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|row| row["metrics"]["end"].is_number())
-        });
-    assert!(
-        ended,
-        "the run span must finish even when source failure precedes all cases"
-    );
+        .any(|request| request.url.path() == "/logs3"));
 }
 
 #[tokio::test]
@@ -698,5 +692,245 @@ async fn serialization_failures_keep_outputs_and_finalize_recording() {
         .filter(|row| row["metrics"]["end"].is_number())
         .map(|row| row["id"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(ended.len(), 2, "both case and run recording must finalize");
+    assert_eq!(ended.len(), 1, "case recording must finalize");
+}
+
+#[tokio::test]
+async fn experiment_is_resolved_before_source_reads_and_case_roots_keep_independent_traces() {
+    use serde_json::json;
+    use std::{
+        cell::Cell,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+    use wiremock::{
+        matchers::{header, method, path},
+        Mock, ResponseTemplate,
+    };
+    let (client, server) = recording_client().await;
+    let registered = Arc::new(AtomicBool::new(false));
+    Mock::given(method("POST")).and(path("/api/experiment/register"))
+        .and(header("authorization", "Bearer test-key"))
+        .and(header("x-bt-org-name", "org"))
+        .respond_with({
+            let registered = registered.clone();
+            move |_: &wiremock::Request| {
+                registered.store(true, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"chosen-project","name":"chosen"},"experiment":{"id":"chosen-id","name":"resolved-name"}}))
+            }
+        }).with_priority(1).expect(1).mount(&server).await;
+    struct Source {
+        cursor: Cell<usize>,
+        registered: Arc<AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl CaseSource<usize, usize> for Source {
+        async fn next(&mut self) -> anyhow::Result<Option<Case<usize, usize>>> {
+            assert!(self.registered.load(Ordering::SeqCst));
+            let index = self.cursor.get();
+            self.cursor.set(index + 1);
+            Ok((index < 2).then(|| Case {
+                input: index,
+                metadata: Some(json!({"collision":"case"}).as_object().unwrap().clone()),
+                tags: Some(vec!["shared".into(), "case".into()]),
+                ..Default::default()
+            }))
+        }
+    }
+    let definition = EvalDefinition::new(
+        Box::new(task(|input: &usize, hooks| {
+            Box::pin(async move {
+                assert_eq!(hooks.get_metadata().unwrap()["shared"], "run");
+                assert_eq!(hooks.get_metadata().unwrap()["collision"], "case");
+                let child = hooks
+                    .span
+                    .unwrap()
+                    .child_builder()
+                    .unwrap()
+                    .name("nested")
+                    .build();
+                child
+                    .log(SpanLog::builder().input(json!(input)).build().unwrap())
+                    .await?;
+                child.end().await?;
+                hooks.add_tag("task");
+                Ok(*input * 2)
+            })
+        })),
+        vec![],
+    )
+    .unwrap();
+    let opts = EvalOpts::builder()
+        .name("named-eval".into())
+        .source(Box::new(Source {
+            cursor: Cell::new(0),
+            registered,
+        }))
+        .definition(definition)
+        .project_name("chosen".into())
+        .experiment_name("requested-name".into())
+        .metadata(
+            json!({"shared":"run", "collision":"run"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .tags(vec!["run".into(), "shared".into()])
+        .quiet(true)
+        .build();
+    let summary = run(EvalRequest::recorded(opts, client)).await.unwrap();
+    assert_eq!(
+        summary.recording.as_ref().unwrap(),
+        &EvalRecording {
+            project_id: "chosen-project".into(),
+            experiment_id: "chosen-id".into(),
+            experiment_name: "resolved-name".into(),
+        }
+    );
+    assert_eq!(
+        summary.results[0].tags.as_ref().unwrap(),
+        &["run", "shared", "case", "task"]
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests
+        .iter()
+        .any(|request| request.url.path() == "/api/project/register"));
+    let registration: serde_json::Value = serde_json::from_slice(
+        &requests
+            .iter()
+            .find(|request| request.url.path() == "/api/experiment/register")
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert_eq!(registration["project_name"], "chosen");
+    assert_eq!(registration["experiment_name"], "requested-name");
+    assert_eq!(registration["metadata"]["collision"], "run");
+    let rows: Vec<serde_json::Value> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .flat_map(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    assert!(rows
+        .iter()
+        .all(|row| row["experiment_id"] == "chosen-id" && row.get("project_id").is_none()));
+    assert!(rows
+        .iter()
+        .all(|row| row["span_attributes"]["name"] != "eval-named-eval"));
+    let mut roots = std::collections::HashSet::new();
+    for case in &summary.results {
+        let id = case.span_id.as_ref().unwrap();
+        let root = rows
+            .iter()
+            .find(|row| row["span_id"] == *id && row["metrics"]["end"].is_number())
+            .unwrap();
+        assert_eq!(root["root_span_id"], *id);
+        roots.insert(id.clone());
+        let child = rows
+            .iter()
+            .find(|row| row["span_attributes"]["name"] == "nested" && row["root_span_id"] == *id)
+            .unwrap();
+        assert_eq!(child["span_parents"][0], *id);
+    }
+    assert_eq!(roots.len(), 2);
+    assert_eq!(
+        summary_to_value(&summary)["recording"]["experiment_id"],
+        "chosen-id"
+    );
+}
+
+#[tokio::test]
+async fn registration_failure_reads_no_cases_and_a_later_run_can_record_normally() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use wiremock::{
+        matchers::{method, path},
+        Mock, ResponseTemplate,
+    };
+    let (client, server) = recording_client().await;
+    Mock::given(method("POST"))
+        .and(path("/api/experiment/register"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("registration denied"))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let definition = EvalDefinition::new(
+        Box::new(SimpleFnTask::new({
+            let calls = calls.clone();
+            move |input: &usize| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(*input)
+            }
+        })),
+        vec![],
+    )
+    .unwrap();
+    let opts = EvalOpts::builder()
+        .name("blocked".into())
+        .source(Box::new(IterCaseSource::new({
+            let reads = reads.clone();
+            (0..1).map(move |input| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(Case {
+                    input,
+                    ..Default::default()
+                })
+            })
+        })))
+        .definition(definition.clone())
+        .quiet(true)
+        .build();
+    let error = run(EvalRequest::recorded(opts, client.clone()))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.failures.as_slice(),
+        [EvalRunFailure::Recording {
+            case_index: None,
+            source: BraintrustError::Api { status: 403, .. }
+        }]
+    ));
+    assert!(error.partial.is_none());
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| request.url.path() == "/logs3"));
+    let opts = EvalOpts::builder()
+        .name("later".into())
+        .source(
+            vec![Case {
+                input: 5,
+                ..Default::default()
+            }]
+            .into(),
+        )
+        .definition(definition)
+        .quiet(true)
+        .build();
+    let summary = run(EvalRequest::recorded(opts, client.clone()))
+        .await
+        .unwrap();
+    assert_eq!(summary.results[0].output, Some(5));
+    assert_eq!(summary.recording.unwrap().experiment_id, "experiment");
+    client
+        .shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
 }

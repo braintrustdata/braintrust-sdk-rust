@@ -18,13 +18,14 @@ pub struct EvalOpts<I, O> {
     pub source: Box<dyn CaseSource<I, O>>,
     /// Reusable task and ordered scorers
     pub definition: EvalDefinition<I, O>,
-    /// Braintrust project to log results to
+    /// Braintrust project for recording; falls back to the client default project.
     pub project_name: Option<String>,
-    /// Optional experiment name for Braintrust logging
+    /// Experiment name for recording; defaults to the evaluation name.
     pub experiment_name: Option<String>,
-    /// Optional metadata for the evaluation
+    /// Run metadata stored on the experiment and used as case defaults.
+    /// Case metadata overrides matching keys.
     pub metadata: Option<Map<String, Value>>,
-    /// Optional tags for the evaluation
+    /// Case tag defaults, combined with source case tags without duplicates.
     pub tags: Option<Vec<String>>,
     /// Maximum concurrent evaluations (default: 5)
     #[builder(default = 5)]

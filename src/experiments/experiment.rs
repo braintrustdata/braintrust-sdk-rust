@@ -545,7 +545,7 @@ impl Experiment {
     }
 
     /// Polled only on the selected context, by preparation or a bound operation.
-    async fn register_metadata(&self) -> Result<&ExperimentMetadata> {
+    pub(crate) async fn register_metadata(&self) -> Result<&ExperimentMetadata> {
         self.state
             .metadata
             .get_or_try_init(|| async {

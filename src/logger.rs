@@ -622,12 +622,42 @@ impl BraintrustClient {
     }
 
     async fn span_builder_inner(&self) -> Result<crate::span::SpanBuilder> {
-        self.span_builder_for_operation(self.span_submitter()).await
+        self.span_builder_for_operation(self.span_submitter(), None)
+            .await
+    }
+
+    pub(crate) async fn experiment_builder_for_operation(
+        &self,
+        submitter: Arc<dyn SpanSubmitter>,
+        project: Option<String>,
+    ) -> Result<ExperimentBuilder> {
+        let project = project
+            .or_else(|| self.inner.default_project.clone())
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                BraintrustError::InvalidConfig(
+                    "recorded evaluations require project_name or a client default project".into(),
+                )
+            })?;
+        if self.inner.login_skipped {
+            return Err(BraintrustError::InvalidConfig(
+                "recording requires login".into(),
+            ));
+        }
+        let state = self.wait_for_login_state().await?;
+        Ok(ExperimentBuilder::new(
+            self.resource_transport(),
+            self.inner.execution.clone(),
+            submitter,
+            state.scope()?,
+        )
+        .project_name(project))
     }
 
     pub(crate) async fn span_builder_for_operation(
         &self,
         submitter: Arc<dyn SpanSubmitter>,
+        parent: Option<ParentSpanInfo>,
     ) -> Result<crate::span::SpanBuilder> {
         if self.inner.login_skipped {
             return Err(BraintrustError::InvalidConfig(
@@ -642,7 +672,9 @@ impl BraintrustClient {
         if let Some(span_origin) = &self.inner.span_origin {
             builder = builder.span_origin(span_origin.clone());
         }
-        if let Some(ref project) = self.inner.default_project {
+        if let Some(parent) = parent {
+            builder = builder.parent_info(parent);
+        } else if let Some(ref project) = self.inner.default_project {
             builder = builder.project_name(project);
         }
         Ok(builder)

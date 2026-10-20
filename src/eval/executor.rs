@@ -17,6 +17,8 @@ pub(crate) struct EvalPlan<I, O> {
     source: Box<dyn super::CaseSource<I, O>>,
     definition: EvalDefinition<I, O>,
     concurrency: usize,
+    metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    tags: Option<Vec<String>>,
 }
 impl<I, O> EvalPlan<I, O> {
     pub fn new(opts: EvalOpts<I, O>) -> std::result::Result<Self, super::EvalConfigError> {
@@ -26,12 +28,35 @@ impl<I, O> EvalPlan<I, O> {
             source: opts.source,
             definition: opts.definition,
             concurrency: opts.max_concurrency,
+            metadata: opts.metadata,
+            tags: opts.tags,
         })
+    }
+    fn apply_context(&self, case: &mut Case<I, O>) {
+        if let Some(defaults) = &self.metadata {
+            let mut metadata = defaults.clone();
+            if let Some(specific) = case.metadata.take() {
+                metadata.extend(specific);
+            }
+            case.metadata = Some(metadata);
+        }
+        if let Some(defaults) = &self.tags {
+            let mut tags = Vec::new();
+            for tag in defaults.iter().chain(case.tags.iter().flatten()) {
+                if !tags.contains(tag) {
+                    tags.push(tag.clone());
+                }
+            }
+            case.tags = Some(tags);
+        }
     }
 }
 
 #[async_trait]
 pub(crate) trait EvalRecorder<I, O>: Send + Sync {
+    fn target(&self) -> Option<super::EvalRecording> {
+        None
+    }
     async fn start(&self, index: usize, case: &Case<I, O>) -> Result<Box<dyn CaseRecording<I, O>>>;
     async fn finish(&self) -> Vec<BraintrustError>;
 }
@@ -70,23 +95,25 @@ impl EvalExecutor {
         loop {
             // Keep one source read alive while cases run. Sources may await
             // case progress and need not support cancellation/restarting next().
-            let mut next = Box::pin(plan.source.next());
-            let next_case = loop {
-                if pending.is_empty() {
-                    break next.await;
-                }
-                match select(next.as_mut(), pending.next()).await {
-                    Either::Left((case, _)) => break case,
-                    Either::Right((Some((index, outcome)), _)) => {
-                        Self::collect(index, outcome, &mut results, &mut failures, reporter);
-                        if !failures.is_empty() {
-                            break Ok(None);
-                        }
+            let next_case = {
+                let mut next = Box::pin(plan.source.next());
+                loop {
+                    if pending.is_empty() {
+                        break next.await;
                     }
-                    Either::Right((None, _)) => unreachable!("nonempty pending cases"),
+                    match select(next.as_mut(), pending.next()).await {
+                        Either::Left((case, _)) => break case,
+                        Either::Right((Some((index, outcome)), _)) => {
+                            Self::collect(index, outcome, &mut results, &mut failures, reporter);
+                            if !failures.is_empty() {
+                                break Ok(None);
+                            }
+                        }
+                        Either::Right((None, _)) => unreachable!("nonempty pending cases"),
+                    }
                 }
             };
-            let case = match next_case {
+            let mut case = match next_case {
                 Ok(Some(case)) => case,
                 Ok(None) => break,
                 Err(source) => {
@@ -97,6 +124,7 @@ impl EvalExecutor {
                     break;
                 }
             };
+            plan.apply_context(&mut case);
             let index = case_count;
             case_count += 1;
             let definition = &plan.definition;
@@ -142,6 +170,7 @@ impl EvalExecutor {
             successful_cases,
             failed_cases: case_count - successful_cases,
             dataset,
+            recording: recorder.and_then(|recorder| recorder.target()),
         };
         reporter.finished(&summary);
         if failures.is_empty() {
