@@ -82,11 +82,18 @@ pub fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
                     return Completion::rejected(EvalRunError::new(EvalRunFailure::Runtime(source)))
                 }
             };
+            let callbacks = binding.clone();
             binding.response(async move {
                 let mut reporter = TerminalReporter {
                     quiet: options.quiet,
                 };
-                EvalExecutor::run(EvalPlan::new(options)?, None, &mut reporter).await
+                EvalExecutor::run(
+                    EvalPlan::new(options)?,
+                    None,
+                    &mut reporter,
+                    Some(&callbacks),
+                )
+                .await
             })
         }
         Target::Recorded { client, submit } => {
@@ -103,6 +110,7 @@ fn recorded<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + '
     options: EvalOpts<I, O>,
 ) -> RunCompletion<I, O> {
     let binding = client.execution_binding();
+    let callbacks = binding.clone();
     binding.response_try(|| {
         let operation = client.span_operation()?;
         Ok(async move {
@@ -117,8 +125,13 @@ fn recorded<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + '
                 options.tags.clone(),
             )
             .await?;
-            let result =
-                EvalExecutor::run(EvalPlan::new(options)?, Some(&recorder), &mut reporter).await;
+            let result = EvalExecutor::run(
+                EvalPlan::new(options)?,
+                Some(&recorder),
+                &mut reporter,
+                Some(&callbacks),
+            )
+            .await;
             drop(recorder);
             // Revoke write permission before publishing, including escaped spans.
             drop(operation);

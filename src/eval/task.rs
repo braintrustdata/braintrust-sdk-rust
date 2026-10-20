@@ -12,6 +12,18 @@ use super::types::TaskHooks;
 /// Callback errors use `anyhow::Result` to preserve application error causes.
 #[async_trait]
 pub trait Task<I, O>: Send + Sync {
+    /// Whether evaluation runs should invoke this callback on their blocking pool.
+    /// Override together with `run_blocking` for synchronous work; async tasks use the defaults.
+    fn is_blocking(&self) -> bool {
+        false
+    }
+
+    /// Synchronous callback body used when `is_blocking()` returns true.
+    /// The evaluation runner calls this on its selected blocking pool.
+    fn run_blocking(&self, _input: &I, _hooks: &TaskHooks<'_, I, O>) -> Result<O> {
+        anyhow::bail!("task has no synchronous callback")
+    }
+
     /// Execute the task on the given input
     async fn run(&self, input: &I, hooks: &TaskHooks<'_, I, O>) -> Result<O>;
 }
@@ -19,7 +31,8 @@ pub trait Task<I, O>: Send + Sync {
 /// Wrapper for sync task functions
 ///
 /// This allows sync functions to be used as tasks in both async and sync evaluators.
-/// The function runs synchronously but is wrapped in an async trait implementation.
+/// Evaluation runs dispatch this callback on their selected runtime's blocking pool.
+/// Direct calls to `Task::run` execute the callback on the calling thread.
 pub struct SyncFnTask<I, O, F>
 where
     F: Fn(&I, &TaskHooks<'_, I, O>) -> Result<O> + Send + Sync,
@@ -47,7 +60,15 @@ where
     I: Send + Sync,
     O: Send + Sync,
 {
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: &I, hooks: &TaskHooks<'_, I, O>) -> Result<O> {
+        self.run_blocking(input, hooks)
+    }
+
+    fn run_blocking(&self, input: &I, hooks: &TaskHooks<'_, I, O>) -> Result<O> {
         (self.func)(input, hooks)
     }
 }
@@ -74,7 +95,7 @@ where
     }
 }
 
-/// Simple wrapper for tasks that don't need hooks
+/// Synchronous task without hooks, dispatched on the run's managed blocking pool.
 pub struct SimpleFnTask<I, O, F>
 where
     F: Fn(&I) -> Result<O> + Send + Sync,
@@ -102,7 +123,15 @@ where
     I: Send + Sync,
     O: Send + Sync,
 {
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: &I, _hooks: &TaskHooks<'_, I, O>) -> Result<O> {
+        self.run_blocking(input, _hooks)
+    }
+
+    fn run_blocking(&self, input: &I, _hooks: &TaskHooks<'_, I, O>) -> Result<O> {
         (self.func)(input)
     }
 }

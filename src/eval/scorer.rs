@@ -15,6 +15,18 @@ pub trait Scorer<I, O>: Send + Sync {
     /// Name of this scorer (used in results)
     fn name(&self) -> &str;
 
+    /// Whether evaluation runs should invoke this callback on their blocking pool.
+    /// Override together with `score_blocking` for synchronous work; async scorers use the defaults.
+    fn is_blocking(&self) -> bool {
+        false
+    }
+
+    /// Synchronous callback body used when `is_blocking()` returns true.
+    /// The evaluation runner calls this on its selected blocking pool.
+    fn score_blocking(&self, _args: ScorerArgs<'_, I, O>) -> Result<Scores> {
+        anyhow::bail!("scorer has no synchronous callback")
+    }
+
     /// Score the output
     async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores>;
 }
@@ -48,7 +60,8 @@ where
 
 /// Wrapper for sync scoring functions
 ///
-/// This allows sync functions to be used as scorers in both async and sync evaluators.
+/// Evaluation runs dispatch this callback on their selected runtime's blocking pool.
+/// Direct calls to `Scorer::score` execute the callback on the calling thread.
 pub struct SyncFnScorer<I, O, F>
 where
     F: Fn(ScorerArgs<'_, I, O>) -> Result<Scores> + Send + Sync,
@@ -78,11 +91,19 @@ where
     I: Send + Sync,
     O: Send + Sync,
 {
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
+        self.score_blocking(args)
+    }
+
+    fn score_blocking(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
         (self.func)(args)
     }
 }
@@ -116,11 +137,19 @@ where
     O: PartialEq + Send + Sync,
     I: Send + Sync,
 {
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
+        self.score_blocking(args)
+    }
+
+    fn score_blocking(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
         let score = match args.expected {
             Some(expected) if expected == args.output => 1.0,
             Some(_) => 0.0,
@@ -205,11 +234,19 @@ impl<I> Scorer<I, String> for LevenshteinScorer
 where
     I: Send + Sync,
 {
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn score(&self, args: ScorerArgs<'_, I, String>) -> Result<Scores> {
+        self.score_blocking(args)
+    }
+
+    fn score_blocking(&self, args: ScorerArgs<'_, I, String>) -> Result<Scores> {
         let expected = match args.expected {
             Some(e) => e,
             None => return Ok(vec![Score::new(self.name.clone(), 0.0)]),
@@ -274,11 +311,19 @@ impl<I> Scorer<I, f64> for NumericDiffScorer
 where
     I: Send + Sync,
 {
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn score(&self, args: ScorerArgs<'_, I, f64>) -> Result<Scores> {
+        self.score_blocking(args)
+    }
+
+    fn score_blocking(&self, args: ScorerArgs<'_, I, f64>) -> Result<Scores> {
         let expected = match args.expected {
             Some(e) => e,
             None => return Ok(vec![Score::new(self.name.clone(), 0.0)]),

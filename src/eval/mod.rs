@@ -49,6 +49,7 @@
 //! # }
 //! ```
 
+mod blocking;
 mod bt_runner;
 mod case_runner;
 mod definition;
