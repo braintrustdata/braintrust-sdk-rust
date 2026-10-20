@@ -73,7 +73,8 @@ pub use run::{run, EvalRequest};
 pub use runner::{EvalOpts, Evaluator};
 pub use scorer::{scorer, ExactMatch, LevenshteinScorer, NumericDiffScorer, Scorer, SyncFnScorer};
 pub use source::{
-    CaseSource, DatasetVersionRef, IterCaseSource, SourceError, StreamCaseSource, VecCaseSource,
+    CaseSource, DatasetCaseSource, DatasetVersionRef, IterCaseSource, SourceError,
+    StreamCaseSource, VecCaseSource,
 };
 pub use task::{task, SimpleFnTask, SyncFnTask, Task};
 pub use types::{

@@ -595,6 +595,7 @@ struct DatasetCursor {
     scope: CredentialScope,
     dataset_id: String,
     batch_size: usize,
+    version: Option<String>,
     cursor: Option<String>,
     buffer: VecDeque<DatasetRecord>,
     done: bool,
@@ -634,6 +635,7 @@ impl DatasetIterator {
                 scope,
                 dataset_id,
                 batch_size,
+                version: None,
                 cursor: None,
                 buffer: VecDeque::new(),
                 done: false,
@@ -690,6 +692,8 @@ impl DatasetIterator {
     }
 }
 
+pub(crate) mod read_session;
+
 impl DatasetCursor {
     /// Get the next record, fetching a new batch if needed.
     async fn next(&mut self) -> Result<Option<DatasetRecord>> {
@@ -707,6 +711,7 @@ impl DatasetCursor {
                     limit: Some(self.batch_size),
                     cursor: previous_cursor.clone(),
                 },
+                version: self.version.clone(),
             };
             // A failed request leaves the cursor and EOF state untouched.
             let response = self
