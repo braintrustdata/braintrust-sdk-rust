@@ -1,0 +1,244 @@
+//! Fixed execution binding and ownership of a continuously driven SDK runtime.
+use crate::{BraintrustError, Completion, EnqueueError, ExecutionError};
+use std::{future::Future, sync::Arc, time::Duration};
+use tokio::{
+    runtime::{Handle, Runtime},
+    sync::{oneshot, Semaphore},
+    task::JoinHandle,
+};
+
+const MAX_RESPONSE_TASKS: usize = 1024;
+
+#[derive(Clone)]
+pub(crate) struct ExecutionBinding {
+    handle: Handle,
+    // Handles alone do not own a runtime. Every accepted task retains this lease.
+    _owner: Option<Arc<RuntimeOwner>>,
+    responses: Arc<Semaphore>,
+}
+struct RuntimeOwner {
+    stop: Option<oneshot::Sender<()>>,
+    #[cfg(test)]
+    exit: Arc<ExitProbe>,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct ExitProbe {
+    done: std::sync::atomic::AtomicBool,
+    wake: tokio::sync::Notify,
+}
+#[cfg(test)]
+impl ExitProbe {
+    async fn wait(&self) {
+        let wake = self.wake.notified();
+        if !self.done.load(std::sync::atomic::Ordering::Acquire) {
+            wake.await;
+        }
+    }
+    fn finish(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.wake.notify_one();
+    }
+}
+impl Drop for RuntimeOwner {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+impl ExecutionBinding {
+    pub fn new(runtime: Option<Handle>) -> Result<Self, BraintrustError> {
+        if let Some(handle) = runtime {
+            return Ok(Self::external(handle));
+        }
+        let (initialized, receiver) = std::sync::mpsc::sync_channel(1);
+        let (stop, stopped) = oneshot::channel();
+        #[cfg(test)]
+        let exit = Arc::new(ExitProbe::default());
+        #[cfg(test)]
+        let host_exit = exit.clone();
+        std::thread::Builder::new()
+            .name("braintrust-runtime".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = initialized.send(Err(error));
+                        return;
+                    }
+                };
+                if initialized.send(Ok(runtime.handle().clone())).is_err() {
+                    return;
+                }
+                drive(runtime, stopped);
+                #[cfg(test)]
+                host_exit.finish();
+            })
+            .map_err(|error| {
+                BraintrustError::InvalidConfig(format!("failed to start SDK runtime: {error}"))
+            })?;
+        let handle = receiver
+            .recv()
+            .map_err(|_| BraintrustError::Execution(ExecutionError::WorkerLost))?
+            .map_err(|error| {
+                BraintrustError::InvalidConfig(format!("failed to initialize SDK runtime: {error}"))
+            })?;
+        Ok(Self {
+            handle,
+            _owner: Some(Arc::new(RuntimeOwner {
+                stop: Some(stop),
+                #[cfg(test)]
+                exit,
+            })),
+            responses: Arc::new(Semaphore::new(MAX_RESPONSE_TASKS)),
+        })
+    }
+    pub fn external(handle: Handle) -> Self {
+        Self {
+            handle,
+            _owner: None,
+            responses: Arc::new(Semaphore::new(MAX_RESPONSE_TASKS)),
+        }
+    }
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let lease = self.clone();
+        self.handle.spawn(async move {
+            let _lease = lease;
+            future.await
+        })
+    }
+    pub fn spawn_blocking<F, T>(&self, work: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let lease = self.clone();
+        self.handle.spawn_blocking(move || {
+            let _lease = lease;
+            work()
+        })
+    }
+    pub fn response<T, E, F>(&self, work: F) -> Completion<T, E>
+    where
+        T: Send + 'static,
+        E: From<ExecutionError> + From<EnqueueError> + Send + 'static,
+        F: Future<Output = Result<T, E>> + Send + 'static,
+    {
+        let (sender, mut completion) = Completion::pair();
+        let Ok(permit) = self.responses.clone().try_acquire_owned() else {
+            completion.record_issuance(Err(EnqueueError::Full.into()));
+            return completion;
+        };
+        self.spawn(async move {
+            let _permit = permit;
+            let _ = sender.send(work.await);
+        });
+        completion
+    }
+}
+// Runtime destruction occurs on its host thread after leaving the runtime
+// context. No join or Runtime::drop runs on an SDK worker or caller's executor.
+fn drive(runtime: Runtime, stopped: oneshot::Receiver<()>) {
+    runtime.block_on(async {
+        let _ = stopped.await;
+    });
+    runtime.shutdown_timeout(Duration::from_millis(100));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn default_binding_ignores_ambient_runtime_and_explicit_binding_honors_it() {
+        let ambient = Handle::current().id();
+        let owned = ExecutionBinding::new(None).unwrap();
+        let selected = owned.spawn(async { Handle::current().id() }).await.unwrap();
+        assert_ne!(selected, ambient);
+        assert_eq!(
+            owned
+                .spawn_blocking(|| Handle::current().id())
+                .await
+                .unwrap(),
+            selected
+        );
+        let explicit = ExecutionBinding::new(crate::current_runtime()).unwrap();
+        assert_eq!(
+            explicit
+                .spawn(async { Handle::current().id() })
+                .await
+                .unwrap(),
+            ambient
+        );
+        assert!(owned._owner.is_some());
+        assert!(explicit._owner.is_none());
+    }
+
+    #[tokio::test]
+    async fn accepted_response_tasks_retain_the_owner_and_bound_unobserved_work() {
+        let binding = ExecutionBinding::new(None).unwrap();
+        let owner = Arc::downgrade(binding._owner.as_ref().unwrap());
+        let exit = binding._owner.as_ref().unwrap().exit.clone();
+        let gate = Arc::new(Semaphore::new(0));
+        let (finished, mut done) = mpsc::unbounded_channel();
+        let mut tokens = Vec::new();
+        for _ in 0..MAX_RESPONSE_TASKS {
+            let gate = gate.clone();
+            let finished = finished.clone();
+            let token = binding.response::<_, BraintrustError, _>(async move {
+                gate.acquire().await.unwrap().forget();
+                finished.send(()).unwrap();
+                Ok(())
+            });
+            assert!(token.is_ok());
+            tokens.push(token);
+        }
+        drop(tokens.pop());
+        assert!(matches!(
+            binding
+                .response::<(), BraintrustError, _>(async { Ok(()) })
+                .await,
+            Err(BraintrustError::Admission(EnqueueError::Full))
+        ));
+        drop(binding);
+        assert!(
+            owner.upgrade().is_some(),
+            "accepted tasks must retain the runtime owner"
+        );
+        gate.add_permits(MAX_RESPONSE_TASKS);
+        for token in tokens {
+            token.await.unwrap();
+        }
+        for _ in 0..MAX_RESPONSE_TASKS {
+            done.recv().await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), exit.wait())
+            .await
+            .unwrap();
+        assert!(
+            owner.upgrade().is_none(),
+            "runtime host must stop after accepted work and owners retire"
+        );
+    }
+
+    #[test]
+    fn current_runtime_outside_tokio_selects_the_internal_default() {
+        assert!(crate::current_runtime().is_none());
+        let binding = ExecutionBinding::new(crate::current_runtime()).unwrap();
+        futures::executor::block_on(async {
+            binding
+                .response::<_, BraintrustError, _>(async { Ok(()) })
+                .await
+                .unwrap();
+        });
+    }
+}

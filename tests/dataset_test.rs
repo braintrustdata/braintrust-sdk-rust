@@ -288,6 +288,7 @@ async fn dataset_summarize_returns_summary() {
 
 async fn isolated_client(server: &MockServer) -> BraintrustClient {
     BraintrustClient::builder()
+        .runtime(braintrust_sdk_rust::current_runtime())
         .skip_login(true)
         .app_url(server.uri())
         .api_url(server.uri())

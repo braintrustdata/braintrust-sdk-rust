@@ -11,6 +11,7 @@ use crate::dataset::DatasetBuilder;
 use crate::error::{BraintrustError, Result};
 use crate::experiments::ExperimentBuilder;
 use crate::http::{build_http_client, CaBundleConfig};
+use crate::internal::execution::ExecutionBinding;
 use crate::internal::ports::SpanSubmitter;
 use crate::internal::resources::ResourceTransport;
 use crate::internal::retry::{exponential, RetryExecutor};
@@ -188,6 +189,7 @@ pub struct BraintrustClientBuilder {
     environment: Option<SpanOriginEnvironment>,
     span_origin: Option<SpanOrigin>,
     user_agent: Option<String>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl BraintrustClientBuilder {
@@ -219,6 +221,7 @@ impl BraintrustClientBuilder {
             environment: None,
             span_origin: None,
             user_agent: None,
+            runtime: None,
         }
     }
 
@@ -318,10 +321,10 @@ impl BraintrustClientBuilder {
         self
     }
 
-    /// Block until login completes (default: false, login happens in background).
+    /// Wait for login before initialization completes (default: false).
     ///
-    /// When `false` (default), login happens asynchronously in a background task.
-    /// When `true`, the `build()` method waits for login to complete before returning.
+    /// When `false`, the build completion returns a client while login continues
+    /// in the background. When `true`, that completion also observes login.
     pub fn blocking_login(mut self, blocking: bool) -> Self {
         self.blocking_login = blocking;
         self
@@ -356,11 +359,44 @@ impl BraintrustClientBuilder {
         self
     }
 
-    /// Build the client, performing login.
-    ///
-    /// If `blocking_login` is true, waits for login to complete.
-    /// Otherwise, login happens in the background with retry logic.
-    pub async fn build(self) -> Result<BraintrustClient> {
+    /// Select one runtime for initialization, resource I/O and delivery.
+    /// `None` (the default) owns and drives an internal runtime. An explicit
+    /// handle requires its caller-owned runtime to stay alive and progressing.
+    pub fn runtime(mut self, runtime: Option<tokio::runtime::Handle>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    /// Schedule client initialization immediately and observe its result.
+    /// Dropping the completion does not cancel initialization or login.
+    pub fn build(self) -> crate::Completion<BraintrustClient, BraintrustError> {
+        let validate = || -> Result<()> {
+            Url::parse(self.app_url.as_deref().unwrap_or(DEFAULT_APP_URL))
+                .map_err(|_| BraintrustError::InvalidConfig("invalid app_url".into()))?;
+            Url::parse(self.api_url.as_deref().unwrap_or(DEFAULT_API_URL))
+                .map_err(|_| BraintrustError::InvalidConfig("invalid api_url".into()))?;
+            if !self.skip_login && self.api_key.is_none() {
+                return Err(BraintrustError::InvalidConfig(
+                    "API key required: set BRAINTRUST_API_KEY or call .api_key()".into(),
+                ));
+            }
+            Ok(())
+        };
+        let binding = validate().and_then(|()| ExecutionBinding::new(self.runtime.clone()));
+        match binding {
+            Ok(binding) => {
+                let context = binding.clone();
+                binding.response(async move { self.initialize(context).await })
+            }
+            Err(error) => {
+                let (_, mut completion) = crate::Completion::pair();
+                completion.record_issuance(Err(error));
+                completion
+            }
+        }
+    }
+
+    async fn initialize(self, execution: ExecutionBinding) -> Result<BraintrustClient> {
         let app_url_str = self.app_url.unwrap_or_else(|| DEFAULT_APP_URL.into());
         let api_url_str = self.api_url.unwrap_or_else(|| DEFAULT_API_URL.into());
 
@@ -388,12 +424,18 @@ impl BraintrustClientBuilder {
             .build();
 
         // Commands carry their own immutable scope; the worker has no session fallback.
-        let queue = LogQueue::new(log_config, http_client.clone(), self.queue_size);
+        let queue = LogQueue::new(
+            log_config,
+            http_client.clone(),
+            self.queue_size,
+            execution.clone(),
+        );
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
                 api_url,
                 app_url,
+                execution,
                 queue,
                 login_state,
                 login_notify: Notify::new(),
@@ -438,6 +480,7 @@ pub struct BraintrustClient {
 }
 
 struct ClientInner {
+    execution: ExecutionBinding,
     #[allow(dead_code)]
     api_url: Url,
     app_url: Url,
@@ -463,7 +506,10 @@ impl std::fmt::Debug for ClientInner {
 
 impl BraintrustClient {
     fn resource_transport(&self) -> Arc<ResourceTransport> {
-        Arc::new(ResourceTransport::new(self.inner.http_client.clone()))
+        Arc::new(ResourceTransport::new(
+            self.inner.http_client.clone(),
+            self.inner.execution.clone(),
+        ))
     }
 
     fn span_submitter(&self) -> Arc<dyn SpanSubmitter> {
@@ -832,7 +878,7 @@ impl BraintrustClient {
     /// Start login in a background task with retry logic.
     fn start_background_login(&self, api_key: String, org_name: Option<String>) {
         let client = self.clone();
-        tokio::spawn(async move {
+        self.inner.execution.spawn(async move {
             const MAX_ATTEMPTS: usize = 10;
             let outcome = RetryExecutor::new(
                 MAX_ATTEMPTS - 1,
@@ -1144,6 +1190,41 @@ mod tests {
             .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
             .collect();
         ResponseTemplate::new(200).set_body_json(serde_json::json!({ "org_info": org_info }))
+    }
+
+    #[tokio::test]
+    async fn reads_and_empty_lifecycle_calls_do_not_start_a_log_worker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/api/dataset/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"project":{"id":"project","name":"p"},"dataset":{"id":"dataset","name":"d"}})))
+            .expect(1).mount(&server).await;
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .build()
+            .await
+            .unwrap();
+        assert!(!client.inner.queue.is_started());
+        client.flush().await.unwrap();
+        let dataset = client
+            .dataset_builder_with_credentials("token", "tenant")
+            .project_name("p")
+            .dataset_name("d")
+            .build()
+            .unwrap();
+        assert_eq!(dataset.dataset_id().await.unwrap(), "dataset");
+        assert!(!client.inner.queue.is_started());
+        client.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert!(!client.inner.queue.is_started());
+        let span = client
+            .span_builder_with_credentials("token", "org")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "project".into(),
+            })
+            .build();
+        assert!(span.log(SpanLog::default()).is_err());
+        assert!(!client.inner.queue.is_started());
     }
 
     #[tokio::test]
