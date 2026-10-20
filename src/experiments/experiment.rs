@@ -18,7 +18,7 @@ use crate::experiments::metadata::{
 use crate::experiments::span_builder::ExperimentSpanBuilder;
 use crate::experiments::summary::{ExperimentSummary, MetricSummary, ScoreSummary};
 use crate::internal::execution::ExecutionBinding;
-use crate::internal::ports::{ExperimentApi, SpanSubmitter};
+use crate::internal::ports::{ExperimentApi, PreparedSpan, SpanSubmitter};
 use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle, SpanLog};
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanPayload, SpanType};
@@ -457,13 +457,18 @@ impl Experiment {
             )
         } else {
             let experiment = self.clone();
-            self.submitter.submit_resolving_parent(
-                self.scope.clone(),
-                payload,
+            let scope = self.scope.clone();
+            self.submitter.submit_deferred(
+                payload.row_id.clone(),
                 Box::pin(async move {
                     let metadata = experiment.register_metadata().await?;
-                    Ok(ParentSpanInfo::Experiment {
+                    let parent_info = Some(ParentSpanInfo::Experiment {
                         object_id: metadata.experiment_id.clone(),
+                    });
+                    Ok(PreparedSpan {
+                        scope,
+                        payload,
+                        parent_info,
                     })
                 }),
             )

@@ -1104,11 +1104,13 @@ mod tests {
         }
         #[async_trait]
         impl SpanSubmitter for Submitter {
-            fn submit_resolving_parent(
+            fn submit_deferred(
                 &self,
-                _: CredentialScope,
-                _: SpanPayload,
-                _: futures::future::BoxFuture<'static, Result<ParentSpanInfo>>,
+                _: String,
+                _: futures::future::BoxFuture<
+                    'static,
+                    Result<crate::internal::ports::PreparedSpan>,
+                >,
             ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
                 unreachable!("this test submitter only accepts ready span snapshots")
             }
@@ -1188,11 +1190,13 @@ mod tests {
         }
         #[async_trait]
         impl SpanSubmitter for Submitter {
-            fn submit_resolving_parent(
+            fn submit_deferred(
                 &self,
-                _: CredentialScope,
-                _: SpanPayload,
-                _: futures::future::BoxFuture<'static, Result<ParentSpanInfo>>,
+                _: String,
+                _: futures::future::BoxFuture<
+                    'static,
+                    Result<crate::internal::ports::PreparedSpan>,
+                >,
             ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
                 unreachable!("this test submitter only accepts ready span snapshots")
             }

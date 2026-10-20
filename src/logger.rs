@@ -13,7 +13,7 @@ use crate::experiments::ExperimentBuilder;
 use crate::http::{build_http_client, CaBundleConfig};
 use crate::internal::execution::ExecutionBinding;
 use crate::internal::lifecycle::Lifecycle;
-use crate::internal::ports::SpanSubmitter;
+use crate::internal::ports::{PreparedSpan, SpanSubmitter};
 use crate::internal::resources::ResourceTransport;
 use crate::internal::retry::{exponential, RetryExecutor};
 use crate::internal::session::CredentialScope;
@@ -477,6 +477,50 @@ pub struct BraintrustClient {
     inner: Arc<ClientInner>,
 }
 
+/// Validated, owned patch data without unresolved or placeholder credentials.
+struct SpanUpdate {
+    row_id: String,
+    span_id: String,
+    components: SpanComponents,
+    event_data: SpanEventData,
+}
+impl SpanUpdate {
+    fn into_prepared(self, scope: CredentialScope) -> PreparedSpan {
+        let Self {
+            row_id,
+            span_id,
+            components,
+            event_data,
+        } = self;
+        let payload = SpanPayload {
+            row_id,
+            span_id,
+            is_merge: true,
+            span_components: Some(components),
+            org_id: scope.org_id().to_owned(),
+            org_name: scope.org_name().map(str::to_owned),
+            project_name: None,
+            input: event_data.input,
+            output: event_data.output,
+            expected: event_data.expected,
+            error: event_data.error,
+            scores: event_data.scores,
+            metadata: event_data.metadata,
+            metrics: event_data.metrics,
+            tags: event_data.tags,
+            context: event_data.context,
+            span_attributes: event_data.span_attributes,
+            extra: event_data.extra,
+        };
+
+        PreparedSpan {
+            scope,
+            payload,
+            parent_info: None,
+        }
+    }
+}
+
 struct ClientInner {
     lifecycle: Lifecycle,
     execution: ExecutionBinding,
@@ -686,47 +730,88 @@ impl BraintrustClient {
         builder
     }
 
-    /// Update an existing span using the output of `SpanHandle::export()`.
-    ///
-    /// Validation happens before queuing. The actual upload remains asynchronous.
-    pub async fn update_span(&self, exported: &str, event: crate::span::SpanLog) -> Result<()> {
-        let login_state = if self.inner.login_state.is_logged_in() {
-            self.inner.login_state.clone()
+    /// Submit an update using exported span context and the shared login state.
+    /// Validation and admission happen immediately. The completion includes
+    /// login (if pending), preparation and full batch delivery.
+    pub fn update_span(
+        &self,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> crate::Completion<(), BraintrustError> {
+        let scope = if self.inner.login_state.is_logged_in() {
+            match self.inner.login_state.scope() {
+                Ok(scope) => Some(scope),
+                Err(error) => return crate::Completion::rejected(error),
+            }
         } else if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+            return crate::Completion::rejected(BraintrustError::InvalidConfig(
                 "update_span() requires a logged-in client; use update_span_with_credentials() when skip_login is enabled".into(),
             ));
         } else {
-            self.wait_for_login_state().await?
+            None
         };
-
-        self.update_span_internal(login_state.scope()?, exported, event)
+        self.schedule_span_update(scope, exported, event)
     }
 
-    /// Update an existing span using explicit credentials instead of shared login state.
-    ///
-    /// This is the safe entrypoint for multi-tenant `skip_login` clients: the
-    /// supplied credentials travel with the queued row and are NOT written into
-    /// the client's shared login state.
+    /// Submit an update with immutable explicit credentials and configured routes.
+    /// Credentials travel with this write and never populate shared login state.
+    /// Dropping the token does not cancel an admitted update.
     pub fn update_span_with_credentials(
         &self,
         token: impl Into<String>,
         org_id: impl Into<String>,
         exported: &str,
         event: crate::span::SpanLog,
-    ) -> Result<()> {
-        let token = token.into();
-        let org_id = org_id.into();
-
-        self.update_span_internal(self.explicit_scope(token, org_id, None), exported, event)
+    ) -> crate::Completion<(), BraintrustError> {
+        let scope = self.explicit_scope(token.into(), org_id.into(), None);
+        self.schedule_span_update(Some(scope), exported, event)
     }
 
-    fn update_span_internal(
+    // None means the immutable session scope is still waiting for login. The
+    // queue owns that resolution before any flush or shutdown can capture it.
+    fn schedule_span_update(
         &self,
-        scope: CredentialScope,
+        scope: Option<CredentialScope>,
         exported: &str,
         event: crate::span::SpanLog,
-    ) -> Result<()> {
+    ) -> crate::Completion<(), BraintrustError> {
+        self.inner.execution.response_try(|| {
+            let update = self.prepare_span_update(exported, event)?;
+            let delivery = match scope {
+                Some(scope) => {
+                    let PreparedSpan {
+                        scope,
+                        payload,
+                        parent_info,
+                    } = update.into_prepared(scope);
+                    self.submit_payload(scope, payload, parent_info)
+                }
+                None => {
+                    let client = self.clone();
+                    self.inner.queue.submit_deferred(
+                        update.row_id.clone(),
+                        Box::pin(async move {
+                            let state = client.wait_for_login_state().await?;
+                            Ok(update.into_prepared(state.scope()?))
+                        }),
+                    )
+                }
+            };
+            if let Err(error) = &*delivery {
+                return Err(error.clone().into());
+            }
+            Ok(async move {
+                delivery.await?;
+                Ok(())
+            })
+        })
+    }
+
+    fn prepare_span_update(
+        &self,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> Result<SpanUpdate> {
         let components = SpanComponents::parse(exported)?;
         let row_id = components.row_id.clone().ok_or_else(|| {
             BraintrustError::InvalidConfig("Exported span must have a row_id".into())
@@ -798,32 +883,12 @@ impl BraintrustClient {
             event_data.apply_propagated_event(propagated_event);
         }
 
-        let payload = SpanPayload {
+        Ok(SpanUpdate {
             row_id,
             span_id,
-            is_merge: true,
-            span_components: Some(components),
-            org_id: scope.org_id().to_owned(),
-            org_name: scope.org_name().map(str::to_owned),
-            project_name: None,
-            input: event_data.input,
-            output: event_data.output,
-            expected: event_data.expected,
-            error: event_data.error,
-            scores: event_data.scores,
-            metadata: event_data.metadata,
-            metrics: event_data.metrics,
-            tags: event_data.tags,
-            context: event_data.context,
-            span_attributes: event_data.span_attributes,
-            extra: event_data.extra,
-        };
-
-        let completion = self.submit_payload(scope, payload, None);
-        if let Err(error) = &*completion {
-            return Err(BraintrustError::Background(error.to_string()));
-        }
-        Ok(())
+            components,
+            event_data,
+        })
     }
 
     /// Perform login synchronously.
