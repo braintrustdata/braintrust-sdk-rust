@@ -186,8 +186,13 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 /// ```no_run
 /// use braintrust_sdk_rust::eval::*;
 ///
-/// # async fn example() -> braintrust_sdk_rust::Result<()> {
+/// # async fn example() -> anyhow::Result<()> {
 /// let mut runner = BtEvalRunner::from_env().await?;
+///
+/// let definition = EvalDefinition::new(
+///     Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()))),
+///     vec![Box::new(ExactMatch::new())],
+/// )?;
 ///
 /// runner.eval(
 ///     "my-project",
@@ -198,8 +203,7 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 ///             expected: Some("HELLO".to_string()),
 ///             ..Default::default()
 ///         }].into())
-///         .task(Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()))))
-///         .scorers(vec![Box::new(ExactMatch::new())])
+///         .definition(definition.clone())
 ///         .build(),
 /// ).await?;
 ///

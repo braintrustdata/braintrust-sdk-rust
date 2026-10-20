@@ -29,15 +29,19 @@
 //!     },
 //! ];
 //!
+//! // Reuse this definition with a fresh source and options for every run.
+//! let definition = EvalDefinition::new(
+//!     Box::new(task(|input: &String, _hooks| Box::pin(async move {
+//!         Ok(input.to_uppercase())
+//!     }))),
+//!     vec![Box::new(ExactMatch::new())],
+//! )?;
 //! let result = evaluator
 //!     .run(
 //!         EvalOpts::builder()
 //!             .name("uppercase-eval".to_string())
 //!             .source(cases.into())
-//!             .task(Box::new(task(|input: &String, _hooks| Box::pin(async move {
-//!                 Ok(input.to_uppercase())
-//!             }))))
-//!             .scorers(vec![Box::new(ExactMatch::new())])
+//!             .definition(definition.clone())
 //!             .build(),
 //!     )
 //!     .await?;
@@ -49,6 +53,7 @@
 
 mod bt_runner;
 mod case_runner;
+mod definition;
 mod error;
 mod runner;
 mod scorer;
@@ -56,6 +61,7 @@ mod source;
 mod task;
 mod types;
 
+pub use definition::EvalDefinition;
 pub use error::{CaseError, EvalConfigError, EvalRunError, EvalRunFailure};
 
 // Re-export public API
