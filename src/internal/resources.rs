@@ -1,4 +1,5 @@
 //! Resource ports adapt SDK policy to the shared one-attempt API contracts.
+use crate::internal::execution::ExecutionBinding;
 use crate::internal::session::CredentialScope;
 use async_trait::async_trait;
 
@@ -16,14 +17,15 @@ use crate::error::{BraintrustError, Result};
 use crate::experiments::BaseExperimentInfo;
 use crate::internal::ports::{DatasetApi, ExperimentApi};
 
-/// Shared HTTP pool without retaining client/session/delivery state.
+/// Shared HTTP pool and execution lease without client/session/delivery state.
 #[derive(Clone)]
 pub(crate) struct ResourceTransport {
     http: reqwest::Client,
+    execution: ExecutionBinding,
 }
 impl ResourceTransport {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+    pub fn new(http: reqwest::Client, execution: ExecutionBinding) -> Self {
+        Self { http, execution }
     }
     fn resource_api(&self, scope: &CredentialScope) -> Result<crate::api::Client> {
         scope.api(&self.http)
@@ -37,11 +39,15 @@ impl ExperimentApi for ResourceTransport {
         scope: &CredentialScope,
         request: ExperimentRegisterRequest,
     ) -> Result<ExperimentRegisterResponse> {
-        self.resource_api(scope)?
-            .experiments()
-            .register(request)
+        let api = self.resource_api(scope)?;
+        self.execution
+            .response(async move {
+                api.experiments()
+                    .register(request)
+                    .await
+                    .map_err(BraintrustError::from)
+            })
             .await
-            .map_err(Into::into)
     }
 
     async fn fetch_base_experiment(
@@ -49,22 +55,23 @@ impl ExperimentApi for ResourceTransport {
         scope: &CredentialScope,
         experiment_id: &str,
     ) -> Result<Option<BaseExperimentInfo>> {
-        let response = match self
-            .resource_api(scope)?
-            .experiments()
-            .base(BaseExperimentRequest {
-                id: experiment_id.to_owned(),
+        let api = self.resource_api(scope)?;
+        let request = BaseExperimentRequest {
+            id: experiment_id.to_owned(),
+        };
+        self.execution
+            .response(async move {
+                let response = match api.experiments().base(request).await {
+                    // The SDK interprets 400 as no base; the API layer preserves the status.
+                    Err(crate::api::Error::Http { status: 400, .. }) => return Ok(None),
+                    result => result.map_err(BraintrustError::from)?,
+                };
+                Ok(match (response.base_exp_id, response.base_exp_name) {
+                    (Some(id), Some(name)) => Some(BaseExperimentInfo { id, name }),
+                    _ => None,
+                })
             })
             .await
-        {
-            // The SDK interprets 400 as no base; the API layer preserves the status.
-            Err(crate::api::Error::Http { status: 400, .. }) => return Ok(None),
-            result => result.map_err(BraintrustError::from)?,
-        };
-        Ok(match (response.base_exp_id, response.base_exp_name) {
-            (Some(id), Some(name)) => Some(BaseExperimentInfo { id, name }),
-            _ => None,
-        })
     }
 
     async fn fetch_experiment_comparison(
@@ -73,11 +80,17 @@ impl ExperimentApi for ResourceTransport {
         experiment_id: &str,
         base_experiment_id: Option<&str>,
     ) -> Result<ExperimentComparisonResponse> {
-        self.resource_api(scope)?
-            .experiments()
-            .compare(experiment_id, base_experiment_id)
+        let api = self.resource_api(scope)?;
+        let experiment_id = experiment_id.to_owned();
+        let base_experiment_id = base_experiment_id.map(str::to_owned);
+        self.execution
+            .response(async move {
+                api.experiments()
+                    .compare(&experiment_id, base_experiment_id.as_deref())
+                    .await
+                    .map_err(BraintrustError::from)
+            })
             .await
-            .map_err(Into::into)
     }
 }
 
@@ -88,11 +101,15 @@ impl DatasetApi for ResourceTransport {
         scope: &CredentialScope,
         request: DatasetRegisterRequest,
     ) -> Result<DatasetRegisterResponse> {
-        self.resource_api(scope)?
-            .datasets()
-            .register(request)
+        let api = self.resource_api(scope)?;
+        self.execution
+            .response(async move {
+                api.datasets()
+                    .register(request)
+                    .await
+                    .map_err(BraintrustError::from)
+            })
             .await
-            .map_err(Into::into)
     }
 
     async fn fetch_dataset_records(
@@ -100,11 +117,15 @@ impl DatasetApi for ResourceTransport {
         scope: &CredentialScope,
         query: BTQLQuery,
     ) -> Result<BTQLResponse> {
-        self.resource_api(scope)?
-            .btql()
-            .query_dataset_records(query)
+        let api = self.resource_api(scope)?;
+        self.execution
+            .response(async move {
+                api.btql()
+                    .query_dataset_records(query)
+                    .await
+                    .map_err(BraintrustError::from)
+            })
             .await
-            .map_err(Into::into)
     }
 
     async fn fetch_dataset_summary(
@@ -112,18 +133,27 @@ impl DatasetApi for ResourceTransport {
         scope: &CredentialScope,
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse> {
-        self.resource_api(scope)?
-            .datasets()
-            .summarize(dataset_id)
+        let api = self.resource_api(scope)?;
+        let dataset_id = dataset_id.to_owned();
+        self.execution
+            .response(async move {
+                api.datasets()
+                    .summarize(&dataset_id)
+                    .await
+                    .map_err(BraintrustError::from)
+            })
             .await
-            .map_err(Into::into)
     }
 
     async fn write_dataset_record(&self, scope: &CredentialScope, row: DatasetWrite) -> Result<()> {
-        self.resource_api(scope)?
-            .datasets()
-            .write(&[row])
+        let api = self.resource_api(scope)?;
+        self.execution
+            .response(async move {
+                api.datasets()
+                    .write(&[row])
+                    .await
+                    .map_err(BraintrustError::from)
+            })
             .await
-            .map_err(Into::into)
     }
 }

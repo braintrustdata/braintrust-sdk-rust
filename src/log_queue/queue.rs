@@ -7,6 +7,7 @@ use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use crate::error::{BraintrustError, Result};
 use crate::internal::delivery::WriteService;
+use crate::internal::execution::ExecutionBinding;
 use crate::internal::ports::{DeliveryControl, SpanSubmitter};
 use crate::internal::session::CredentialScope;
 use crate::internal::write_outcome::WriteOutcome;
@@ -18,7 +19,7 @@ use crate::{
 use futures::future::join_all;
 use indexmap::IndexMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
@@ -51,16 +52,22 @@ struct LogQueueCore {
     last_drop_log_time: AtomicU64,
     config: LogQueueConfig,
     client: reqwest::Client,
+    execution: ExecutionBinding,
     project_cache: TokioMutex<IndexMap<(CredentialScope, String), String>>,
     version_info: TokioMutex<IndexMap<CredentialScope, (usize, bool)>>,
 }
 impl LogQueueCore {
-    fn new(config: LogQueueConfig, client: reqwest::Client) -> Arc<Self> {
+    fn new(
+        config: LogQueueConfig,
+        client: reqwest::Client,
+        execution: ExecutionBinding,
+    ) -> Arc<Self> {
         Arc::new(Self {
             dropped_count: AtomicUsize::new(0),
             last_drop_log_time: AtomicU64::new(0),
             config,
             client,
+            execution,
             project_cache: TokioMutex::new(IndexMap::new()),
             version_info: TokioMutex::new(IndexMap::new()),
         })
@@ -141,25 +148,27 @@ impl LogQueueCore {
 
             for chunk in chunks {
                 let config = self.config.clone();
-                let batches = tokio::task::spawn_blocking(move || {
-                    let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
-                    for row in chunk {
-                        let key = RowKey::from_row(&row);
-                        if let Some(existing) = merged.get_mut(&key) {
-                            if row.is_merge.unwrap_or(false) {
-                                merge_row_into(existing, row);
+                let batches = self
+                    .execution
+                    .spawn_blocking(move || {
+                        let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
+                        for row in chunk {
+                            let key = RowKey::from_row(&row);
+                            if let Some(existing) = merged.get_mut(&key) {
+                                if row.is_merge.unwrap_or(false) {
+                                    merge_row_into(existing, row);
+                                } else {
+                                    *existing = row;
+                                }
                             } else {
-                                *existing = row;
+                                merged.insert(key, row);
                             }
-                        } else {
-                            merged.insert(key, row);
                         }
-                    }
 
-                    let rows: Vec<Logs3Row> = merged.into_values().collect();
-                    batch_and_serialize_rows(rows, &config, effective_batch_bytes)
-                })
-                .await;
+                        let rows: Vec<Logs3Row> = merged.into_values().collect();
+                        batch_and_serialize_rows(rows, &config, effective_batch_bytes)
+                    })
+                    .await;
                 let batches = match batches {
                     Ok(Ok(batches)) => batches,
                     Ok(Err(error)) => {
@@ -490,10 +499,7 @@ impl LogQueueCore {
         if dirs.is_empty() {
             return;
         }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        handle.spawn(async move {
+        self.execution.spawn(async move {
             let SubmitCommand {
                 scope: _,
                 payload,
@@ -620,22 +626,29 @@ impl LogQueueCore {
 #[derive(Clone)]
 pub struct LogQueue {
     core: Arc<LogQueueCore>,
-    writes: WriteService<SubmitCommand>,
+    writes: Arc<Mutex<QueueState>>,
+}
+enum QueueState {
+    Dormant,
+    Running(WriteService<SubmitCommand>),
+    Closed,
 }
 impl LogQueue {
-    pub fn new(config: LogQueueConfig, client: reqwest::Client, _worker_queue_size: usize) -> Self {
-        let capacity = config.queue_max_size();
-        let core = LogQueueCore::new(config, client);
-        let processor = core.clone();
-        let writes = WriteService::new(
-            capacity,
-            tokio::runtime::Handle::current(),
-            move |commands| {
-                let processor = processor.clone();
-                Box::pin(async move { processor.process(commands).await })
-            },
-        );
-        Self { core, writes }
+    pub fn new(
+        config: LogQueueConfig,
+        client: reqwest::Client,
+        _worker_queue_size: usize,
+        execution: ExecutionBinding,
+    ) -> Self {
+        Self {
+            core: LogQueueCore::new(config, client, execution),
+            writes: Arc::new(Mutex::new(QueueState::Dormant)),
+        }
+    }
+    fn state(&self) -> MutexGuard<'_, QueueState> {
+        self.writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn submit(
@@ -650,30 +663,82 @@ impl LogQueue {
             payload,
             parent_info,
         };
-        self.writes
-            .enqueue_with_rejection(command, outcome, |command, error| {
-                self.core.dropped_count.fetch_add(1, Ordering::Relaxed);
-                if matches!(error, crate::EnqueueError::Full) {
-                    self.core.log_drop_warning();
-                } else {
-                    warn!(%error, "span submission rejected");
-                }
-                self.core.dump_dropped_row_if_configured(command);
-            })
+        let mut state = self.state();
+        if matches!(*state, QueueState::Dormant) {
+            let processor = self.core.clone();
+            *state = QueueState::Running(WriteService::new(
+                self.core.config.queue_max_size(),
+                self.core.execution.clone(),
+                move |commands| {
+                    let processor = processor.clone();
+                    Box::pin(async move { processor.process(commands).await })
+                },
+            ));
+        }
+        match &*state {
+            QueueState::Running(writes) => {
+                writes.enqueue_with_rejection(command, outcome, |command, error| {
+                    self.reject(command, error)
+                })
+            }
+            QueueState::Closed => {
+                let (sender, mut completion) = Completion::pair();
+                completion.record_issuance(Err(crate::EnqueueError::Closed.into()));
+                let _ = crate::internal::write_outcome::WriteResponder::new(sender, outcome)
+                    .send(Err(crate::EnqueueError::Closed.into()));
+                self.reject(command, crate::EnqueueError::Closed);
+                completion
+            }
+            QueueState::Dormant => unreachable!("worker installed before admission"),
+        }
+    }
+    fn reject(&self, command: SubmitCommand, error: crate::EnqueueError) {
+        self.core.dropped_count.fetch_add(1, Ordering::Relaxed);
+        if matches!(error, crate::EnqueueError::Full) {
+            self.core.log_drop_warning();
+        } else {
+            warn!(%error, "span submission rejected");
+        }
+        self.core.dump_dropped_row_if_configured(command);
     }
 
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
-        self.writes.flush()
+        match &*self.state() {
+            QueueState::Running(writes) => writes.flush(),
+            state => {
+                let (sender, mut completion) = Completion::pair();
+                if matches!(state, QueueState::Closed) {
+                    completion.record_issuance(Err(crate::EnqueueError::Closed.into()));
+                } else {
+                    let _ = sender.send(Ok(FlushReport::default()));
+                }
+                completion
+            }
+        }
     }
     pub fn shutdown(
         &self,
         timeout: std::time::Duration,
     ) -> Completion<ShutdownReport, ShutdownError> {
-        self.writes.shutdown(timeout)
+        let mut state = self.state();
+        if let QueueState::Running(writes) = &*state {
+            return writes.shutdown(timeout);
+        }
+        *state = QueueState::Closed;
+        let (sender, completion) = Completion::pair();
+        let _ = sender.send(Ok(ShutdownReport::default()));
+        completion
     }
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.writes.is_empty()
+        match &*self.state() {
+            QueueState::Running(writes) => writes.is_empty(),
+            _ => true,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn is_started(&self) -> bool {
+        matches!(*self.state(), QueueState::Running(_))
     }
     pub async fn trigger_flush_command(&self) -> Result<()> {
         let token = self.flush();
@@ -743,6 +808,7 @@ mod tests {
             LogQueueConfig::builder().num_retries(0).build(),
             reqwest::Client::new(),
             32,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
         )
     }
     fn scope(server: &MockServer, token: &str) -> CredentialScope {
@@ -758,6 +824,56 @@ mod tests {
         Some(ParentSpanInfo::Experiment {
             object_id: "experiment".into(),
         })
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_submissions_share_one_bounded_lazy_worker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let queue = LogQueue::new(
+            LogQueueConfig::builder()
+                .queue_max_size(8)
+                .num_retries(0)
+                .build(),
+            reqwest::Client::new(),
+            8,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
+        );
+        assert!(!queue.is_started());
+        let tokens = std::thread::scope(|threads| {
+            (0..32)
+                .map(|number| {
+                    let queue = &queue;
+                    let server = &server;
+                    threads.spawn(move || {
+                        queue.submit(
+                            scope(server, "token"),
+                            payload(&format!("row-{number}"), false),
+                            parent(),
+                            None,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(tokens.iter().filter(|token| token.is_ok()).count(), 8);
+        assert!(queue.is_started());
+        assert_eq!(queue.flush().await.unwrap().delivered, 8);
+        for token in tokens {
+            let _ = token.await;
+        }
+        queue
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
