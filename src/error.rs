@@ -19,3 +19,21 @@ pub enum BraintrustError {
 }
 
 pub type Result<T> = std::result::Result<T, BraintrustError>;
+
+// Compatibility for resource APIs that still return BraintrustError while the
+// public operation surfaces migrate to typed completion errors.
+impl From<crate::FlushError> for BraintrustError {
+    fn from(error: crate::FlushError) -> Self {
+        if let crate::FlushError::Delivery(failure) = &error {
+            if let Some(Self::Api { status, message }) =
+                failure.cause.cause().downcast_ref::<Self>()
+            {
+                return Self::Api {
+                    status: *status,
+                    message: message.clone(),
+                };
+            }
+        }
+        Self::Background(error.to_string())
+    }
+}
