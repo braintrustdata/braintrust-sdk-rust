@@ -147,6 +147,7 @@ async fn btql_readback_preserves_cursor_and_request_errors() {
                 limit: Some(5),
                 cursor: Some("next".into()),
             },
+            version: None,
         })
         .await
         .unwrap();
@@ -169,7 +170,8 @@ async fn btql_readback_preserves_cursor_and_request_errors() {
                     from: "dataset('id')".into(),
                     limit: None,
                     cursor: None,
-                }
+                },
+                version: None,
             })
             .await,
         Err(api::Error::Http { status: 500, .. })

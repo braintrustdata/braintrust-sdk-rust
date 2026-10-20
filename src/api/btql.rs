@@ -33,6 +33,9 @@ pub struct DatasetRecord {
 #[derive(Debug, Clone, Serialize)]
 pub struct BTQLQuery {
     pub query: BTQLQueryInner,
+    /// Optional immutable dataset snapshot version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Inner BTQL query structure.

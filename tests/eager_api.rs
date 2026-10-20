@@ -107,6 +107,7 @@ async fn all_endpoint_families_run_unobserved_from_a_plain_thread_and_drain_afte
                 limit: None,
                 cursor: None,
             },
+            version: None,
         }));
         abandon(client.experiments().register(ExperimentRegisterRequest {
             project_name: "p".into(),

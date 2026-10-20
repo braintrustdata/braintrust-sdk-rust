@@ -87,12 +87,19 @@ impl EvalExecutor {
         binding: Option<&crate::internal::execution::ExecutionBinding>,
     ) -> std::result::Result<EvalSummary<I, O>, EvalRunError<I, O>> {
         reporter.started(&plan.name);
+        let prepared = plan.source.prepare().await;
         let dataset = plan.source.provenance();
         let mut results = Vec::new();
         let mut failures = Vec::new();
+        if let Err(source) = prepared {
+            failures.push(EvalRunFailure::Source {
+                case_index: 0,
+                source,
+            });
+        }
         let mut case_count = 0;
         let mut pending = FuturesUnordered::new();
-        loop {
+        while failures.is_empty() {
             // Keep one source read alive while cases run. Sources may await
             // case progress and need not support cancellation/restarting next().
             let next_case = {

@@ -34,6 +34,11 @@ pub struct DatasetVersionRef {
 /// without requiring Sync, cloning user values, or serializing local cases.
 #[async_trait]
 pub trait CaseSource<I, O>: Send {
+    /// Resolve source identity before provenance is captured or cases are read.
+    async fn prepare(&mut self) -> Result<(), SourceError> {
+        Ok(())
+    }
+
     async fn next(&mut self) -> Result<Option<Case<I, O>>, SourceError>;
     fn provenance(&self) -> Option<DatasetVersionRef> {
         None
@@ -101,5 +106,96 @@ where
 impl<I: Send + 'static, O: Send + 'static> From<Vec<Case<I, O>>> for Box<dyn CaseSource<I, O>> {
     fn from(cases: Vec<Case<I, O>>) -> Self {
         Box::new(VecCaseSource::new(cases))
+    }
+}
+
+/// Demand-driven typed cases from an SDK dataset on its bound runtime.
+///
+/// Construction admits one bounded read session immediately. Consume the source
+/// or drop it before waiting for its client's shutdown; a live unread source is
+/// accepted work. Dropping the source closes its session. Pages are fetched only
+/// as cases are requested, with no nested response-slot reservation.
+///
+/// `version` pins every page to that snapshot. With `None`, the source reads live
+/// data and reports no snapshot version. Input/output deserialization is required
+/// only at this source boundary; values need not implement Clone or Serialize.
+///
+/// ```no_run
+/// use braintrust_sdk_rust::{Dataset, eval::{CaseSource, DatasetCaseSource}};
+/// # async fn read(dataset: Dataset) -> anyhow::Result<()> {
+/// let mut cases = DatasetCaseSource::<String, String>::new(
+///     dataset, Some("snapshot-version".into()), Some(100),
+/// )?;
+/// cases.prepare().await?;
+/// while let Some(case) = cases.next().await? { println!("{}", case.input); }
+/// # Ok(())
+/// # }
+/// ```
+pub struct DatasetCaseSource<I, O> {
+    session: crate::dataset::read_session::ReadSession,
+    provenance: Option<DatasetVersionRef>,
+    version: Option<String>,
+    marker: std::marker::PhantomData<fn() -> (I, O)>,
+}
+impl<I, O> DatasetCaseSource<I, O> {
+    pub fn new(
+        dataset: crate::Dataset,
+        version: Option<String>,
+        batch_size: Option<usize>,
+    ) -> Result<Self, SourceError> {
+        Ok(Self {
+            session: crate::dataset::read_session::ReadSession::start(
+                dataset,
+                batch_size,
+                version.clone(),
+            )?,
+            provenance: None,
+            version,
+            marker: std::marker::PhantomData,
+        })
+    }
+}
+#[async_trait]
+impl<I: serde::de::DeserializeOwned + Send, O: serde::de::DeserializeOwned + Send> CaseSource<I, O>
+    for DatasetCaseSource<I, O>
+{
+    async fn prepare(&mut self) -> Result<(), SourceError> {
+        let metadata = self.session.prepare().await?;
+        if self.provenance.is_none() {
+            self.provenance = Some(DatasetVersionRef {
+                dataset_id: metadata.dataset_id.clone(),
+                version: self.version.clone(),
+            });
+        }
+        Ok(())
+    }
+    fn provenance(&self) -> Option<DatasetVersionRef> {
+        self.provenance.clone()
+    }
+    async fn next(&mut self) -> Result<Option<Case<I, O>>, SourceError> {
+        self.prepare().await?;
+        let Some(record) = self.session.next().await? else {
+            return Ok(None);
+        };
+        let input = record.input.unwrap_or(serde_json::Value::Null);
+        let input = serde_json::from_value(input).map_err(|error| {
+            anyhow::Error::new(error).context(format!("dataset record {} input", record.id))
+        })?;
+        let expected = record
+            .expected
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                anyhow::Error::new(error).context(format!("dataset record {} expected", record.id))
+            })?;
+        Ok(Some(Case {
+            input,
+            expected,
+            metadata: record.metadata,
+            tags: record.tags,
+            id: Some(record.id),
+            xact_id: record.xact_id,
+            created: record.created,
+        }))
     }
 }
