@@ -65,6 +65,23 @@ impl<B: Iterator<Item = Duration>, S: Sleeper> RetryExecutor<B, S> {
 
     pub(crate) async fn run<T, E, F, Fut, C, N>(
         mut self,
+        operation: F,
+        retryable: C,
+        on_retry: N,
+    ) -> RetryOutcome<T, E>
+    where
+        F: FnMut(Attempt) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        C: FnMut(&E) -> bool,
+        N: FnMut(Attempt, &E, Duration),
+    {
+        self.run_shared(operation, retryable, on_retry).await
+    }
+
+    /// Execute one stage, sharing the remaining retry allowance with later
+    /// stages. Successful stages do not consume retries or reset the schedule.
+    pub(crate) async fn run_shared<T, E, F, Fut, C, N>(
+        &mut self,
         mut operation: F,
         mut retryable: C,
         mut on_retry: N,
@@ -75,10 +92,13 @@ impl<B: Iterator<Item = Duration>, S: Sleeper> RetryExecutor<B, S> {
         C: FnMut(&E) -> bool,
         N: FnMut(Attempt, &E, Duration),
     {
-        // Construction always provides the initial attempt, even for an empty
-        // delay schedule. A classified error is returned without cloning it.
-        while let Some(attempt) = self.next().await {
-            let attempts = attempt.index.saturating_add(1);
+        if self.next_index == Some(0) {
+            self.next().await;
+        }
+        let mut attempts: usize = 0;
+        loop {
+            let attempt = Attempt { index: attempts };
+            attempts = attempts.saturating_add(1);
             match operation(attempt).await {
                 Ok(value) => {
                     return RetryOutcome {
@@ -87,7 +107,7 @@ impl<B: Iterator<Item = Duration>, S: Sleeper> RetryExecutor<B, S> {
                     }
                 }
                 Err(error) => {
-                    if attempt.index == self.max_retries || !retryable(&error) {
+                    if !retryable(&error) || self.next_index.is_none() {
                         return RetryOutcome {
                             result: Err(error),
                             attempts,
@@ -100,10 +120,15 @@ impl<B: Iterator<Item = Duration>, S: Sleeper> RetryExecutor<B, S> {
                         };
                     };
                     on_retry(attempt, &error, delay);
+                    if self.next().await.is_none() {
+                        return RetryOutcome {
+                            result: Err(error),
+                            attempts,
+                        };
+                    }
                 }
             }
         }
-        unreachable!("initial attempt exists and a terminal error returns immediately")
     }
 }
 
@@ -144,6 +169,46 @@ mod tests {
             self.delays.lock().unwrap().push(delay);
             Box::pin(async {})
         }
+    }
+
+    #[tokio::test]
+    async fn stages_share_retries_without_resetting_the_delay_schedule() {
+        let sleeper = FakeSleeper::default();
+        let mut executor = RetryExecutor::with_sleeper(
+            2,
+            exponential(Duration::from_secs(1), Duration::from_secs(8)),
+            sleeper.clone(),
+        );
+        for _ in 0..2 {
+            let outcome = executor
+                .run_shared(
+                    |attempt| async move {
+                        if attempt.index == 0 {
+                            Err("transient")
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |_| true,
+                    |_, _, _| {},
+                )
+                .await;
+            assert_eq!(outcome.attempts, 2);
+            assert_eq!(outcome.result, Ok(()));
+        }
+        let outcome = executor
+            .run_shared(
+                |_| async { Err::<(), _>("exhausted") },
+                |_| true,
+                |_, _, _| {},
+            )
+            .await;
+        assert_eq!(outcome.attempts, 1);
+        assert_eq!(outcome.result, Err("exhausted"));
+        assert_eq!(
+            *sleeper.delays.lock().unwrap(),
+            vec![Duration::from_secs(1), Duration::from_secs(2)]
+        );
     }
 
     #[tokio::test]

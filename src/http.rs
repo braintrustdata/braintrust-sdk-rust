@@ -69,6 +69,8 @@ pub(crate) fn build_http_client_builder(
     user_agent: Option<&str>,
 ) -> Result<reqwest::ClientBuilder> {
     let mut builder = Client::builder()
+        // SDK retries own request repetition; redirects must not add attempts.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .user_agent(user_agent.unwrap_or(USER_AGENT));
 
