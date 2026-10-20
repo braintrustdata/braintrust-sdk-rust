@@ -126,6 +126,6 @@ async fn background_login_is_accepted_work_covered_by_shutdown() {
         client.shutdown(Duration::from_millis(20)).await,
         Err(ShutdownError::Execution(ExecutionError::TimedOut))
     ));
-    assert!(!client.is_logged_in().await);
+    assert!(!client.is_logged_in());
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

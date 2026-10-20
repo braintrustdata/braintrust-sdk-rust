@@ -456,7 +456,7 @@ async fn explicit_experiment_credentials_never_prime_the_shared_session() {
         .mount(&server)
         .await;
     let client = isolated_client(&server).await;
-    let state = client.login_state().await;
+    let state = client.login_state();
     let experiment = client
         .experiment_builder_with_credentials("private-token", "tenant")
         .project_name("project")
@@ -465,7 +465,7 @@ async fn explicit_experiment_credentials_never_prime_the_shared_session() {
     assert!(!state.is_logged_in());
     experiment.project().await.unwrap();
     assert!(!state.is_logged_in());
-    assert!(!client.is_logged_in().await);
+    assert!(!client.is_logged_in());
     assert!(client.dataset_builder().await.is_err());
     let exported = experiment.export().await.unwrap();
     assert_eq!(exported.object_id, "experiment");
