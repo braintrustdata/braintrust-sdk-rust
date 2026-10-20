@@ -44,6 +44,8 @@ pub struct ExperimentBuilder {
     experiment_name: Option<String>,
     description: Option<String>,
     base_experiment: Option<String>,
+    dataset_id: Option<String>,
+    dataset_version: Option<String>,
     metadata: Option<Map<String, Value>>,
     public: Option<bool>,
     update: Option<bool>,
@@ -61,6 +63,8 @@ impl Clone for ExperimentBuilder {
             experiment_name: self.experiment_name.clone(),
             description: self.description.clone(),
             base_experiment: self.base_experiment.clone(),
+            dataset_id: self.dataset_id.clone(),
+            dataset_version: self.dataset_version.clone(),
             metadata: self.metadata.clone(),
             public: self.public,
             update: self.update,
@@ -86,6 +90,8 @@ impl ExperimentBuilder {
             experiment_name: None,
             description: None,
             base_experiment: None,
+            dataset_id: None,
+            dataset_version: None,
             metadata: None,
             public: None,
             update: None,
@@ -120,6 +126,12 @@ impl ExperimentBuilder {
     /// Set the base experiment name for comparison.
     pub fn base_experiment(mut self, base_experiment: impl Into<String>) -> Self {
         self.base_experiment = Some(base_experiment.into());
+        self
+    }
+
+    pub(crate) fn dataset_reference(mut self, id: String, version: Option<String>) -> Self {
+        self.dataset_id = Some(id);
+        self.dataset_version = version;
         self
     }
 
@@ -176,6 +188,8 @@ impl ExperimentBuilder {
             experiment_name: self.experiment_name,
             description: self.description,
             base_experiment: self.base_experiment,
+            dataset_id: self.dataset_id,
+            dataset_version: self.dataset_version,
             metadata: self.metadata,
             public: self.public,
             update: self.update,

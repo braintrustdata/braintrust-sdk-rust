@@ -415,3 +415,205 @@ async fn source_runtime_loss_reports_original_worker_loss_without_running_reads_
     assert!(control.received_requests().await.unwrap().is_empty());
     assert!(data.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn recorded_dataset_selection_and_row_origins_preserve_distinct_versions() {
+    for version in [Some("snapshot".to_owned()), None] {
+        let (client, dataset, control, data) = setup(true).await;
+        page(ResponseTemplate::new(200).set_body_json(json!({"data":[
+            {"id":"one","input":1,"_xact_id":"row-one","created":"timestamp"},
+            {"id":"two","input":2,"_xact_id":"row-two"},
+            {"id":"three","input":3},
+            {"id":"four","input":4,"_xact_id":""},
+            {"id":"","input":5,"_xact_id":"row-five"}
+        ],"cursor":null})))
+        .expect(1)
+        .mount(&data)
+        .await;
+        let source =
+            DatasetCaseSource::<usize, usize>::new(dataset, version.clone(), None).unwrap();
+        let definition = EvalDefinition::new(
+            Box::new(task(|input: &usize, hooks| {
+                Box::pin(async move {
+                    let child = hooks.span.unwrap().child_builder()?.name("child").build();
+                    child.end().await?;
+                    Ok(*input)
+                })
+            })),
+            vec![],
+        )
+        .unwrap();
+        let opts = EvalOpts::builder()
+            .name("dataset-origins".into())
+            .source(Box::new(source))
+            .definition(definition)
+            .quiet(true)
+            .build();
+        let summary = run(EvalRequest::recorded(opts, client.clone()))
+            .await
+            .unwrap();
+        client.shutdown(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(summary.dataset.as_ref().unwrap().version, version);
+        let requests = control.received_requests().await.unwrap();
+        let dataset_index = requests
+            .iter()
+            .position(|r| r.url.path() == "/api/dataset/register")
+            .unwrap();
+        let experiment_index = requests
+            .iter()
+            .position(|r| r.url.path() == "/api/experiment/register")
+            .unwrap();
+        assert!(dataset_index < experiment_index);
+        let registration: serde_json::Value =
+            serde_json::from_slice(&requests[experiment_index].body).unwrap();
+        assert_eq!(registration["dataset_id"], "dataset-id");
+        assert_eq!(
+            registration.get("dataset_version"),
+            version.as_ref().map(|v| json!(v)).as_ref()
+        );
+        let requests = data.received_requests().await.unwrap();
+        let rows: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/logs3")
+            .flat_map(|r| {
+                serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["rows"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        assert!(!rows.is_empty());
+        for (index, result) in summary.results.iter().enumerate() {
+            let case_rows: Vec<_> = rows
+                .iter()
+                .filter(|r| r["span_id"] == *result.span_id.as_ref().unwrap())
+                .collect();
+            assert!(!case_rows.is_empty());
+            for row in case_rows {
+                assert_eq!(row["experiment_id"], "experiment");
+                // Instrumentation context and dataset provenance are separate fields.
+                assert_eq!(row["context"]["span_origin"]["name"], "braintrust.sdk.rust");
+                let expected = match index {
+                    0 => Some(
+                        json!({"object_type":"dataset","object_id":"dataset-id","id":"one","_xact_id":"row-one","created":"timestamp"}),
+                    ),
+                    1 => Some(
+                        json!({"object_type":"dataset","object_id":"dataset-id","id":"two","_xact_id":"row-two"}),
+                    ),
+                    _ => None,
+                };
+                assert_eq!(row.get("origin"), expected.as_ref());
+            }
+        }
+        let children: Vec<_> = rows
+            .iter()
+            .filter(|r| r["span_attributes"]["name"] == "child")
+            .collect();
+        assert_eq!(children.len(), 5);
+        assert!(children.iter().all(|r| r.get("origin").is_none()));
+    }
+}
+
+#[tokio::test]
+async fn failed_dataset_preparation_creates_no_experiment_and_returns_empty_partial() {
+    let (client, dataset, control, data) = setup(true).await;
+    Mock::given(method("POST"))
+        .and(path("/api/dataset/register"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("no dataset access"))
+        .with_priority(1)
+        .mount(&control)
+        .await;
+    let source = DatasetCaseSource::<usize, usize>::new(dataset, None, None).unwrap();
+    let opts = EvalOpts::builder()
+        .name("failed-source".into())
+        .source(Box::new(source))
+        .definition(
+            EvalDefinition::new(
+                Box::new(SimpleFnTask::new(|_: &usize| -> anyhow::Result<usize> {
+                    panic!("must not execute")
+                })),
+                vec![],
+            )
+            .unwrap(),
+        )
+        .quiet(true)
+        .build();
+    let error = run(EvalRequest::recorded(opts, client.clone()))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.failures.as_slice(),
+        [EvalRunFailure::Source { case_index: 0, .. }]
+    ));
+    let partial = error.partial.unwrap();
+    assert_eq!(partial.total_cases, 0);
+    assert!(partial.recording.is_none());
+    assert!(partial.dataset.is_none());
+    client.shutdown(Duration::from_secs(5)).await.unwrap();
+    assert!(!control
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.path() == "/api/experiment/register"));
+    assert!(!data
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| matches!(r.url.path(), "/btql" | "/logs3")));
+}
+
+#[tokio::test]
+async fn failed_experiment_registration_retains_prepared_dataset_without_reading_pages() {
+    let (client, dataset, control, data) = setup(true).await;
+    Mock::given(method("POST"))
+        .and(path("/api/experiment/register"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("no experiment access"))
+        .with_priority(1)
+        .mount(&control)
+        .await;
+    let source =
+        DatasetCaseSource::<usize, usize>::new(dataset, Some("snapshot".into()), None).unwrap();
+    let opts = EvalOpts::builder()
+        .name("failed-target".into())
+        .source(Box::new(source))
+        .definition(
+            EvalDefinition::new(
+                Box::new(SimpleFnTask::new(|_: &usize| -> anyhow::Result<usize> {
+                    panic!("must not execute")
+                })),
+                vec![],
+            )
+            .unwrap(),
+        )
+        .quiet(true)
+        .build();
+    let error = run(EvalRequest::recorded(opts, client.clone()))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.failures.as_slice(),
+        [EvalRunFailure::Recording {
+            case_index: None,
+            ..
+        }]
+    ));
+    let partial = error.partial.unwrap();
+    assert_eq!(partial.total_cases, 0);
+    assert!(partial.recording.is_none());
+    assert_eq!(
+        partial.dataset,
+        Some(DatasetVersionRef {
+            dataset_id: "dataset-id".into(),
+            version: Some("snapshot".into())
+        })
+    );
+    client.shutdown(Duration::from_secs(5)).await.unwrap();
+    assert!(!data
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| matches!(r.url.path(), "/btql" | "/logs3")));
+}

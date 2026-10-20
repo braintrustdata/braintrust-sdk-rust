@@ -1,7 +1,7 @@
 //! Braintrust serialization and write completions, outside the run engine.
 use super::{
     executor::{CaseRecording, EvalRecorder},
-    Case, EvalRecording, EvalResult,
+    Case, DatasetVersionRef, EvalRecording, EvalResult,
 };
 use crate::{
     BraintrustClient, BraintrustError, Completion, DeliveryReceipt, Result, SpanHandle, SpanLog,
@@ -15,23 +15,47 @@ use std::sync::Arc;
 type Write = Completion<DeliveryReceipt, WriteError>;
 
 pub(crate) struct BraintrustRecorder {
+    client: BraintrustClient,
+    submitter: Arc<dyn crate::internal::ports::SpanSubmitter>,
+    project_name: Option<String>,
+    experiment_name: String,
+    metadata: Option<Map<String, Value>>,
+    ready: Option<RecordingState>,
+}
+struct RecordingState {
     template: crate::span::SpanBuilder,
     target: EvalRecording,
+    dataset: Option<DatasetVersionRef>,
 }
 impl BraintrustRecorder {
-    pub async fn new(
+    pub fn new(
         client: BraintrustClient,
         submitter: Arc<dyn crate::internal::ports::SpanSubmitter>,
         project_name: Option<String>,
         experiment_name: String,
         metadata: Option<Map<String, Value>>,
-    ) -> Result<Self> {
-        let mut builder = client
-            .experiment_builder_for_operation(submitter.clone(), project_name)
+    ) -> Self {
+        Self {
+            client,
+            submitter,
+            project_name,
+            experiment_name,
+            metadata,
+            ready: None,
+        }
+    }
+    async fn initialize(&mut self, dataset: Option<&DatasetVersionRef>) -> Result<()> {
+        let mut builder = self
+            .client
+            .experiment_builder_for_operation(self.submitter.clone(), self.project_name.clone())
             .await?
-            .experiment_name(experiment_name);
-        if let Some(metadata) = metadata {
-            builder = builder.metadata(metadata);
+            .experiment_name(self.experiment_name.clone());
+        if let Some(metadata) = &self.metadata {
+            builder = builder.metadata(metadata.clone());
+        }
+        if let Some(dataset) = dataset {
+            builder =
+                builder.dataset_reference(dataset.dataset_id.clone(), dataset.version.clone());
         }
         let experiment = builder
             .build()
@@ -42,16 +66,22 @@ impl BraintrustRecorder {
             experiment_id: resolved.experiment_id.clone(),
             experiment_name: resolved.experiment_name.clone(),
         };
-        let template = client
+        let template = self
+            .client
             .span_builder_for_operation(
-                submitter,
+                self.submitter.clone(),
                 Some(crate::types::ParentSpanInfo::Experiment {
                     object_id: target.experiment_id.clone(),
                 }),
             )
             .await?
             .span_type(crate::SpanType::Eval);
-        Ok(Self { template, target })
+        self.ready = Some(RecordingState {
+            template,
+            target,
+            dataset: dataset.cloned(),
+        });
+        Ok(())
     }
 }
 
@@ -79,12 +109,30 @@ fn serialize<T: Serialize>(
 impl<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static> EvalRecorder<I, O>
     for BraintrustRecorder
 {
+    async fn prepare(&mut self, dataset: Option<&DatasetVersionRef>) -> Result<()> {
+        self.initialize(dataset).await
+    }
     async fn start(&self, index: usize, case: &Case<I, O>) -> Result<Box<dyn CaseRecording<I, O>>> {
-        let span = self
-            .template
-            .clone()
-            .name(format!("case-{}", index + 1))
-            .build();
+        let ready = self.ready.as_ref().ok_or_else(|| {
+            BraintrustError::Background("evaluation recorder is not initialized".into())
+        })?;
+        let mut builder = ready.template.clone().name(format!("case-{}", index + 1));
+        // Match the dataset object-reference contract: both row identity and row
+        // transaction are required. The selected dataset version is run metadata,
+        // not a substitute for a particular record's transaction.
+        if let (Some(dataset), Some(id), Some(xact_id)) = (
+            &ready.dataset,
+            case.id.as_ref().filter(|id| !id.is_empty()),
+            case.xact_id.as_ref().filter(|id| !id.is_empty()),
+        ) {
+            builder = builder.dataset_record_origin(crate::types::DatasetRecordOrigin {
+                object_id: dataset.dataset_id.clone(),
+                id: id.clone(),
+                xact_id: xact_id.clone(),
+                created: case.created.clone(),
+            });
+        }
+        let span = builder.build();
         let mut failures = Vec::new();
         let mut log = SpanLog::builder().name(format!("case-{}", index + 1));
         if let Some(input) = serialize(&case.input, "input", &mut failures) {
@@ -109,7 +157,7 @@ impl<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static>
         }))
     }
     fn target(&self) -> Option<EvalRecording> {
-        Some(self.target.clone())
+        self.ready.as_ref().map(|ready| ready.target.clone())
     }
 
     async fn finish(&self) -> Vec<BraintrustError> {

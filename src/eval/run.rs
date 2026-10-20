@@ -117,7 +117,7 @@ fn recorded<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + '
             let mut reporter = TerminalReporter {
                 quiet: options.quiet,
             };
-            let recorder = BraintrustRecorder::new(
+            let mut recorder = BraintrustRecorder::new(
                 client,
                 operation.submitter.clone(),
                 options.project_name.clone(),
@@ -126,11 +126,10 @@ fn recorded<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + '
                     .clone()
                     .unwrap_or_else(|| options.name.clone()),
                 options.metadata.clone(),
-            )
-            .await?;
+            );
             let result = EvalExecutor::run(
                 EvalPlan::new(options)?,
-                Some(&recorder),
+                Some(&mut recorder),
                 &mut reporter,
                 Some(&callbacks),
             )

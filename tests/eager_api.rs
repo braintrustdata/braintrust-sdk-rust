@@ -115,6 +115,8 @@ async fn all_endpoint_families_run_unobserved_from_a_plain_thread_and_drain_afte
             experiment_name: None,
             description: None,
             base_experiment: None,
+            dataset_id: None,
+            dataset_version: None,
             metadata: None,
             public: None,
             update: None,
