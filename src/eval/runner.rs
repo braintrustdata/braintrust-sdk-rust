@@ -30,7 +30,7 @@ pub struct EvalOpts<I, O> {
     /// Maximum concurrent evaluations (default: 5)
     #[builder(default = 5)]
     pub max_concurrency: usize,
-    /// Suppress progress output (default: false)
+    /// Suppress default terminal output (default: false). An explicit request reporter takes precedence.
     #[builder(default = false)]
     pub quiet: bool,
     /// Explicit runtime for local runs. Recorded runs inherit their client binding.

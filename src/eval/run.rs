@@ -2,14 +2,16 @@
 use super::{
     executor::{EvalExecutor, EvalPlan},
     recorder::BraintrustRecorder,
-    reporter::TerminalReporter,
-    EvalConfigError, EvalOpts, EvalRunError, EvalRunFailure, EvalSummary,
+    reporter::{SilentReporter, TerminalReporter},
+    EvalConfigError, EvalOpts, EvalReporter, EvalRunError, EvalRunFailure, EvalSummary,
 };
 use crate::{internal::execution::ExecutionBinding, BraintrustClient, Completion};
 use serde::Serialize;
 
 type RunCompletion<I, O> = Completion<EvalSummary<I, O>, EvalRunError<I, O>>;
-type SubmitRecorded<I, O> = fn(BraintrustClient, EvalOpts<I, O>) -> RunCompletion<I, O>;
+type RunReporter<I, O> = Box<dyn EvalReporter<I, O>>;
+type SubmitRecorded<I, O> =
+    fn(BraintrustClient, EvalOpts<I, O>, RunReporter<I, O>) -> RunCompletion<I, O>;
 
 /// An owned invocation of a reusable definition with its own source and options.
 ///
@@ -17,6 +19,7 @@ type SubmitRecorded<I, O> = fn(BraintrustClient, EvalOpts<I, O>) -> RunCompletio
 /// serialization and inherit their client's execution binding and lifecycle.
 pub struct EvalRequest<I, O> {
     options: EvalOpts<I, O>,
+    reporter: Option<RunReporter<I, O>>,
     target: Target<I, O>,
 }
 enum Target<I, O> {
@@ -27,10 +30,17 @@ enum Target<I, O> {
     },
 }
 impl<I, O> EvalRequest<I, O> {
+    /// Select run-owned output. This overrides `EvalOpts::quiet`, which only
+    /// controls the default terminal reporter. Reporter failures preserve results.
+    pub fn with_reporter(mut self, reporter: impl EvalReporter<I, O> + 'static) -> Self {
+        self.reporter = Some(Box::new(reporter));
+        self
+    }
     /// Run without login, HTTP or recording, on `options.runtime` or an owned runtime.
     pub fn local(options: EvalOpts<I, O>) -> Self {
         Self {
             options,
+            reporter: None,
             target: Target::Local,
         }
     }
@@ -40,6 +50,7 @@ impl<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static>
     pub fn recorded(options: EvalOpts<I, O>, client: BraintrustClient) -> Self {
         Self {
             options,
+            reporter: None,
             target: Target::Recorded {
                 client,
                 submit: recorded::<I, O>,
@@ -73,6 +84,13 @@ pub fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
     if let Err(error) = request.options.validate() {
         return Completion::rejected(error.into());
     }
+    let mut reporter = request.reporter.unwrap_or_else(|| {
+        if request.options.quiet {
+            Box::new(SilentReporter)
+        } else {
+            Box::new(TerminalReporter::default())
+        }
+    });
     match request.target {
         Target::Local => {
             let mut options = request.options;
@@ -84,13 +102,10 @@ pub fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
             };
             let callbacks = binding.clone();
             binding.response(async move {
-                let mut reporter = TerminalReporter {
-                    quiet: options.quiet,
-                };
                 EvalExecutor::run(
                     EvalPlan::new(options)?,
                     None,
-                    &mut reporter,
+                    reporter.as_mut(),
                     Some(&callbacks),
                 )
                 .await
@@ -100,7 +115,7 @@ pub fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
             if request.options.runtime.is_some() {
                 return Completion::rejected(EvalConfigError::RecordedRuntime.into());
             }
-            submit(client, request.options)
+            submit(client, request.options, reporter)
         }
     }
 }
@@ -108,15 +123,13 @@ pub fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
 fn recorded<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static>(
     client: BraintrustClient,
     options: EvalOpts<I, O>,
+    mut reporter: RunReporter<I, O>,
 ) -> RunCompletion<I, O> {
     let binding = client.execution_binding();
     let callbacks = binding.clone();
     binding.response_try(|| {
         let operation = client.span_operation()?;
         Ok(async move {
-            let mut reporter = TerminalReporter {
-                quiet: options.quiet,
-            };
             let mut recorder = BraintrustRecorder::new(
                 client,
                 operation.submitter.clone(),
@@ -130,7 +143,7 @@ fn recorded<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + '
             let result = EvalExecutor::run(
                 EvalPlan::new(options)?,
                 Some(&mut recorder),
-                &mut reporter,
+                reporter.as_mut(),
                 Some(&callbacks),
             )
             .await;

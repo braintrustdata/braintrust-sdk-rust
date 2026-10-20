@@ -16,8 +16,7 @@ use serde_json::{json, Value};
 use crate::{BraintrustClient, BraintrustError, Result};
 
 use super::{
-    runner::{EvalOpts, Evaluator},
-    types::EvalSummary,
+    runner::EvalOpts, types::EvalSummary, EvalReporter, EvalRequest, JsonlReporter, ReportError,
 };
 
 /// A filter for selecting which evaluators to run, read from `BT_EVAL_FILTER_PARSED`.
@@ -115,12 +114,27 @@ struct SseWriter {
 }
 
 impl SseWriter {
-    fn send(&self, event: &str, data: &Value) {
-        let data_str = serde_json::to_string(data).unwrap_or_default();
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = write!(w, "event: {}\ndata: {}\n\n", event, data_str);
-            let _ = w.flush();
-        }
+    fn send(&self, event: &str, data: &Value) -> std::result::Result<(), ReportError> {
+        let data_str = serde_json::to_string(data)?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("SSE writer lock poisoned"))?;
+        write!(writer, "event: {}\ndata: {}\n\n", event, data_str)?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
+struct SseReporter {
+    sse: Arc<SseWriter>,
+}
+impl<I: Serialize, O: Serialize> EvalReporter<I, O> for SseReporter {
+    fn started(&mut self, name: &str) -> std::result::Result<(), ReportError> {
+        self.sse.send("start", &json!({"name": name}))
+    }
+    fn finished(&mut self, summary: &EvalSummary<I, O>) -> std::result::Result<(), ReportError> {
+        self.sse.send("summary", &summary_to_value(summary)?)
     }
 }
 
@@ -224,14 +238,17 @@ pub struct BtEvalRunner {
 impl BtEvalRunner {
     /// Create a new runner, reading configuration from environment variables.
     ///
-    /// In non-list mode, this creates a `BraintrustClient` from environment variables
-    /// (e.g. `BRAINTRUST_API_KEY`). In list mode, no client is created.
+    /// Recording mode creates a client from environment variables (e.g.
+    /// `BRAINTRUST_API_KEY`). List and local modes create no client.
     pub async fn from_env() -> Result<Self> {
         let config = RunnerConfig::from_env();
         let sse = create_sse_writer();
 
-        // Only create a client when we'll actually run evals
-        let client = if !config.list {
+        Self::from_config(config, sse).await
+    }
+
+    async fn from_config(config: RunnerConfig, sse: Option<Arc<SseWriter>>) -> Result<Self> {
+        let client = if !config.list && !config.no_send_logs {
             Some(Arc::new(BraintrustClient::builder().build().await?))
         } else {
             None
@@ -311,29 +328,26 @@ impl BtEvalRunner {
             opts.project_name = Some(project.to_string());
         }
 
-        let client = self
-            .client
-            .clone()
-            .ok_or_else(|| BraintrustError::Background("BtEvalRunner has no client".to_string()))?;
+        let request = if self.config.no_send_logs {
+            EvalRequest::local(opts)
+        } else {
+            let client = self.client.as_ref().ok_or_else(|| {
+                BraintrustError::Background("BtEvalRunner has no client".to_string())
+            })?;
+            EvalRequest::recorded(opts, client.as_ref().clone())
+        };
+        // Protocol output replaces terminal progress even when quiet is false.
+        let request = if let Some(sse) = &self.sse {
+            request.with_reporter(SseReporter { sse: sse.clone() })
+        } else if self.config.jsonl {
+            request.with_reporter(JsonlReporter::new(std::io::stdout()))
+        } else {
+            request
+        };
 
-        let evaluator = Evaluator::<I, O>::from_arc(client);
-
-        if let Some(sse) = &self.sse {
-            sse.send("start", &json!({ "name": name }));
-        }
-
-        match evaluator.run(opts).await {
+        match super::run(request).await {
             Ok(summary) => {
                 let failed = summary.failed_cases;
-
-                if let Some(sse) = &self.sse {
-                    let summary_value = serde_json::to_value(&summary).unwrap_or(Value::Null);
-                    sse.send("summary", &summary_value);
-                } else if self.config.jsonl {
-                    if let Ok(json) = serde_json::to_string(&summary) {
-                        println!("{}", json);
-                    }
-                }
 
                 if failed > 0 {
                     self.all_passed = false;
@@ -347,8 +361,17 @@ impl BtEvalRunner {
             }
             Err(e) => {
                 self.all_passed = false;
-                if let Some(sse) = &self.sse {
-                    sse.send("error", &json!({ "message": e.to_string() }));
+                let output_failed = e
+                    .failures
+                    .iter()
+                    .any(|failure| matches!(failure, super::EvalRunFailure::Reporting { .. }));
+                if let Some(sse) = self.sse.as_ref().filter(|_| !output_failed) {
+                    if let Err(output) = sse.send("error", &json!({ "message": e.to_string() })) {
+                        eprintln!(
+                            "Evaluator '{}' failed: {}; error output also failed: {}",
+                            name, e, output
+                        );
+                    }
                 } else {
                     eprintln!("Evaluator '{}' failed: {}", name, e);
                 }
@@ -394,13 +417,13 @@ impl BtEvalRunner {
 
 /// Serialize an [`EvalSummary`] in a way compatible with the SSE summary event.
 ///
-/// This is used internally by [`BtEvalRunner`] and is public only for advanced use cases.
-pub fn summary_to_value<I, O>(summary: &EvalSummary<I, O>) -> Value
+/// Serialization failures are returned with their cause; no null placeholder is emitted.
+pub fn summary_to_value<I, O>(summary: &EvalSummary<I, O>) -> serde_json::Result<Value>
 where
     I: Serialize,
     O: Serialize,
 {
-    serde_json::to_value(summary).unwrap_or(Value::Null)
+    serde_json::to_value(summary)
 }
 
 #[cfg(test)]
@@ -468,5 +491,122 @@ mod tests {
         };
         assert!(filter.matches("foo-eval"));
         assert!(!filter.matches("bar-eval"));
+    }
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn local_config(terminate_on_failure: bool) -> RunnerConfig {
+        RunnerConfig {
+            jsonl: true,
+            list: false,
+            terminate_on_failure,
+            filters: vec![],
+            no_send_logs: true,
+        }
+    }
+    fn local_options(fail: bool) -> EvalOpts<usize, usize> {
+        super::super::EvalOpts::builder()
+            .name("cli".into())
+            .quiet(false)
+            .source(
+                vec![super::super::Case {
+                    input: 1,
+                    ..Default::default()
+                }]
+                .into(),
+            )
+            .definition(
+                super::super::EvalDefinition::new(
+                    Box::new(super::super::SimpleFnTask::new(move |input: &usize| {
+                        if fail {
+                            anyhow::bail!("case failed")
+                        } else {
+                            Ok(*input)
+                        }
+                    })),
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .build()
+    }
+    #[tokio::test]
+    async fn sse_protocol_is_the_only_reporter_and_case_failures_update_cli_status() {
+        let output = Buffer::default();
+        let sse = Arc::new(SseWriter {
+            writer: Mutex::new(Box::new(output.clone())),
+        });
+        let mut runner = BtEvalRunner::from_config(local_config(false), Some(sse))
+            .await
+            .unwrap();
+        assert!(runner.client.is_none());
+        runner.eval("project", local_options(false)).await.unwrap();
+        runner.eval("project", local_options(true)).await.unwrap();
+        assert!(!runner.all_passed());
+        assert!(!runner.finish().await.unwrap());
+        let bytes = output.0.lock().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let events: Vec<_> = text.split("\n\n").filter(|s| !s.is_empty()).collect();
+        assert_eq!(events.len(), 4);
+        assert!(events[0].starts_with("event: start\ndata: "));
+        assert!(events[1].starts_with("event: summary\ndata: "));
+        assert!(events[2].starts_with("event: start\ndata: "));
+        let summary: Value =
+            serde_json::from_str(events[3].strip_prefix("event: summary\ndata: ").unwrap())
+                .unwrap();
+        assert_eq!(summary["failed_cases"], 1);
+    }
+    #[tokio::test]
+    async fn terminate_on_failure_returns_an_error_and_retains_failed_session_status() {
+        let sse = Arc::new(SseWriter {
+            writer: Mutex::new(Box::new(Buffer::default())),
+        });
+        let mut runner = BtEvalRunner::from_config(local_config(true), Some(sse))
+            .await
+            .unwrap();
+        assert!(runner.eval("project", local_options(true)).await.is_err());
+        assert!(!runner.all_passed());
+        assert!(!runner.finish().await.unwrap());
+    }
+    #[tokio::test]
+    async fn sse_write_failure_is_a_report_failure_without_losing_computation() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed socket",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sse = Arc::new(SseWriter {
+            writer: Mutex::new(Box::new(Broken)),
+        });
+        let result = super::super::run(
+            EvalRequest::local(local_options(false))
+                .with_reporter(SseReporter { sse: sse.clone() }),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error.failures.as_slice(),
+            [super::super::EvalRunFailure::Reporting {
+                stage: super::super::ReportStage::Started,
+                source: ReportError::Io(_),
+                ..
+            }]
+        ));
+        assert_eq!(error.partial.unwrap().successful_cases, 1);
     }
 }
