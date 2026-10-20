@@ -8,11 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 use tokio::sync::OnceCell;
 
+use crate::api::experiments::ExperimentRegisterRequest;
 use crate::error::Result;
-use crate::experiments::api::{
-    BaseExperimentFetcher, ExperimentComparisonFetcher, ExperimentRegisterRequest,
-    ExperimentRegistrar,
-};
 use crate::experiments::event_log::ExperimentLog;
 use crate::experiments::feedback::Feedback;
 use crate::experiments::metadata::{
@@ -20,8 +17,9 @@ use crate::experiments::metadata::{
 };
 use crate::experiments::span_builder::ExperimentSpanBuilder;
 use crate::experiments::summary::{ExperimentSummary, MetricSummary, ScoreSummary};
+use crate::internal::ports::{ExperimentApi, SpanSubmitter};
 use crate::internal::session::CredentialScope;
-use crate::span::{SpanBuilder, SpanHandle, SpanLog, SpanSubmitter};
+use crate::span::{SpanBuilder, SpanHandle, SpanLog};
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanPayload, SpanType};
 
 /// Metadata from experiment registration, cached after lazy initialization.
@@ -35,9 +33,9 @@ pub(crate) struct ExperimentMetadata {
 /// Handle to a Braintrust experiment.
 ///
 /// Use this to log evaluation events, create spans, log feedback, and get summaries.
-#[allow(private_bounds)]
-pub struct Experiment<S: SpanSubmitter> {
-    pub(crate) submitter: Arc<S>,
+pub struct Experiment {
+    pub(crate) api: Arc<dyn ExperimentApi>,
+    pub(crate) submitter: Arc<dyn SpanSubmitter>,
     pub(crate) scope: CredentialScope,
     pub(crate) project_name: String,
     pub(crate) experiment_name: Option<String>,
@@ -59,10 +57,11 @@ pub(crate) struct ExperimentState {
     called_start_span: AtomicBool,
 }
 
-impl<S: SpanSubmitter> Clone for Experiment<S> {
+impl Clone for Experiment {
     fn clone(&self) -> Self {
         Self {
-            submitter: Arc::clone(&self.submitter),
+            api: self.api.clone(),
+            submitter: self.submitter.clone(),
             scope: self.scope.clone(),
             project_name: self.project_name.clone(),
             experiment_name: self.experiment_name.clone(),
@@ -77,15 +76,7 @@ impl<S: SpanSubmitter> Clone for Experiment<S> {
     }
 }
 
-#[allow(private_bounds)]
-impl<
-        S: SpanSubmitter
-            + ExperimentRegistrar
-            + BaseExperimentFetcher
-            + ExperimentComparisonFetcher
-            + 'static,
-    > Experiment<S>
-{
+impl Experiment {
     /// Log an event to the experiment, creating and ending a span internally.
     ///
     /// Returns the span ID which can be used with `log_feedback()`.
@@ -142,7 +133,7 @@ impl<
     ///
     /// Use this for more control over span lifecycle. Once called,
     /// you cannot use `log()` on this experiment.
-    pub async fn start_span(&self) -> Result<ExperimentSpanBuilder<'_, S>> {
+    pub async fn start_span(&self) -> Result<ExperimentSpanBuilder> {
         let metadata = self.ensure_registered().await?;
         self.state.called_start_span.store(true, Ordering::Release);
         Ok(ExperimentSpanBuilder::new(self, metadata.clone()))
@@ -221,7 +212,7 @@ impl<
 
         // Fetch comparison data from API
         let comparison = self
-            .submitter
+            .api
             .fetch_experiment_comparison(
                 &self.scope,
                 &metadata.experiment_id,
@@ -336,7 +327,7 @@ impl<
     /// ```
     pub async fn traced<F, Fut, R>(&self, callback: F) -> Result<R>
     where
-        F: FnOnce(SpanHandle<S>) -> Fut,
+        F: FnOnce(SpanHandle) -> Fut,
         Fut: std::future::Future<Output = R>,
     {
         let span = self.start_span().await?.name("root").build();
@@ -394,7 +385,7 @@ impl<
     /// Returns `None` if no base experiment has been configured or detected.
     pub async fn fetch_base_experiment(&self) -> Result<Option<BaseExperimentInfo>> {
         let metadata = self.ensure_registered().await?;
-        self.submitter
+        self.api
             .fetch_base_experiment(&self.scope, &metadata.experiment_id)
             .await
     }
@@ -427,10 +418,7 @@ impl<
                     update: self.update,
                     repo_info: self.repo_info.clone(),
                 };
-                let response = self
-                    .submitter
-                    .register_experiment(&self.scope, request)
-                    .await?;
+                let response = self.api.register_experiment(&self.scope, request).await?;
                 Ok(ExperimentMetadata {
                     project_id: response.project.id,
                     experiment_id: response.experiment.id,
@@ -441,11 +429,7 @@ impl<
     }
 
     /// Create an internal span for log() calls.
-    fn create_internal_span(
-        &self,
-        metadata: &ExperimentMetadata,
-        start_time: f64,
-    ) -> SpanHandle<S> {
+    fn create_internal_span(&self, metadata: &ExperimentMetadata, start_time: f64) -> SpanHandle {
         let parent_info = ParentSpanInfo::Experiment {
             object_id: metadata.experiment_id.clone(),
         };

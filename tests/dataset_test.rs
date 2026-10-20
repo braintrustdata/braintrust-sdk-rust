@@ -298,7 +298,7 @@ async fn isolated_client(server: &MockServer) -> BraintrustClient {
 fn registration() -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"project","name":"project"},"dataset":{"id":"dataset","name":"dataset"}}))
 }
-fn dataset(client: &BraintrustClient) -> braintrust_sdk_rust::Dataset<BraintrustClient> {
+fn dataset(client: &BraintrustClient) -> braintrust_sdk_rust::Dataset {
     client
         .dataset_builder_with_credentials("token", "tenant")
         .project_name("project")
@@ -381,12 +381,12 @@ async fn pagination_failure_is_an_error_and_retry_preserves_the_failed_cursor() 
     let client = isolated_client(&server).await;
     let dataset = dataset(&client);
     let mut iterator = dataset.fetch(Some(1)).await.unwrap();
-    assert_eq!(iterator.next().await.unwrap().unwrap().id, "first");
+    assert_eq!(iterator.next().await.unwrap().unwrap().id(), "first");
     assert!(matches!(
         iterator.next().await,
         Err(braintrust_sdk_rust::BraintrustError::Api { status: 503, .. })
     ));
-    assert_eq!(iterator.next().await.unwrap().unwrap().id, "second");
+    assert_eq!(iterator.next().await.unwrap().unwrap().id(), "second");
     assert!(iterator.next().await.unwrap().is_none());
     let requests = server.received_requests().await.unwrap();
     let cursors: Vec<_> = requests
@@ -469,7 +469,7 @@ async fn empty_pages_with_a_continuation_do_not_end_iteration() {
         .await
         .unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].id, "record");
+    assert_eq!(records[0].id(), "record");
     for request in server
         .received_requests()
         .await
@@ -516,11 +516,11 @@ async fn a_non_advancing_cursor_is_reported_and_does_not_poison_a_later_retry() 
     let client = isolated_client(&server).await;
     let dataset = dataset(&client);
     let mut iterator = dataset.fetch(None).await.unwrap();
-    assert_eq!(iterator.next().await.unwrap().unwrap().id, "first");
+    assert_eq!(iterator.next().await.unwrap().unwrap().id(), "first");
     assert!(
         matches!(iterator.next().await, Err(braintrust_sdk_rust::BraintrustError::Background(message)) if message.contains("did not advance"))
     );
-    assert_eq!(iterator.next().await.unwrap().unwrap().id, "second");
+    assert_eq!(iterator.next().await.unwrap().unwrap().id(), "second");
     assert!(iterator.next().await.unwrap().is_none());
 }
 
@@ -705,7 +705,7 @@ async fn resource_operations_preserve_configured_planes_prefixes_and_transport_h
     let dataset = dataset(&client);
     dataset.insert(record(1)).await.unwrap();
     assert_eq!(
-        dataset.fetch(None).await.unwrap().collect().await.unwrap()[0].id,
+        dataset.fetch(None).await.unwrap().collect().await.unwrap()[0].id(),
         "record"
     );
     dataset.summarize().await.unwrap();
@@ -720,13 +720,7 @@ async fn resource_operations_preserve_configured_planes_prefixes_and_transport_h
 }
 
 fn request_header<'a>(request: &'a wiremock::Request, name: &str) -> &'a str {
-    request
-        .headers
-        .iter()
-        .find(|(key, _)| key.as_str() == name)
-        .unwrap()
-        .1[0]
-        .as_str()
+    request.headers.get(name).unwrap().to_str().unwrap()
 }
 
 #[tokio::test]
@@ -749,9 +743,9 @@ async fn dataset_flush_observes_the_shared_trace_queue_and_retires_its_failure()
         .build();
     let write = span.log(SpanLog::builder().input(json!(1)).build().unwrap());
     let flush = dataset.flush();
-    assert!(matches!(flush.await, Err(FlushError::Delivery(failure)) if failure.failed == 1));
+    assert!(matches!(flush.await, Err(FlushError::Delivery(failure)) if failure.failed() == 1));
     assert!(write.await.is_err());
-    assert_eq!(dataset.flush().await.unwrap().delivered, 0);
+    assert_eq!(dataset.flush().await.unwrap().delivered(), 0);
     let requests = server.received_requests().await.unwrap();
     assert!(requests
         .iter()

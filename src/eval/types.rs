@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::{Arc, Mutex};
 
-use crate::{BraintrustClient, SpanHandle};
+use crate::SpanHandle;
 
 /// A single test case for evaluation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,7 +203,7 @@ impl<I, O> EvalSummary<I, O> {
 /// Hooks provided to tasks for instrumentation and metadata
 pub struct TaskHooks<'a, I, O> {
     /// Span handle for logging
-    pub span: &'a SpanHandle<BraintrustClient>,
+    pub span: &'a SpanHandle,
     /// Expected output (if available)
     pub expected: Option<&'a O>,
     /// Mutable metadata map for the task to add context
@@ -215,7 +215,7 @@ pub struct TaskHooks<'a, I, O> {
 }
 
 impl<'a, I, O> TaskHooks<'a, I, O> {
-    pub fn new(span: &'a SpanHandle<BraintrustClient>, expected: Option<&'a O>) -> Self {
+    pub fn new(span: &'a SpanHandle, expected: Option<&'a O>) -> Self {
         Self {
             span,
             expected,

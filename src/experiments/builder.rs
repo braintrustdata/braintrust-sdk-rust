@@ -7,8 +7,8 @@ use serde_json::{Map, Value};
 
 use crate::experiments::experiment::{Experiment, ExperimentState};
 use crate::experiments::metadata::RepoInfo;
+use crate::internal::ports::{ExperimentApi, SpanSubmitter};
 use crate::internal::session::CredentialScope;
-use crate::span::SpanSubmitter;
 
 /// Error type for ExperimentBuilder validation.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,9 +34,9 @@ impl std::error::Error for ExperimentBuilderError {}
 ///
 /// Registration is shared by clones of the resulting handle. Explicit
 /// credentials belong to the resource and do not mutate the client's session.
-#[allow(private_bounds)]
-pub struct ExperimentBuilder<S: SpanSubmitter> {
-    submitter: Arc<S>,
+pub struct ExperimentBuilder {
+    api: Arc<dyn ExperimentApi>,
+    submitter: Arc<dyn SpanSubmitter>,
     scope: CredentialScope,
     project_name: Option<String>,
     experiment_name: Option<String>,
@@ -48,10 +48,11 @@ pub struct ExperimentBuilder<S: SpanSubmitter> {
     repo_info: Option<RepoInfo>,
 }
 
-impl<S: SpanSubmitter> Clone for ExperimentBuilder<S> {
+impl Clone for ExperimentBuilder {
     fn clone(&self) -> Self {
         Self {
-            submitter: Arc::clone(&self.submitter),
+            api: self.api.clone(),
+            submitter: self.submitter.clone(),
             scope: self.scope.clone(),
             project_name: self.project_name.clone(),
             experiment_name: self.experiment_name.clone(),
@@ -65,11 +66,15 @@ impl<S: SpanSubmitter> Clone for ExperimentBuilder<S> {
     }
 }
 
-#[allow(private_bounds)]
-impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
+impl ExperimentBuilder {
     /// Create a new ExperimentBuilder (internal use).
-    pub(crate) fn new(submitter: Arc<S>, scope: CredentialScope) -> Self {
+    pub(crate) fn new(
+        api: Arc<dyn ExperimentApi>,
+        submitter: Arc<dyn SpanSubmitter>,
+        scope: CredentialScope,
+    ) -> Self {
         Self {
+            api,
             submitter,
             scope,
             project_name: None,
@@ -152,12 +157,13 @@ impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
     }
 
     /// Build the experiment. Returns an error if required fields are missing.
-    pub fn build(self) -> std::result::Result<Experiment<S>, ExperimentBuilderError> {
+    pub fn build(self) -> std::result::Result<Experiment, ExperimentBuilderError> {
         let project_name = self
             .project_name
             .ok_or(ExperimentBuilderError::MissingProjectName)?;
 
         Ok(Experiment {
+            api: self.api,
             submitter: self.submitter,
             scope: self.scope,
             project_name,

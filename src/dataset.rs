@@ -27,7 +27,6 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::OnceCell;
@@ -35,8 +34,8 @@ use uuid::Uuid;
 
 use crate::api::datasets::{DatasetFields, DatasetWrite};
 use crate::error::Result;
+use crate::internal::ports::{DatasetApi, DeliveryControl};
 use crate::internal::session::CredentialScope;
-use crate::span::SpanSubmitter;
 
 // ============================================================================
 // Dataset Insert Types
@@ -237,53 +236,8 @@ pub(crate) struct DatasetMetadata {
     pub project_id: String,
 }
 
-pub(crate) use crate::api::btql::{BTQLQuery, BTQLQueryInner, BTQLResponse};
-pub(crate) use crate::api::datasets::{
-    DatasetRegisterRequest, DatasetRegisterResponse, DatasetSummaryResponse,
-};
-
-// ============================================================================
-// Traits for API Operations
-// ============================================================================
-
-/// Trait for registering datasets.
-#[async_trait]
-pub(crate) trait DatasetRegistrar: Send + Sync {
-    /// Register a dataset with the API.
-    async fn register_dataset(
-        &self,
-        scope: &CredentialScope,
-        request: DatasetRegisterRequest,
-    ) -> Result<DatasetRegisterResponse>;
-}
-
-/// Trait for fetching dataset records via BTQL.
-#[async_trait]
-pub(crate) trait DatasetFetcher: Send + Sync {
-    /// Fetch dataset records via BTQL query.
-    async fn fetch_dataset_records(
-        &self,
-        scope: &CredentialScope,
-        query: BTQLQuery,
-    ) -> Result<BTQLResponse>;
-}
-
-/// Trait for fetching dataset summary.
-#[async_trait]
-pub(crate) trait DatasetSummarizer: Send + Sync {
-    /// Fetch dataset summary.
-    async fn fetch_dataset_summary(
-        &self,
-        scope: &CredentialScope,
-        dataset_id: &str,
-    ) -> Result<DatasetSummaryResponse>;
-}
-
-/// Direct dataset mutation port; writes are acknowledged by the endpoint.
-#[async_trait]
-pub(crate) trait DatasetWriter: Send + Sync {
-    async fn write_dataset_record(&self, scope: &CredentialScope, row: DatasetWrite) -> Result<()>;
-}
+use crate::api::btql::{BTQLQuery, BTQLQueryInner};
+use crate::api::datasets::DatasetRegisterRequest;
 
 // ============================================================================
 // DatasetBuilder Error Types
@@ -319,11 +273,9 @@ impl std::error::Error for DatasetBuilderError {}
 // ============================================================================
 
 /// Builder for creating datasets with lazy registration.
-#[allow(private_bounds)]
-pub struct DatasetBuilder<
-    S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter,
-> {
-    submitter: Arc<S>,
+pub struct DatasetBuilder {
+    api: Arc<dyn DatasetApi>,
+    lifecycle: Arc<dyn DeliveryControl>,
     scope: CredentialScope,
     project_name: Option<String>,
     dataset_name: Option<String>,
@@ -331,12 +283,11 @@ pub struct DatasetBuilder<
     metadata: Option<Map<String, Value>>,
 }
 
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter> Clone
-    for DatasetBuilder<S>
-{
+impl Clone for DatasetBuilder {
     fn clone(&self) -> Self {
         Self {
-            submitter: Arc::clone(&self.submitter),
+            api: self.api.clone(),
+            lifecycle: self.lifecycle.clone(),
             scope: self.scope.clone(),
             project_name: self.project_name.clone(),
             dataset_name: self.dataset_name.clone(),
@@ -346,20 +297,16 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     }
 }
 
-#[allow(private_bounds)]
-impl<
-        S: SpanSubmitter
-            + DatasetRegistrar
-            + DatasetFetcher
-            + DatasetSummarizer
-            + DatasetWriter
-            + 'static,
-    > DatasetBuilder<S>
-{
+impl DatasetBuilder {
     /// Create a new DatasetBuilder (internal use).
-    pub(crate) fn new(submitter: Arc<S>, scope: CredentialScope) -> Self {
+    pub(crate) fn new(
+        api: Arc<dyn DatasetApi>,
+        lifecycle: Arc<dyn DeliveryControl>,
+        scope: CredentialScope,
+    ) -> Self {
         Self {
-            submitter,
+            api,
+            lifecycle,
             scope,
             project_name: None,
             dataset_name: None,
@@ -401,7 +348,7 @@ impl<
     }
 
     /// Build the dataset (lazy registration).
-    pub fn build(self) -> std::result::Result<Dataset<S>, DatasetBuilderError> {
+    pub fn build(self) -> std::result::Result<Dataset, DatasetBuilderError> {
         let project_name = self
             .project_name
             .ok_or(DatasetBuilderError::MissingProjectName)?;
@@ -410,7 +357,8 @@ impl<
             .ok_or(DatasetBuilderError::MissingDatasetName)?;
 
         Ok(Dataset {
-            submitter: self.submitter,
+            api: self.api,
+            lifecycle: self.lifecycle,
             scope: self.scope,
             project_name,
             dataset_name,
@@ -428,11 +376,9 @@ impl<
 /// A dataset for storing test/evaluation data.
 ///
 /// Datasets are lazily registered with the API on first use.
-#[allow(private_bounds)]
-pub struct Dataset<
-    S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter,
-> {
-    submitter: Arc<S>,
+pub struct Dataset {
+    api: Arc<dyn DatasetApi>,
+    lifecycle: Arc<dyn DeliveryControl>,
     scope: CredentialScope,
     project_name: String,
     dataset_name: String,
@@ -441,12 +387,11 @@ pub struct Dataset<
     lazy_metadata: Arc<OnceCell<DatasetMetadata>>,
 }
 
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter> Clone
-    for Dataset<S>
-{
+impl Clone for Dataset {
     fn clone(&self) -> Self {
         Self {
-            submitter: self.submitter.clone(),
+            api: self.api.clone(),
+            lifecycle: self.lifecycle.clone(),
             scope: self.scope.clone(),
             project_name: self.project_name.clone(),
             dataset_name: self.dataset_name.clone(),
@@ -457,9 +402,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     }
 }
 
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + DatasetWriter>
-    fmt::Debug for Dataset<S>
-{
+impl fmt::Debug for Dataset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Dataset")
             .field("project_name", &self.project_name)
@@ -469,16 +412,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     }
 }
 
-#[allow(private_bounds)]
-impl<
-        S: SpanSubmitter
-            + DatasetRegistrar
-            + DatasetFetcher
-            + DatasetSummarizer
-            + DatasetWriter
-            + 'static,
-    > Dataset<S>
-{
+impl Dataset {
     /// Ensure the dataset is registered, returning cached metadata.
     async fn ensure_registered(&self) -> Result<&DatasetMetadata> {
         self.lazy_metadata
@@ -490,10 +424,7 @@ impl<
                     description: self.description.clone(),
                     metadata: self.metadata.clone(),
                 };
-                let response = self
-                    .submitter
-                    .register_dataset(&self.scope, request)
-                    .await?;
+                let response = self.api.register_dataset(&self.scope, request).await?;
                 Ok(DatasetMetadata {
                     dataset_id: response.dataset.id,
                     project_id: response.project.id,
@@ -521,7 +452,7 @@ impl<
     pub async fn insert(&self, record: DatasetInsert) -> Result<String> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         let id = Uuid::new_v4().to_string();
-        self.submitter
+        self.api
             .write_dataset_record(
                 &self.scope,
                 DatasetWrite::Insert {
@@ -537,7 +468,7 @@ impl<
     /// Merge supplied fields into a record, returning after API acknowledgement.
     pub async fn update(&self, id: &str, record: DatasetInsert) -> Result<()> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
-        self.submitter
+        self.api
             .write_dataset_record(
                 &self.scope,
                 DatasetWrite::Update {
@@ -552,7 +483,7 @@ impl<
     /// Delete a record, returning after API acknowledgement.
     pub async fn delete(&self, id: &str) -> Result<()> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
-        self.submitter
+        self.api
             .write_dataset_record(
                 &self.scope,
                 DatasetWrite::Delete {
@@ -566,10 +497,10 @@ impl<
     /// Fetch records with pagination.
     ///
     /// Returns an iterator that fetches records in batches.
-    pub async fn fetch(&self, batch_size: Option<usize>) -> Result<DatasetIterator<S>> {
+    pub async fn fetch(&self, batch_size: Option<usize>) -> Result<DatasetIterator> {
         let metadata = self.ensure_registered().await?;
         Ok(DatasetIterator::new(
-            Arc::clone(&self.submitter),
+            self.api.clone(),
             self.scope.clone(),
             metadata.dataset_id.clone(),
             batch_size.unwrap_or(1000).max(1),
@@ -582,7 +513,7 @@ impl<
 
         // Fetch summary from API
         let response = self
-            .submitter
+            .api
             .fetch_dataset_summary(&self.scope, &metadata.dataset_id)
             .await?;
 
@@ -600,7 +531,7 @@ impl<
     /// Flush the client's shared trace queue. Dataset mutations are already
     /// acknowledged when their individual operation completes.
     pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
-        self.submitter.flush()
+        self.lifecycle.flush()
     }
 }
 
@@ -611,18 +542,17 @@ impl<
 /// Iterator for fetching dataset records with pagination.
 ///
 /// ```no_run
-/// use braintrust_sdk_rust::{BraintrustClient, BraintrustError, Dataset};
-/// # async fn read(dataset: &Dataset<BraintrustClient>) -> Result<(), BraintrustError> {
+/// use braintrust_sdk_rust::{BraintrustError, Dataset};
+/// # async fn read(dataset: &Dataset) -> Result<(), BraintrustError> {
 /// let mut records = dataset.fetch(Some(100)).await?;
 /// while let Some(record) = records.next().await? {
-///     println!("{}", record.id);
+///     println!("{}", record.id());
 /// }
 /// # Ok(())
 /// # }
 /// ```
-#[allow(private_bounds)]
-pub struct DatasetIterator<S: DatasetFetcher> {
-    fetcher: Arc<S>,
+pub struct DatasetIterator {
+    fetcher: Arc<dyn DatasetApi>,
     scope: CredentialScope,
     dataset_id: String,
     batch_size: usize,
@@ -631,9 +561,13 @@ pub struct DatasetIterator<S: DatasetFetcher> {
     done: bool,
 }
 
-#[allow(private_bounds)]
-impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
-    fn new(fetcher: Arc<S>, scope: CredentialScope, dataset_id: String, batch_size: usize) -> Self {
+impl DatasetIterator {
+    fn new(
+        fetcher: Arc<dyn DatasetApi>,
+        scope: CredentialScope,
+        dataset_id: String,
+        batch_size: usize,
+    ) -> Self {
         Self {
             fetcher,
             scope,

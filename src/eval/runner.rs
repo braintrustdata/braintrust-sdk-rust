@@ -200,7 +200,7 @@ where
         case: Case<I, O>,
         task: &dyn Task<I, O>,
         scorers: &[Box<dyn Scorer<I, O>>],
-        _root_span: &SpanHandle<BraintrustClient>,
+        _root_span: &SpanHandle,
         client: &BraintrustClient,
         case_num: usize,
         quiet: bool,

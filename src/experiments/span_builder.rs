@@ -3,23 +3,24 @@
 use std::sync::Arc;
 
 use crate::experiments::experiment::{Experiment, ExperimentMetadata};
-use crate::span::{SpanBuilder, SpanHandle, SpanSubmitter};
+use crate::internal::{ports::SpanSubmitter, session::CredentialScope};
+use crate::span::{SpanBuilder, SpanHandle};
 use crate::types::{ParentSpanInfo, SpanType};
 
 /// Builder for creating spans within an experiment.
-#[allow(private_bounds)]
-pub struct ExperimentSpanBuilder<'a, S: SpanSubmitter> {
-    experiment: &'a Experiment<S>,
+pub struct ExperimentSpanBuilder {
+    submitter: Arc<dyn SpanSubmitter>,
+    scope: CredentialScope,
     metadata: ExperimentMetadata,
     name: Option<String>,
     span_type: SpanType,
 }
 
-#[allow(private_bounds)]
-impl<'a, S: SpanSubmitter + 'static> ExperimentSpanBuilder<'a, S> {
-    pub(crate) fn new(experiment: &'a Experiment<S>, metadata: ExperimentMetadata) -> Self {
+impl ExperimentSpanBuilder {
+    pub(crate) fn new(experiment: &Experiment, metadata: ExperimentMetadata) -> Self {
         Self {
-            experiment,
+            submitter: experiment.submitter.clone(),
+            scope: experiment.scope.clone(),
             metadata,
             name: None,
             span_type: SpanType::Eval,
@@ -39,19 +40,16 @@ impl<'a, S: SpanSubmitter + 'static> ExperimentSpanBuilder<'a, S> {
     }
 
     /// Build the span.
-    pub fn build(self) -> SpanHandle<S> {
+    pub fn build(self) -> SpanHandle {
         let parent_info = ParentSpanInfo::Experiment {
             object_id: self.metadata.experiment_id.clone(),
         };
 
         // Note: When using ParentSpanInfo::Experiment, we don't need project_name
         // because the destination is determined by the experiment_id.
-        let builder = SpanBuilder::new(
-            Arc::clone(&self.experiment.submitter),
-            self.experiment.scope.clone(),
-        )
-        .parent_info(parent_info)
-        .span_type(self.span_type);
+        let builder = SpanBuilder::new(self.submitter, self.scope)
+            .parent_info(parent_info)
+            .span_type(self.span_type);
 
         builder.build()
     }

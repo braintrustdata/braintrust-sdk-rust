@@ -7,6 +7,7 @@ use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use crate::error::{BraintrustError, Result};
 use crate::internal::delivery::WriteService;
+use crate::internal::ports::{DeliveryControl, SpanSubmitter};
 use crate::internal::session::CredentialScope;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
@@ -689,6 +690,27 @@ impl LogQueue {
             return Err(error.clone().into());
         }
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl DeliveryControl for LogQueue {
+    fn flush(&self) -> Completion<FlushReport, FlushError> {
+        LogQueue::flush(self)
+    }
+    async fn trigger_flush(&self) -> Result<()> {
+        self.trigger_flush_command().await
+    }
+}
+#[async_trait::async_trait]
+impl SpanSubmitter for LogQueue {
+    fn submit(
+        &self,
+        scope: CredentialScope,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        LogQueue::submit(self, scope, payload, parent_info)
     }
 }
 
