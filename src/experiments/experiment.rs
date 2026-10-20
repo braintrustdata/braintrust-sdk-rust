@@ -20,6 +20,7 @@ use crate::experiments::metadata::{
 };
 use crate::experiments::span_builder::ExperimentSpanBuilder;
 use crate::experiments::summary::{ExperimentSummary, MetricSummary, ScoreSummary};
+use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle, SpanLog, SpanSubmitter};
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanPayload, SpanType};
 
@@ -37,9 +38,7 @@ pub(crate) struct ExperimentMetadata {
 #[allow(private_bounds)]
 pub struct Experiment<S: SpanSubmitter> {
     pub(crate) submitter: Arc<S>,
-    pub(crate) token: String,
-    pub(crate) org_id: String,
-    pub(crate) org_name: Option<String>,
+    pub(crate) scope: CredentialScope,
     pub(crate) project_name: String,
     pub(crate) experiment_name: Option<String>,
     pub(crate) description: Option<String>,
@@ -64,9 +63,7 @@ impl<S: SpanSubmitter> Clone for Experiment<S> {
     fn clone(&self) -> Self {
         Self {
             submitter: Arc::clone(&self.submitter),
-            token: self.token.clone(),
-            org_id: self.org_id.clone(),
-            org_name: self.org_name.clone(),
+            scope: self.scope.clone(),
             project_name: self.project_name.clone(),
             experiment_name: self.experiment_name.clone(),
             description: self.description.clone(),
@@ -183,8 +180,8 @@ impl<
             span_id: id.to_string(), // Use same ID for merge
             is_merge: true,
             span_components: None,
-            org_id: self.org_id.clone(),
-            org_name: self.org_name.clone(),
+            org_id: self.scope.org_id().to_owned(),
+            org_name: self.scope.org_name().map(str::to_owned),
             project_name: None,
             input: None,
             output: None,
@@ -204,7 +201,7 @@ impl<
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info))
+            .submit(self.scope.clone(), payload, Some(parent_info))
             .await?;
         Ok(())
     }
@@ -226,7 +223,7 @@ impl<
         let comparison = self
             .submitter
             .fetch_experiment_comparison(
-                &self.token,
+                &self.scope,
                 &metadata.experiment_id,
                 base_exp_id.as_deref(),
             )
@@ -361,8 +358,8 @@ impl<
             span_id: id.to_string(),
             is_merge: true,
             span_components: None,
-            org_id: self.org_id.clone(),
-            org_name: self.org_name.clone(),
+            org_id: self.scope.org_id().to_owned(),
+            org_name: self.scope.org_name().map(str::to_owned),
             project_name: None,
             input: event.input,
             output: event.output,
@@ -387,7 +384,7 @@ impl<
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info))
+            .submit(self.scope.clone(), payload, Some(parent_info))
             .await?;
         Ok(())
     }
@@ -398,7 +395,7 @@ impl<
     pub async fn fetch_base_experiment(&self) -> Result<Option<BaseExperimentInfo>> {
         let metadata = self.ensure_registered().await?;
         self.submitter
-            .fetch_base_experiment(&self.token, &metadata.experiment_id)
+            .fetch_base_experiment(&self.scope, &metadata.experiment_id)
             .await
     }
 
@@ -421,7 +418,7 @@ impl<
             .get_or_try_init(|| async {
                 let request = ExperimentRegisterRequest {
                     project_name: self.project_name.clone(),
-                    org_id: self.org_id.clone(),
+                    org_id: self.scope.org_id().to_owned(),
                     experiment_name: self.experiment_name.clone(),
                     description: self.description.clone(),
                     base_experiment: self.base_experiment.clone(),
@@ -432,7 +429,7 @@ impl<
                 };
                 let response = self
                     .submitter
-                    .register_experiment(&self.token, request)
+                    .register_experiment(&self.scope, request)
                     .await?;
                 Ok(ExperimentMetadata {
                     project_id: response.project.id,
@@ -455,18 +452,10 @@ impl<
 
         // Note: When using ParentSpanInfo::Experiment, we don't need project_name
         // because the destination is determined by the experiment_id.
-        let mut builder = SpanBuilder::new(
-            Arc::clone(&self.submitter),
-            self.token.clone(),
-            self.org_id.clone(),
-        )
-        .parent_info(parent_info)
-        .span_type(SpanType::Eval)
-        .start_time(start_time);
-
-        if let Some(org_name) = &self.org_name {
-            builder = builder.org_name(org_name.clone());
-        }
+        let builder = SpanBuilder::new(Arc::clone(&self.submitter), self.scope.clone())
+            .parent_info(parent_info)
+            .span_type(SpanType::Eval)
+            .start_time(start_time);
 
         builder.build()
     }

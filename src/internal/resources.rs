@@ -1,4 +1,5 @@
 //! Resource ports adapt SDK policy to the shared one-attempt API contracts.
+use crate::internal::session::CredentialScope;
 use async_trait::async_trait;
 
 use crate::api::{
@@ -23,10 +24,10 @@ use crate::BraintrustClient;
 impl ExperimentRegistrar for BraintrustClient {
     async fn register_experiment(
         &self,
-        token: &str,
+        scope: &CredentialScope,
         request: ExperimentRegisterRequest,
     ) -> Result<ExperimentRegisterResponse> {
-        self.resource_api(token, None)?
+        self.resource_api(scope)?
             .experiments()
             .register(request)
             .await
@@ -38,11 +39,11 @@ impl ExperimentRegistrar for BraintrustClient {
 impl BaseExperimentFetcher for BraintrustClient {
     async fn fetch_base_experiment(
         &self,
-        token: &str,
+        scope: &CredentialScope,
         experiment_id: &str,
     ) -> Result<Option<BaseExperimentInfo>> {
         let response = match self
-            .resource_api(token, None)?
+            .resource_api(scope)?
             .experiments()
             .base(BaseExperimentRequest {
                 id: experiment_id.to_owned(),
@@ -64,11 +65,11 @@ impl BaseExperimentFetcher for BraintrustClient {
 impl ExperimentComparisonFetcher for BraintrustClient {
     async fn fetch_experiment_comparison(
         &self,
-        token: &str,
+        scope: &CredentialScope,
         experiment_id: &str,
         base_experiment_id: Option<&str>,
     ) -> Result<ExperimentComparisonResponse> {
-        self.resource_api(token, None)?
+        self.resource_api(scope)?
             .experiments()
             .compare(experiment_id, base_experiment_id)
             .await
@@ -80,10 +81,10 @@ impl ExperimentComparisonFetcher for BraintrustClient {
 impl DatasetRegistrar for BraintrustClient {
     async fn register_dataset(
         &self,
-        token: &str,
+        scope: &CredentialScope,
         request: DatasetRegisterRequest,
     ) -> Result<DatasetRegisterResponse> {
-        self.resource_api(token, Some(&request.org_name))?
+        self.resource_api(scope)?
             .datasets()
             .register(request)
             .await
@@ -95,11 +96,10 @@ impl DatasetRegistrar for BraintrustClient {
 impl DatasetFetcher for BraintrustClient {
     async fn fetch_dataset_records(
         &self,
-        token: &str,
-        org_name: &str,
+        scope: &CredentialScope,
         query: BTQLQuery,
     ) -> Result<BTQLResponse> {
-        self.resource_api(token, Some(org_name))?
+        self.resource_api(scope)?
             .btql()
             .query_dataset_records(query)
             .await
@@ -111,11 +111,10 @@ impl DatasetFetcher for BraintrustClient {
 impl DatasetSummarizer for BraintrustClient {
     async fn fetch_dataset_summary(
         &self,
-        token: &str,
-        org_name: &str,
+        scope: &CredentialScope,
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse> {
-        self.resource_api(token, Some(org_name))?
+        self.resource_api(scope)?
             .datasets()
             .summarize(dataset_id)
             .await
@@ -125,13 +124,8 @@ impl DatasetSummarizer for BraintrustClient {
 
 #[async_trait]
 impl DatasetWriter for BraintrustClient {
-    async fn write_dataset_record(
-        &self,
-        token: &str,
-        org_name: &str,
-        row: DatasetWrite,
-    ) -> Result<()> {
-        self.resource_api(token, Some(org_name))?
+    async fn write_dataset_record(&self, scope: &CredentialScope, row: DatasetWrite) -> Result<()> {
+        self.resource_api(scope)?
             .datasets()
             .write(&[row])
             .await

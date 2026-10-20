@@ -4,4 +4,5 @@ pub(crate) mod ingest;
 pub(crate) mod object_store;
 pub(crate) mod resources;
 pub(crate) mod retry;
+pub(crate) mod session;
 pub(crate) mod upload;
