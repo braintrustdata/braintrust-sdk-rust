@@ -1,13 +1,11 @@
 //! Builder for creating experiments.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, OnceCell};
 
-use crate::experiments::experiment::Experiment;
+use crate::experiments::experiment::{Experiment, ExperimentState};
 use crate::experiments::metadata::RepoInfo;
 use crate::span::SpanSubmitter;
 
@@ -33,9 +31,8 @@ impl std::error::Error for ExperimentBuilderError {}
 
 /// Builder for creating experiments with lazy registration.
 ///
-/// Note: This builder uses `experiment_builder_with_credentials` naming to indicate
-/// that API credentials must be passed explicitly. This will be deprecated in favor
-/// of `experiment_builder()` once the login-flow branch lands.
+/// Registration is shared by clones of the resulting handle. Explicit
+/// credentials belong to the resource and do not mutate the client's session.
 #[allow(private_bounds)]
 pub struct ExperimentBuilder<S: SpanSubmitter> {
     submitter: Arc<S>,
@@ -182,10 +179,7 @@ impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
             public: self.public,
             update: self.update,
             repo_info: self.repo_info,
-            lazy_metadata: OnceCell::new(),
-            last_start_time: AtomicU64::new(0),
-            called_start_span: AtomicBool::new(false),
-            pending_flushes: Arc::new(Mutex::new(Vec::new())),
+            state: Arc::new(ExperimentState::default()),
         })
     }
 }

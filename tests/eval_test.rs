@@ -1,3 +1,4 @@
+use braintrust_sdk_rust::eval::Dataset;
 use braintrust_sdk_rust::eval::*;
 use braintrust_sdk_rust::*;
 

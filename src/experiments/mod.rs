@@ -12,7 +12,7 @@
 //!     .experiment_builder_with_credentials(&api_key, &org_id)
 //!     .project_name("my-project")
 //!     .experiment_name("gpt-4-baseline")
-//!     .build();
+//!     .build()?;
 //!
 //! let id = experiment.log(
 //!     ExperimentLog::builder()
@@ -20,8 +20,8 @@
 //!         .output(json!({"answer": "4"}))
 //!         .expected(json!({"answer": "4"}))
 //!         .score("accuracy", 1.0)
-//!         .build()?
-//! ).await;
+//!         .build()
+//! ).await?;
 //!
 //! experiment.flush().await?;
 //! ```

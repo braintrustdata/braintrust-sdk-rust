@@ -398,7 +398,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             dataset_name,
             description: self.description,
             metadata: self.metadata,
-            lazy_metadata: OnceCell::new(),
+            lazy_metadata: Arc::new(OnceCell::new()),
             pending_rows: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -420,8 +420,26 @@ pub struct Dataset<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + Datase
     dataset_name: String,
     description: Option<String>,
     metadata: Option<Map<String, Value>>,
-    lazy_metadata: OnceCell<std::result::Result<DatasetMetadata, String>>,
+    lazy_metadata: Arc<OnceCell<DatasetMetadata>>,
     pending_rows: Arc<Mutex<Vec<PendingDatasetRow>>>,
+}
+
+impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> Clone
+    for Dataset<S>
+{
+    fn clone(&self) -> Self {
+        Self {
+            submitter: self.submitter.clone(),
+            token: self.token.clone(),
+            org_name: self.org_name.clone(),
+            project_name: self.project_name.clone(),
+            dataset_name: self.dataset_name.clone(),
+            description: self.description.clone(),
+            metadata: self.metadata.clone(),
+            lazy_metadata: self.lazy_metadata.clone(),
+            pending_rows: self.pending_rows.clone(),
+        }
+    }
 }
 
 impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> fmt::Debug
@@ -454,7 +472,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     /// Ensure the dataset is registered, returning cached metadata.
     async fn ensure_registered(&self) -> Result<&DatasetMetadata> {
         self.lazy_metadata
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 let request = DatasetRegisterRequest {
                     project_name: self.project_name.clone(),
                     org_name: self.org_name.clone(),
@@ -462,18 +480,16 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                     description: self.description.clone(),
                     metadata: self.metadata.clone(),
                 };
-
-                match self.submitter.register_dataset(&self.token, request).await {
-                    Ok(response) => Ok(DatasetMetadata {
-                        dataset_id: response.dataset.id,
-                        project_id: response.project.id,
-                    }),
-                    Err(e) => Err(e.to_string()),
-                }
+                let response = self
+                    .submitter
+                    .register_dataset(&self.token, request)
+                    .await?;
+                Ok(DatasetMetadata {
+                    dataset_id: response.dataset.id,
+                    project_id: response.project.id,
+                })
             })
             .await
-            .as_ref()
-            .map_err(|e| crate::error::BraintrustError::InvalidConfig(e.clone()))
     }
 
     /// Get the dataset ID (triggers registration if needed).
@@ -552,7 +568,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             Arc::clone(&self.submitter),
             self.token.clone(),
             metadata.dataset_id.clone(),
-            batch_size.unwrap_or(1000),
+            batch_size.unwrap_or(1000).max(1),
         ))
     }
 
@@ -652,6 +668,17 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 // ============================================================================
 
 /// Iterator for fetching dataset records with pagination.
+///
+/// ```no_run
+/// use braintrust_sdk_rust::{BraintrustClient, BraintrustError, Dataset};
+/// # async fn read(dataset: &Dataset<BraintrustClient>) -> Result<(), BraintrustError> {
+/// let mut records = dataset.fetch(Some(100)).await?;
+/// while let Some(record) = records.next().await? {
+///     println!("{}", record.id);
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[allow(private_bounds)]
 pub struct DatasetIterator<S: DatasetFetcher> {
     fetcher: Arc<S>,
@@ -678,53 +705,46 @@ impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
     }
 
     /// Get the next record, fetching a new batch if needed.
-    pub async fn next(&mut self) -> Option<DatasetRecord> {
-        // Return buffered record if available
-        if let Some(record) = self.buffer.pop_front() {
-            return Some(record);
-        }
-
-        // If we've exhausted all pages, return None
-        if self.done {
-            return None;
-        }
-
-        // Fetch next batch
-        let query = BTQLQuery {
-            query: BTQLQueryInner {
-                from: format!("dataset('{}')", self.dataset_id),
-                limit: Some(self.batch_size),
-                cursor: self.cursor.take(),
-            },
-        };
-
-        match self.fetcher.fetch_dataset_records(&self.token, query).await {
-            Ok(response) => {
-                // Update cursor for next page
-                self.cursor = response.cursor;
-                self.done = self.cursor.is_none();
-
-                // Buffer the records
-                self.buffer.extend(response.data);
-
-                // Return first record
-                self.buffer.pop_front()
+    pub async fn next(&mut self) -> Result<Option<DatasetRecord>> {
+        loop {
+            if let Some(record) = self.buffer.pop_front() {
+                return Ok(Some(record));
             }
-            Err(e) => {
-                tracing::warn!("failed to fetch dataset records: {}", e);
-                self.done = true;
-                None
+            if self.done {
+                return Ok(None);
             }
+            let previous_cursor = self.cursor.clone();
+            let query = BTQLQuery {
+                query: BTQLQueryInner {
+                    from: format!("dataset('{}')", self.dataset_id),
+                    limit: Some(self.batch_size),
+                    cursor: previous_cursor.clone(),
+                },
+            };
+            // A failed request leaves the cursor and EOF state untouched.
+            let response = self
+                .fetcher
+                .fetch_dataset_records(&self.token, query)
+                .await?;
+            if response.cursor.is_some() && response.cursor == previous_cursor {
+                return Err(crate::BraintrustError::Background(
+                    "dataset pagination cursor did not advance".into(),
+                ));
+            }
+            self.cursor = response.cursor;
+            self.done = self.cursor.is_none();
+            self.buffer.extend(response.data);
+            // Empty pages with a continuation are not end-of-data.
         }
     }
 
-    /// Collect all remaining records into a Vec.
-    pub async fn collect(mut self) -> Vec<DatasetRecord> {
+    /// Collect all remaining records, preserving any page failure as an error.
+    pub async fn collect(mut self) -> Result<Vec<DatasetRecord>> {
         let mut records = Vec::new();
-        while let Some(record) = self.next().await {
+        while let Some(record) = self.next().await? {
             records.push(record);
         }
-        records
+        Ok(records)
     }
 }
 
