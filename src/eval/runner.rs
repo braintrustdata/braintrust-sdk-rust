@@ -1,6 +1,6 @@
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{de::DeserializeOwned, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -8,10 +8,11 @@ use tokio::sync::Semaphore;
 use crate::{BraintrustClient, Result, SpanHandle};
 
 use super::{
+    case_runner::CaseRunner,
     dataset::Dataset,
     scorer::Scorer,
     task::Task,
-    types::{Case, EvalResult, EvalSummary, TaskHooks},
+    types::{Case, EvalResult, EvalSummary},
 };
 
 /// Options for running an evaluation
@@ -167,7 +168,7 @@ where
 
         // Compute statistics
         let score_stats = EvalSummary::<I, O>::compute_stats(&results);
-        let successful = results.iter().filter(|r| r.error.is_none()).count();
+        let successful = results.iter().filter(|r| r.errors.is_empty()).count();
         let failed = results.len() - successful;
 
         if !opts.quiet {
@@ -232,117 +233,59 @@ where
             log_builder = log_builder.tags(tags.clone());
         }
 
-        case_span.log(log_builder.build().unwrap());
+        let initial_write = case_span.log(log_builder.build().unwrap());
+        let mut result = CaseRunner::run(case, task, scorers, Some(&case_span)).await;
+        result.span_id = case_span.export()?.span_id;
 
-        // Create hooks for the task
-        let hooks = TaskHooks::new(&case_span, case.expected.as_ref());
-
-        // Run the task
-        let output = match task.run(&case.input, &hooks).await {
-            Ok(output) => output,
-            Err(e) => {
-                // Log error to span
-                case_span.log(
-                    crate::SpanLog::builder()
-                        .error(json!(e.to_string()))
-                        .build()
-                        .unwrap(),
-                );
-                case_span.end().await?;
-
-                return Ok(EvalResult {
-                    input: case.input.clone(),
-                    output: None, // Task failed, no output
-                    expected: case.expected.clone(),
-                    scores: vec![],
-                    metadata: case.metadata.clone(),
-                    tags: case.tags.clone(),
-                    error: Some(e.to_string()),
-                    span_id: None,
-                });
+        // Recording adapts the completed outcome; computation never waits on
+        // HTTP or emits console messages. Observe every accepted write before
+        // reporting recording success, including writes that failed earlier.
+        let mut final_log = crate::SpanLog::builder().scores(
+            result
+                .scores
+                .iter()
+                .map(|score| (score.name.clone(), score.score))
+                .collect(),
+        );
+        if let Some(output) = &result.output {
+            if let Ok(output) = serde_json::to_value(output) {
+                final_log = final_log.output(output);
             }
-        };
-
-        // Set output in span
-        if let Ok(output_json) = serde_json::to_value(&output) {
-            case_span.log(
-                crate::SpanLog::builder()
-                    .output(output_json)
-                    .build()
-                    .unwrap(),
-            );
         }
-
-        // Run scorers in parallel
-        let mut scorer_futures = FuturesUnordered::new();
-        for scorer in scorers {
-            let scorer_args = super::types::ScorerArgs {
-                input: &case.input,
-                output: &output,
-                expected: case.expected.as_ref(),
-                metadata: case.metadata.as_ref(),
-            };
-
-            let future = async move {
-                match scorer.score(scorer_args).await {
-                    Ok(scores) => scores,
-                    Err(e) => {
-                        eprintln!("Scorer {} failed: {}", scorer.name(), e);
-                        vec![]
-                    }
-                }
-            };
-
-            scorer_futures.push(future);
+        if let Some(metadata) = &result.metadata {
+            final_log = final_log.metadata(metadata.clone());
         }
-
-        // Collect all scores
-        let mut all_scores = vec![];
-        while let Some(scores) = scorer_futures.next().await {
-            all_scores.extend(scores);
-        }
-
-        // Add scores to span
-        let mut scores_map = std::collections::HashMap::new();
-        for score in &all_scores {
-            scores_map.insert(score.name.clone(), score.score);
-        }
-
-        // Get final metadata and tags from hooks
-        let final_metadata = hooks.get_metadata().or(case.metadata.clone());
-        let final_tags = hooks.get_tags().or(case.tags.clone());
-
-        // Log scores and final metadata/tags
-        let mut final_log = crate::SpanLog::builder().scores(scores_map);
-        if let Some(meta) = &final_metadata {
-            final_log = final_log.metadata(meta.clone());
-        }
-        if let Some(tags) = &final_tags {
+        if let Some(tags) = &result.tags {
             final_log = final_log.tags(tags.clone());
         }
-        case_span.log(final_log.build().unwrap());
-
-        case_span.end().await?;
+        if !result.errors.is_empty() {
+            final_log = final_log.error(
+                serde_json::to_value(&result.errors)
+                    .map_err(|error| crate::BraintrustError::Background(error.to_string()))?,
+            );
+        }
+        let final_write = case_span.log(final_log.build().unwrap());
+        let end = case_span.end();
+        let initial_result = initial_write.await;
+        let final_result = final_write.await;
+        let end_result = end.await;
+        initial_result?;
+        final_result?;
+        end_result?;
 
         if !quiet {
-            let score_str = all_scores
+            let score_str = result
+                .scores
                 .iter()
                 .map(|s| format!("{}={:.3}", s.name, s.score))
                 .collect::<Vec<_>>()
                 .join(", ");
             println!("Case {}: {}", case_num, score_str);
+            for error in &result.errors {
+                eprintln!("Case {}: {}", case_num, error);
+            }
         }
-
-        Ok(EvalResult {
-            input: case.input.clone(),
-            output: Some(output.clone()),
-            expected: case.expected.clone(),
-            scores: all_scores,
-            metadata: final_metadata,
-            tags: final_tags,
-            error: None,
-            span_id: None,
-        })
+        Ok(result)
     }
 }
 

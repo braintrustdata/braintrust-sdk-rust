@@ -2,14 +2,14 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::marker::PhantomData;
 
-use crate::Result;
+use anyhow::Result;
 
 use super::types::TaskHooks;
 
 /// Task trait for transforming inputs to outputs
 ///
 /// Tasks can be async functions, closures, or custom structs implementing this trait.
-/// Only async version is needed - SyncEvaluator uses this via Runtime::block_on().
+/// Callback errors use `anyhow::Result` to preserve application error causes.
 #[async_trait]
 pub trait Task<I, O>: Send + Sync {
     /// Execute the task on the given input

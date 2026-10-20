@@ -48,11 +48,15 @@
 //! ```
 
 mod bt_runner;
+mod case_runner;
 mod dataset;
+mod error;
 mod runner;
 mod scorer;
 mod task;
 mod types;
+
+pub use error::CaseError;
 
 // Re-export public API
 pub use bt_runner::{summary_to_value, BtEvalRunner};
