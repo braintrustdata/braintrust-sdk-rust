@@ -11,10 +11,12 @@ use crate::dataset::DatasetBuilder;
 use crate::error::{BraintrustError, Result};
 use crate::experiments::ExperimentBuilder;
 use crate::http::{build_http_client, CaBundleConfig};
+use crate::internal::ports::SpanSubmitter;
+use crate::internal::resources::ResourceTransport;
 use crate::internal::retry::{exponential, RetryExecutor};
 use crate::internal::session::CredentialScope;
 use crate::log_queue::{LogQueue, LogQueueConfig};
-use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
+use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
 
@@ -460,8 +462,12 @@ impl std::fmt::Debug for ClientInner {
 }
 
 impl BraintrustClient {
-    pub(crate) fn resource_api(&self, scope: &CredentialScope) -> Result<crate::api::Client> {
-        scope.api(&self.inner.http_client)
+    fn resource_transport(&self) -> Arc<ResourceTransport> {
+        Arc::new(ResourceTransport::new(self.inner.http_client.clone()))
+    }
+
+    fn span_submitter(&self) -> Arc<dyn SpanSubmitter> {
+        Arc::new(self.inner.queue.clone())
     }
 
     fn explicit_scope(
@@ -540,14 +546,14 @@ impl BraintrustClient {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder<Self>> {
+    pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder> {
         if self.inner.login_skipped {
             return Err(BraintrustError::InvalidConfig(
                 "span_builder() requires login; use span_builder_with_credentials() when skip_login is enabled".into(),
             ));
         }
         let state = self.wait_for_login_state().await?;
-        let mut builder = crate::span::SpanBuilder::new(Arc::new(self.clone()), state.scope()?);
+        let mut builder = crate::span::SpanBuilder::new(self.span_submitter(), state.scope()?);
         if let Some(environment) = &self.inner.environment {
             builder = builder.span_origin_environment(environment.clone());
         }
@@ -563,12 +569,16 @@ impl BraintrustClient {
     /// Create a dataset builder using the logged-in state.
     ///
     /// This waits for login to complete if it hasn't already.
-    pub async fn dataset_builder(&self) -> Result<DatasetBuilder<Self>> {
+    pub async fn dataset_builder(&self) -> Result<DatasetBuilder> {
         if self.inner.login_skipped {
             return Err(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
         }
         let state = self.wait_for_login_state().await?;
-        Ok(DatasetBuilder::new(Arc::new(self.clone()), state.scope()?))
+        Ok(DatasetBuilder::new(
+            self.resource_transport(),
+            Arc::new(self.inner.queue.clone()),
+            state.scope()?,
+        ))
     }
 
     /// Create a dataset builder with immutable explicit credentials, without
@@ -577,9 +587,10 @@ impl BraintrustClient {
         &self,
         token: impl Into<String>,
         org_name: impl Into<String>,
-    ) -> DatasetBuilder<Self> {
+    ) -> DatasetBuilder {
         DatasetBuilder::new(
-            Arc::new(self.clone()),
+            self.resource_transport(),
+            Arc::new(self.inner.queue.clone()),
             self.explicit_scope(token.into(), String::new(), Some(org_name.into())),
         )
     }
@@ -594,11 +605,11 @@ impl BraintrustClient {
         &self,
         token: impl Into<String>,
         org_id: impl Into<String>,
-    ) -> crate::span::SpanBuilder<Self> {
+    ) -> crate::span::SpanBuilder {
         let token = token.into();
         let org_id = org_id.into();
 
-        let submitter = Arc::new(self.clone());
+        let submitter = self.span_submitter();
         let mut builder =
             crate::span::SpanBuilder::new(submitter, self.explicit_scope(token, org_id, None));
         if let Some(environment) = &self.inner.environment {
@@ -905,12 +916,16 @@ impl BraintrustClient {
         &self,
         token: impl Into<String>,
         org_id: impl Into<String>,
-    ) -> ExperimentBuilder<Self> {
+    ) -> ExperimentBuilder {
         let token = token.into();
         let org_id = org_id.into();
 
-        let submitter = Arc::new(self.clone());
-        ExperimentBuilder::new(submitter, self.explicit_scope(token, org_id, None))
+        let submitter = self.span_submitter();
+        ExperimentBuilder::new(
+            self.resource_transport(),
+            submitter,
+            self.explicit_scope(token, org_id, None),
+        )
     }
 
     /// Submit immediately; the token observes admission and full batch delivery.
@@ -942,26 +957,6 @@ impl BraintrustClient {
     /// Does not wait for completion - useful for streaming writes.
     pub async fn trigger_flush(&self) -> Result<()> {
         self.inner.queue.trigger_flush_command().await
-    }
-}
-
-#[async_trait::async_trait]
-impl SpanSubmitter for BraintrustClient {
-    fn submit(
-        &self,
-        scope: CredentialScope,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
-        self.submit_payload(scope, payload, parent_info)
-    }
-
-    fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
-        BraintrustClient::flush(self)
-    }
-
-    async fn trigger_flush(&self) -> Result<()> {
-        BraintrustClient::trigger_flush(self).await
     }
 }
 
@@ -1149,6 +1144,32 @@ mod tests {
             .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
             .collect();
         ResponseTemplate::new(200).set_body_json(serde_json::json!({ "org_info": org_info }))
+    }
+
+    #[tokio::test]
+    async fn resource_ports_do_not_retain_the_whole_client_or_login_state() {
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .build()
+            .await
+            .unwrap();
+        let weak = Arc::downgrade(&client.inner);
+        let span = client.span_builder_with_credentials("token", "org");
+        let dataset = client
+            .dataset_builder_with_credentials("token", "tenant")
+            .project_name("p")
+            .dataset_name("d");
+        let experiment = client
+            .experiment_builder_with_credentials("token", "org")
+            .project_name("p");
+        drop(client);
+        assert!(
+            weak.upgrade().is_none(),
+            "resource dependencies must not retain ClientInner"
+        );
+        let _span = span.build();
+        let _dataset = dataset.build().unwrap();
+        let _experiment = experiment.build().unwrap();
     }
 
     #[tokio::test]

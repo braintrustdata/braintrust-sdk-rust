@@ -5,11 +5,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::internal::ports::SpanSubmitter;
 use crate::internal::session::CredentialScope;
 use crate::span_components::SpanComponents;
 use crate::types::{
@@ -248,27 +250,8 @@ impl SpanLogBuilder {
     }
 }
 
-#[async_trait]
-pub(crate) trait SpanSubmitter: Send + Sync {
-    /// Attempt admission immediately and observe the logical batch outcome.
-    fn submit(
-        &self,
-        scope: CredentialScope,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
-
-    /// Flush all queued span data through to the server.
-    fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError>;
-
-    /// Trigger a non-blocking background flush.
-    async fn trigger_flush(&self) -> Result<()>;
-}
-
-#[derive(Debug)]
-#[allow(private_bounds)]
-pub struct SpanBuilder<S: SpanSubmitter> {
-    submitter: Arc<S>,
+pub struct SpanBuilder {
+    submitter: Arc<dyn SpanSubmitter>,
     scope: CredentialScope,
     project_name: Option<String>,
     parent_info: Option<ParentSpanInfo>,
@@ -282,7 +265,17 @@ pub struct SpanBuilder<S: SpanSubmitter> {
     span_attributes_extra: HashMap<String, Value>,
 }
 
-impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
+impl fmt::Debug for SpanBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpanBuilder")
+            .field("scope", &self.scope)
+            .field("project_name", &self.project_name)
+            .field("parent_info", &self.parent_info)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for SpanBuilder {
     fn clone(&self) -> Self {
         Self {
             submitter: Arc::clone(&self.submitter),
@@ -369,9 +362,8 @@ impl SpanOrigin {
     }
 }
 
-#[allow(private_bounds)]
-impl<S: SpanSubmitter> SpanBuilder<S> {
-    pub(crate) fn new(submitter: Arc<S>, scope: CredentialScope) -> Self {
+impl SpanBuilder {
+    pub(crate) fn new(submitter: Arc<dyn SpanSubmitter>, scope: CredentialScope) -> Self {
         Self {
             submitter,
             scope,
@@ -479,7 +471,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
         self
     }
 
-    pub fn build(self) -> SpanHandle<S> {
+    pub fn build(self) -> SpanHandle {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         // Generate both IDs ONCE at span creation - reused for all flushes.
@@ -535,9 +527,8 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
     }
 }
 
-#[allow(private_bounds)]
-pub struct SpanHandle<S: SpanSubmitter> {
-    submitter: Arc<S>,
+pub struct SpanHandle {
+    submitter: Arc<dyn SpanSubmitter>,
     scope: CredentialScope,
     parent_info: Option<ParentSpanInfo>,
     /// Stable identifier set at creation, accessible without locking.
@@ -545,7 +536,7 @@ pub struct SpanHandle<S: SpanSubmitter> {
     inner: Arc<Mutex<SpanData>>,
 }
 
-impl<S: SpanSubmitter> Clone for SpanHandle<S> {
+impl Clone for SpanHandle {
     fn clone(&self) -> Self {
         Self {
             submitter: Arc::clone(&self.submitter),
@@ -557,8 +548,7 @@ impl<S: SpanSubmitter> Clone for SpanHandle<S> {
     }
 }
 
-#[allow(private_bounds)]
-impl<S: SpanSubmitter> SpanHandle<S> {
+impl SpanHandle {
     /// Return the stable row ID for this span, usable with `log_feedback()` and `update_span()`.
     pub fn row_id(&self) -> &str {
         &self.row_id
@@ -1085,6 +1075,9 @@ mod tests {
                 }
                 completion
             }
+        }
+        #[async_trait]
+        impl crate::internal::ports::DeliveryControl for Submitter {
             fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
                 let (sender, completion) = crate::Completion::pair();
                 let _ = sender.send(Ok(crate::FlushReport::default()));

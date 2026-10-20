@@ -26,9 +26,6 @@
 //! experiment.flush().await?;
 //! ```
 
-// Internal API module (not public)
-pub(crate) mod api;
-
 // Public modules
 mod builder;
 mod event_log;
