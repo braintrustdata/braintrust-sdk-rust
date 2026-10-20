@@ -112,20 +112,7 @@ impl Experiment {
                 .start_time(start_time)
                 .into_payload(event);
             let row_id = payload.row_id.clone();
-            let experiment = self.clone();
-            let delivery = self.submitter.submit_resolving_parent(
-                self.scope.clone(),
-                payload,
-                Box::pin(async move {
-                    let metadata = experiment.register_metadata().await?;
-                    Ok(ParentSpanInfo::Experiment {
-                        object_id: metadata.experiment_id.clone(),
-                    })
-                }),
-            );
-            if let Err(error) = &*delivery {
-                return Err(error.clone().into());
-            }
+            let delivery = self.admit_payload(payload)?;
             let state = self.state.clone();
             Ok(async move {
                 delivery.await?;
@@ -150,9 +137,13 @@ impl Experiment {
     /// Log feedback on an existing span/record.
     ///
     /// Use this to add scores, comments, or other feedback after the initial log.
-    pub async fn log_feedback(&self, id: &str, feedback: Feedback) -> Result<()> {
-        let metadata = self.ensure_registered().await?;
-
+    /// Admission happens before registration. Dropping the token does not cancel
+    /// the patch; awaiting reports full batch delivery.
+    pub fn log_feedback(
+        &self,
+        id: &str,
+        feedback: Feedback,
+    ) -> crate::Completion<(), crate::BraintrustError> {
         // Create a merge payload for the existing span
         let mut scores = HashMap::new();
         if let Some(fb_scores) = feedback.scores {
@@ -195,14 +186,7 @@ impl Experiment {
             extra: HashMap::new(),
         };
 
-        let parent_info = ParentSpanInfo::Experiment {
-            object_id: metadata.experiment_id.clone(),
-        };
-
-        self.submitter
-            .submit(self.scope.clone(), payload, Some(parent_info), None)
-            .await?;
-        Ok(())
+        self.submit_patch(payload)
     }
 
     /// Get a summary of the experiment's performance.
@@ -352,9 +336,13 @@ impl Experiment {
     ///
     /// This is useful for adding information to a span after it has been created,
     /// such as adding scores or metadata computed later.
-    pub async fn update_span(&self, id: &str, event: SpanLog) -> Result<()> {
-        let metadata = self.ensure_registered().await?;
-
+    /// Admission happens before registration. Dropping the token does not cancel
+    /// the patch; awaiting reports full batch delivery.
+    pub fn update_span(
+        &self,
+        id: &str,
+        event: SpanLog,
+    ) -> crate::Completion<(), crate::BraintrustError> {
         let payload = SpanPayload {
             row_id: id.to_string(),
             span_id: id.to_string(),
@@ -381,14 +369,51 @@ impl Experiment {
             extra: HashMap::new(),
         };
 
-        let parent_info = ParentSpanInfo::Experiment {
-            object_id: metadata.experiment_id.clone(),
-        };
+        self.submit_patch(payload)
+    }
 
-        self.submitter
-            .submit(self.scope.clone(), payload, Some(parent_info), None)
-            .await?;
-        Ok(())
+    fn submit_patch(&self, payload: SpanPayload) -> crate::Completion<(), crate::BraintrustError> {
+        self.execution.response_try(|| {
+            let delivery = self.admit_payload(payload)?;
+            Ok(async move {
+                delivery.await?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Called only after reserving response capacity, so a rejected response
+    /// never leaves a write behind. The write owns all remaining preparation.
+    fn admit_payload(
+        &self,
+        payload: SpanPayload,
+    ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
+        let delivery = if let Some(metadata) = self.state.metadata.get() {
+            self.submitter.submit(
+                self.scope.clone(),
+                payload,
+                Some(ParentSpanInfo::Experiment {
+                    object_id: metadata.experiment_id.clone(),
+                }),
+                None,
+            )
+        } else {
+            let experiment = self.clone();
+            self.submitter.submit_resolving_parent(
+                self.scope.clone(),
+                payload,
+                Box::pin(async move {
+                    let metadata = experiment.register_metadata().await?;
+                    Ok(ParentSpanInfo::Experiment {
+                        object_id: metadata.experiment_id.clone(),
+                    })
+                }),
+            )
+        };
+        if let Err(error) = &*delivery {
+            return Err(error.clone().into());
+        }
+        Ok(delivery)
     }
 
     /// Fetch the base experiment used for comparison.
