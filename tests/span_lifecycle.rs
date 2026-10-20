@@ -820,3 +820,44 @@ fn usage_extractors_return_expected_metrics() {
     assert_eq!(anthropic_usage.completion_tokens(), Some(7));
     assert_eq!(anthropic_usage.total_tokens(), Some(10));
 }
+
+#[tokio::test]
+async fn finished_span_ignores_later_mutations() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build()
+        .await
+        .unwrap();
+    let span = client
+        .span_builder_with_credentials("token", "org")
+        .parent_info(ParentSpanInfo::ProjectLogs {
+            object_id: "project".into(),
+        })
+        .build();
+    span.end_with_time(123.0);
+    let covering = client.flush();
+    span.clone()
+        .log(SpanLog::builder().input(json!("too late")).build().unwrap())
+        .await
+        .unwrap();
+    covering.await.unwrap();
+    client.flush().await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let uploads: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path() == "/logs3")
+        .collect();
+    assert_eq!(uploads.len(), 1);
+    let body: Value = serde_json::from_slice(&uploads[0].body).unwrap();
+    assert!(body["rows"][0].get("input").is_none());
+    assert_eq!(body["rows"][0]["metrics"]["end"], 123.0);
+}

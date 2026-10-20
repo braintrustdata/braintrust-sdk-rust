@@ -7,3 +7,4 @@ pub(crate) mod resources;
 pub(crate) mod retry;
 pub(crate) mod session;
 pub(crate) mod upload;
+pub(crate) mod write_outcome;

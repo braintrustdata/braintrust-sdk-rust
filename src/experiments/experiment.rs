@@ -192,7 +192,7 @@ impl Experiment {
         };
 
         self.submitter
-            .submit(self.scope.clone(), payload, Some(parent_info))
+            .submit(self.scope.clone(), payload, Some(parent_info), None)
             .await?;
         Ok(())
     }
@@ -314,7 +314,7 @@ impl Experiment {
     /// Execute a callback within a traced span.
     ///
     /// Finalizes the span and flushes active work when the callback completes.
-    /// Setup and final-flush errors are returned. Individual writes expose their
+    /// Setup, final-write, and final-flush errors are returned. Individual writes expose their
     /// delivery results through the completion tokens returned inside the callback.
     ///
     /// # Example
@@ -332,8 +332,12 @@ impl Experiment {
     {
         let span = self.start_span().await?.name("root").build();
         let result = callback(span.clone()).await;
-        span.end();
-        span.flush().await?;
+        let end = span.end();
+        let flush = span.flush();
+        let ended = end.await;
+        let flushed = flush.await;
+        ended?;
+        flushed?;
         Ok(result)
     }
 
@@ -375,7 +379,7 @@ impl Experiment {
         };
 
         self.submitter
-            .submit(self.scope.clone(), payload, Some(parent_info))
+            .submit(self.scope.clone(), payload, Some(parent_info), None)
             .await?;
         Ok(())
     }

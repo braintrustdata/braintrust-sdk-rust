@@ -47,10 +47,13 @@ impl ExperimentSpanBuilder {
 
         // Note: When using ParentSpanInfo::Experiment, we don't need project_name
         // because the destination is determined by the experiment_id.
-        let builder = SpanBuilder::new(self.submitter, self.scope)
+        let mut builder = SpanBuilder::new(self.submitter, self.scope)
             .parent_info(parent_info)
             .span_type(self.span_type);
 
+        if let Some(name) = self.name {
+            builder = builder.name(name);
+        }
         builder.build()
     }
 }
