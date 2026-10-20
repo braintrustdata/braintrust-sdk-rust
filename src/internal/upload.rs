@@ -81,7 +81,7 @@ pub(crate) struct UploadResult {
 }
 
 pub(crate) struct UploadCoordinator {
-    logs: api::logs3::Logs3,
+    logs: api::Transport,
     objects: ObjectStoreTransport,
     policy: UploadPolicy,
 }
@@ -93,9 +93,8 @@ impl UploadCoordinator {
         org_name: Option<&str>,
         policy: UploadPolicy,
     ) -> Result<Self> {
-        let logs = api::Client::for_scope(http.clone(), api_url, api_url, token, org_name)
-            .map_err(BraintrustError::from)?
-            .logs3();
+        let logs = api::Transport::for_scope(http.clone(), api_url, api_url, token, org_name)
+            .map_err(BraintrustError::from)?;
         Ok(Self {
             logs,
             objects: ObjectStoreTransport { http },
@@ -108,7 +107,7 @@ impl UploadCoordinator {
         fallback: usize,
         override_bytes: Option<usize>,
     ) -> Capabilities {
-        let server_limit = match self.logs.version().await {
+        let server_limit = match self.logs.logs3_version().await {
             Ok(version) => version.logs3_payload_max_bytes.filter(|limit| *limit > 0),
             Err(error) => {
                 warn!(%error, "failed to fetch ingestion capabilities");
@@ -150,7 +149,7 @@ impl UploadCoordinator {
                     match budget
                         .run(|| async {
                             self.logs
-                                .post_raw(batch.data.to_vec())
+                                .logs3_post_raw(batch.data.to_vec())
                                 .await
                                 .map_err(BraintrustError::from)
                         })
@@ -181,7 +180,7 @@ impl UploadCoordinator {
         let grant = budget
             .run(|| async {
                 self.logs
-                    .request_overflow_upload(Logs3OverflowUploadRequest {
+                    .logs3_request_overflow_upload(Logs3OverflowUploadRequest {
                         content_type: "application/json".into(),
                         size_bytes: batch.data.len(),
                         rows: batch.overflow_rows.clone(),
@@ -196,7 +195,7 @@ impl UploadCoordinator {
         budget
             .run(|| async {
                 self.logs
-                    .commit_overflow(Logs3OverflowRequest {
+                    .logs3_commit_overflow(Logs3OverflowRequest {
                         rows: Logs3OverflowReference {
                             reference_type: "logs3_overflow",
                             key: grant.key.clone(),

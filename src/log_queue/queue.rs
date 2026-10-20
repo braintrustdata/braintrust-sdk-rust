@@ -453,8 +453,7 @@ impl LogQueueCore {
         }
         let response = scope
             .api(&self.client)?
-            .projects()
-            .register(ProjectRegisterRequest {
+            .register_project(ProjectRegisterRequest {
                 project_name: project_name.to_owned(),
                 org_id: (!scope.org_id().is_empty()).then(|| scope.org_id().to_owned()),
                 org_name: scope.org_name().map(str::to_owned),
