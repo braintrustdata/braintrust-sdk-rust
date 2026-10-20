@@ -17,6 +17,7 @@ use crate::experiments::metadata::{
 };
 use crate::experiments::span_builder::ExperimentSpanBuilder;
 use crate::experiments::summary::{ExperimentSummary, MetricSummary, ScoreSummary};
+use crate::internal::execution::ExecutionBinding;
 use crate::internal::ports::{ExperimentApi, SpanSubmitter};
 use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle, SpanLog};
@@ -35,6 +36,7 @@ pub(crate) struct ExperimentMetadata {
 /// Use this to log evaluation events, create spans, log feedback, and get summaries.
 pub struct Experiment {
     pub(crate) api: Arc<dyn ExperimentApi>,
+    pub(crate) execution: ExecutionBinding,
     pub(crate) submitter: Arc<dyn SpanSubmitter>,
     pub(crate) scope: CredentialScope,
     pub(crate) project_name: String,
@@ -61,6 +63,7 @@ impl Clone for Experiment {
     fn clone(&self) -> Self {
         Self {
             api: self.api.clone(),
+            execution: self.execution.clone(),
             submitter: self.submitter.clone(),
             scope: self.scope.clone(),
             project_name: self.project_name.clone(),
@@ -83,50 +86,55 @@ impl Experiment {
     ///
     /// Returns an error if registration/delivery fails, or if start_span() has
     /// already selected the span-recording interface for this experiment.
-    pub async fn log(&self, event: ExperimentLog) -> Result<String> {
-        if self.state.called_start_span.load(Ordering::Acquire) {
-            return Err(crate::BraintrustError::InvalidConfig(
-                "cannot use log() after start_span(); use the span to log events".into(),
-            ));
-        }
-
-        // Get or create experiment registration
-        let metadata = self.ensure_registered().await?;
-
-        // Create a span for this log event
-        let start_time = f64::from_bits(self.state.last_start_time.load(Ordering::Acquire));
-        let start_time = if start_time == 0.0 {
-            SystemTime::now()
+    /// Admission happens immediately, before registration. Dropping the token
+    /// does not cancel the write; awaiting includes full batch delivery.
+    pub fn log(&self, event: ExperimentLog) -> crate::Completion<String, crate::BraintrustError> {
+        self.execution.response_try(|| {
+            if self.state.called_start_span.load(Ordering::Acquire) {
+                return Err(crate::BraintrustError::InvalidConfig(
+                    "cannot use log() after start_span(); use the span to log events".into(),
+                ));
+            }
+            let start_time = f64::from_bits(self.state.last_start_time.load(Ordering::Acquire));
+            let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0)
-        } else {
-            start_time
-        };
-
-        let span = self.create_internal_span(metadata, start_time);
-
-        // Get the row_id before logging - it's stable from span creation
-        let row_id = span.row_id().to_string();
-
-        let end_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs_f64())
-            .unwrap_or(0.0);
-        let mut span_log = event.into_span_log();
-        span_log
-            .metrics
-            .get_or_insert_with(HashMap::new)
-            .entry("end".into())
-            .or_insert(end_time);
-        // A single complete event snapshot owns the delivery obligation.
-        span.log(span_log).await?;
-
-        self.state
-            .last_start_time
-            .store(end_time.to_bits(), Ordering::Release);
-
-        Ok(row_id)
+                .map(|duration| duration.as_secs_f64())
+                .unwrap_or(0.0);
+            let start_time = if start_time == 0.0 { now } else { start_time };
+            let mut event = event.into_span_log();
+            event
+                .metrics
+                .get_or_insert_with(HashMap::new)
+                .entry("end".into())
+                .or_insert(now);
+            let payload = SpanBuilder::new(self.submitter.clone(), self.scope.clone())
+                .span_type(SpanType::Eval)
+                .start_time(start_time)
+                .into_payload(event);
+            let row_id = payload.row_id.clone();
+            let experiment = self.clone();
+            let delivery = self.submitter.submit_resolving_parent(
+                self.scope.clone(),
+                payload,
+                Box::pin(async move {
+                    let metadata = experiment.register_metadata().await?;
+                    Ok(ParentSpanInfo::Experiment {
+                        object_id: metadata.experiment_id.clone(),
+                    })
+                }),
+            );
+            if let Err(error) = &*delivery {
+                return Err(error.clone().into());
+            }
+            let state = self.state.clone();
+            Ok(async move {
+                delivery.await?;
+                state
+                    .last_start_time
+                    .store(now.to_bits(), Ordering::Release);
+                Ok(row_id)
+            })
+        })
     }
 
     /// Start a new root span for this experiment.
@@ -278,10 +286,9 @@ impl Experiment {
         Ok(summary)
     }
 
-    /// Flush all pending experiment data to Braintrust.
-    pub async fn flush(&self) -> Result<()> {
-        self.submitter.flush().await?;
-        Ok(())
+    /// Capture pending writes through this call, including unresolved registration.
+    pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+        self.submitter.flush()
     }
 
     /// Get the experiment ID (after registration).
@@ -407,7 +414,18 @@ impl Experiment {
     }
 
     /// Ensure the experiment is registered, returning cached metadata.
-    pub(crate) async fn ensure_registered(&self) -> Result<&ExperimentMetadata> {
+    pub(crate) async fn ensure_registered(&self) -> Result<ExperimentMetadata> {
+        if let Some(metadata) = self.state.metadata.get() {
+            return Ok(metadata.clone());
+        }
+        let experiment = self.clone();
+        self.execution
+            .response(async move { experiment.register_metadata().await.cloned() })
+            .await
+    }
+
+    /// Polled only on the selected context, by preparation or a bound operation.
+    async fn register_metadata(&self) -> Result<&ExperimentMetadata> {
         self.state
             .metadata
             .get_or_try_init(|| async {
@@ -430,21 +448,5 @@ impl Experiment {
                 })
             })
             .await
-    }
-
-    /// Create an internal span for log() calls.
-    fn create_internal_span(&self, metadata: &ExperimentMetadata, start_time: f64) -> SpanHandle {
-        let parent_info = ParentSpanInfo::Experiment {
-            object_id: metadata.experiment_id.clone(),
-        };
-
-        // Note: When using ParentSpanInfo::Experiment, we don't need project_name
-        // because the destination is determined by the experiment_id.
-        let builder = SpanBuilder::new(Arc::clone(&self.submitter), self.scope.clone())
-            .parent_info(parent_info)
-            .span_type(SpanType::Eval)
-            .start_time(start_time);
-
-        builder.build()
     }
 }

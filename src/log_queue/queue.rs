@@ -16,7 +16,7 @@ use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, Spa
 use crate::{
     Completion, DeliveryReceipt, FlushError, FlushReport, ShutdownError, ShutdownReport, WriteError,
 };
-use futures::future::join_all;
+use futures::future::{join_all, BoxFuture};
 use indexmap::IndexMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -43,7 +43,11 @@ fn cache_insert<K: Eq + std::hash::Hash, V>(cache: &mut IndexMap<K, V>, key: K, 
 struct SubmitCommand {
     scope: CredentialScope,
     payload: SpanPayload,
-    parent_info: Option<ParentSpanInfo>,
+    parent_info: ParentResolution,
+}
+enum ParentResolution {
+    Ready(Option<ParentSpanInfo>),
+    Deferred(BoxFuture<'static, Result<ParentSpanInfo>>),
 }
 
 /// Preparation and protocol orchestration, independent of admission/lifecycle.
@@ -113,7 +117,15 @@ impl LogQueueCore {
                 payload,
                 parent_info,
             } = cmd;
-            match self.prepare_row(&scope, payload, parent_info).await {
+            let prepared = async {
+                let parent = match parent_info {
+                    ParentResolution::Ready(parent) => parent,
+                    ParentResolution::Deferred(resolve) => Some(resolve.await?),
+                };
+                self.prepare_row(&scope, payload, parent).await
+            }
+            .await;
+            match prepared {
                 Ok(row) => {
                     groups.entry(scope).or_default().push(row);
                 }
@@ -506,6 +518,11 @@ impl LogQueueCore {
                 parent_info,
             } = cmd;
 
+            let ParentResolution::Ready(parent_info) = parent_info else {
+                // Rejection must not trigger registration just for a debug dump.
+                warn!(row_id = %payload.row_id, "cannot dump rejected row with unresolved destination");
+                return;
+            };
             let span_components = payload.span_components.clone();
 
             let span_id = payload.span_id.clone();
@@ -658,11 +675,21 @@ impl LogQueue {
         parent_info: Option<ParentSpanInfo>,
         outcome: Option<WriteOutcome>,
     ) -> Completion<DeliveryReceipt, WriteError> {
-        let command = SubmitCommand {
-            scope,
-            payload,
-            parent_info,
-        };
+        self.submit_command(
+            SubmitCommand {
+                scope,
+                payload,
+                parent_info: ParentResolution::Ready(parent_info),
+            },
+            outcome,
+        )
+    }
+
+    fn submit_command(
+        &self,
+        command: SubmitCommand,
+        outcome: Option<WriteOutcome>,
+    ) -> Completion<DeliveryReceipt, WriteError> {
         let mut state = self.state();
         if matches!(*state, QueueState::Dormant) {
             let processor = self.core.clone();
@@ -730,11 +757,17 @@ impl LogQueue {
         completion
     }
     pub fn cancel(&self, error: crate::ExecutionError) {
-        let mut state = self.state();
-        if let QueueState::Running(writes) = &*state {
+        let writes = {
+            let mut state = self.state();
+            if let QueueState::Running(writes) = &*state {
+                Some(writes.clone())
+            } else {
+                *state = QueueState::Closed;
+                None
+            }
+        };
+        if let Some(writes) = writes {
             writes.cancel(error);
-        } else {
-            *state = QueueState::Closed;
         }
     }
 
@@ -769,6 +802,22 @@ impl DeliveryControl for LogQueue {
 }
 #[async_trait::async_trait]
 impl SpanSubmitter for LogQueue {
+    fn submit_resolving_parent(
+        &self,
+        scope: CredentialScope,
+        payload: SpanPayload,
+        resolve: BoxFuture<'static, Result<ParentSpanInfo>>,
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        self.submit_command(
+            SubmitCommand {
+                scope,
+                payload,
+                parent_info: ParentResolution::Deferred(resolve),
+            },
+            None,
+        )
+    }
+
     fn submit(
         &self,
         scope: CredentialScope,

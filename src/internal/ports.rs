@@ -25,6 +25,15 @@ pub(crate) trait DeliveryControl: Send + Sync {
 
 #[async_trait]
 pub(crate) trait SpanSubmitter: DeliveryControl {
+    /// Queue the write now, resolving its destination during preparation.
+    /// Rejected work must drop the resolver without polling it.
+    fn submit_resolving_parent(
+        &self,
+        scope: CredentialScope,
+        payload: SpanPayload,
+        resolve: futures::future::BoxFuture<'static, Result<ParentSpanInfo>>,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
+
     fn submit(
         &self,
         scope: CredentialScope,

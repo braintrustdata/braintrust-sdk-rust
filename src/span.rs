@@ -481,6 +481,17 @@ impl SpanBuilder {
         self
     }
 
+    /// Normalize a complete event whose destination will resolve later.
+    pub(crate) fn into_payload(self, event: SpanLog) -> SpanPayload {
+        let span = self.build();
+        let mut inner = span
+            .inner
+            .lock()
+            .expect("span mutex should not be poisoned");
+        apply_span_log_to_data(&mut inner, event);
+        current_span_payload(&mut inner)
+    }
+
     pub fn build(self) -> SpanHandle {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1093,6 +1104,14 @@ mod tests {
         }
         #[async_trait]
         impl SpanSubmitter for Submitter {
+            fn submit_resolving_parent(
+                &self,
+                _: CredentialScope,
+                _: SpanPayload,
+                _: futures::future::BoxFuture<'static, Result<ParentSpanInfo>>,
+            ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+                unreachable!("this test submitter only accepts ready span snapshots")
+            }
             fn submit(
                 &self,
                 _: CredentialScope,
@@ -1169,6 +1188,14 @@ mod tests {
         }
         #[async_trait]
         impl SpanSubmitter for Submitter {
+            fn submit_resolving_parent(
+                &self,
+                _: CredentialScope,
+                _: SpanPayload,
+                _: futures::future::BoxFuture<'static, Result<ParentSpanInfo>>,
+            ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+                unreachable!("this test submitter only accepts ready span snapshots")
+            }
             fn submit(
                 &self,
                 _: CredentialScope,
