@@ -52,6 +52,7 @@
 mod blocking;
 mod bt_runner;
 mod case_runner;
+mod cli_session;
 mod definition;
 mod error;
 mod executor;
@@ -61,9 +62,11 @@ mod run;
 mod runner;
 mod scorer;
 mod source;
+mod submission;
 mod task;
 mod types;
 
+pub use cli_session::{BtEvalError, BtFinishError};
 pub use definition::EvalDefinition;
 pub use error::{CaseError, EvalConfigError, EvalRunError, EvalRunFailure};
 

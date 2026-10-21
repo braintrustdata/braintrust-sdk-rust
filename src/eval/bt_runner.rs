@@ -13,10 +13,16 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::{BraintrustClient, BraintrustError, Result};
+use crate::{
+    internal::execution::ExecutionBinding, BraintrustClient, BraintrustError, Completion, Result,
+};
 
 use super::{
-    runner::EvalOpts, types::EvalSummary, EvalReporter, EvalRequest, JsonlReporter, ReportError,
+    cli_session::{ready, Session},
+    runner::EvalOpts,
+    submission::{self, RunReporter},
+    types::EvalSummary,
+    BtEvalError, BtFinishError, EvalReporter, JsonlReporter, ReportError,
 };
 
 /// A filter for selecting which evaluators to run, read from `BT_EVAL_FILTER_PARSED`.
@@ -208,7 +214,7 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 ///     vec![Box::new(ExactMatch::new())],
 /// )?;
 ///
-/// runner.eval(
+/// let completion = runner.eval(
 ///     "my-project",
 ///     EvalOpts::builder()
 ///         .name("my-eval".to_string())
@@ -219,7 +225,9 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 ///         }].into())
 ///         .definition(definition.clone())
 ///         .build(),
-/// ).await?;
+/// );
+/// assert!(completion.is_ok()); // accepted before awaiting
+/// completion.await?;
 ///
 /// let _passed = runner.finish().await?;
 /// Ok(())
@@ -231,8 +239,8 @@ pub struct BtEvalRunner {
     client: Option<Arc<BraintrustClient>>,
     /// Names registered in list mode, in order of registration.
     registered_names: Vec<String>,
-    /// Whether all evals that have run so far passed (no failures).
-    all_passed: bool,
+    binding: Option<ExecutionBinding>,
+    session: Session,
 }
 
 impl BtEvalRunner {
@@ -254,28 +262,41 @@ impl BtEvalRunner {
             None
         };
 
+        let binding = if let Some(client) = &client {
+            Some(client.execution_binding())
+        } else if !config.list {
+            Some(ExecutionBinding::new(None)?)
+        } else {
+            None
+        };
+        let session = Session::new(config.terminate_on_failure);
         Ok(Self {
             config,
             sse,
             client,
+            binding,
+            session,
             registered_names: Vec::new(),
-            all_passed: true,
         })
     }
 
     /// Create a new runner with an explicit client.
     ///
     /// Environment variables are still read for mode configuration (list, JSONL, SSE, etc.),
-    /// but the provided client is used instead of creating a new one.
+    /// but the provided client is used instead of creating a new one. All runs,
+    /// including local mode, inherit its fixed execution binding.
     pub fn with_client(client: Arc<BraintrustClient>) -> Self {
         let config = RunnerConfig::from_env();
         let sse = create_sse_writer();
+        let binding = Some(client.execution_binding());
+        let session = Session::new(config.terminate_on_failure);
         Self {
             config,
             sse,
             client: Some(client),
+            binding,
+            session,
             registered_names: Vec::new(),
-            all_passed: true,
         }
     }
 
@@ -289,9 +310,10 @@ impl BtEvalRunner {
         self.config.no_send_logs
     }
 
-    /// Returns `true` if all evals that have run so far passed.
+    /// Returns true if no completed evaluation or admission has failed.
+    /// Pending evaluations are included once `finish()` joins the session.
     pub fn all_passed(&self) -> bool {
-        self.all_passed
+        self.session.all_passed()
     }
 
     fn passes_filter(&self, name: &str) -> bool {
@@ -301,117 +323,163 @@ impl BtEvalRunner {
         self.config.filters.iter().any(|f| f.matches(name))
     }
 
-    /// Register and/or run an evaluator.
+    /// Submit a CLI evaluation now, in call order on the session/client binding.
+    /// Dropping its completion does not cancel it. Filtered/list entries complete
+    /// immediately without evaluation admission. Local runs use an owned session
+    /// runtime; an explicit client supplies its binding. Omit `opts.runtime`.
     ///
-    /// - In **list mode**: records the eval name and returns without running.
-    /// - In **normal mode**: runs the evaluator and sends results via SSE if configured.
-    ///
-    /// If the eval name does not pass the configured filters, it is skipped silently.
-    pub async fn eval<I, O>(&mut self, project: &str, mut opts: EvalOpts<I, O>) -> Result<()>
+    /// With terminate-on-failure enabled, failures are returned with their typed
+    /// results, and queued/later evaluations are skipped. Otherwise failures mark
+    /// `all_passed()` false and the session continues, as with the CLI protocol.
+    /// Admission/configuration errors are still reported synchronously on the token.
+    pub fn eval<I, O>(
+        &mut self,
+        project: &str,
+        mut opts: EvalOpts<I, O>,
+    ) -> Completion<(), BtEvalError<I, O>>
     where
         I: Serialize + Send + Sync + 'static,
         O: Serialize + Send + Sync + 'static,
     {
-        let name = opts.name.clone();
-
-        if !self.passes_filter(&name) {
-            return Ok(());
+        if !self.passes_filter(&opts.name) {
+            return ready(());
         }
-
         if self.config.list {
-            self.registered_names.push(name);
-            return Ok(());
+            self.registered_names.push(opts.name);
+            return ready(());
         }
-
-        // Set the project name from the argument if not already set in opts
+        if self.session.stopped() {
+            return Completion::rejected(BtEvalError::Stopped);
+        }
+        if opts.runtime.is_some() {
+            self.session.fail();
+            return Completion::rejected(BtEvalError::RuntimeOverride);
+        }
         if opts.project_name.is_none() {
             opts.project_name = Some(project.to_string());
         }
-
-        let request = if self.config.no_send_logs {
-            EvalRequest::local(opts)
-        } else {
-            let client = self.client.as_ref().ok_or_else(|| {
-                BraintrustError::Background("BtEvalRunner has no client".to_string())
-            })?;
-            EvalRequest::recorded(opts, client.as_ref().clone())
-        };
-        // Protocol output replaces terminal progress even when quiet is false.
-        let request = if let Some(sse) = &self.sse {
-            request.with_reporter(SseReporter { sse: sse.clone() })
+        let name = opts.name.clone();
+        let reporter: RunReporter<I, O> = if let Some(sse) = &self.sse {
+            Box::new(SseReporter { sse: sse.clone() })
         } else if self.config.jsonl {
-            request.with_reporter(JsonlReporter::new(std::io::stdout()))
+            Box::new(JsonlReporter::new(std::io::stdout()))
+        } else if opts.quiet {
+            Box::new(super::SilentReporter)
         } else {
-            request
+            Box::new(super::TerminalReporter::default())
         };
-
-        match super::run(request).await {
-            Ok(summary) => {
-                let failed = summary.failed_cases;
-
-                if failed > 0 {
-                    self.all_passed = false;
-                    if self.config.terminate_on_failure {
-                        return Err(BraintrustError::Background(format!(
-                            "Evaluator '{}' failed with {} error(s)",
-                            name, failed
-                        )));
-                    }
-                }
-            }
-            Err(e) => {
-                self.all_passed = false;
-                let output_failed = e
-                    .failures
-                    .iter()
-                    .any(|failure| matches!(failure, super::EvalRunFailure::Reporting { .. }));
-                if let Some(sse) = self.sse.as_ref().filter(|_| !output_failed) {
-                    if let Err(output) = sse.send("error", &json!({ "message": e.to_string() })) {
-                        eprintln!(
-                            "Evaluator '{}' failed: {}; error output also failed: {}",
-                            name, e, output
-                        );
-                    }
+        let session = self.session.clone();
+        let sse = self.sse.clone();
+        let terminate = self.config.terminate_on_failure;
+        let make = || {
+            let (previous, ticket) = session.reserve::<I, O>()?;
+            let sequence = ticket.sequence();
+            let before = async move {
+                previous.await;
+                if session.should_skip(sequence) {
+                    Err(BtEvalError::Stopped)
                 } else {
-                    eprintln!("Evaluator '{}' failed: {}", name, e);
+                    Ok(())
                 }
-                if self.config.terminate_on_failure {
-                    return Err(BraintrustError::Background(e.to_string()));
+            };
+            let outcome_session = self.session.clone();
+            let after = move |outcome: std::result::Result<
+                EvalSummary<I, O>,
+                BtEvalError<I, O>,
+            >| {
+                let failed = !matches!(&outcome, Ok(summary) if summary.failed_cases == 0);
+                let result = match outcome {
+                    Ok(summary) if summary.failed_cases > 0 && terminate => {
+                        Err(BtEvalError::CaseFailures {
+                            summary: Box::new(summary),
+                        })
+                    }
+                    Ok(_) => Ok(()),
+                    Err(BtEvalError::Stopped) => Err(BtEvalError::Stopped),
+                    Err(error) => {
+                        let output_failed = matches!(&error, BtEvalError::Run(run) if run.failures.iter().any(|failure| matches!(failure, super::EvalRunFailure::Reporting { .. })));
+                        if let Some(sse) = sse.as_ref().filter(|_| !output_failed) {
+                            if let Err(output) =
+                                sse.send("error", &json!({"message":error.to_string()}))
+                            {
+                                eprintln!(
+                                    "Evaluator '{}' failed: {}; error output also failed: {}",
+                                    name, error, output
+                                );
+                            }
+                        } else {
+                            eprintln!("Evaluator '{}' failed: {}", name, error);
+                        }
+                        if terminate {
+                            Err(error)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                };
+                if failed {
+                    outcome_session.fail_at(sequence);
                 }
-            }
+                result
+            };
+            Ok((before, after, move |published: bool| {
+                ticket.complete(!published)
+            }))
+        };
+        let token = if self.config.no_send_logs {
+            submission::local(
+                opts,
+                self.binding
+                    .as_ref()
+                    .expect("non-list session has a binding")
+                    .clone(),
+                reporter,
+                make,
+            )
+        } else if let Some(client) = &self.client {
+            submission::recorded(client.as_ref().clone(), opts, reporter, make)
+        } else {
+            Completion::rejected(BtEvalError::Run(
+                BraintrustError::Background("BtEvalRunner has no client".into()).into(),
+            ))
+        };
+        if token.is_err() {
+            self.session.fail();
         }
-
-        Ok(())
+        token
     }
 
-    /// Finish the runner session.
-    ///
-    /// In list mode, prints all registered eval names to stdout (one per line).
-    /// The SSE connection (if any) is closed when this method returns.
-    ///
-    /// Returns `true` if all evals passed, `false` if any failed.
-    pub async fn finish(self) -> Result<bool> {
+    /// Close the session and join every accepted evaluation, including discarded
+    /// observers. Output and recording finish before this completion is published.
+    /// The supplied client remains usable; this does not shut down shared clients.
+    /// Returns false if any evaluation/admission failed or lost its worker.
+    pub fn finish(self) -> Completion<bool, BtFinishError> {
         if self.config.list {
+            let mut output = std::io::stdout().lock();
             for name in &self.registered_names {
-                println!("{}", name);
+                if let Err(error) = writeln!(output, "{}", name) {
+                    return Completion::rejected(BtFinishError::Output(error.into()));
+                }
             }
+            if let Err(error) = output.flush() {
+                return Completion::rejected(BtFinishError::Output(error.into()));
+            }
+            return ready(self.session.all_passed());
         }
-        // SSE connection is closed when `self.sse` is dropped
-        Ok(self.all_passed)
-    }
-
-    /// Convenience method: run multiple evaluations whose results can be summarized.
-    ///
-    /// Returns `true` if all evals passed.
-    pub async fn run_all<F, Fut>(&mut self, evals: Vec<F>) -> Result<bool>
-    where
-        F: FnOnce(&mut Self) -> Fut,
-        Fut: std::future::Future<Output = Result<()>>,
-    {
-        for eval_fn in evals {
-            eval_fn(self).await?;
-        }
-        Ok(self.all_passed)
+        let binding = self
+            .binding
+            .as_ref()
+            .expect("non-list session has a binding")
+            .clone();
+        let (sender, completion) = Completion::pair();
+        // One consuming control operation, independent of full run capacity.
+        binding.spawn(async move {
+            self.session.tail().await;
+            let passed = self.session.all_passed();
+            drop(self); // Close the CLI socket and release ownership before publication.
+            let _ = sender.send(Ok(passed));
+        });
+        completion
     }
 }
 
@@ -427,186 +495,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use super::*;
-
-    // Serialize tests that mutate BT_EVAL_FILTER_PARSED to avoid race conditions.
-    static FILTER_ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn test_env_flag() {
-        // Not set → false
-        assert!(!env_flag("BT_TEST_NONEXISTENT_FLAG_XYZ"));
-    }
-
-    #[test]
-    fn test_parse_filters_empty() {
-        let _guard = FILTER_ENV_MUTEX.lock().unwrap();
-        // When BT_EVAL_FILTER_PARSED is not set, filters should be empty
-        std::env::remove_var("BT_EVAL_FILTER_PARSED");
-        let filters = parse_filters();
-        assert!(filters.is_empty());
-    }
-
-    #[test]
-    fn test_parse_filters_valid() {
-        let _guard = FILTER_ENV_MUTEX.lock().unwrap();
-        std::env::set_var(
-            "BT_EVAL_FILTER_PARSED",
-            r#"[{"path":["name"],"pattern":"foo.*"}]"#,
-        );
-        let filters = parse_filters();
-        assert_eq!(filters.len(), 1);
-        assert!(filters[0].matches("foobar"));
-        assert!(!filters[0].matches("bar"));
-        std::env::remove_var("BT_EVAL_FILTER_PARSED");
-    }
-
-    #[test]
-    fn test_parse_filters_invalid_json() {
-        let _guard = FILTER_ENV_MUTEX.lock().unwrap();
-        std::env::set_var("BT_EVAL_FILTER_PARSED", "not-json");
-        let filters = parse_filters();
-        assert!(filters.is_empty());
-        std::env::remove_var("BT_EVAL_FILTER_PARSED");
-    }
-
-    #[test]
-    fn test_eval_filter_matches_by_name() {
-        let filter = EvalFilter {
-            path: vec!["name".to_string()],
-            pattern: regex::Regex::new("^my-.*").unwrap(),
-        };
-        assert!(filter.matches("my-eval"));
-        assert!(!filter.matches("your-eval"));
-    }
-
-    #[test]
-    fn test_eval_filter_empty_path_matches_name() {
-        let filter = EvalFilter {
-            path: vec![],
-            pattern: regex::Regex::new("foo").unwrap(),
-        };
-        assert!(filter.matches("foo-eval"));
-        assert!(!filter.matches("bar-eval"));
-    }
-    #[derive(Clone, Default)]
-    struct Buffer(Arc<Mutex<Vec<u8>>>);
-    impl Write for Buffer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    fn local_config(terminate_on_failure: bool) -> RunnerConfig {
-        RunnerConfig {
-            jsonl: true,
-            list: false,
-            terminate_on_failure,
-            filters: vec![],
-            no_send_logs: true,
-        }
-    }
-    fn local_options(fail: bool) -> EvalOpts<usize, usize> {
-        super::super::EvalOpts::builder()
-            .name("cli".into())
-            .quiet(false)
-            .source(
-                vec![super::super::Case {
-                    input: 1,
-                    ..Default::default()
-                }]
-                .into(),
-            )
-            .definition(
-                super::super::EvalDefinition::new(
-                    Box::new(super::super::SimpleFnTask::new(move |input: &usize| {
-                        if fail {
-                            anyhow::bail!("case failed")
-                        } else {
-                            Ok(*input)
-                        }
-                    })),
-                    vec![],
-                )
-                .unwrap(),
-            )
-            .build()
-    }
-    #[tokio::test]
-    async fn sse_protocol_is_the_only_reporter_and_case_failures_update_cli_status() {
-        let output = Buffer::default();
-        let sse = Arc::new(SseWriter {
-            writer: Mutex::new(Box::new(output.clone())),
-        });
-        let mut runner = BtEvalRunner::from_config(local_config(false), Some(sse))
-            .await
-            .unwrap();
-        assert!(runner.client.is_none());
-        runner.eval("project", local_options(false)).await.unwrap();
-        runner.eval("project", local_options(true)).await.unwrap();
-        assert!(!runner.all_passed());
-        assert!(!runner.finish().await.unwrap());
-        let bytes = output.0.lock().unwrap();
-        let text = std::str::from_utf8(&bytes).unwrap();
-        let events: Vec<_> = text.split("\n\n").filter(|s| !s.is_empty()).collect();
-        assert_eq!(events.len(), 4);
-        assert!(events[0].starts_with("event: start\ndata: "));
-        assert!(events[1].starts_with("event: summary\ndata: "));
-        assert!(events[2].starts_with("event: start\ndata: "));
-        let summary: Value =
-            serde_json::from_str(events[3].strip_prefix("event: summary\ndata: ").unwrap())
-                .unwrap();
-        assert_eq!(summary["failed_cases"], 1);
-    }
-    #[tokio::test]
-    async fn terminate_on_failure_returns_an_error_and_retains_failed_session_status() {
-        let sse = Arc::new(SseWriter {
-            writer: Mutex::new(Box::new(Buffer::default())),
-        });
-        let mut runner = BtEvalRunner::from_config(local_config(true), Some(sse))
-            .await
-            .unwrap();
-        assert!(runner.eval("project", local_options(true)).await.is_err());
-        assert!(!runner.all_passed());
-        assert!(!runner.finish().await.unwrap());
-    }
-    #[tokio::test]
-    async fn sse_write_failure_is_a_report_failure_without_losing_computation() {
-        struct Broken;
-        impl Write for Broken {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "closed socket",
-                ))
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let sse = Arc::new(SseWriter {
-            writer: Mutex::new(Box::new(Broken)),
-        });
-        let result = super::super::run(
-            EvalRequest::local(local_options(false))
-                .with_reporter(SseReporter { sse: sse.clone() }),
-        )
-        .await;
-        let error = result.unwrap_err();
-        assert!(matches!(
-            error.failures.as_slice(),
-            [super::super::EvalRunFailure::Reporting {
-                stage: super::super::ReportStage::Started,
-                source: ReportError::Io(_),
-                ..
-            }]
-        ));
-        assert_eq!(error.partial.unwrap().successful_cases, 1);
-    }
-}
+mod tests;
