@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 #![deny(private_bounds, private_interfaces)]
 
 pub mod api;
