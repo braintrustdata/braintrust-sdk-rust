@@ -15,6 +15,23 @@ Add this to your `Cargo.toml`:
 braintrust-sdk-rust = "0.1.0-alpha.1"
 ```
 
+## Rust version
+
+The minimum supported Rust version is **1.86.0**. This repository uses Cargo
+resolver 3 to prefer dependency versions compatible with its declared MSRV.
+
+Consuming applications control their own resolver and lockfile. For Rust 1.86
+builds, select resolver 3 in the application's root manifest, for example:
+
+```toml
+[workspace]
+resolver = "3"
+```
+
+Regenerate an existing incompatible lockfile with the compatible resolver;
+changing the resolver alone does not replace versions already locked. See
+[Cargo's dependency resolver documentation](https://doc.rust-lang.org/cargo/reference/resolver.html#resolver-versions).
+
 ## Usage
 
 ```rust
