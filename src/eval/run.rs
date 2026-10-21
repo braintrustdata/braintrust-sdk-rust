@@ -1,15 +1,13 @@
 //! Immediate submission of local and recorded evaluations.
 use super::{
-    executor::{EvalExecutor, EvalPlan},
-    recorder::BraintrustRecorder,
     reporter::{SilentReporter, TerminalReporter},
+    submission::{self, RunReporter},
     EvalConfigError, EvalOpts, EvalReporter, EvalRunError, EvalRunFailure, EvalSummary,
 };
 use crate::{internal::execution::ExecutionBinding, BraintrustClient, Completion};
 use serde::Serialize;
 
 type RunCompletion<I, O> = Completion<EvalSummary<I, O>, EvalRunError<I, O>>;
-type RunReporter<I, O> = Box<dyn EvalReporter<I, O>>;
 type SubmitRecorded<I, O> =
     fn(BraintrustClient, EvalOpts<I, O>, RunReporter<I, O>) -> RunCompletion<I, O>;
 
@@ -84,7 +82,7 @@ pub fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
     if let Err(error) = request.options.validate() {
         return Completion::rejected(error.into());
     }
-    let mut reporter = request.reporter.unwrap_or_else(|| {
+    let reporter = request.reporter.unwrap_or_else(|| {
         if request.options.quiet {
             Box::new(SilentReporter)
         } else {
@@ -100,15 +98,8 @@ pub fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
                     return Completion::rejected(EvalRunError::new(EvalRunFailure::Runtime(source)))
                 }
             };
-            let callbacks = binding.clone();
-            binding.response(async move {
-                EvalExecutor::run(
-                    EvalPlan::new(options)?,
-                    None,
-                    reporter.as_mut(),
-                    Some(&callbacks),
-                )
-                .await
+            submission::local(options, binding, reporter, || {
+                Ok((std::future::ready(Ok(())), std::convert::identity, |_| {}))
             })
         }
         Target::Recorded { client, submit } => {
@@ -123,34 +114,9 @@ pub fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
 fn recorded<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static>(
     client: BraintrustClient,
     options: EvalOpts<I, O>,
-    mut reporter: RunReporter<I, O>,
+    reporter: RunReporter<I, O>,
 ) -> RunCompletion<I, O> {
-    let binding = client.execution_binding();
-    let callbacks = binding.clone();
-    binding.response_try(|| {
-        let operation = client.span_operation()?;
-        Ok(async move {
-            let mut recorder = BraintrustRecorder::new(
-                client,
-                operation.submitter.clone(),
-                options.project_name.clone(),
-                options
-                    .experiment_name
-                    .clone()
-                    .unwrap_or_else(|| options.name.clone()),
-                options.metadata.clone(),
-            );
-            let result = EvalExecutor::run(
-                EvalPlan::new(options)?,
-                Some(&mut recorder),
-                reporter.as_mut(),
-                Some(&callbacks),
-            )
-            .await;
-            drop(recorder);
-            // Revoke write permission before publishing, including escaped spans.
-            drop(operation);
-            result
-        })
+    submission::recorded(client, options, reporter, || {
+        Ok((std::future::ready(Ok(())), std::convert::identity, |_| {}))
     })
 }
