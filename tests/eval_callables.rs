@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use braintrust_sdk_rust::{
     eval::{
-        scorer, task, Case, CaseSource, EvalConfigError, EvalDefinition, EvalOpts, Evaluator,
-        ExactMatch, Score, Scorer, ScorerArgs, Scores, SimpleFnTask, Task, TaskHooks,
+        run, scorer, task, Case, CaseSource, EvalConfigError, EvalDefinition, EvalOpts,
+        EvalRequest, ExactMatch, Score, Scorer, ScorerArgs, Scores, SimpleFnTask, Task, TaskHooks,
     },
     BraintrustClient,
 };
@@ -156,7 +156,7 @@ async fn invalid_concurrency_and_names_fail_before_login_recording_or_source_acc
         .build()
         .await
         .unwrap();
-    let evaluator = Evaluator::new(client);
+    let execute = |options| run(EvalRequest::recorded(options, client.clone()));
     let accessed = Arc::new(AtomicBool::new(false));
     for (concurrency, names, expected) in [
         (0, vec!["one"], EvalConfigError::ZeroConcurrency),
@@ -199,7 +199,7 @@ async fn invalid_concurrency_and_names_fail_before_login_recording_or_source_acc
                 .build();
         assert_eq!(opts.validate(), Err(expected.clone()));
         assert!(
-            matches!(evaluator.run(opts).await, Err(error) if matches!(&error.failures[0], braintrust_sdk_rust::eval::EvalRunFailure::Config(actual) if actual == &expected) && error.partial.is_none())
+            matches!(execute(opts).await, Err(error) if matches!(&error.failures[0], braintrust_sdk_rust::eval::EvalRunFailure::Config(actual) if actual == &expected) && error.partial.is_none())
         );
     }
     assert!(!accessed.load(Ordering::SeqCst));

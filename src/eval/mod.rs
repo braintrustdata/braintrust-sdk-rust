@@ -56,27 +56,27 @@ mod cli_session;
 mod definition;
 mod error;
 mod executor;
+mod options;
 mod recorder;
 mod reporter;
 mod run;
-mod runner;
 mod scorer;
 mod source;
 mod submission;
 mod task;
 mod types;
 
-pub use cli_session::{BtEvalError, BtFinishError};
+pub use cli_session::{BtEvalError, BtFinishError, BtInitError};
 pub use definition::EvalDefinition;
 pub use error::{CaseError, EvalConfigError, EvalRunError, EvalRunFailure};
 
 // Re-export public API
 pub use bt_runner::{summary_to_value, BtEvalRunner};
+pub use options::EvalOpts;
 pub use reporter::{
     EvalReporter, JsonlReporter, ReportError, ReportStage, SilentReporter, TerminalReporter,
 };
 pub use run::{run, EvalRequest};
-pub use runner::{EvalOpts, Evaluator};
 pub use scorer::{scorer, ExactMatch, LevenshteinScorer, NumericDiffScorer, Scorer, SyncFnScorer};
 pub use source::{
     CaseSource, DatasetCaseSource, DatasetVersionRef, IterCaseSource, SourceError,

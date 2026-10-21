@@ -13,99 +13,20 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::{
-    internal::execution::ExecutionBinding, BraintrustClient, BraintrustError, Completion, Result,
-};
+use crate::{internal::execution::ExecutionBinding, BraintrustClient, BraintrustError, Completion};
 
 use super::{
     cli_session::{ready, Session},
-    runner::EvalOpts,
+    options::EvalOpts,
     submission::{self, RunReporter},
     types::EvalSummary,
-    BtEvalError, BtFinishError, EvalReporter, JsonlReporter, ReportError,
+    BtEvalError, BtFinishError, BtInitError, EvalReporter, JsonlReporter, ReportError,
 };
 
-/// A filter for selecting which evaluators to run, read from `BT_EVAL_FILTER_PARSED`.
-struct EvalFilter {
-    path: Vec<String>,
-    pattern: regex::Regex,
-}
-
-impl EvalFilter {
-    /// Returns true if the given eval name matches this filter.
-    fn matches(&self, name: &str) -> bool {
-        // Match against the eval name when path is ["name"] or empty
-        if self.path.is_empty() || self.path == ["name"] {
-            return self.pattern.is_match(name);
-        }
-        // Unknown path — include by default
-        true
-    }
-}
-
-/// Configuration read from `BT_EVAL_*` environment variables.
-struct RunnerConfig {
-    /// Output summaries as JSONL to stdout (`BT_EVAL_JSONL=1`)
-    jsonl: bool,
-    /// List evaluator names without running them (`BT_EVAL_LIST=1`)
-    list: bool,
-    /// Stop running after the first failure (`BT_EVAL_TERMINATE_ON_FAILURE=1`)
-    terminate_on_failure: bool,
-    /// Filters to select which evaluators to run (`BT_EVAL_FILTER_PARSED`)
-    filters: Vec<EvalFilter>,
-    /// Skip sending logs to Braintrust (`BT_EVAL_NO_SEND_LOGS=1` or `BT_EVAL_LOCAL=1`)
-    no_send_logs: bool,
-}
-
-impl RunnerConfig {
-    fn from_env() -> Self {
-        Self {
-            jsonl: env_flag("BT_EVAL_JSONL"),
-            list: env_flag("BT_EVAL_LIST"),
-            terminate_on_failure: env_flag("BT_EVAL_TERMINATE_ON_FAILURE"),
-            filters: parse_filters(),
-            no_send_logs: env_flag("BT_EVAL_NO_SEND_LOGS") || env_flag("BT_EVAL_LOCAL"),
-        }
-    }
-}
-
-fn env_flag(name: &str) -> bool {
-    !matches!(
-        std::env::var(name).ok().as_deref(),
-        None | Some("") | Some("0") | Some("false") | Some("no") | Some("off")
-    )
-}
-
-fn parse_filters() -> Vec<EvalFilter> {
-    let serialized = match std::env::var("BT_EVAL_FILTER_PARSED").ok() {
-        Some(s) if !s.is_empty() => s,
-        _ => return vec![],
-    };
-
-    let parsed: Vec<Value> = match serde_json::from_str(&serialized) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Invalid BT_EVAL_FILTER_PARSED: {}", e);
-            return vec![];
-        }
-    };
-
-    parsed
-        .into_iter()
-        .filter_map(|v| {
-            let path = v["path"]
-                .as_array()?
-                .iter()
-                .filter_map(|s| s.as_str().map(String::from))
-                .collect();
-            let pattern_str = v["pattern"].as_str()?;
-            let pattern = regex::Regex::new(pattern_str)
-                .map_err(|e| eprintln!("Invalid filter pattern '{}': {}", pattern_str, e))
-                .ok()?;
-            Some(EvalFilter { path, pattern })
-        })
-        .collect()
-}
+mod config;
+#[cfg(test)]
+use config::{env_flag, parse_filters, EvalFilter};
+use config::{RunnerConfig, SseEndpoint};
 
 /// SSE event writer that sends events over a socket to the `bt eval` CLI.
 ///
@@ -144,43 +65,47 @@ impl<I: Serialize, O: Serialize> EvalReporter<I, O> for SseReporter {
     }
 }
 
-fn create_sse_writer() -> Option<Arc<SseWriter>> {
-    // Unix socket SSE is only available on Unix platforms; Windows continues
-    // to the TCP fallback below.
-    #[cfg(unix)]
-    if let Ok(sock_path) = std::env::var("BT_EVAL_SSE_SOCK") {
-        if !sock_path.is_empty() {
-            match std::os::unix::net::UnixStream::connect(&sock_path) {
-                Ok(stream) => {
-                    return Some(Arc::new(SseWriter {
-                        writer: Mutex::new(Box::new(stream)),
-                    }));
-                }
-                Err(e) => {
-                    eprintln!("Failed to connect to SSE socket {}: {}", sock_path, e);
-                }
-            }
+fn connect_sse(endpoint: SseEndpoint) -> std::result::Result<Arc<SseWriter>, BtInitError> {
+    let writer: Box<dyn Write + Send> = match endpoint {
+        #[cfg(unix)]
+        SseEndpoint::Unix(path) => Box::new(
+            std::os::unix::net::UnixStream::connect(path).map_err(|source| BtInitError::Sse {
+                transport: "Unix socket",
+                source,
+            })?,
+        ),
+        SseEndpoint::Tcp(address) => {
+            let stream =
+                std::net::TcpStream::connect(address).map_err(|source| BtInitError::Sse {
+                    transport: "TCP",
+                    source,
+                })?;
+            let _ = stream.set_nodelay(true);
+            Box::new(stream)
+        }
+    };
+    Ok(Arc::new(SseWriter {
+        writer: Mutex::new(writer),
+    }))
+}
+async fn prepare_sse(
+    binding: &ExecutionBinding,
+    endpoint: Option<SseEndpoint>,
+) -> std::result::Result<Option<Arc<SseWriter>>, BtInitError> {
+    let Some(endpoint) = endpoint else {
+        return Ok(None);
+    };
+    let work = binding.spawn_blocking(move || connect_sse(endpoint));
+    struct Abort(tokio::task::AbortHandle);
+    impl Drop for Abort {
+        fn drop(&mut self) {
+            self.0.abort();
         }
     }
-
-    // Try TCP address (BT_EVAL_SSE_ADDR)
-    if let Ok(addr) = std::env::var("BT_EVAL_SSE_ADDR") {
-        if !addr.is_empty() {
-            match std::net::TcpStream::connect(&addr) {
-                Ok(stream) => {
-                    let _ = stream.set_nodelay(true);
-                    return Some(Arc::new(SseWriter {
-                        writer: Mutex::new(Box::new(stream)),
-                    }));
-                }
-                Err(e) => {
-                    eprintln!("Failed to connect to SSE address {}: {}", addr, e);
-                }
-            }
-        }
-    }
-
-    None
+    let _abort = Abort(work.abort_handle());
+    work.await
+        .map_err(|_| BtInitError::Execution(crate::ExecutionError::WorkerLost))?
+        .map(Some)
 }
 
 /// A runner designed to work with the `bt eval` CLI.
@@ -207,7 +132,8 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 /// use braintrust_sdk_rust::eval::*;
 ///
 /// # async fn example() -> anyhow::Result<()> {
-/// let mut runner = BtEvalRunner::from_env().await?;
+/// let initialization = BtEvalRunner::from_env(); // initialization is admitted now
+/// let mut runner = initialization.await?;
 ///
 /// let definition = EvalDefinition::new(
 ///     Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()))),
@@ -247,56 +173,82 @@ impl BtEvalRunner {
     /// Create a new runner, reading configuration from environment variables.
     ///
     /// Recording mode creates a client from environment variables (e.g.
-    /// `BRAINTRUST_API_KEY`). List and local modes create no client.
-    pub async fn from_env() -> Result<Self> {
-        let config = RunnerConfig::from_env();
-        let sse = create_sse_writer();
-
-        Self::from_config(config, sse).await
+    /// `BRAINTRUST_API_KEY`). List and local modes create no client. Configuration
+    /// is captured and initialization admitted at the call; awaiting only observes
+    /// the result. Invalid filters reject immediately; SSE failures are returned
+    /// without switching output transports. Socket setup precedes client login.
+    pub fn from_env() -> Completion<Self, BtInitError> {
+        let config = match RunnerConfig::from_env() {
+            Ok(config) => config,
+            Err(error) => return Completion::rejected(error),
+        };
+        Self::initialize(config, None)
     }
 
-    async fn from_config(config: RunnerConfig, sse: Option<Arc<SseWriter>>) -> Result<Self> {
-        let client = if !config.list && !config.no_send_logs {
-            Some(Arc::new(BraintrustClient::builder().build().await?))
-        } else {
-            None
-        };
-
-        let binding = if let Some(client) = &client {
-            Some(client.execution_binding())
-        } else if !config.list {
-            Some(ExecutionBinding::new(None)?)
-        } else {
-            None
-        };
+    fn assemble(
+        config: RunnerConfig,
+        sse: Option<Arc<SseWriter>>,
+        client: Option<Arc<BraintrustClient>>,
+        binding: Option<ExecutionBinding>,
+    ) -> Self {
         let session = Session::new(config.terminate_on_failure);
-        Ok(Self {
+        Self {
             config,
             sse,
             client,
             binding,
             session,
             registered_names: Vec::new(),
-        })
+        }
     }
 
-    /// Create a new runner with an explicit client.
-    ///
-    /// Environment variables are still read for mode configuration (list, JSONL, SSE, etc.),
-    /// but the provided client is used instead of creating a new one. All runs,
-    /// including local mode, inherit its fixed execution binding.
-    pub fn with_client(client: Arc<BraintrustClient>) -> Self {
-        let config = RunnerConfig::from_env();
-        let sse = create_sse_writer();
-        let binding = Some(client.execution_binding());
-        let session = Session::new(config.terminate_on_failure);
-        Self {
-            config,
-            sse,
-            client: Some(client),
-            binding,
-            session,
-            registered_names: Vec::new(),
+    /// Initialize now on this client's fixed binding. Dropping the completion
+    /// does not cancel socket setup. List mode uses neither its runtime nor SSE.
+    /// Configuration is captured from the environment at the call.
+    pub fn with_client(client: Arc<BraintrustClient>) -> Completion<Self, BtInitError> {
+        let config = match RunnerConfig::from_env() {
+            Ok(config) => config,
+            Err(error) => return Completion::rejected(error),
+        };
+        Self::initialize(config, Some(client))
+    }
+
+    fn initialize(
+        config: RunnerConfig,
+        supplied: Option<Arc<BraintrustClient>>,
+    ) -> Completion<Self, BtInitError> {
+        if config.list {
+            return ready(Self::assemble(config, None, supplied, None));
+        }
+        if let Some(client) = supplied {
+            let binding = client.execution_binding();
+            let context = binding.clone();
+            return binding.response(async move {
+                let sse = prepare_sse(&context, config.endpoint.clone()).await?;
+                Ok(Self::assemble(config, sse, Some(client), Some(context)))
+            });
+        }
+        if config.no_send_logs {
+            let binding = match ExecutionBinding::new(None) {
+                Ok(binding) => binding,
+                Err(error) => return Completion::rejected(error.into()),
+            };
+            let context = binding.clone();
+            binding.response(async move {
+                let sse = prepare_sse(&context, config.endpoint.clone()).await?;
+                Ok(Self::assemble(config, sse, None, Some(context)))
+            })
+        } else {
+            BraintrustClient::builder().build_with(|builder, binding| async move {
+                let sse = prepare_sse(&binding, config.endpoint.clone()).await?;
+                let client = builder.initialize(binding.clone()).await?;
+                Ok(Self::assemble(
+                    config,
+                    sse,
+                    Some(Arc::new(client)),
+                    Some(binding),
+                ))
+            })
         }
     }
 
