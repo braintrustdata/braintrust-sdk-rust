@@ -12,7 +12,8 @@ use braintrust_sdk_rust::eval::*;
 async fn main() -> anyhow::Result<()> {
     // BtEvalRunner reads BT_EVAL_* env vars automatically.
     // Recording mode creates a client; local and list modes need no credentials.
-    let mut runner = BtEvalRunner::from_env().await?;
+    let initialization = BtEvalRunner::from_env();
+    let mut runner = initialization.await?;
 
     // Define test cases
     let cases = vec![

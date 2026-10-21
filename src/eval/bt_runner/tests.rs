@@ -3,45 +3,28 @@ use std::sync::Mutex;
 use super::*;
 use crate::eval::EvalRequest;
 
-// Serialize tests that mutate BT_EVAL_FILTER_PARSED to avoid race conditions.
-static FILTER_ENV_MUTEX: Mutex<()> = Mutex::new(());
-
 #[test]
 fn test_env_flag() {
-    // Not set → false
     assert!(!env_flag("BT_TEST_NONEXISTENT_FLAG_XYZ"));
 }
-
 #[test]
 fn test_parse_filters_empty() {
-    let _guard = FILTER_ENV_MUTEX.lock().unwrap();
-    // When BT_EVAL_FILTER_PARSED is not set, filters should be empty
-    std::env::remove_var("BT_EVAL_FILTER_PARSED");
-    let filters = parse_filters();
-    assert!(filters.is_empty());
+    assert!(parse_filters(None).unwrap().is_empty());
+    assert!(parse_filters(Some("")).unwrap().is_empty());
 }
-
 #[test]
 fn test_parse_filters_valid() {
-    let _guard = FILTER_ENV_MUTEX.lock().unwrap();
-    std::env::set_var(
-        "BT_EVAL_FILTER_PARSED",
-        r#"[{"path":["name"],"pattern":"foo.*"}]"#,
-    );
-    let filters = parse_filters();
+    let filters = parse_filters(Some(r#"[{"path":["name"],"pattern":"foo.*"}]"#)).unwrap();
     assert_eq!(filters.len(), 1);
     assert!(filters[0].matches("foobar"));
     assert!(!filters[0].matches("bar"));
-    std::env::remove_var("BT_EVAL_FILTER_PARSED");
 }
-
 #[test]
 fn test_parse_filters_invalid_json() {
-    let _guard = FILTER_ENV_MUTEX.lock().unwrap();
-    std::env::set_var("BT_EVAL_FILTER_PARSED", "not-json");
-    let filters = parse_filters();
-    assert!(filters.is_empty());
-    std::env::remove_var("BT_EVAL_FILTER_PARSED");
+    assert!(matches!(
+        parse_filters(Some("not-json")),
+        Err(BtInitError::Filters(_))
+    ));
 }
 
 #[test]
@@ -81,7 +64,16 @@ fn local_config(terminate_on_failure: bool) -> RunnerConfig {
         terminate_on_failure,
         filters: vec![],
         no_send_logs: true,
+        endpoint: None,
     }
+}
+fn local_reported_runner(config: RunnerConfig, sse: Arc<SseWriter>) -> BtEvalRunner {
+    BtEvalRunner::assemble(
+        config,
+        Some(sse),
+        None,
+        Some(ExecutionBinding::new(None).unwrap()),
+    )
 }
 fn local_options(fail: bool) -> EvalOpts<usize, usize> {
     super::super::EvalOpts::builder()
@@ -115,9 +107,7 @@ async fn sse_protocol_is_the_only_reporter_and_case_failures_update_cli_status()
     let sse = Arc::new(SseWriter {
         writer: Mutex::new(Box::new(output.clone())),
     });
-    let mut runner = BtEvalRunner::from_config(local_config(false), Some(sse))
-        .await
-        .unwrap();
+    let mut runner = local_reported_runner(local_config(false), sse);
     assert!(runner.client.is_none());
     runner.eval("project", local_options(false)).await.unwrap();
     runner.eval("project", local_options(true)).await.unwrap();
@@ -139,9 +129,7 @@ async fn terminate_on_failure_returns_an_error_and_retains_failed_session_status
     let sse = Arc::new(SseWriter {
         writer: Mutex::new(Box::new(Buffer::default())),
     });
-    let mut runner = BtEvalRunner::from_config(local_config(true), Some(sse))
-        .await
-        .unwrap();
+    let mut runner = local_reported_runner(local_config(true), sse);
     assert!(runner.eval("project", local_options(true)).await.is_err());
     assert!(!runner.all_passed());
     assert!(!runner.finish().await.unwrap());
@@ -606,9 +594,7 @@ async fn finish_closes_sse_before_publication_even_when_its_observer_is_dropped(
                 notice: Some(notice),
             })),
         });
-        let mut runner = BtEvalRunner::from_config(local_config(false), Some(sse))
-            .await
-            .unwrap();
+        let mut runner = local_reported_runner(local_config(false), sse);
         drop(runner.eval("project", quiet_options(1)));
         let finish = runner.finish();
         assert!(finish.is_ok());
@@ -640,4 +626,64 @@ async fn later_issuance_failure_does_not_skip_earlier_accepted_work() {
         Err(BtEvalError::Stopped)
     ));
     assert!(!runner.finish().await.unwrap());
+}
+
+#[tokio::test]
+async fn constructor_uses_one_client_response_slot_and_rejects_before_socket_work() {
+    use crate::internal::response_tasks::MAX_RESPONSE_TASKS;
+    let client = BraintrustClient::builder()
+        .runtime(crate::current_runtime())
+        .skip_login(true)
+        .build()
+        .await
+        .unwrap();
+    let binding = client.execution_binding();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    for _ in 0..MAX_RESPONSE_TASKS {
+        let gate = gate.clone();
+        let token = binding.response::<(), BraintrustError, _>(async move {
+            gate.acquire().await.unwrap().forget();
+            Ok(())
+        });
+        assert!(token.is_ok());
+        drop(token);
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut config = local_config(false);
+    config.endpoint = Some(SseEndpoint::Tcp(listener.local_addr().unwrap().to_string()));
+    let rejected = BtEvalRunner::initialize(config, Some(Arc::new(client.clone())));
+    assert!(rejected.is_err());
+    assert!(matches!(
+        rejected.await,
+        Err(BtInitError::Admission(crate::EnqueueError::Full))
+    ));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    gate.add_permits(MAX_RESPONSE_TASKS);
+    binding.responses_drained().await.unwrap();
+    let token = BtEvalRunner::initialize(local_config(false), Some(Arc::new(client.clone())));
+    assert!(token.is_ok());
+    assert_eq!(binding.outstanding_responses(), 1);
+    let runner = token.await.unwrap();
+    assert!(runner.finish().await.unwrap());
+    client
+        .shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let rejected = BtEvalRunner::initialize(local_config(false), Some(Arc::new(client.clone())));
+    assert!(rejected.is_err());
+    assert!(matches!(
+        rejected.await,
+        Err(BtInitError::Admission(crate::EnqueueError::Closed))
+    ));
+    let mut list = local_config(false);
+    list.list = true;
+    let token = BtEvalRunner::initialize(list, Some(Arc::new(client)));
+    assert!(token.is_ok());
+    let list = token.await.unwrap();
+    assert!(list.binding.is_none());
+    assert!(list.sse.is_none());
+    assert!(list.finish().await.unwrap());
 }

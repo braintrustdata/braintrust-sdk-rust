@@ -5,7 +5,6 @@ use std::future::IntoFuture;
 fn main() -> anyhow::Result<()> {
     // The client's owned runtime drives work; this thread only waits for tokens.
     let client = futures::executor::block_on(BraintrustClient::builder().build().into_future())?;
-    let evaluator = Evaluator::new(client);
 
     // Define test cases
     let cases = vec![
@@ -36,17 +35,16 @@ fn main() -> anyhow::Result<()> {
     println!("Starting synchronous evaluation...\n");
 
     let definition = EvalDefinition::new(Box::new(task), scorers)?;
-    let result = futures::executor::block_on(
-        evaluator
-            .run(
-                EvalOpts::builder()
-                    .name("sync-uppercase-eval".to_string())
-                    .source(cases.into())
-                    .definition(definition.clone())
-                    .build(),
-            )
-            .into_future(),
-    )?;
+    let completion = run(EvalRequest::recorded(
+        EvalOpts::builder()
+            .name("sync-uppercase-eval".to_string())
+            .source(cases.into())
+            .definition(definition.clone())
+            .build(),
+        client,
+    ));
+    assert!(completion.is_ok());
+    let result = futures::executor::block_on(completion.into_future())?;
 
     // Print results
     println!("\n=== Results ===\n");

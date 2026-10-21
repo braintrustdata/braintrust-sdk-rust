@@ -11,6 +11,31 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+/// Failure to configure or initialize a CLI session.
+#[derive(Debug, thiserror::Error)]
+pub enum BtInitError {
+    #[error(transparent)]
+    Client(#[from] crate::BraintrustError),
+    #[error(transparent)]
+    Execution(#[from] ExecutionError),
+    #[error(transparent)]
+    Admission(#[from] EnqueueError),
+    #[error("invalid BT_EVAL_FILTER_PARSED: {0}")]
+    Filters(#[source] serde_json::Error),
+    #[error("invalid pattern in CLI filter {index}: {source}")]
+    FilterPattern {
+        index: usize,
+        #[source]
+        source: regex::Error,
+    },
+    #[error("failed to connect to CLI SSE {transport}: {source}")]
+    Sse {
+        transport: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// CLI run failure. Detailed computation/recording results remain available.
 pub enum BtEvalError<I, O> {
     Run(EvalRunError<I, O>),

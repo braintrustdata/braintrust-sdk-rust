@@ -48,7 +48,7 @@ async fn recording_client() -> (BraintrustClient, wiremock::MockServer) {
 #[tokio::test]
 async fn test_basic_eval_flow() {
     let (client, server) = recording_client().await;
-    let evaluator = Evaluator::new(client);
+    let execute = |options| run(EvalRequest::recorded(options, client.clone()));
 
     let cases = vec![
         Case {
@@ -80,17 +80,16 @@ async fn test_basic_eval_flow() {
         },
     ))];
 
-    let result = evaluator
-        .run(
-            EvalOpts::builder()
-                .name("test-basic-eval".to_string())
-                .source(cases.into())
-                .definition(EvalDefinition::new(Box::new(callback), scorers).unwrap())
-                .quiet(true)
-                .build(),
-        )
-        .await
-        .expect("Evaluation failed");
+    let result = execute(
+        EvalOpts::builder()
+            .name("test-basic-eval".to_string())
+            .source(cases.into())
+            .definition(EvalDefinition::new(Box::new(callback), scorers).unwrap())
+            .quiet(true)
+            .build(),
+    )
+    .await
+    .expect("Evaluation failed");
 
     assert_eq!(result.total_cases, 2);
     assert_eq!(result.successful_cases, 2);
@@ -203,38 +202,37 @@ fn test_eval_opts_builder() {
 #[tokio::test]
 async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
     let (client, server) = recording_client().await;
-    let evaluator = Evaluator::new(client);
+    let execute = |options| run(EvalRequest::recorded(options, client.clone()));
     let scorers: Vec<Box<dyn Scorer<String, String>>> = vec![
         Box::new(ExactMatch::new()),
         Box::new(SyncFnScorer::new("broken", |_| {
             anyhow::bail!("scoring failed")
         })),
     ];
-    let result = evaluator
-        .run(
-            EvalOpts::builder()
-                .name("failed-scorer".into())
-                .source(
-                    vec![Case {
-                        input: "a".to_owned(),
-                        expected: Some("A".to_owned()),
-                        id: Some("source-case".into()),
-                        ..Default::default()
-                    }]
-                    .into(),
+    let result = execute(
+        EvalOpts::builder()
+            .name("failed-scorer".into())
+            .source(
+                vec![Case {
+                    input: "a".to_owned(),
+                    expected: Some("A".to_owned()),
+                    id: Some("source-case".into()),
+                    ..Default::default()
+                }]
+                .into(),
+            )
+            .definition(
+                EvalDefinition::new(
+                    Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()))),
+                    scorers,
                 )
-                .definition(
-                    EvalDefinition::new(
-                        Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()))),
-                        scorers,
-                    )
-                    .unwrap(),
-                )
-                .quiet(true)
-                .build(),
-        )
-        .await
-        .unwrap();
+                .unwrap(),
+            )
+            .quiet(true)
+            .build(),
+    )
+    .await
+    .unwrap();
     assert_eq!(result.successful_cases, 0);
     assert_eq!(result.failed_cases, 1);
     assert_eq!(result.score_stats[0].name, "exact_match");
@@ -356,7 +354,7 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
         .max_concurrency(3)
         .quiet(true)
         .build();
-    let run = tokio::spawn(async move { Evaluator::new(client).run(opts).await });
+    let run = tokio::spawn(async move { run(EvalRequest::recorded(opts, client)).await });
     tokio::time::timeout(std::time::Duration::from_secs(3), failed.notified())
         .await
         .expect("pending source reads must allow active task progress");
@@ -445,7 +443,7 @@ async fn failure_before_the_first_case_returns_the_resolved_target_without_trace
         )
         .quiet(true)
         .build();
-    let error = Evaluator::new(client).run(opts).await.unwrap_err();
+    let error = run(EvalRequest::recorded(opts, client)).await.unwrap_err();
     assert!(
         matches!(&error.failures[0],EvalRunFailure::Source {case_index:0,source} if source.to_string()=="source unavailable")
     );
@@ -517,7 +515,7 @@ async fn recording_failure_stops_new_cases_but_drains_already_scheduled_cases() 
         .max_concurrency(2)
         .quiet(true)
         .build();
-    let run = tokio::spawn(async move { Evaluator::new(client).run(opts).await });
+    let run = tokio::spawn(async move { run(EvalRequest::recorded(opts, client)).await });
     tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
         .await
         .unwrap();
@@ -572,7 +570,7 @@ async fn reusable_definition_keeps_recorded_runs_and_sources_independent() {
         Arc,
     };
     let (client, _server) = recording_client().await;
-    let evaluator = Evaluator::new(client);
+    let execute = |options| run(EvalRequest::recorded(options, client.clone()));
     let calls = Arc::new(AtomicUsize::new(0));
     let definition = EvalDefinition::new(
         Box::new(task({
@@ -602,8 +600,8 @@ async fn reusable_definition_keeps_recorded_runs_and_sources_independent() {
             .build()
     };
     let (first, second) = tokio::join!(
-        evaluator.run(options("first", 2, 4)),
-        evaluator.run(options("second", 3, 100)),
+        execute(options("first", 2, 4)),
+        execute(options("second", 3, 100)),
     );
     let first = first.unwrap();
     let second = second.unwrap();
@@ -616,7 +614,7 @@ async fn reusable_definition_keeps_recorded_runs_and_sources_independent() {
     assert_eq!(first.results[0].tags, Some(vec!["input-2".into()]));
     assert_eq!(second.results[0].tags, Some(vec!["input-3".into()]));
     assert_ne!(first.results[0].span_id, second.results[0].span_id);
-    let later = evaluator.run(options("later", 5, 10)).await.unwrap();
+    let later = execute(options("later", 5, 10)).await.unwrap();
     assert_eq!(later.total_cases, 1);
     assert_eq!(later.results[0].output, Some(10));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -657,7 +655,9 @@ async fn serialization_failures_keep_outputs_and_finalize_recording() {
         )
         .quiet(true)
         .build();
-    let error = Evaluator::new(client).run(options).await.unwrap_err();
+    let error = run(EvalRequest::recorded(options, client))
+        .await
+        .unwrap_err();
     let fields = error
         .failures
         .iter()
