@@ -8,6 +8,8 @@ authors = ["Braintrust Team <team@braintrust.dev>"]
 description = "Rust SDK for Braintrust logging and tracing"
 repository = "https://github.com/braintrustdata/braintrust-sdk-rust"
 license = "Apache-2.0"
+readme = "README.md"
+include = ["src/**", "tests/**", "examples/**", "README.md", "LICENSE", "braintrust-logo.svg"]
 keywords = ["braintrust", "logging", "tracing", "observability"]
 categories = ["api-bindings", "asynchronous", "development-tools"]
 

@@ -76,6 +76,9 @@ jobs:
       - name: Run tests and doctests on MSRV
         run: cargo test --locked --all-features
 
+      - name: Verify packaged crate on MSRV
+        run: cargo package --locked
+
   # Check documentation builds
   docs:
     runs-on: ubuntu-latest
