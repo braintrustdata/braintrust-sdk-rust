@@ -1,20 +1,19 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use braintrust_sdk_rust::Logs3BatchUploader;
+use braintrust_sdk_rust::{api::Config, ingest::BatchUploader};
 use serde_json::{json, Map, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 #[test]
 fn uploader_rejects_malformed_custom_ca_bundle() {
-    let error = Logs3BatchUploader::new_with_custom_ca_bundle_pem(
-        "https://example.com",
-        "test-key",
-        None,
-        "-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n",
-    )
-    .expect_err("malformed CA bundle should fail");
+    let mut config = Config::new("test-key");
+    config.custom_ca_bundle_pem =
+        Some(b"-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n".to_vec());
+    let error = BatchUploader::new(config)
+        .err()
+        .expect("malformed CA bundle should fail");
 
     assert!(error
         .to_string()
@@ -88,10 +87,12 @@ async fn uploader_splits_batches_on_413_without_overflow() {
         .mount(&server)
         .await;
 
-    let mut uploader = Logs3BatchUploader::new(server.uri(), "test-key", None).expect("uploader");
+    let mut config = Config::new("test-key");
+    config.api_url = server.uri();
+    let uploader = BatchUploader::new(config).expect("uploader");
     let rows = vec![make_row("1", 32), make_row("2", 32), make_row("3", 32)];
 
-    let result = uploader.upload_rows(&rows, 100).await.expect("upload");
+    let result = uploader.upload_rows(rows, 100).await.expect("upload");
     assert_eq!(result.rows_uploaded, 3);
     assert!(
         calls.load(Ordering::SeqCst) >= 3,
@@ -142,10 +143,12 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
         .mount(&server)
         .await;
 
-    let mut uploader = Logs3BatchUploader::new(server.uri(), "test-key", None).expect("uploader");
+    let mut config = Config::new("test-key");
+    config.api_url = server.uri();
+    let uploader = BatchUploader::new(config).expect("uploader");
     let rows = vec![make_row("big", 8_000)];
 
-    let result = uploader.upload_rows(&rows, 100).await.expect("upload");
+    let result = uploader.upload_rows(rows, 100).await.expect("upload");
     assert_eq!(result.rows_uploaded, 1);
 
     let requests = server.received_requests().await.unwrap();
@@ -169,4 +172,63 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
     let body: Value = serde_json::from_slice(&logs_request.body).expect("logs3 json");
     assert_eq!(body["rows"]["type"], "logs3_overflow");
     assert_eq!(body["rows"]["key"], "overflow-key-1");
+}
+
+#[tokio::test]
+async fn accepted_bulk_work_progresses_without_polling_and_shutdown_closes_clones() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut config = Config::new("test-key");
+    config.api_url = server.uri();
+    let uploader = BatchUploader::new(config).unwrap();
+    let observer = std::thread::spawn({
+        let uploader = uploader.clone();
+        move || {
+            let observer = uploader.upload_rows(vec![make_row("eager", 8)], 100);
+            assert!(observer.is_ok());
+            observer
+        }
+    })
+    .join()
+    .unwrap();
+    uploader
+        .shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(observer.await.unwrap().rows_uploaded, 1);
+    assert!(uploader.clone().upload_rows(vec![], 100).is_err());
+}
+
+#[tokio::test]
+async fn a_terminal_bulk_failure_does_not_poison_the_next_batch() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    let mut config = Config::new("test-key");
+    config.api_url = server.uri();
+    let uploader = BatchUploader::new(config).unwrap();
+    assert!(uploader
+        .upload_rows(vec![make_row("failed", 8)], 100)
+        .await
+        .is_err());
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    drop(uploader.upload_rows(vec![make_row("fresh", 8)], 100));
+    uploader
+        .shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
 }

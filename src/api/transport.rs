@@ -28,6 +28,9 @@ struct Inner {
     headers: HeaderMap,
 }
 impl Transport {
+    pub(crate) fn http_client(&self) -> reqwest::Client {
+        self.inner.http.clone()
+    }
     pub fn new(config: Config) -> Result<Self, Error> {
         let api_url = base_url(&config.api_url)?;
         let app_url = base_url(&config.app_url)?;

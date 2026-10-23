@@ -10,11 +10,11 @@ pub mod eval;
 mod experiments;
 mod extractors;
 mod http;
+pub mod ingest;
 mod internal;
 mod json_merge;
 mod log_queue;
 mod logger;
-mod logs3;
 mod runtime;
 mod span;
 mod span_components;
@@ -45,7 +45,6 @@ pub use logger::{
     BraintrustClient, BraintrustClientBuilder, LoginState, OrgInfo, DEFAULT_API_URL,
     DEFAULT_APP_URL,
 };
-pub use logs3::{Logs3BatchUploader, Logs3UploadResult};
 pub use runtime::current_runtime;
 pub use span::{
     SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanLogBuilderError, SpanOrigin,
