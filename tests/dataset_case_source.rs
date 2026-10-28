@@ -165,7 +165,7 @@ async fn typed_pages_pin_version_and_preserve_case_fields_without_clone_or_seria
 
 #[tokio::test]
 async fn recorded_source_admitted_before_shutdown_can_fetch_all_pages_and_finish_recording() {
-    let (client, dataset, _, data) = setup(true).await;
+    let (client, dataset, _control, data) = setup(true).await;
     page(
         ResponseTemplate::new(200)
             .set_body_json(json!({"data":[{"id":"one","input":1}],"cursor":"next"})),
@@ -251,13 +251,20 @@ async fn registration_failure_is_a_typed_source_error_before_cases_are_consumed(
     let partial = error.partial.unwrap();
     assert_eq!(partial.total_cases, 0);
     assert!(partial.dataset.is_none());
-    assert!(data.received_requests().await.unwrap().is_empty());
+    // Client startup may discover ingestion capabilities; no dataset reads
+    // may run outside the source's fixed execution binding.
+    assert!(data
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|request| request.url.path() == "/version"));
     client.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
 #[tokio::test]
 async fn later_page_failure_retains_completed_cases_and_snapshot_identity() {
-    let (client, dataset, _, data) = setup(false).await;
+    let (client, dataset, _control, data) = setup(false).await;
     page(
         ResponseTemplate::new(200)
             .set_body_json(json!({"data":[{"id":"one","input":{"value":4}}],"cursor":"next"})),
@@ -288,7 +295,7 @@ async fn later_page_failure_retains_completed_cases_and_snapshot_identity() {
 
 #[tokio::test]
 async fn malformed_row_keeps_decode_cause_and_preceding_results() {
-    let (client, dataset, _, data) = setup(false).await;
+    let (client, dataset, _control, data) = setup(false).await;
     page(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"good","input":{"value":2}},{"id":"bad","input":"invalid input"}],"cursor":null}))).mount(&data).await;
     let error = run(EvalRequest::local(options(
         DatasetCaseSource::new(dataset, None, None).unwrap(),
@@ -320,11 +327,18 @@ async fn malformed_row_keeps_decode_cause_and_preceding_results() {
 
 #[tokio::test]
 async fn dropping_an_unread_source_releases_accepted_work_and_closed_admission_is_immediate() {
-    let (client, dataset, _, data) = setup(false).await;
+    let (client, dataset, _control, data) = setup(false).await;
     let source = DatasetCaseSource::<usize, usize>::new(dataset.clone(), None, None).unwrap();
     drop(source);
     client.shutdown(Duration::from_secs(5)).await.unwrap();
-    assert!(data.received_requests().await.unwrap().is_empty());
+    // Client startup may discover ingestion capabilities; no dataset reads
+    // may run outside the source's fixed execution binding.
+    assert!(data
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|request| request.url.path() == "/version"));
     let error = DatasetCaseSource::<usize, usize>::new(dataset, None, None)
         .err()
         .expect("source admission must be closed");
@@ -336,7 +350,7 @@ async fn dropping_an_unread_source_releases_accepted_work_and_closed_admission_i
 
 #[tokio::test]
 async fn empty_live_source_reports_identity_without_claiming_a_snapshot() {
-    let (client, dataset, _, data) = setup(false).await;
+    let (client, dataset, _control, data) = setup(false).await;
     page(ResponseTemplate::new(200).set_body_json(json!({"data":[],"cursor":null})))
         .expect(1)
         .mount(&data)
@@ -413,7 +427,14 @@ async fn source_runtime_loss_reports_original_worker_loss_without_running_reads_
         ))
     )));
     assert!(control.received_requests().await.unwrap().is_empty());
-    assert!(data.received_requests().await.unwrap().is_empty());
+    // Client startup may discover ingestion capabilities; no dataset reads
+    // may run outside the source's fixed execution binding.
+    assert!(data
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|request| request.url.path() == "/version"));
 }
 
 #[tokio::test]
