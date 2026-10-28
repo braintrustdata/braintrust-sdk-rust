@@ -134,6 +134,7 @@ async fn finishing_a_parent_does_not_finish_its_child_and_explicit_updates_remai
                 .build()
                 .unwrap(),
         )
+        .await
         .unwrap();
     client.flush().await.unwrap();
     let bodies: Vec<Value> = server

@@ -35,6 +35,11 @@ pub struct Completion<T, E> {
     receiver: oneshot::Receiver<Result<T, E>>,
 }
 impl<T, E> Completion<T, E> {
+    pub(crate) fn rejected(error: E) -> Self {
+        let (_, mut completion) = Self::pair();
+        completion.record_issuance(Err(error));
+        completion
+    }
     pub(crate) fn pair() -> (oneshot::Sender<Result<T, E>>, Self) {
         let (sender, receiver) = oneshot::channel();
         (

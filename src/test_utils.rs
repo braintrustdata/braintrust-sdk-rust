@@ -7,7 +7,7 @@ use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle};
 use crate::types::{ParentSpanInfo, SpanPayload};
 
-use crate::internal::ports::{DeliveryControl, SpanSubmitter};
+use crate::internal::ports::{DeliveryControl, PreparedSpan, SpanSubmitter};
 use crate::internal::shared_outcome::{WriteOutcome, WriteResponder};
 
 #[derive(Clone, Default)]
@@ -60,6 +60,40 @@ impl MockBraintrustClient {
 
 #[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
+    fn operation(
+        &self,
+    ) -> std::result::Result<crate::internal::ports::SpanOperation, crate::EnqueueError> {
+        Ok(crate::internal::ports::SpanOperation::new(
+            Arc::new(self.clone()),
+            || {},
+        ))
+    }
+    fn submit_deferred(
+        &self,
+        _: String,
+        prepare: futures::future::BoxFuture<'static, Result<PreparedSpan>>,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+        let collector = self.collector.clone();
+        crate::internal::execution::ExecutionBinding::external(tokio::runtime::Handle::current())
+            .response(async move {
+                let PreparedSpan {
+                    scope,
+                    payload,
+                    parent_info,
+                } = prepare.await.map_err(|source| {
+                    crate::WriteError::Delivery(Arc::new(crate::DeliveryError {
+                        source: source.into(),
+                    }))
+                })?;
+                collector.push(CapturedSpan {
+                    token: scope.token().to_owned(),
+                    payload,
+                    parent: parent_info,
+                });
+                Ok(crate::DeliveryReceipt)
+            })
+    }
+
     fn submit(
         &self,
         scope: CredentialScope,

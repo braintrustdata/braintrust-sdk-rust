@@ -147,12 +147,32 @@ impl ExecutionBinding {
         E: From<ExecutionError> + From<EnqueueError> + Send + 'static,
         F: Future<Output = Result<T, E>> + Send + 'static,
     {
+        self.response_try(|| Ok(work))
+    }
+
+    /// Reserve response capacity before synchronously admitting dependent work.
+    /// A rejected reservation never invokes the factory; a rejected dependency
+    /// retires the reservation and reports that same issuance failure.
+    pub fn response_try<T, E, F, M>(&self, make: M) -> Completion<T, E>
+    where
+        T: Send + 'static,
+        E: From<ExecutionError> + From<EnqueueError> + Send + 'static,
+        F: Future<Output = Result<T, E>> + Send + 'static,
+        M: FnOnce() -> Result<F, E>,
+    {
         let (sender, mut completion) = Completion::pair();
         let (guard, response) = match self.responses.admit(sender) {
             Ok(admitted) => admitted,
             Err(error) => {
                 completion.record_issuance(Err(error.into()));
                 return completion;
+            }
+        };
+        let work = match make() {
+            Ok(work) => work,
+            Err(error) => {
+                completion.record_issuance(Err(error));
+                return completion; // The guard retires this reserved slot.
             }
         };
         let id = guard.id;

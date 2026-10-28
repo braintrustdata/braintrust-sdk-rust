@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::experiments::experiment::{Experiment, ExperimentState};
 use crate::experiments::metadata::RepoInfo;
+use crate::internal::execution::ExecutionBinding;
 use crate::internal::ports::{ExperimentApi, SpanSubmitter};
 use crate::internal::session::CredentialScope;
 
@@ -36,6 +37,7 @@ impl std::error::Error for ExperimentBuilderError {}
 /// credentials belong to the resource and do not mutate the client's session.
 pub struct ExperimentBuilder {
     api: Arc<dyn ExperimentApi>,
+    execution: ExecutionBinding,
     submitter: Arc<dyn SpanSubmitter>,
     scope: CredentialScope,
     project_name: Option<String>,
@@ -52,6 +54,7 @@ impl Clone for ExperimentBuilder {
     fn clone(&self) -> Self {
         Self {
             api: self.api.clone(),
+            execution: self.execution.clone(),
             submitter: self.submitter.clone(),
             scope: self.scope.clone(),
             project_name: self.project_name.clone(),
@@ -70,11 +73,13 @@ impl ExperimentBuilder {
     /// Create a new ExperimentBuilder (internal use).
     pub(crate) fn new(
         api: Arc<dyn ExperimentApi>,
+        execution: ExecutionBinding,
         submitter: Arc<dyn SpanSubmitter>,
         scope: CredentialScope,
     ) -> Self {
         Self {
             api,
+            execution,
             submitter,
             scope,
             project_name: None,
@@ -164,6 +169,7 @@ impl ExperimentBuilder {
 
         Ok(Experiment {
             api: self.api,
+            execution: self.execution,
             submitter: self.submitter,
             scope: self.scope,
             project_name,

@@ -481,6 +481,17 @@ impl SpanBuilder {
         self
     }
 
+    /// Normalize a complete event whose destination will resolve later.
+    pub(crate) fn into_payload(self, event: SpanLog) -> SpanPayload {
+        let span = self.build();
+        let mut inner = span
+            .inner
+            .lock()
+            .expect("span mutex should not be poisoned");
+        apply_span_log_to_data(&mut inner, event);
+        current_span_payload(&mut inner)
+    }
+
     pub fn build(self) -> SpanHandle {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -560,6 +571,22 @@ impl Clone for SpanHandle {
 }
 
 impl SpanHandle {
+    /// Create a child builder with this span's context and execution scope.
+    /// The child has its own finish state. Retaining it does not extend a
+    /// callback's permission to submit dependent writes during shutdown.
+    pub fn child_builder(&self) -> Result<SpanBuilder> {
+        let parent = self.export()?.to_parent_span_info()?;
+        let inner = self
+            .inner
+            .lock()
+            .expect("span mutex should not be poisoned");
+        let mut builder =
+            SpanBuilder::new(self.submitter.clone(), self.scope.clone()).parent_info(parent);
+        builder.environment = inner.environment.clone();
+        builder.span_origin = inner.span_origin.clone();
+        Ok(builder)
+    }
+
     /// Return the stable row ID for this span, usable with `log_feedback()` and `update_span()`.
     pub fn row_id(&self) -> &str {
         &self.row_id
@@ -1093,6 +1120,22 @@ mod tests {
         }
         #[async_trait]
         impl SpanSubmitter for Submitter {
+            fn operation(
+                &self,
+            ) -> std::result::Result<crate::internal::ports::SpanOperation, crate::EnqueueError>
+            {
+                unreachable!("this test submitter only accepts ready span snapshots")
+            }
+            fn submit_deferred(
+                &self,
+                _: String,
+                _: futures::future::BoxFuture<
+                    'static,
+                    Result<crate::internal::ports::PreparedSpan>,
+                >,
+            ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+                unreachable!("this test submitter only accepts ready span snapshots")
+            }
             fn submit(
                 &self,
                 _: CredentialScope,
@@ -1169,6 +1212,22 @@ mod tests {
         }
         #[async_trait]
         impl SpanSubmitter for Submitter {
+            fn operation(
+                &self,
+            ) -> std::result::Result<crate::internal::ports::SpanOperation, crate::EnqueueError>
+            {
+                unreachable!("this test submitter only accepts ready span snapshots")
+            }
+            fn submit_deferred(
+                &self,
+                _: String,
+                _: futures::future::BoxFuture<
+                    'static,
+                    Result<crate::internal::ports::PreparedSpan>,
+                >,
+            ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+                unreachable!("this test submitter only accepts ready span snapshots")
+            }
             fn submit(
                 &self,
                 _: CredentialScope,

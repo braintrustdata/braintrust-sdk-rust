@@ -337,7 +337,7 @@ async fn failed_dataset_registration_is_retryable_and_clone_registration_is_shar
     assert_eq!(first.unwrap(), "dataset");
     assert_eq!(second.unwrap(), "dataset");
     assert_eq!(dataset.clone().dataset_id().await.unwrap(), "dataset");
-    assert!(!client.is_logged_in().await);
+    assert!(!client.is_logged_in());
 }
 
 #[tokio::test]

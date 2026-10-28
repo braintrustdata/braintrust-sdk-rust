@@ -13,7 +13,7 @@ use crate::experiments::ExperimentBuilder;
 use crate::http::{build_http_client, CaBundleConfig};
 use crate::internal::execution::ExecutionBinding;
 use crate::internal::lifecycle::Lifecycle;
-use crate::internal::ports::SpanSubmitter;
+use crate::internal::ports::{PreparedSpan, SpanSubmitter};
 use crate::internal::resources::ResourceTransport;
 use crate::internal::retry::{exponential, RetryExecutor};
 use crate::internal::session::CredentialScope;
@@ -389,11 +389,7 @@ impl BraintrustClientBuilder {
                 let context = binding.clone();
                 binding.response(async move { self.initialize(context).await })
             }
-            Err(error) => {
-                let (_, mut completion) = crate::Completion::pair();
-                completion.record_issuance(Err(error));
-                completion
-            }
+            Err(error) => crate::Completion::rejected(error),
         }
     }
 
@@ -481,6 +477,50 @@ pub struct BraintrustClient {
     inner: Arc<ClientInner>,
 }
 
+/// Validated, owned patch data without unresolved or placeholder credentials.
+struct SpanUpdate {
+    row_id: String,
+    span_id: String,
+    components: SpanComponents,
+    event_data: SpanEventData,
+}
+impl SpanUpdate {
+    fn into_prepared(self, scope: CredentialScope) -> PreparedSpan {
+        let Self {
+            row_id,
+            span_id,
+            components,
+            event_data,
+        } = self;
+        let payload = SpanPayload {
+            row_id,
+            span_id,
+            is_merge: true,
+            span_components: Some(components),
+            org_id: scope.org_id().to_owned(),
+            org_name: scope.org_name().map(str::to_owned),
+            project_name: None,
+            input: event_data.input,
+            output: event_data.output,
+            expected: event_data.expected,
+            error: event_data.error,
+            scores: event_data.scores,
+            metadata: event_data.metadata,
+            metrics: event_data.metrics,
+            tags: event_data.tags,
+            context: event_data.context,
+            span_attributes: event_data.span_attributes,
+            extra: event_data.extra,
+        };
+
+        PreparedSpan {
+            scope,
+            payload,
+            parent_info: None,
+        }
+    }
+}
+
 struct ClientInner {
     lifecycle: Lifecycle,
     execution: ExecutionBinding,
@@ -509,10 +549,7 @@ impl std::fmt::Debug for ClientInner {
 
 impl BraintrustClient {
     fn resource_transport(&self) -> Arc<ResourceTransport> {
-        Arc::new(ResourceTransport::new(
-            self.inner.http_client.clone(),
-            self.inner.execution.clone(),
-        ))
+        Arc::new(ResourceTransport::new(self.inner.http_client.clone()))
     }
 
     fn span_submitter(&self) -> Arc<dyn SpanSubmitter> {
@@ -553,31 +590,37 @@ impl BraintrustClient {
         BraintrustClientBuilder::new()
     }
 
-    /// Check if the client is logged in.
-    pub async fn is_logged_in(&self) -> bool {
+    /// Check local login state immediately, without scheduling work.
+    pub fn is_logged_in(&self) -> bool {
         self.inner.login_state.is_logged_in()
     }
 
     /// Wait for login to complete (useful if using background login).
     ///
-    /// Returns the login state once available, or an error if login times out.
-    pub async fn wait_for_login(&self) -> Result<LoginState> {
+    /// Submits the wait immediately on the selected runtime. Awaiting observes
+    /// the login state or a timeout; dropping the token does not cancel the wait.
+    /// Login-dependent methods reject issuance when login was skipped.
+    pub fn wait_for_login(&self) -> crate::Completion<LoginState, BraintrustError> {
         if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+            return crate::Completion::rejected(BraintrustError::InvalidConfig(
                 "wait_for_login() not available when skip_login is enabled".into(),
             ));
         }
-        self.wait_for_login_state().await
+        let client = self.clone();
+        self.inner
+            .execution
+            .response(async move { client.wait_for_login_state().await })
     }
 
-    /// Get the current login state.
-    pub async fn login_state(&self) -> LoginState {
+    /// Get a shared view of local login state without scheduling work.
+    pub fn login_state(&self) -> LoginState {
         self.inner.login_state.clone()
     }
 
     /// Create a span builder using the logged-in state and default project.
     ///
-    /// This waits for login to complete if it hasn't already.
+    /// Submits immediately, waiting for login on the selected runtime if needed.
+    /// Dropping the returned completion does not cancel accepted work.
     ///
     /// # Example
     ///
@@ -595,12 +638,19 @@ impl BraintrustClient {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder> {
+    pub fn span_builder(&self) -> crate::Completion<crate::span::SpanBuilder, BraintrustError> {
         if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+            return crate::Completion::rejected(BraintrustError::InvalidConfig(
                 "span_builder() requires login; use span_builder_with_credentials() when skip_login is enabled".into(),
             ));
         }
+        let client = self.clone();
+        self.inner
+            .execution
+            .response(async move { client.span_builder_inner().await })
+    }
+
+    async fn span_builder_inner(&self) -> Result<crate::span::SpanBuilder> {
         let state = self.wait_for_login_state().await?;
         let mut builder = crate::span::SpanBuilder::new(self.span_submitter(), state.scope()?);
         if let Some(environment) = &self.inner.environment {
@@ -617,14 +667,23 @@ impl BraintrustClient {
 
     /// Create a dataset builder using the logged-in state.
     ///
-    /// This waits for login to complete if it hasn't already.
-    pub async fn dataset_builder(&self) -> Result<DatasetBuilder> {
+    /// Submits immediately, waiting for login on the selected runtime if needed.
+    /// Dropping the returned completion does not cancel accepted work.
+    pub fn dataset_builder(&self) -> crate::Completion<DatasetBuilder, BraintrustError> {
         if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
+            return crate::Completion::rejected(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
         }
+        let client = self.clone();
+        self.inner
+            .execution
+            .response(async move { client.dataset_builder_inner().await })
+    }
+
+    async fn dataset_builder_inner(&self) -> Result<DatasetBuilder> {
         let state = self.wait_for_login_state().await?;
         Ok(DatasetBuilder::new(
             self.resource_transport(),
+            self.inner.execution.clone(),
             Arc::new(self.inner.queue.clone()),
             state.scope()?,
         ))
@@ -639,6 +698,7 @@ impl BraintrustClient {
     ) -> DatasetBuilder {
         DatasetBuilder::new(
             self.resource_transport(),
+            self.inner.execution.clone(),
             Arc::new(self.inner.queue.clone()),
             self.explicit_scope(token.into(), String::new(), Some(org_name.into())),
         )
@@ -670,47 +730,88 @@ impl BraintrustClient {
         builder
     }
 
-    /// Update an existing span using the output of `SpanHandle::export()`.
-    ///
-    /// Validation happens before queuing. The actual upload remains asynchronous.
-    pub async fn update_span(&self, exported: &str, event: crate::span::SpanLog) -> Result<()> {
-        let login_state = if self.inner.login_state.is_logged_in() {
-            self.inner.login_state.clone()
+    /// Submit an update using exported span context and the shared login state.
+    /// Validation and admission happen immediately. The completion includes
+    /// login (if pending), preparation and full batch delivery.
+    pub fn update_span(
+        &self,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> crate::Completion<(), BraintrustError> {
+        let scope = if self.inner.login_state.is_logged_in() {
+            match self.inner.login_state.scope() {
+                Ok(scope) => Some(scope),
+                Err(error) => return crate::Completion::rejected(error),
+            }
         } else if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+            return crate::Completion::rejected(BraintrustError::InvalidConfig(
                 "update_span() requires a logged-in client; use update_span_with_credentials() when skip_login is enabled".into(),
             ));
         } else {
-            self.wait_for_login_state().await?
+            None
         };
-
-        self.update_span_internal(login_state.scope()?, exported, event)
+        self.schedule_span_update(scope, exported, event)
     }
 
-    /// Update an existing span using explicit credentials instead of shared login state.
-    ///
-    /// This is the safe entrypoint for multi-tenant `skip_login` clients: the
-    /// supplied credentials travel with the queued row and are NOT written into
-    /// the client's shared login state.
+    /// Submit an update with immutable explicit credentials and configured routes.
+    /// Credentials travel with this write and never populate shared login state.
+    /// Dropping the token does not cancel an admitted update.
     pub fn update_span_with_credentials(
         &self,
         token: impl Into<String>,
         org_id: impl Into<String>,
         exported: &str,
         event: crate::span::SpanLog,
-    ) -> Result<()> {
-        let token = token.into();
-        let org_id = org_id.into();
-
-        self.update_span_internal(self.explicit_scope(token, org_id, None), exported, event)
+    ) -> crate::Completion<(), BraintrustError> {
+        let scope = self.explicit_scope(token.into(), org_id.into(), None);
+        self.schedule_span_update(Some(scope), exported, event)
     }
 
-    fn update_span_internal(
+    // None means the immutable session scope is still waiting for login. The
+    // queue owns that resolution before any flush or shutdown can capture it.
+    fn schedule_span_update(
         &self,
-        scope: CredentialScope,
+        scope: Option<CredentialScope>,
         exported: &str,
         event: crate::span::SpanLog,
-    ) -> Result<()> {
+    ) -> crate::Completion<(), BraintrustError> {
+        self.inner.execution.response_try(|| {
+            let update = self.prepare_span_update(exported, event)?;
+            let delivery = match scope {
+                Some(scope) => {
+                    let PreparedSpan {
+                        scope,
+                        payload,
+                        parent_info,
+                    } = update.into_prepared(scope);
+                    self.submit_payload(scope, payload, parent_info)
+                }
+                None => {
+                    let client = self.clone();
+                    self.inner.queue.submit_deferred(
+                        update.row_id.clone(),
+                        Box::pin(async move {
+                            let state = client.wait_for_login_state().await?;
+                            Ok(update.into_prepared(state.scope()?))
+                        }),
+                    )
+                }
+            };
+            if let Err(error) = &*delivery {
+                return Err(error.clone().into());
+            }
+            Ok(async move {
+                delivery.await?;
+                Ok(())
+            })
+        })
+    }
+
+    fn prepare_span_update(
+        &self,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> Result<SpanUpdate> {
         let components = SpanComponents::parse(exported)?;
         let row_id = components.row_id.clone().ok_or_else(|| {
             BraintrustError::InvalidConfig("Exported span must have a row_id".into())
@@ -782,32 +883,12 @@ impl BraintrustClient {
             event_data.apply_propagated_event(propagated_event);
         }
 
-        let payload = SpanPayload {
+        Ok(SpanUpdate {
             row_id,
             span_id,
-            is_merge: true,
-            span_components: Some(components),
-            org_id: scope.org_id().to_owned(),
-            org_name: scope.org_name().map(str::to_owned),
-            project_name: None,
-            input: event_data.input,
-            output: event_data.output,
-            expected: event_data.expected,
-            error: event_data.error,
-            scores: event_data.scores,
-            metadata: event_data.metadata,
-            metrics: event_data.metrics,
-            tags: event_data.tags,
-            context: event_data.context,
-            span_attributes: event_data.span_attributes,
-            extra: event_data.extra,
-        };
-
-        let completion = self.submit_payload(scope, payload, None);
-        if let Err(error) = &*completion {
-            return Err(BraintrustError::Background(error.to_string()));
-        }
-        Ok(())
+            components,
+            event_data,
+        })
     }
 
     /// Perform login synchronously.
@@ -973,6 +1054,7 @@ impl BraintrustClient {
         let submitter = self.span_submitter();
         ExperimentBuilder::new(
             self.resource_transport(),
+            self.inner.execution.clone(),
             submitter,
             self.explicit_scope(token, org_id, None),
         )
@@ -1699,7 +1781,7 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await;
+        let login_state = client.login_state();
         assert!(login_state.is_logged_in(), "should be logged in");
         assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
         assert_eq!(login_state.org_name().as_deref(), Some("First Org"));
@@ -1729,7 +1811,7 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await;
+        let login_state = client.login_state();
         assert!(login_state.is_logged_in(), "should be logged in");
         assert_eq!(login_state.org_id().as_deref(), Some("org-2"));
         assert_eq!(login_state.org_name().as_deref(), Some("Second Org"));
@@ -1822,7 +1904,7 @@ mod tests {
             .expect("client");
 
         // Initially should not be logged in (background login hasn't completed)
-        let is_logged_in = client.is_logged_in().await;
+        let is_logged_in = client.is_logged_in();
         assert!(!is_logged_in);
     }
 
@@ -1847,7 +1929,7 @@ mod tests {
         // Wait for background login to complete
         let login_state = client.wait_for_login().await.expect("login should succeed");
         assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
-        assert!(client.is_logged_in().await);
+        assert!(client.is_logged_in());
     }
 
     #[tokio::test]
@@ -2016,7 +2098,7 @@ mod tests {
 
         // No credential leak into shared global state.
         assert!(
-            !client.is_logged_in().await,
+            !client.is_logged_in(),
             "per-request credentials must not populate the shared login state"
         );
 

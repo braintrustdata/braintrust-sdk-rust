@@ -6,9 +6,9 @@ use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry}
 use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use crate::error::{BraintrustError, Result};
-use crate::internal::delivery::WriteService;
+use crate::internal::delivery::{WriteLease, WriteService};
 use crate::internal::execution::ExecutionBinding;
-use crate::internal::ports::{DeliveryControl, SpanSubmitter};
+use crate::internal::ports::{DeliveryControl, PreparedSpan, SpanOperation, SpanSubmitter};
 use crate::internal::session::CredentialScope;
 use crate::internal::shared_outcome::WriteOutcome;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
@@ -16,7 +16,7 @@ use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, Spa
 use crate::{
     Completion, DeliveryReceipt, FlushError, FlushReport, ShutdownError, ShutdownReport, WriteError,
 };
-use futures::future::join_all;
+use futures::future::{join_all, BoxFuture};
 use indexmap::IndexMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -40,10 +40,12 @@ fn cache_insert<K: Eq + std::hash::Hash, V>(cache: &mut IndexMap<K, V>, key: K, 
 ///
 /// Fields are private — construction and destructuring happen only within this
 /// module. `worker.rs` never touches the fields directly.
-struct SubmitCommand {
-    scope: CredentialScope,
-    payload: SpanPayload,
-    parent_info: Option<ParentSpanInfo>,
+enum SubmitCommand {
+    Ready(Box<PreparedSpan>),
+    Deferred {
+        row_id: String,
+        prepare: BoxFuture<'static, Result<PreparedSpan>>,
+    },
 }
 
 /// Preparation and protocol orchestration, independent of admission/lifecycle.
@@ -108,13 +110,21 @@ impl LogQueueCore {
         // exact scope captured by each producer when its handle was created.
         let mut groups: IndexMap<CredentialScope, Vec<Logs3Row>> = IndexMap::new();
         for cmd in cmds {
-            let SubmitCommand {
-                scope,
-                payload,
-                parent_info,
-            } = cmd;
-            match self.prepare_row(&scope, payload, parent_info).await {
-                Ok(row) => {
+            let prepared = async {
+                let PreparedSpan {
+                    scope,
+                    payload,
+                    parent_info,
+                } = match cmd {
+                    SubmitCommand::Ready(span) => *span,
+                    SubmitCommand::Deferred { prepare, .. } => prepare.await?,
+                };
+                let row = self.prepare_row(&scope, payload, parent_info).await?;
+                Ok::<_, anyhow::Error>((scope, row))
+            }
+            .await;
+            match prepared {
+                Ok((scope, row)) => {
                     groups.entry(scope).or_default().push(row);
                 }
                 Err(e) => {
@@ -500,12 +510,19 @@ impl LogQueueCore {
             return;
         }
         self.execution.spawn(async move {
-            let SubmitCommand {
+            let PreparedSpan {
                 scope: _,
                 payload,
                 parent_info,
-            } = cmd;
-
+            } = match cmd {
+                SubmitCommand::Ready(span) => *span,
+                SubmitCommand::Deferred { row_id, .. } => {
+                    // Rejection must not initiate login or registration merely
+                    // to serialize a concrete wire row for a debug dump.
+                    warn!(%row_id, "cannot dump rejected row with unresolved scope or destination");
+                    return;
+                }
+            };
             let span_components = payload.span_components.clone();
 
             let span_id = payload.span_id.clone();
@@ -627,6 +644,7 @@ impl LogQueueCore {
 pub struct LogQueue {
     core: Arc<LogQueueCore>,
     writes: Arc<Mutex<QueueState>>,
+    lease: Option<WriteLease<SubmitCommand>>,
 }
 enum QueueState {
     Dormant,
@@ -643,6 +661,7 @@ impl LogQueue {
         Self {
             core: LogQueueCore::new(config, client, execution),
             writes: Arc::new(Mutex::new(QueueState::Dormant)),
+            lease: None,
         }
     }
     fn state(&self) -> MutexGuard<'_, QueueState> {
@@ -658,15 +677,20 @@ impl LogQueue {
         parent_info: Option<ParentSpanInfo>,
         outcome: Option<WriteOutcome>,
     ) -> Completion<DeliveryReceipt, WriteError> {
-        let command = SubmitCommand {
-            scope,
-            payload,
-            parent_info,
-        };
-        let mut state = self.state();
-        if matches!(*state, QueueState::Dormant) {
+        self.submit_command(
+            SubmitCommand::Ready(Box::new(PreparedSpan {
+                scope,
+                payload,
+                parent_info,
+            })),
+            outcome,
+        )
+    }
+
+    fn ensure_running(&self, state: &mut MutexGuard<'_, QueueState>) {
+        if matches!(**state, QueueState::Dormant) {
             let processor = self.core.clone();
-            *state = QueueState::Running(WriteService::new(
+            **state = QueueState::Running(WriteService::new(
                 self.core.config.queue_max_size(),
                 self.core.execution.clone(),
                 move |commands| {
@@ -675,12 +699,26 @@ impl LogQueue {
                 },
             ));
         }
+    }
+
+    fn submit_command(
+        &self,
+        command: SubmitCommand,
+        outcome: Option<WriteOutcome>,
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        let mut state = self.state();
+        self.ensure_running(&mut state);
         match &*state {
-            QueueState::Running(writes) => {
-                writes.enqueue_with_rejection(command, outcome, |command, error| {
+            QueueState::Running(writes) => match &self.lease {
+                Some(lease) => {
+                    writes.enqueue_with_lease(command, outcome, Some(lease), |command, error| {
+                        self.reject(command, error)
+                    })
+                }
+                None => writes.enqueue_with_rejection(command, outcome, |command, error| {
                     self.reject(command, error)
-                })
-            }
+                }),
+            },
             QueueState::Closed => {
                 let (sender, mut completion) = Completion::pair();
                 completion.record_issuance(Err(crate::EnqueueError::Closed.into()));
@@ -704,7 +742,10 @@ impl LogQueue {
 
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
         match &*self.state() {
-            QueueState::Running(writes) => writes.flush(),
+            QueueState::Running(writes) => match &self.lease {
+                Some(lease) => writes.flush_with_lease(Some(lease)),
+                None => writes.flush(),
+            },
             state => {
                 let (sender, mut completion) = Completion::pair();
                 if matches!(state, QueueState::Closed) {
@@ -730,11 +771,17 @@ impl LogQueue {
         completion
     }
     pub fn cancel(&self, error: crate::ExecutionError) {
-        let mut state = self.state();
-        if let QueueState::Running(writes) = &*state {
+        let writes = {
+            let mut state = self.state();
+            if let QueueState::Running(writes) = &*state {
+                Some(writes.clone())
+            } else {
+                *state = QueueState::Closed;
+                None
+            }
+        };
+        if let Some(writes) = writes {
             writes.cancel(error);
-        } else {
-            *state = QueueState::Closed;
         }
     }
 
@@ -769,6 +816,28 @@ impl DeliveryControl for LogQueue {
 }
 #[async_trait::async_trait]
 impl SpanSubmitter for LogQueue {
+    fn operation(&self) -> std::result::Result<SpanOperation, crate::EnqueueError> {
+        let lease = {
+            let mut state = self.state();
+            self.ensure_running(&mut state);
+            match &*state {
+                QueueState::Running(writes) => writes.lease()?,
+                _ => return Err(crate::EnqueueError::Closed),
+            }
+        };
+        let mut scoped = self.clone();
+        scoped.lease = Some(lease.clone());
+        Ok(SpanOperation::new(Arc::new(scoped), move || lease.revoke()))
+    }
+
+    fn submit_deferred(
+        &self,
+        row_id: String,
+        prepare: BoxFuture<'static, Result<PreparedSpan>>,
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        self.submit_command(SubmitCommand::Deferred { row_id, prepare }, None)
+    }
+
     fn submit(
         &self,
         scope: CredentialScope,
