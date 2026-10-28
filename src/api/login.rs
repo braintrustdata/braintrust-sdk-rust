@@ -29,6 +29,7 @@ impl OrgInfo {
 
 /// Response from the login endpoint.
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct LoginResponse {
     pub org_info: Vec<OrgInfo>,
 }

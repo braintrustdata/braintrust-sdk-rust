@@ -2,7 +2,7 @@ use std::{error::Error as _, time::Duration};
 
 use braintrust_sdk_rust::api::{
     self,
-    btql::{BTQLQuery, BTQLQueryInner},
+    btql::BTQLQuery,
     datasets::DatasetRegisterRequest,
     experiments::{BaseExperimentRequest, ExperimentRegisterRequest},
     logs3::{InsertRows, Logs3OverflowUploadRequest},
@@ -141,12 +141,11 @@ async fn btql_readback_preserves_cursor_and_request_errors() {
         .await;
     let page = client
         .btql()
-        .query_dataset_records(BTQLQuery {
-            query: BTQLQueryInner {
-                from: "dataset('id')".into(),
-                limit: Some(5),
-                cursor: Some("next".into()),
-            },
+        .query_dataset_records({
+            let mut query = BTQLQuery::new("dataset('id')");
+            query.query.limit = Some(5);
+            query.query.cursor = Some("next".into());
+            query
         })
         .await
         .unwrap();
@@ -164,13 +163,7 @@ async fn btql_readback_preserves_cursor_and_request_errors() {
     assert!(matches!(
         client
             .btql()
-            .query_dataset_records(BTQLQuery {
-                query: BTQLQueryInner {
-                    from: "dataset('id')".into(),
-                    limit: None,
-                    cursor: None,
-                }
-            })
+            .query_dataset_records(BTQLQuery::new("dataset('id')"))
             .await,
         Err(api::Error::Http { status: 500, .. })
     ));
@@ -229,10 +222,10 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
     assert_eq!(
         client
             .projects()
-            .register(ProjectRegisterRequest {
-                project_name: "p".into(),
-                org_id: Some("org".into()),
-                org_name: None
+            .register({
+                let mut request = ProjectRegisterRequest::new("p");
+                request.org_id = Some("org".into());
+                request
             })
             .await
             .unwrap()
@@ -243,13 +236,7 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
     assert_eq!(
         client
             .datasets()
-            .register(DatasetRegisterRequest {
-                project_name: "p".into(),
-                org_name: "org".into(),
-                dataset_name: "d".into(),
-                description: None,
-                metadata: None
-            })
+            .register(DatasetRegisterRequest::new("p", "org", "d"))
             .await
             .unwrap()
             .dataset
@@ -259,16 +246,10 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
     assert_eq!(
         client
             .experiments()
-            .register(ExperimentRegisterRequest {
-                project_name: "p".into(),
-                org_id: "org".into(),
-                experiment_name: Some("e".into()),
-                description: None,
-                base_experiment: None,
-                metadata: None,
-                public: None,
-                update: None,
-                repo_info: None,
+            .register({
+                let mut request = ExperimentRegisterRequest::new("p", "org");
+                request.experiment_name = Some("e".into());
+                request
             })
             .await
             .unwrap()
@@ -279,9 +260,7 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
     assert_eq!(
         client
             .experiments()
-            .base(BaseExperimentRequest {
-                id: "experiment".into()
-            })
+            .base(BaseExperimentRequest::new("experiment"))
             .await
             .unwrap()
             .base_exp_id
@@ -345,11 +324,11 @@ async fn overflow_grant_is_explicit_and_does_not_upload_or_commit() {
     let client = api::Client::new(config(&server, &server, "token")).unwrap();
     let grant = client
         .logs3()
-        .request_overflow_upload(Logs3OverflowUploadRequest {
-            content_type: "application/json".into(),
-            size_bytes: 123,
-            rows: vec![],
-        })
+        .request_overflow_upload(Logs3OverflowUploadRequest::new(
+            "application/json",
+            123,
+            vec![],
+        ))
         .await
         .unwrap();
     assert_eq!(grant.key, "key");

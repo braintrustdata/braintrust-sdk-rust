@@ -31,12 +31,14 @@ pub struct DatasetRecord {
 
 /// BTQL query for fetching dataset records.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct BTQLQuery {
     pub query: BTQLQueryInner,
 }
 
 /// Inner BTQL query structure.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct BTQLQueryInner {
     /// Dataset reference: dataset('id')
     pub from: String,
@@ -50,6 +52,7 @@ pub struct BTQLQueryInner {
 
 /// Response from BTQL query.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct BTQLResponse {
     /// Records in JSONL format.
     #[serde(default)]
@@ -66,5 +69,24 @@ impl Btql {
     /// Execute one dataset page request; no visibility polling or pagination loop.
     pub async fn query_dataset_records(&self, query: BTQLQuery) -> Result<BTQLResponse, Error> {
         self.client.post_json(Plane::Data, "btql", &query).await
+    }
+}
+
+impl BTQLQuery {
+    /// Construct a dataset query from its source expression.
+    pub fn new(from: impl Into<String>) -> Self {
+        Self {
+            query: BTQLQueryInner::new(from),
+        }
+    }
+}
+impl BTQLQueryInner {
+    /// Construct the query body with no page limit or cursor.
+    pub fn new(from: impl Into<String>) -> Self {
+        Self {
+            from: from.into(),
+            limit: None,
+            cursor: None,
+        }
     }
 }

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 /// Repository information for experiment tracking.
 #[derive(Debug, Clone, Default, Serialize)]
+#[non_exhaustive]
 pub struct RepoInfo {
     /// Git commit SHA.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,6 +36,7 @@ pub struct RepoInfo {
 
 /// Request body for experiment registration.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ExperimentRegisterRequest {
     pub project_name: String,
     pub org_id: String,
@@ -56,6 +58,7 @@ pub struct ExperimentRegisterRequest {
 
 /// Response from experiment registration.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ExperimentRegisterResponse {
     pub project: ProjectInfo,
     pub experiment: ExperimentInfo,
@@ -63,6 +66,7 @@ pub struct ExperimentRegisterResponse {
 
 /// Project information from registration response.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ProjectInfo {
     pub id: String,
     pub name: String,
@@ -70,6 +74,7 @@ pub struct ProjectInfo {
 
 /// Experiment information from registration response.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ExperimentInfo {
     pub id: String,
     pub name: String,
@@ -77,18 +82,21 @@ pub struct ExperimentInfo {
 
 /// Request body for fetching base experiment.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct BaseExperimentRequest {
     pub id: String,
 }
 
 /// Response from base experiment fetch.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct BaseExperimentResponse {
     pub base_exp_id: Option<String>,
     pub base_exp_name: Option<String>,
 }
 /// Response from experiment comparison API.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ExperimentComparisonResponse {
     #[serde(default)]
     pub scores: HashMap<String, ComparisonScoreData>,
@@ -99,6 +107,7 @@ pub struct ExperimentComparisonResponse {
 
 /// Score data from comparison API.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ComparisonScoreData {
     pub score: f64,
     pub diff: Option<f64>,
@@ -108,6 +117,7 @@ pub struct ComparisonScoreData {
 
 /// Metric data from comparison API.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ComparisonMetricData {
     pub metric: f64,
     pub unit: Option<String>,
@@ -150,5 +160,28 @@ impl Experiments {
         self.client
             .get_json(Plane::Control, "experiment-comparison2", &query)
             .await
+    }
+}
+
+impl ExperimentRegisterRequest {
+    /// Construct a registration request with required project name and organization ID.
+    pub fn new(project_name: impl Into<String>, org_id: impl Into<String>) -> Self {
+        Self {
+            project_name: project_name.into(),
+            org_id: org_id.into(),
+            experiment_name: None,
+            description: None,
+            base_experiment: None,
+            metadata: None,
+            public: None,
+            update: None,
+            repo_info: None,
+        }
+    }
+}
+impl BaseExperimentRequest {
+    /// Construct a base experiment lookup for an experiment ID.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
     }
 }
