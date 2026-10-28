@@ -31,5 +31,12 @@ impl OrgInfo {
 #[derive(Debug, Deserialize)]
 #[non_exhaustive]
 pub struct LoginResponse {
-    pub org_info: Vec<OrgInfo>,
+    pub(crate) org_info: Vec<OrgInfo>,
+}
+
+impl LoginResponse {
+    /// Return the org info.
+    pub fn org_info(&self) -> &[OrgInfo] {
+        &self.org_info
+    }
 }

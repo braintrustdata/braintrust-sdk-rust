@@ -2,7 +2,7 @@ use std::{error::Error as _, time::Duration};
 
 use braintrust_sdk_rust::api::{
     self,
-    btql::BTQLQuery,
+    btql::{BTQLQuery, BTQLQueryInner},
     datasets::DatasetRegisterRequest,
     experiments::{BaseExperimentRequest, ExperimentRegisterRequest},
     logs3::{InsertRows, Logs3OverflowUploadRequest},
@@ -16,10 +16,10 @@ use wiremock::{
 
 fn config(api: &MockServer, app: &MockServer, token: &str) -> api::Config {
     let mut config = api::Config::new(token);
-    config.api_url = api.uri();
-    config.app_url = app.uri();
-    config.org_name = Some("isolated-org".into());
-    config.timeout = Duration::from_secs(3);
+    config.set_api_url(api.uri());
+    config.set_app_url(app.uri());
+    config.set_org_name(Some("isolated-org".into()));
+    config.set_timeout(Duration::from_secs(3));
     config
 }
 
@@ -28,7 +28,7 @@ async fn explicit_scope_works_without_login_and_login_does_not_mutate_it() {
     let api = MockServer::start().await;
     let app = MockServer::start().await;
     let mut settings = config(&api, &app, "explicit-token");
-    settings.user_agent = Some("manual-ingest/1".into());
+    settings.set_user_agent(Some("manual-ingest/1".into()));
     let client = api::Client::new(settings).unwrap();
     assert!(api.received_requests().await.unwrap().is_empty());
     assert!(app.received_requests().await.unwrap().is_empty());
@@ -44,7 +44,10 @@ async fn explicit_scope_works_without_login_and_login_does_not_mutate_it() {
         .expect(1)
         .mount(&app)
         .await;
-    assert_eq!(client.login().await.unwrap().org_info[0].id(), "other-org");
+    assert_eq!(
+        client.login().await.unwrap().org_info()[0].id(),
+        "other-org"
+    );
     Mock::given(method("POST"))
         .and(path("/logs3"))
         .and(header("authorization", "Bearer explicit-token"))
@@ -142,15 +145,16 @@ async fn btql_readback_preserves_cursor_and_request_errors() {
     let page = client
         .btql()
         .query_dataset_records({
+            let mut inner = BTQLQueryInner::new("dataset('id')");
+            inner.set_limit(Some(5)).set_cursor(Some("next".into()));
             let mut query = BTQLQuery::new("dataset('id')");
-            query.query.limit = Some(5);
-            query.query.cursor = Some("next".into());
+            query.set_query(inner);
             query
         })
         .await
         .unwrap();
-    assert_eq!(page.cursor.as_deref(), Some("last"));
-    assert_eq!(page.data.len(), 1);
+    assert_eq!(page.cursor(), Some("last"));
+    assert_eq!(page.data().len(), 1);
     assert!(control.received_requests().await.unwrap().is_empty());
 
     data.reset().await;
@@ -224,13 +228,13 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
             .projects()
             .register({
                 let mut request = ProjectRegisterRequest::new("p");
-                request.org_id = Some("org".into());
+                request.set_org_id(Some("org".into()));
                 request
             })
             .await
             .unwrap()
-            .project
-            .id,
+            .project()
+            .id(),
         "project"
     );
     assert_eq!(
@@ -239,8 +243,8 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
             .register(DatasetRegisterRequest::new("p", "org", "d"))
             .await
             .unwrap()
-            .dataset
-            .id,
+            .dataset()
+            .id(),
         "dataset"
     );
     assert_eq!(
@@ -248,13 +252,13 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
             .experiments()
             .register({
                 let mut request = ExperimentRegisterRequest::new("p", "org");
-                request.experiment_name = Some("e".into());
+                request.set_experiment_name(Some("e".into()));
                 request
             })
             .await
             .unwrap()
-            .experiment
-            .id,
+            .experiment()
+            .id(),
         "experiment"
     );
     assert_eq!(
@@ -263,8 +267,7 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
             .base(BaseExperimentRequest::new("experiment"))
             .await
             .unwrap()
-            .base_exp_id
-            .as_deref(),
+            .base_exp_id(),
         Some("base")
     );
     Mock::given(method("GET"))
@@ -301,7 +304,7 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
             .summarize("dataset")
             .await
             .unwrap()
-            .dataset_id,
+            .dataset_id(),
         "dataset"
     );
     assert_eq!(data.received_requests().await.unwrap().len(), 1);
@@ -331,14 +334,14 @@ async fn overflow_grant_is_explicit_and_does_not_upload_or_commit() {
         ))
         .await
         .unwrap();
-    assert_eq!(grant.key, "key");
+    assert_eq!(grant.key(), "key");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[test]
 fn config_rejects_ambiguous_routes_and_redacts_credentials() {
     let mut settings = api::Config::new("do-not-print-token");
-    settings.api_url = "https://user:secret@example.test".into();
+    settings.set_api_url("https://user:secret@example.test");
     assert!(!format!("{settings:?}").contains("secret"));
     assert!(!format!("{settings:?}").contains("do-not-print-token"));
     for url in [
@@ -347,7 +350,7 @@ fn config_rejects_ambiguous_routes_and_redacts_credentials() {
         "https://example.test/?key=secret",
         "https://example.test/#fragment",
     ] {
-        settings.api_url = url.into();
+        settings.set_api_url(url);
         assert!(matches!(
             api::Client::new(settings.clone()),
             Err(api::Error::Config(_))
@@ -366,13 +369,13 @@ async fn base_path_is_preserved_without_a_trailing_slash() {
         .mount(&server)
         .await;
     let mut settings = config(&server, &server, "token");
-    settings.api_url = format!("{}/prefix", server.uri());
+    settings.set_api_url(format!("{}/prefix", server.uri()));
     assert!(api::Client::new(settings)
         .unwrap()
         .logs3()
         .version()
         .await
         .unwrap()
-        .logs3_payload_max_bytes
+        .logs3_payload_max_bytes()
         .is_none());
 }

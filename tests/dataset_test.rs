@@ -219,8 +219,8 @@ async fn dataset_fetch_returns_records() {
     let records = iter.collect().await;
 
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0].id, "rec-1");
-    assert_eq!(records[1].id, "rec-2");
+    assert_eq!(records[0].id(), "rec-1");
+    assert_eq!(records[1].id(), "rec-2");
 }
 
 #[tokio::test]

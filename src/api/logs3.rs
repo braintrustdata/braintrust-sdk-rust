@@ -9,11 +9,11 @@ use std::collections::HashMap;
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Logs3OverflowUpload {
-    pub method: String,
-    pub signed_url: String,
-    pub headers: Option<HashMap<String, String>>,
-    pub fields: Option<HashMap<String, String>>,
-    pub key: String,
+    pub(crate) method: String,
+    pub(crate) signed_url: String,
+    pub(crate) headers: Option<HashMap<String, String>>,
+    pub(crate) fields: Option<HashMap<String, String>>,
+    pub(crate) key: String,
 }
 
 /// A single row's overflow metadata, sent when requesting the overflow upload URL.
@@ -21,53 +21,53 @@ pub struct Logs3OverflowUpload {
 #[non_exhaustive]
 pub struct Logs3OverflowInputRow {
     /// Key identifying fields extracted from the row (experiment_id, dataset_id, etc.)
-    pub object_ids: serde_json::Map<String, Value>,
+    pub(crate) object_ids: serde_json::Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_delete: Option<bool>,
-    pub input_row: Logs3OverflowInputRowMeta,
+    pub(crate) is_delete: Option<bool>,
+    pub(crate) input_row: Logs3OverflowInputRowMeta,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct Logs3OverflowInputRowMeta {
-    pub byte_size: usize,
+    pub(crate) byte_size: usize,
 }
 
 /// Reference sent to POST logs3 after a successful overflow upload.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct Logs3OverflowRequest {
-    pub rows: Logs3OverflowReference,
-    pub api_version: u8,
+    pub(crate) rows: Logs3OverflowReference,
+    pub(crate) api_version: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct Logs3OverflowReference {
     #[serde(rename = "type")]
-    pub reference_type: &'static str,
-    pub key: String,
+    pub(crate) reference_type: &'static str,
+    pub(crate) key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct VersionInfo {
-    pub logs3_payload_max_bytes: Option<usize>,
+    pub(crate) logs3_payload_max_bytes: Option<usize>,
 }
 /// Explicit request for an overflow grant. Uploading the object is a separate operation.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct Logs3OverflowUploadRequest {
-    pub content_type: String,
-    pub size_bytes: usize,
-    pub rows: Vec<Logs3OverflowInputRow>,
+    pub(crate) content_type: String,
+    pub(crate) size_bytes: usize,
+    pub(crate) rows: Vec<Logs3OverflowInputRow>,
 }
 /// Input for a single logs3 insertion. Rows use the existing ingestion wire format.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct InsertRows {
-    pub rows: Vec<Value>,
-    pub api_version: u8,
+    pub(crate) rows: Vec<Value>,
+    pub(crate) api_version: u8,
 }
 impl InsertRows {
     pub fn new(rows: Vec<Value>) -> Self {
@@ -151,5 +151,170 @@ impl Logs3OverflowUploadRequest {
             size_bytes,
             rows,
         }
+    }
+}
+
+impl Logs3OverflowUpload {
+    /// Return the method.
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+    /// Return the signed url.
+    pub fn signed_url(&self) -> &str {
+        &self.signed_url
+    }
+    /// Return the headers.
+    pub fn headers(&self) -> Option<&HashMap<String, String>> {
+        self.headers.as_ref()
+    }
+    /// Return the fields.
+    pub fn fields(&self) -> Option<&HashMap<String, String>> {
+        self.fields.as_ref()
+    }
+    /// Return the key.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl Logs3OverflowInputRow {
+    /// Return the object ids.
+    pub fn object_ids(&self) -> &serde_json::Map<String, Value> {
+        &self.object_ids
+    }
+    /// Set the object ids.
+    pub fn set_object_ids(&mut self, value: serde_json::Map<String, Value>) -> &mut Self {
+        self.object_ids = value;
+        self
+    }
+    /// Return the is delete.
+    pub fn is_delete(&self) -> Option<&bool> {
+        self.is_delete.as_ref()
+    }
+    /// Set the is delete.
+    pub fn set_is_delete(&mut self, value: Option<bool>) -> &mut Self {
+        self.is_delete = value;
+        self
+    }
+    /// Return the input row.
+    pub fn input_row(&self) -> &Logs3OverflowInputRowMeta {
+        &self.input_row
+    }
+    /// Set the input row.
+    pub fn set_input_row(&mut self, value: Logs3OverflowInputRowMeta) -> &mut Self {
+        self.input_row = value;
+        self
+    }
+}
+
+impl Logs3OverflowInputRowMeta {
+    /// Return the byte size.
+    pub fn byte_size(&self) -> usize {
+        self.byte_size
+    }
+    /// Set the byte size.
+    pub fn set_byte_size(&mut self, value: usize) -> &mut Self {
+        self.byte_size = value;
+        self
+    }
+}
+
+impl Logs3OverflowRequest {
+    /// Return the rows.
+    pub fn rows(&self) -> &Logs3OverflowReference {
+        &self.rows
+    }
+    /// Set the rows.
+    pub fn set_rows(&mut self, value: Logs3OverflowReference) -> &mut Self {
+        self.rows = value;
+        self
+    }
+    /// Return the api version.
+    pub fn api_version(&self) -> u8 {
+        self.api_version
+    }
+    /// Set the api version.
+    pub fn set_api_version(&mut self, value: u8) -> &mut Self {
+        self.api_version = value;
+        self
+    }
+}
+
+impl Logs3OverflowReference {
+    /// Return the reference type.
+    pub fn reference_type(&self) -> &&'static str {
+        &self.reference_type
+    }
+    /// Set the reference type.
+    pub fn set_reference_type(&mut self, value: &'static str) -> &mut Self {
+        self.reference_type = value;
+        self
+    }
+    /// Return the key.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+    /// Set the key.
+    pub fn set_key(&mut self, value: impl Into<String>) -> &mut Self {
+        self.key = value.into();
+        self
+    }
+}
+
+impl VersionInfo {
+    /// Return the logs3 payload max bytes.
+    pub fn logs3_payload_max_bytes(&self) -> Option<&usize> {
+        self.logs3_payload_max_bytes.as_ref()
+    }
+}
+
+impl Logs3OverflowUploadRequest {
+    /// Return the content type.
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+    /// Set the content type.
+    pub fn set_content_type(&mut self, value: impl Into<String>) -> &mut Self {
+        self.content_type = value.into();
+        self
+    }
+    /// Return the size bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.size_bytes
+    }
+    /// Set the size bytes.
+    pub fn set_size_bytes(&mut self, value: usize) -> &mut Self {
+        self.size_bytes = value;
+        self
+    }
+    /// Return the rows.
+    pub fn rows(&self) -> &[Logs3OverflowInputRow] {
+        &self.rows
+    }
+    /// Set the rows.
+    pub fn set_rows(&mut self, value: Vec<Logs3OverflowInputRow>) -> &mut Self {
+        self.rows = value;
+        self
+    }
+}
+
+impl InsertRows {
+    /// Return the rows.
+    pub fn rows(&self) -> &[Value] {
+        &self.rows
+    }
+    /// Set the rows.
+    pub fn set_rows(&mut self, value: Vec<Value>) -> &mut Self {
+        self.rows = value;
+        self
+    }
+    /// Return the api version.
+    pub fn api_version(&self) -> u8 {
+        self.api_version
+    }
+    /// Set the api version.
+    pub fn set_api_version(&mut self, value: u8) -> &mut Self {
+        self.api_version = value;
+        self
     }
 }

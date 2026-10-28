@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 /// ```
 /// use braintrust_sdk_rust::api::datasets::DatasetRegisterRequest;
 /// let mut request = DatasetRegisterRequest::new("project", "organization", "dataset");
-/// request.description = Some("Evaluation cases".into());
+/// request.set_description(Some("Evaluation cases".into()));
 /// ```
 ///
 /// Struct literals are intentionally unavailable outside this crate, allowing
@@ -26,57 +26,57 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct DatasetRegisterRequest {
-    pub project_name: String,
-    pub org_name: String,
-    pub dataset_name: String,
+    pub(crate) project_name: String,
+    pub(crate) org_name: String,
+    pub(crate) dataset_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Map<String, Value>>,
+    pub(crate) metadata: Option<Map<String, Value>>,
 }
 
 /// Response from dataset registration.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct DatasetRegisterResponse {
-    pub project: DatasetProjectInfo,
-    pub dataset: DatasetInfo,
+    pub(crate) project: DatasetProjectInfo,
+    pub(crate) dataset: DatasetInfo,
 }
 
 /// Project info from registration response.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct DatasetProjectInfo {
-    pub id: String,
-    pub name: String,
+    pub(crate) id: String,
+    pub(crate) name: String,
 }
 
 /// Dataset info from registration response.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct DatasetInfo {
-    pub id: String,
-    pub name: String,
+    pub(crate) id: String,
+    pub(crate) name: String,
 }
 
 /// Response from dataset summary API.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct DatasetSummaryResponse {
-    pub project_name: String,
-    pub dataset_name: String,
-    pub project_id: String,
-    pub dataset_id: String,
-    pub project_url: Option<String>,
-    pub dataset_url: Option<String>,
-    pub data_summary: Option<DataSummaryStats>,
+    pub(crate) project_name: String,
+    pub(crate) dataset_name: String,
+    pub(crate) project_id: String,
+    pub(crate) dataset_id: String,
+    pub(crate) project_url: Option<String>,
+    pub(crate) dataset_url: Option<String>,
+    pub(crate) data_summary: Option<DataSummaryStats>,
 }
 
 /// Data summary statistics.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct DataSummaryStats {
-    pub total_records: Option<u64>,
+    pub(crate) total_records: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -118,5 +118,124 @@ impl DatasetRegisterRequest {
             description: None,
             metadata: None,
         }
+    }
+}
+
+impl DatasetRegisterRequest {
+    /// Return the project name.
+    pub fn project_name(&self) -> &str {
+        &self.project_name
+    }
+    /// Set the project name.
+    pub fn set_project_name(&mut self, value: impl Into<String>) -> &mut Self {
+        self.project_name = value.into();
+        self
+    }
+    /// Return the org name.
+    pub fn org_name(&self) -> &str {
+        &self.org_name
+    }
+    /// Set the org name.
+    pub fn set_org_name(&mut self, value: impl Into<String>) -> &mut Self {
+        self.org_name = value.into();
+        self
+    }
+    /// Return the dataset name.
+    pub fn dataset_name(&self) -> &str {
+        &self.dataset_name
+    }
+    /// Set the dataset name.
+    pub fn set_dataset_name(&mut self, value: impl Into<String>) -> &mut Self {
+        self.dataset_name = value.into();
+        self
+    }
+    /// Return the description.
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+    /// Set the description.
+    pub fn set_description(&mut self, value: Option<String>) -> &mut Self {
+        self.description = value;
+        self
+    }
+    /// Return the metadata.
+    pub fn metadata(&self) -> Option<&Map<String, Value>> {
+        self.metadata.as_ref()
+    }
+    /// Set the metadata.
+    pub fn set_metadata(&mut self, value: Option<Map<String, Value>>) -> &mut Self {
+        self.metadata = value;
+        self
+    }
+}
+
+impl DatasetRegisterResponse {
+    /// Return the project.
+    pub fn project(&self) -> &DatasetProjectInfo {
+        &self.project
+    }
+    /// Return the dataset.
+    pub fn dataset(&self) -> &DatasetInfo {
+        &self.dataset
+    }
+}
+
+impl DatasetProjectInfo {
+    /// Return the id.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    /// Return the name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl DatasetInfo {
+    /// Return the id.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    /// Return the name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl DatasetSummaryResponse {
+    /// Return the project name.
+    pub fn project_name(&self) -> &str {
+        &self.project_name
+    }
+    /// Return the dataset name.
+    pub fn dataset_name(&self) -> &str {
+        &self.dataset_name
+    }
+    /// Return the project id.
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    /// Return the dataset id.
+    pub fn dataset_id(&self) -> &str {
+        &self.dataset_id
+    }
+    /// Return the project url.
+    pub fn project_url(&self) -> Option<&str> {
+        self.project_url.as_deref()
+    }
+    /// Return the dataset url.
+    pub fn dataset_url(&self) -> Option<&str> {
+        self.dataset_url.as_deref()
+    }
+    /// Return the data summary.
+    pub fn data_summary(&self) -> Option<&DataSummaryStats> {
+        self.data_summary.as_ref()
+    }
+}
+
+impl DataSummaryStats {
+    /// Return the total records.
+    pub fn total_records(&self) -> Option<&u64> {
+        self.total_records.as_ref()
     }
 }
