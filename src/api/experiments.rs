@@ -44,6 +44,12 @@ pub struct ExperimentRegisterRequest {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_experiment: Option<String>,
+    /// Dataset associated with this experiment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset_id: Option<String>,
+    /// Explicit dataset snapshot; omitted for a live selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Map<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]

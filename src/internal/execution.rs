@@ -160,6 +160,21 @@ impl ExecutionBinding {
         F: Future<Output = Result<T, E>> + Send + 'static,
         M: FnOnce() -> Result<F, E>,
     {
+        self.response_try_finalized(|| make().map(|work| (work, |_| {})))
+    }
+
+    /// A bounded operation may release its private join/order guard after token
+    /// publication. The finalizer runs outside registry locks; false means a
+    /// cancellation already published instead. Its captures are dropped on task
+    /// loss, including before first poll, just like the operation's captures.
+    pub fn response_try_finalized<T, E, F, M, C>(&self, make: M) -> Completion<T, E>
+    where
+        T: Send + 'static,
+        E: From<ExecutionError> + From<EnqueueError> + Send + 'static,
+        F: Future<Output = Result<T, E>> + Send + 'static,
+        M: FnOnce() -> Result<(F, C), E>,
+        C: FnOnce(bool) + Send + 'static,
+    {
         let (sender, mut completion) = Completion::pair();
         let (guard, response) = match self.responses.admit(sender) {
             Ok(admitted) => admitted,
@@ -168,7 +183,7 @@ impl ExecutionBinding {
                 return completion;
             }
         };
-        let work = match make() {
+        let (work, finalized) = match make() {
             Ok(work) => work,
             Err(error) => {
                 completion.record_issuance(Err(error));
@@ -177,7 +192,8 @@ impl ExecutionBinding {
         };
         let id = guard.id;
         let task = self.spawn(async move {
-            guard.complete(&response, work.await);
+            let published = guard.complete(&response, work.await);
+            finalized(published);
         });
         self.responses.install_abort(id, task.abort_handle());
         completion
@@ -429,5 +445,29 @@ mod tests {
                 .await
                 .unwrap();
         });
+    }
+    #[tokio::test]
+    async fn operation_finalizer_observes_cancellation_that_won_publication() {
+        let binding = ExecutionBinding::external(Handle::current());
+        let cancel = binding.clone();
+        let (sender, finalized) = oneshot::channel();
+        let token = binding.response_try_finalized::<usize, BraintrustError, _, _, _>(|| {
+            Ok((
+                async move {
+                    cancel.cancel_responses(ExecutionError::TimedOut);
+                    Ok(7)
+                },
+                move |published| {
+                    let _ = sender.send(published);
+                },
+            ))
+        });
+        assert!(token.is_ok());
+        assert!(matches!(
+            token.await,
+            Err(BraintrustError::Execution(ExecutionError::TimedOut))
+        ));
+        assert!(!finalized.await.unwrap());
+        assert_eq!(binding.outstanding_responses(), 0);
     }
 }

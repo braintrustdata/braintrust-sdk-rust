@@ -11,8 +11,9 @@ use braintrust_sdk_rust::eval::*;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // BtEvalRunner reads BT_EVAL_* env vars automatically.
-    // In non-list mode it creates a BraintrustClient from the environment.
-    let mut runner = BtEvalRunner::from_env().await?;
+    // Recording mode creates a client; local and list modes need no credentials.
+    let initialization = BtEvalRunner::from_env();
+    let mut runner = initialization.await?;
 
     // Define test cases
     let cases = vec![
@@ -60,17 +61,17 @@ async fn main() -> anyhow::Result<()> {
         ],
     )?;
 
-    runner
-        .eval(
-            "my-project",
-            EvalOpts::builder()
-                .name("uppercase-eval".to_string())
-                .source(cases.into())
-                .definition(definition.clone())
-                .max_concurrency(2)
-                .build(),
-        )
-        .await?;
+    let completion = runner.eval(
+        "my-project",
+        EvalOpts::builder()
+            .name("uppercase-eval".to_string())
+            .source(cases.into())
+            .definition(definition.clone())
+            .max_concurrency(2)
+            .build(),
+    );
+    assert!(completion.is_ok()); // Submission already happened.
+    completion.await?;
 
     let passed = runner.finish().await?;
     if !passed {

@@ -340,29 +340,48 @@ impl BraintrustClientBuilder {
     /// Schedule client initialization immediately and observe its result.
     /// Dropping the completion does not cancel initialization or login.
     pub fn build(self) -> crate::Completion<BraintrustClient, BraintrustError> {
-        let validate = || -> Result<()> {
-            Url::parse(self.app_url.as_deref().unwrap_or(DEFAULT_APP_URL))
-                .map_err(|_| BraintrustError::InvalidConfig("invalid app_url".into()))?;
-            Url::parse(self.api_url.as_deref().unwrap_or(DEFAULT_API_URL))
-                .map_err(|_| BraintrustError::InvalidConfig("invalid api_url".into()))?;
-            if !self.skip_login && self.api_key.is_none() {
-                return Err(BraintrustError::InvalidConfig(
-                    "API key required: set BRAINTRUST_API_KEY or call .api_key()".into(),
-                ));
-            }
-            Ok(())
-        };
-        let binding = validate().and_then(|()| ExecutionBinding::new(self.runtime.clone()));
+        self.build_with(|builder, binding| async move { builder.initialize(binding).await })
+    }
+
+    /// Compose initialization with an internal adapter in one response task on
+    /// the same validated binding. No nested build token or second runtime.
+    pub(crate) fn build_with<T, E, M, F>(self, work: M) -> crate::Completion<T, E>
+    where
+        T: Send + 'static,
+        E: From<BraintrustError>
+            + From<crate::ExecutionError>
+            + From<crate::EnqueueError>
+            + Send
+            + 'static,
+        M: FnOnce(Self, ExecutionBinding) -> F + Send + 'static,
+        F: std::future::Future<Output = std::result::Result<T, E>> + Send + 'static,
+    {
+        let binding = self
+            .validate()
+            .and_then(|()| ExecutionBinding::new(self.runtime.clone()));
         match binding {
             Ok(binding) => {
                 let context = binding.clone();
-                binding.response(async move { self.initialize(context).await })
+                binding.response(async move { work(self, context).await })
             }
-            Err(error) => crate::Completion::rejected(error),
+            Err(error) => crate::Completion::rejected(E::from(error)),
         }
     }
 
-    async fn initialize(self, execution: ExecutionBinding) -> Result<BraintrustClient> {
+    fn validate(&self) -> Result<()> {
+        Url::parse(self.app_url.as_deref().unwrap_or(DEFAULT_APP_URL))
+            .map_err(|_| BraintrustError::InvalidConfig("invalid app_url".into()))?;
+        Url::parse(self.api_url.as_deref().unwrap_or(DEFAULT_API_URL))
+            .map_err(|_| BraintrustError::InvalidConfig("invalid api_url".into()))?;
+        if !self.skip_login && self.api_key.is_none() {
+            return Err(BraintrustError::InvalidConfig(
+                "API key required: set BRAINTRUST_API_KEY or call .api_key()".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn initialize(self, execution: ExecutionBinding) -> Result<BraintrustClient> {
         let app_url_str = self.app_url.unwrap_or_else(|| DEFAULT_APP_URL.into());
         let api_url_str = self.api_url.unwrap_or_else(|| DEFAULT_API_URL.into());
 
@@ -622,12 +641,42 @@ impl BraintrustClient {
     }
 
     async fn span_builder_inner(&self) -> Result<crate::span::SpanBuilder> {
-        self.span_builder_for_operation(self.span_submitter()).await
+        self.span_builder_for_operation(self.span_submitter(), None)
+            .await
+    }
+
+    pub(crate) async fn experiment_builder_for_operation(
+        &self,
+        submitter: Arc<dyn SpanSubmitter>,
+        project: Option<String>,
+    ) -> Result<ExperimentBuilder> {
+        let project = project
+            .or_else(|| self.inner.default_project.clone())
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                BraintrustError::InvalidConfig(
+                    "recorded evaluations require project_name or a client default project".into(),
+                )
+            })?;
+        if self.inner.login_skipped {
+            return Err(BraintrustError::InvalidConfig(
+                "recording requires login".into(),
+            ));
+        }
+        let state = self.wait_for_login_state().await?;
+        Ok(ExperimentBuilder::new(
+            self.resource_transport(),
+            self.inner.execution.clone(),
+            submitter,
+            state.scope()?,
+        )
+        .project_name(project))
     }
 
     pub(crate) async fn span_builder_for_operation(
         &self,
         submitter: Arc<dyn SpanSubmitter>,
+        parent: Option<ParentSpanInfo>,
     ) -> Result<crate::span::SpanBuilder> {
         if self.inner.login_skipped {
             return Err(BraintrustError::InvalidConfig(
@@ -642,7 +691,9 @@ impl BraintrustClient {
         if let Some(span_origin) = &self.inner.span_origin {
             builder = builder.span_origin(span_origin.clone());
         }
-        if let Some(ref project) = self.inner.default_project {
+        if let Some(parent) = parent {
+            builder = builder.parent_info(parent);
+        } else if let Some(ref project) = self.inner.default_project {
             builder = builder.project_name(project);
         }
         Ok(builder)

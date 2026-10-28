@@ -313,7 +313,11 @@ mod tests {
                     .any(|key| key.as_str() == "x-bt-org-name"));
                 assert_eq!(request.body, data);
             }
-            let grant: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            let grant_request = requests
+                .iter()
+                .find(|request| request.url.path() == "/logs3/overflow")
+                .expect("overflow grant request");
+            let grant: Value = serde_json::from_slice(&grant_request.body).unwrap();
             assert_eq!(grant["size_bytes"], data.len());
             assert_eq!(grant["rows"][0]["object_ids"]["project_id"], "project");
         }

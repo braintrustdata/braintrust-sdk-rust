@@ -9,6 +9,7 @@ use super::{
     case_runner::CaseRunner, Case, EvalDefinition, EvalOpts, EvalResult, EvalRunError,
     EvalRunFailure, EvalSummary,
 };
+use super::{reporter::ReporterSession, EvalReporter};
 use crate::{BraintrustError, Result, SpanHandle};
 
 /// An invocation owns its source and options; only the definition is shared.
@@ -17,6 +18,8 @@ pub(crate) struct EvalPlan<I, O> {
     source: Box<dyn super::CaseSource<I, O>>,
     definition: EvalDefinition<I, O>,
     concurrency: usize,
+    metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    tags: Option<Vec<String>>,
 }
 impl<I, O> EvalPlan<I, O> {
     pub fn new(opts: EvalOpts<I, O>) -> std::result::Result<Self, super::EvalConfigError> {
@@ -26,12 +29,39 @@ impl<I, O> EvalPlan<I, O> {
             source: opts.source,
             definition: opts.definition,
             concurrency: opts.max_concurrency,
+            metadata: opts.metadata,
+            tags: opts.tags,
         })
+    }
+    fn apply_context(&self, case: &mut Case<I, O>) {
+        if let Some(defaults) = &self.metadata {
+            let mut metadata = defaults.clone();
+            if let Some(specific) = case.metadata.take() {
+                metadata.extend(specific);
+            }
+            case.metadata = Some(metadata);
+        }
+        if let Some(defaults) = &self.tags {
+            let mut tags = Vec::new();
+            for tag in defaults.iter().chain(case.tags.iter().flatten()) {
+                if !tags.contains(tag) {
+                    tags.push(tag.clone());
+                }
+            }
+            case.tags = Some(tags);
+        }
     }
 }
 
 #[async_trait]
 pub(crate) trait EvalRecorder<I, O>: Send + Sync {
+    /// Initialize recording only after source identity is frozen, before reading cases.
+    async fn prepare(&mut self, _dataset: Option<&super::DatasetVersionRef>) -> Result<()> {
+        Ok(())
+    }
+    fn target(&self) -> Option<super::EvalRecording> {
+        None
+    }
     async fn start(&self, index: usize, case: &Case<I, O>) -> Result<Box<dyn CaseRecording<I, O>>>;
     async fn finish(&self) -> Vec<BraintrustError>;
 }
@@ -40,12 +70,6 @@ pub(crate) trait EvalRecorder<I, O>: Send + Sync {
 pub(crate) trait CaseRecording<I, O>: Send {
     fn span(&self) -> Option<&SpanHandle>;
     async fn finish(self: Box<Self>, result: &mut EvalResult<I, O>) -> Vec<BraintrustError>;
-}
-
-pub(crate) trait EvalReporter<I, O> {
-    fn started(&mut self, name: &str);
-    fn case_finished(&mut self, index: usize, result: &EvalResult<I, O>);
-    fn finished(&mut self, summary: &EvalSummary<I, O>);
 }
 
 struct CaseOutcome<I, O> {
@@ -57,36 +81,63 @@ pub(crate) struct EvalExecutor;
 impl EvalExecutor {
     pub async fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
         mut plan: EvalPlan<I, O>,
-        recorder: Option<&dyn EvalRecorder<I, O>>,
-        reporter: &mut impl EvalReporter<I, O>,
+        mut recorder: Option<&mut dyn EvalRecorder<I, O>>,
+        reporter: &mut dyn EvalReporter<I, O>,
         binding: Option<&crate::internal::execution::ExecutionBinding>,
     ) -> std::result::Result<EvalSummary<I, O>, EvalRunError<I, O>> {
+        let mut reporter = ReporterSession::new(reporter);
         reporter.started(&plan.name);
+        let prepared = plan.source.prepare().await;
         let dataset = plan.source.provenance();
         let mut results = Vec::new();
         let mut failures = Vec::new();
+        if let Err(source) = prepared {
+            failures.push(EvalRunFailure::Source {
+                case_index: 0,
+                source,
+            });
+        }
+        if failures.is_empty() {
+            if let Some(recorder) = recorder.as_deref_mut() {
+                if let Err(source) = recorder.prepare(dataset.as_ref()).await {
+                    failures.push(EvalRunFailure::Recording {
+                        case_index: None,
+                        source,
+                    });
+                }
+            }
+        }
+        let recorder = recorder.as_deref();
         let mut case_count = 0;
         let mut pending = FuturesUnordered::new();
-        loop {
+        while failures.is_empty() {
             // Keep one source read alive while cases run. Sources may await
             // case progress and need not support cancellation/restarting next().
-            let mut next = Box::pin(plan.source.next());
-            let next_case = loop {
-                if pending.is_empty() {
-                    break next.await;
-                }
-                match select(next.as_mut(), pending.next()).await {
-                    Either::Left((case, _)) => break case,
-                    Either::Right((Some((index, outcome)), _)) => {
-                        Self::collect(index, outcome, &mut results, &mut failures, reporter);
-                        if !failures.is_empty() {
-                            break Ok(None);
-                        }
+            let next_case = {
+                let mut next = Box::pin(plan.source.next());
+                loop {
+                    if pending.is_empty() {
+                        break next.await;
                     }
-                    Either::Right((None, _)) => unreachable!("nonempty pending cases"),
+                    match select(next.as_mut(), pending.next()).await {
+                        Either::Left((case, _)) => break case,
+                        Either::Right((Some((index, outcome)), _)) => {
+                            Self::collect(
+                                index,
+                                outcome,
+                                &mut results,
+                                &mut failures,
+                                &mut reporter,
+                            );
+                            if !failures.is_empty() {
+                                break Ok(None);
+                            }
+                        }
+                        Either::Right((None, _)) => unreachable!("nonempty pending cases"),
+                    }
                 }
             };
-            let case = match next_case {
+            let mut case = match next_case {
                 Ok(Some(case)) => case,
                 Ok(None) => break,
                 Err(source) => {
@@ -97,6 +148,7 @@ impl EvalExecutor {
                     break;
                 }
             };
+            plan.apply_context(&mut case);
             let index = case_count;
             case_count += 1;
             let definition = &plan.definition;
@@ -108,7 +160,7 @@ impl EvalExecutor {
             });
             if pending.len() >= plan.concurrency {
                 if let Some((index, outcome)) = pending.next().await {
-                    Self::collect(index, outcome, &mut results, &mut failures, reporter);
+                    Self::collect(index, outcome, &mut results, &mut failures, &mut reporter);
                 }
                 if !failures.is_empty() {
                     break;
@@ -117,7 +169,7 @@ impl EvalExecutor {
         }
         // Stop reading after failure, but finish all cases already accepted.
         while let Some((index, outcome)) = pending.next().await {
-            Self::collect(index, outcome, &mut results, &mut failures, reporter);
+            Self::collect(index, outcome, &mut results, &mut failures, &mut reporter);
         }
         if let Some(recorder) = recorder {
             failures.extend(recorder.finish().await.into_iter().map(|source| {
@@ -142,8 +194,11 @@ impl EvalExecutor {
             successful_cases,
             failed_cases: case_count - successful_cases,
             dataset,
+            recording: recorder.and_then(|recorder| recorder.target()),
         };
-        reporter.finished(&summary);
+        if let Some(failure) = reporter.finished(&summary) {
+            failures.push(failure);
+        }
         if failures.is_empty() {
             Ok(summary)
         } else {
@@ -186,7 +241,7 @@ impl EvalExecutor {
         outcome: CaseOutcome<I, O>,
         results: &mut Vec<(usize, EvalResult<I, O>)>,
         failures: &mut Vec<EvalRunFailure>,
-        reporter: &mut impl EvalReporter<I, O>,
+        reporter: &mut ReporterSession<'_, I, O>,
     ) {
         failures.extend(
             outcome
@@ -233,12 +288,20 @@ mod tests {
         finished: bool,
     }
     impl<I, O> EvalReporter<I, O> for Observed {
-        fn started(&mut self, _: &str) {}
-        fn case_finished(&mut self, index: usize, _: &EvalResult<I, O>) {
+        fn case_finished(
+            &mut self,
+            index: usize,
+            _: &EvalResult<I, O>,
+        ) -> std::result::Result<(), super::super::ReportError> {
             self.cases.push(index);
+            Ok(())
         }
-        fn finished(&mut self, _: &EvalSummary<I, O>) {
+        fn finished(
+            &mut self,
+            _: &EvalSummary<I, O>,
+        ) -> std::result::Result<(), super::super::ReportError> {
             self.finished = true;
+            Ok(())
         }
     }
     struct WaitingSource {
@@ -410,7 +473,7 @@ mod tests {
     #[test]
     fn recorder_start_and_finish_errors_preserve_computation_and_finalize_run() {
         let finished = Arc::new(AtomicUsize::new(0));
-        let recorder = FailingRecorder {
+        let mut recorder = FailingRecorder {
             finished: finished.clone(),
         };
         let cases = (0..3)
@@ -439,7 +502,7 @@ mod tests {
         let mut reporter = Observed::default();
         let error = futures::executor::block_on(EvalExecutor::run(
             plan,
-            Some(&recorder),
+            Some(&mut recorder),
             &mut reporter,
             None,
         ))

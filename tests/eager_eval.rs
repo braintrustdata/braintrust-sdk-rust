@@ -175,6 +175,10 @@ async fn client(server: &MockServer) -> BraintrustClient {
             "/api/project/register",
             serde_json::json!({"project":{"id":"project"}}),
         ),
+        (
+            "/api/experiment/register",
+            serde_json::json!({"project":{"id":"project","name":"project"},"experiment":{"id":"experiment","name":"experiment"}}),
+        ),
         ("/logs3", serde_json::json!({})),
     ] {
         Mock::given(method("POST"))
@@ -515,4 +519,48 @@ async fn synchronous_callback_can_wait_for_recording_without_blocking_delivery()
     let (result, shutdown) = tokio::join!(token, shutdown);
     assert_eq!(result.unwrap().results[0].output, Some(9));
     shutdown.unwrap();
+}
+
+#[test]
+fn local_run_context_uses_case_overrides_without_a_recording_target() {
+    let definition = EvalDefinition::new(
+        Box::new(SyncFnTask::new(
+            |input: &usize, hooks: &TaskHooks<'_, usize, usize>| {
+                assert_eq!(hooks.get_metadata().unwrap()["run"], true);
+                assert_eq!(hooks.get_metadata().unwrap()["collision"], "case");
+                hooks.add_metadata("task", serde_json::json!(true));
+                Ok(*input)
+            },
+        )),
+        vec![],
+    )
+    .unwrap();
+    let mut opts = options(
+        definition,
+        vec![Case {
+            input: 1,
+            metadata: Some(
+                serde_json::json!({"collision":"case"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            tags: Some(vec!["shared".into(), "case".into()]),
+            ..Default::default()
+        }],
+    );
+    opts.metadata = Some(
+        serde_json::json!({"run":true, "collision":"run"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    opts.tags = Some(vec!["run".into(), "shared".into()]);
+    let summary = futures::executor::block_on(run(EvalRequest::local(opts)).into_future()).unwrap();
+    assert!(summary.recording.is_none());
+    assert_eq!(summary.results[0].metadata.as_ref().unwrap()["task"], true);
+    assert_eq!(
+        summary.results[0].tags.as_ref().unwrap(),
+        &["run", "shared", "case"]
+    );
 }

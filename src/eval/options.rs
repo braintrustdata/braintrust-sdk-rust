@@ -1,13 +1,6 @@
-use serde::Serialize;
 use serde_json::{Map, Value};
-use std::marker::PhantomData;
-use std::sync::Arc;
 
-use crate::BraintrustClient;
-
-use super::{
-    source::CaseSource, types::EvalSummary, EvalConfigError, EvalDefinition, EvalRunError,
-};
+use super::{source::CaseSource, EvalConfigError, EvalDefinition};
 
 /// Options for running an evaluation
 #[derive(bon::Builder)]
@@ -18,18 +11,19 @@ pub struct EvalOpts<I, O> {
     pub source: Box<dyn CaseSource<I, O>>,
     /// Reusable task and ordered scorers
     pub definition: EvalDefinition<I, O>,
-    /// Braintrust project to log results to
+    /// Braintrust project for recording; falls back to the client default project.
     pub project_name: Option<String>,
-    /// Optional experiment name for Braintrust logging
+    /// Experiment name for recording; defaults to the evaluation name.
     pub experiment_name: Option<String>,
-    /// Optional metadata for the evaluation
+    /// Run metadata stored on the experiment and used as case defaults.
+    /// Case metadata overrides matching keys.
     pub metadata: Option<Map<String, Value>>,
-    /// Optional tags for the evaluation
+    /// Case tag defaults, combined with source case tags without duplicates.
     pub tags: Option<Vec<String>>,
     /// Maximum concurrent evaluations (default: 5)
     #[builder(default = 5)]
     pub max_concurrency: usize,
-    /// Suppress progress output (default: false)
+    /// Suppress default terminal output (default: false). An explicit request reporter takes precedence.
     #[builder(default = false)]
     pub quiet: bool,
     /// Explicit runtime for local runs. Recorded runs inherit their client binding.
@@ -43,46 +37,6 @@ impl<I, O> EvalOpts<I, O> {
             return Err(EvalConfigError::ZeroConcurrency);
         }
         Ok(())
-    }
-}
-
-/// Client-bound convenience facade for recorded evaluations.
-pub struct Evaluator<I, O> {
-    client: Arc<BraintrustClient>,
-    _phantom: PhantomData<(I, O)>,
-}
-
-impl<I, O> Evaluator<I, O>
-where
-    I: Serialize + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-{
-    /// Create a new evaluator
-    pub fn new(client: BraintrustClient) -> Self {
-        Self {
-            client: Arc::new(client),
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Create a new evaluator from an Arc client (avoids cloning)
-    pub fn from_arc(client: Arc<BraintrustClient>) -> Self {
-        Self {
-            client,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Submit a recorded run immediately on the client binding.
-    /// Dropping the completion does not cancel accepted work.
-    pub fn run(
-        &self,
-        opts: EvalOpts<I, O>,
-    ) -> crate::Completion<EvalSummary<I, O>, EvalRunError<I, O>> {
-        super::run(super::EvalRequest::recorded(
-            opts,
-            self.client.as_ref().clone(),
-        ))
     }
 }
 

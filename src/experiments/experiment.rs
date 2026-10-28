@@ -45,6 +45,8 @@ pub struct Experiment {
     pub(crate) experiment_name: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) base_experiment: Option<String>,
+    pub(crate) dataset_id: Option<String>,
+    pub(crate) dataset_version: Option<String>,
     pub(crate) metadata: Option<Map<String, Value>>,
     pub(crate) public: Option<bool>,
     pub(crate) update: Option<bool>,
@@ -96,6 +98,8 @@ impl Clone for Experiment {
             experiment_name: self.experiment_name.clone(),
             description: self.description.clone(),
             base_experiment: self.base_experiment.clone(),
+            dataset_id: self.dataset_id.clone(),
+            dataset_version: self.dataset_version.clone(),
             update: self.update,
             repo_info: self.repo_info.clone(),
             metadata: self.metadata.clone(),
@@ -545,7 +549,7 @@ impl Experiment {
     }
 
     /// Polled only on the selected context, by preparation or a bound operation.
-    async fn register_metadata(&self) -> Result<&ExperimentMetadata> {
+    pub(crate) async fn register_metadata(&self) -> Result<&ExperimentMetadata> {
         self.state
             .metadata
             .get_or_try_init(|| async {
@@ -555,6 +559,8 @@ impl Experiment {
                     experiment_name: self.experiment_name.clone(),
                     description: self.description.clone(),
                     base_experiment: self.base_experiment.clone(),
+                    dataset_id: self.dataset_id.clone(),
+                    dataset_version: self.dataset_version.clone(),
                     metadata: self.metadata.clone(),
                     public: self.public,
                     update: self.update,

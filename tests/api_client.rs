@@ -147,6 +147,7 @@ async fn btql_readback_preserves_cursor_and_request_errors() {
                 limit: Some(5),
                 cursor: Some("next".into()),
             },
+            version: None,
         })
         .await
         .unwrap();
@@ -169,7 +170,8 @@ async fn btql_readback_preserves_cursor_and_request_errors() {
                     from: "dataset('id')".into(),
                     limit: None,
                     cursor: None,
-                }
+                },
+                version: None,
             })
             .await,
         Err(api::Error::Http { status: 500, .. })
@@ -265,6 +267,8 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
                 experiment_name: Some("e".into()),
                 description: None,
                 base_experiment: None,
+                dataset_id: None,
+                dataset_version: None,
                 metadata: None,
                 public: None,
                 update: None,
