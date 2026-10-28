@@ -93,6 +93,7 @@ async fn failures_make_one_attempt_without_retry_or_overflow() {
                 status: actual,
                 operation,
                 body,
+                ..
             } => {
                 assert_eq!(actual, status);
                 assert_eq!(operation, "logs3");

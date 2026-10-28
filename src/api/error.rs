@@ -7,12 +7,14 @@ pub enum Error {
     #[error("invalid API configuration: {0}")]
     Config(String),
     #[error("{operation}: transport failed")]
+    #[non_exhaustive]
     Transport {
         operation: &'static str,
         #[source]
         source: reqwest::Error,
     },
     #[error("{operation}: HTTP {status}")]
+    #[non_exhaustive]
     Http {
         operation: &'static str,
         status: u16,
@@ -20,6 +22,7 @@ pub enum Error {
         body: String,
     },
     #[error("{operation}: invalid JSON response (HTTP {status})")]
+    #[non_exhaustive]
     Decode {
         operation: &'static str,
         status: u16,
