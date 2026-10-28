@@ -40,6 +40,15 @@ impl Client {
         F: FnOnce(Transport) -> W,
         W: Future<Output = Result<T, Error>> + Send + 'static,
     {
+        self.submit_operation(make)
+    }
+    pub(crate) fn submit_operation<T, E, F, W>(&self, make: F) -> Completion<T, E>
+    where
+        T: Send + 'static,
+        E: From<crate::ExecutionError> + From<crate::EnqueueError> + Send + 'static,
+        F: FnOnce(Transport) -> W,
+        W: Future<Output = Result<T, E>> + Send + 'static,
+    {
         self.execution
             .response_try(|| Ok(make(self.transport.clone())))
     }

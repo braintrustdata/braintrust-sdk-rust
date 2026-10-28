@@ -102,6 +102,16 @@ impl UploadCoordinator {
         })
     }
 
+    pub(crate) fn for_transport(logs: api::Transport, policy: UploadPolicy) -> Self {
+        Self {
+            objects: ObjectStoreTransport {
+                http: logs.http_client(),
+            },
+            logs,
+            policy,
+        }
+    }
+
     pub async fn capabilities(
         &self,
         fallback: usize,
