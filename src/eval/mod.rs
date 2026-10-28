@@ -13,13 +13,11 @@
 //! use braintrust_sdk_rust::*;
 //! use braintrust_sdk_rust::eval::*;
 //!
-//! # async fn example() -> Result<()> {
+//! # async fn example() -> anyhow::Result<()> {
 //! let client = BraintrustClient::builder()
 //!     .api_key("sk-...")
 //!     .build()
 //!     .await?;
-//!
-//! let evaluator = Evaluator::new(client);
 //!
 //! let cases = vec![
 //!     Case {
@@ -29,35 +27,53 @@
 //!     },
 //! ];
 //!
-//! let result = evaluator
-//!     .run(
+//! // Reuse this definition with a fresh source and options for every run.
+//! let definition = EvalDefinition::new(
+//!     Box::new(task(|input: &String, _hooks| Box::pin(async move {
+//!         Ok(input.to_uppercase())
+//!     }))),
+//!     vec![Box::new(ExactMatch::new())],
+//! )?;
+//! let completion = run(EvalRequest::recorded(
 //!         EvalOpts::builder()
 //!             .name("uppercase-eval".to_string())
-//!             .dataset(cases.into())
-//!             .task(Box::new(SimpleFnTask::new(|input: &String| {
-//!                 Ok(input.to_uppercase())
-//!             })))
-//!             .scorers(vec![Box::new(ExactMatch::new())])
+//!             .source(cases.into())
+//!             .definition(definition.clone())
 //!             .build(),
-//!     )
-//!     .await?;
+//!     client,
+//! ));
+//! let result = completion.await?;
 //!
 //! println!("Results: {:?}", result);
 //! # Ok(())
 //! # }
 //! ```
 
+mod blocking;
 mod bt_runner;
-mod dataset;
+mod case_runner;
+mod definition;
+mod error;
+mod executor;
+mod recorder;
+mod reporter;
+mod run;
 mod runner;
 mod scorer;
+mod source;
 mod task;
 mod types;
 
+pub use definition::EvalDefinition;
+pub use error::{CaseError, EvalConfigError, EvalRunError, EvalRunFailure};
+
 // Re-export public API
 pub use bt_runner::{summary_to_value, BtEvalRunner};
-pub use dataset::{Dataset, IterDataset, StreamDataset, VecDataset};
-pub use runner::{EvalOpts, Evaluator, SyncEvaluator};
-pub use scorer::{ExactMatch, LevenshteinScorer, NumericDiffScorer, Scorer, SyncFnScorer};
-pub use task::{AsyncFnTask, SimpleAsyncFnTask, SimpleFnTask, SyncFnTask, Task};
+pub use run::{run, EvalRequest};
+pub use runner::{EvalOpts, Evaluator};
+pub use scorer::{scorer, ExactMatch, LevenshteinScorer, NumericDiffScorer, Scorer, SyncFnScorer};
+pub use source::{
+    CaseSource, DatasetVersionRef, IterCaseSource, SourceError, StreamCaseSource, VecCaseSource,
+};
+pub use task::{task, SimpleFnTask, SyncFnTask, Task};
 pub use types::{Case, EvalResult, EvalSummary, Score, ScoreStats, ScorerArgs, Scores, TaskHooks};

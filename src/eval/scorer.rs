@@ -1,26 +1,67 @@
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use std::marker::PhantomData;
 
-use crate::Result;
+use anyhow::Result;
 
 use super::types::{Score, ScorerArgs, Scores};
 
 /// Scorer trait for evaluating task outputs
 ///
 /// Scorers compare the task output against expected values and produce numeric scores.
-/// Only async version is needed - SyncEvaluator uses this via Runtime::block_on().
+/// Callback errors use `anyhow::Result` to preserve application error causes.
 #[async_trait]
 pub trait Scorer<I, O>: Send + Sync {
     /// Name of this scorer (used in results)
     fn name(&self) -> &str;
 
+    /// Whether evaluation runs should invoke this callback on their blocking pool.
+    /// Override together with `score_blocking` for synchronous work; async scorers use the defaults.
+    fn is_blocking(&self) -> bool {
+        false
+    }
+
+    /// Synchronous callback body used when `is_blocking()` returns true.
+    /// The evaluation runner calls this on its selected blocking pool.
+    fn score_blocking(&self, _args: ScorerArgs<'_, I, O>) -> Result<Scores> {
+        anyhow::bail!("scorer has no synchronous callback")
+    }
+
     /// Score the output
     async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores>;
 }
 
+/// Supply type context for a named async scoring closure. The returned tuple
+/// directly implements [`Scorer`]; names may be borrowed or owned strings.
+pub fn scorer<I, O, N, F>(name: N, callback: F) -> (N, F)
+where
+    N: AsRef<str> + Send + Sync,
+    F: for<'a> Fn(ScorerArgs<'a, I, O>) -> BoxFuture<'a, Result<Scores>> + Send + Sync,
+{
+    (name, callback)
+}
+
+#[async_trait]
+impl<I, O, N, F> Scorer<I, O> for (N, F)
+where
+    N: AsRef<str> + Send + Sync,
+    F: for<'a> Fn(ScorerArgs<'a, I, O>) -> BoxFuture<'a, Result<Scores>> + Send + Sync,
+    I: Send + Sync,
+    O: Send + Sync,
+{
+    fn name(&self) -> &str {
+        self.0.as_ref()
+    }
+
+    async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
+        (self.1)(args).await
+    }
+}
+
 /// Wrapper for sync scoring functions
 ///
-/// This allows sync functions to be used as scorers in both async and sync evaluators.
+/// Evaluation runs dispatch this callback on their selected runtime's blocking pool.
+/// Direct calls to `Scorer::score` execute the callback on the calling thread.
 pub struct SyncFnScorer<I, O, F>
 where
     F: Fn(ScorerArgs<'_, I, O>) -> Result<Scores> + Send + Sync,
@@ -50,11 +91,19 @@ where
     I: Send + Sync,
     O: Send + Sync,
 {
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
+        self.score_blocking(args)
+    }
+
+    fn score_blocking(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
         (self.func)(args)
     }
 }
@@ -88,11 +137,19 @@ where
     O: PartialEq + Send + Sync,
     I: Send + Sync,
 {
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
+        self.score_blocking(args)
+    }
+
+    fn score_blocking(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
         let score = match args.expected {
             Some(expected) if expected == args.output => 1.0,
             Some(_) => 0.0,
@@ -177,11 +234,19 @@ impl<I> Scorer<I, String> for LevenshteinScorer
 where
     I: Send + Sync,
 {
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn score(&self, args: ScorerArgs<'_, I, String>) -> Result<Scores> {
+        self.score_blocking(args)
+    }
+
+    fn score_blocking(&self, args: ScorerArgs<'_, I, String>) -> Result<Scores> {
         let expected = match args.expected {
             Some(e) => e,
             None => return Ok(vec![Score::new(self.name.clone(), 0.0)]),
@@ -246,11 +311,19 @@ impl<I> Scorer<I, f64> for NumericDiffScorer
 where
     I: Send + Sync,
 {
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn score(&self, args: ScorerArgs<'_, I, f64>) -> Result<Scores> {
+        self.score_blocking(args)
+    }
+
+    fn score_blocking(&self, args: ScorerArgs<'_, I, f64>) -> Result<Scores> {
         let expected = match args.expected {
             Some(e) => e,
             None => return Ok(vec![Score::new(self.name.clone(), 0.0)]),
@@ -276,10 +349,11 @@ mod tests {
     async fn test_exact_match() {
         let scorer = ExactMatch::new();
 
+        let expected = String::from("HELLO");
         let args = ScorerArgs {
             input: &"hello".to_string(),
             output: &"HELLO".to_string(),
-            expected: Some(&"HELLO".to_string()),
+            expected: Some(&expected),
             metadata: None,
         };
 
@@ -287,10 +361,11 @@ mod tests {
         assert_eq!(scores.len(), 1);
         assert_eq!(scores[0].score, 1.0);
 
+        let expected = String::from("hello");
         let args = ScorerArgs {
             input: &"hello".to_string(),
             output: &"HELLO".to_string(),
-            expected: Some(&"hello".to_string()),
+            expected: Some(&expected),
             metadata: None,
         };
 
@@ -302,10 +377,11 @@ mod tests {
     async fn test_levenshtein() {
         let scorer = LevenshteinScorer::new();
 
+        let expected = String::from("hallo");
         let args = ScorerArgs {
             input: &"test".to_string(),
             output: &"hello".to_string(),
-            expected: Some(&"hallo".to_string()),
+            expected: Some(&expected),
             metadata: None,
         };
 

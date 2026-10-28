@@ -1,15 +1,11 @@
 use braintrust_sdk_rust::eval::*;
 use braintrust_sdk_rust::*;
+use std::future::IntoFuture;
 
 fn main() -> anyhow::Result<()> {
-    // Note: No #[tokio::main] needed! SyncEvaluator handles async internally
-
-    // Create Braintrust client
-    let rt = tokio::runtime::Runtime::new().map_err(|e| anyhow::anyhow!(e))?;
-    let client = rt.block_on(async { BraintrustClient::builder().build().await })?;
-
-    // Create sync evaluator
-    let evaluator = SyncEvaluator::new(client)?;
+    // The client's owned runtime drives work; this thread only waits for tokens.
+    let client = futures::executor::block_on(BraintrustClient::builder().build().into_future())?;
+    let evaluator = Evaluator::new(client);
 
     // Define test cases
     let cases = vec![
@@ -39,13 +35,17 @@ fn main() -> anyhow::Result<()> {
     // Run evaluation synchronously
     println!("Starting synchronous evaluation...\n");
 
-    let result = evaluator.run(
-        EvalOpts::builder()
-            .name("sync-uppercase-eval".to_string())
-            .dataset(cases.into())
-            .task(Box::new(task))
-            .scorers(scorers)
-            .build(),
+    let definition = EvalDefinition::new(Box::new(task), scorers)?;
+    let result = futures::executor::block_on(
+        evaluator
+            .run(
+                EvalOpts::builder()
+                    .name("sync-uppercase-eval".to_string())
+                    .source(cases.into())
+                    .definition(definition.clone())
+                    .build(),
+            )
+            .into_future(),
     )?;
 
     // Print results
