@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::internal::ports::SpanSubmitter;
 use crate::internal::session::CredentialScope;
-use crate::internal::write_outcome::WriteOutcome;
+use crate::internal::shared_outcome::WriteOutcome;
 use crate::span_components::SpanComponents;
 use crate::types::{
     ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
@@ -1101,7 +1101,7 @@ mod tests {
                 outcome: Option<WriteOutcome>,
             ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
                 let (sender, mut completion) = crate::Completion::pair();
-                let sender = crate::internal::write_outcome::WriteResponder::new(sender, outcome);
+                let sender = crate::internal::shared_outcome::WriteResponder::new(sender, outcome);
                 if self.reject.load(Ordering::Relaxed) {
                     completion.record_issuance(Err(crate::EnqueueError::Full.into()));
                 } else {
@@ -1154,7 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_ends_share_one_snapshot_and_one_delivery_result() {
-        use crate::internal::write_outcome::WriteResponder;
+        use crate::internal::shared_outcome::WriteResponder;
         struct Submitter(Mutex<Vec<(SpanPayload, WriteResponder)>>);
         #[async_trait]
         impl crate::internal::ports::DeliveryControl for Submitter {

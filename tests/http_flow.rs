@@ -23,6 +23,7 @@ async fn submits_with_bearer_token() {
         .await;
 
     let client = BraintrustClient::builder()
+        .runtime(braintrust_sdk_rust::current_runtime())
         .api_key("test-key")
         .user_agent("bt/0.20.0")
         .api_url(server.uri())
@@ -75,6 +76,7 @@ async fn preparation_failure_reaches_write_and_covering_flush() {
         .await;
 
     let client = BraintrustClient::builder()
+        .runtime(braintrust_sdk_rust::current_runtime())
         .api_key("test-key")
         .api_url(server.uri())
         .app_url(server.uri())
@@ -122,6 +124,7 @@ async fn automatic_delivery_reports_backend_rejection_through_completion() {
         .await;
 
     let client = BraintrustClient::builder()
+        .runtime(braintrust_sdk_rust::current_runtime())
         .skip_login(true)
         .api_url(server.uri())
         .app_url(server.uri())
@@ -159,6 +162,7 @@ async fn submission_and_flush_can_be_issued_without_a_call_site_runtime() {
         .mount(&server)
         .await;
     let client = BraintrustClient::builder()
+        .runtime(braintrust_sdk_rust::current_runtime())
         .skip_login(true)
         .api_url(server.uri())
         .app_url(server.uri())

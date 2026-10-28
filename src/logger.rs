@@ -11,6 +11,8 @@ use crate::dataset::DatasetBuilder;
 use crate::error::{BraintrustError, Result};
 use crate::experiments::ExperimentBuilder;
 use crate::http::{build_http_client, CaBundleConfig};
+use crate::internal::execution::ExecutionBinding;
+use crate::internal::lifecycle::Lifecycle;
 use crate::internal::ports::SpanSubmitter;
 use crate::internal::resources::ResourceTransport;
 use crate::internal::retry::{exponential, RetryExecutor};
@@ -188,6 +190,7 @@ pub struct BraintrustClientBuilder {
     environment: Option<SpanOriginEnvironment>,
     span_origin: Option<SpanOrigin>,
     user_agent: Option<String>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl BraintrustClientBuilder {
@@ -219,6 +222,7 @@ impl BraintrustClientBuilder {
             environment: None,
             span_origin: None,
             user_agent: None,
+            runtime: None,
         }
     }
 
@@ -318,10 +322,10 @@ impl BraintrustClientBuilder {
         self
     }
 
-    /// Block until login completes (default: false, login happens in background).
+    /// Wait for login before initialization completes (default: false).
     ///
-    /// When `false` (default), login happens asynchronously in a background task.
-    /// When `true`, the `build()` method waits for login to complete before returning.
+    /// When `false`, the build completion returns a client while login continues
+    /// in the background. When `true`, that completion also observes login.
     pub fn blocking_login(mut self, blocking: bool) -> Self {
         self.blocking_login = blocking;
         self
@@ -356,11 +360,44 @@ impl BraintrustClientBuilder {
         self
     }
 
-    /// Build the client, performing login.
-    ///
-    /// If `blocking_login` is true, waits for login to complete.
-    /// Otherwise, login happens in the background with retry logic.
-    pub async fn build(self) -> Result<BraintrustClient> {
+    /// Select one runtime for initialization, resource I/O and delivery.
+    /// `None` (the default) owns and drives an internal runtime. An explicit
+    /// handle requires its caller-owned runtime to stay alive and progressing.
+    pub fn runtime(mut self, runtime: Option<tokio::runtime::Handle>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    /// Schedule client initialization immediately and observe its result.
+    /// Dropping the completion does not cancel initialization or login.
+    pub fn build(self) -> crate::Completion<BraintrustClient, BraintrustError> {
+        let validate = || -> Result<()> {
+            Url::parse(self.app_url.as_deref().unwrap_or(DEFAULT_APP_URL))
+                .map_err(|_| BraintrustError::InvalidConfig("invalid app_url".into()))?;
+            Url::parse(self.api_url.as_deref().unwrap_or(DEFAULT_API_URL))
+                .map_err(|_| BraintrustError::InvalidConfig("invalid api_url".into()))?;
+            if !self.skip_login && self.api_key.is_none() {
+                return Err(BraintrustError::InvalidConfig(
+                    "API key required: set BRAINTRUST_API_KEY or call .api_key()".into(),
+                ));
+            }
+            Ok(())
+        };
+        let binding = validate().and_then(|()| ExecutionBinding::new(self.runtime.clone()));
+        match binding {
+            Ok(binding) => {
+                let context = binding.clone();
+                binding.response(async move { self.initialize(context).await })
+            }
+            Err(error) => {
+                let (_, mut completion) = crate::Completion::pair();
+                completion.record_issuance(Err(error));
+                completion
+            }
+        }
+    }
+
+    async fn initialize(self, execution: ExecutionBinding) -> Result<BraintrustClient> {
         let app_url_str = self.app_url.unwrap_or_else(|| DEFAULT_APP_URL.into());
         let api_url_str = self.api_url.unwrap_or_else(|| DEFAULT_API_URL.into());
 
@@ -388,12 +425,19 @@ impl BraintrustClientBuilder {
             .build();
 
         // Commands carry their own immutable scope; the worker has no session fallback.
-        let queue = LogQueue::new(log_config, http_client.clone(), self.queue_size);
+        let queue = LogQueue::new(
+            log_config,
+            http_client.clone(),
+            self.queue_size,
+            execution.clone(),
+        );
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
                 api_url,
                 app_url,
+                lifecycle: Lifecycle::new(execution.clone(), queue.clone()),
+                execution,
                 queue,
                 login_state,
                 login_notify: Notify::new(),
@@ -438,6 +482,8 @@ pub struct BraintrustClient {
 }
 
 struct ClientInner {
+    lifecycle: Lifecycle,
+    execution: ExecutionBinding,
     #[allow(dead_code)]
     api_url: Url,
     app_url: Url,
@@ -463,7 +509,10 @@ impl std::fmt::Debug for ClientInner {
 
 impl BraintrustClient {
     fn resource_transport(&self) -> Arc<ResourceTransport> {
-        Arc::new(ResourceTransport::new(self.inner.http_client.clone()))
+        Arc::new(ResourceTransport::new(
+            self.inner.http_client.clone(),
+            self.inner.execution.clone(),
+        ))
     }
 
     fn span_submitter(&self) -> Arc<dyn SpanSubmitter> {
@@ -832,7 +881,7 @@ impl BraintrustClient {
     /// Start login in a background task with retry logic.
     fn start_background_login(&self, api_key: String, org_name: Option<String>) {
         let client = self.clone();
-        tokio::spawn(async move {
+        self.inner.execution.response(async move {
             const MAX_ATTEMPTS: usize = 10;
             let outcome = RetryExecutor::new(
                 MAX_ATTEMPTS - 1,
@@ -852,7 +901,7 @@ impl BraintrustClient {
                 },
             )
             .await;
-            match outcome.result {
+            match &outcome.result {
                 Ok(()) => tracing::debug!("Background login completed successfully"),
                 Err(error) => tracing::error!(
                     "Background login failed after {} attempts: {}. \
@@ -861,6 +910,7 @@ impl BraintrustClient {
                     error
                 ),
             }
+            outcome.result
         });
     }
 
@@ -938,13 +988,15 @@ impl BraintrustClient {
         self.inner.queue.submit(scope, payload, parent_info, None)
     }
 
-    /// Stop accepting writes, drain accepted work and stop the delivery worker.
+    /// Stop response-task and write admission, drain accepted work, and stop delivery.
+    /// Concurrent calls share the first call's deadline and outcome. Individual
+    /// HTTP operation results stay on their own tokens; `delivered` counts writes.
     /// A timeout fails remaining completions and discards active SDK state.
     pub fn shutdown(
         &self,
         timeout: std::time::Duration,
     ) -> crate::Completion<crate::ShutdownReport, crate::ShutdownError> {
-        self.inner.queue.shutdown(timeout)
+        self.inner.lifecycle.shutdown(timeout)
     }
 
     /// Capture a cutoff immediately and observe delivery of the covered batch.
@@ -1144,6 +1196,220 @@ mod tests {
             .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
             .collect();
         ResponseTemplate::new(200).set_body_json(serde_json::json!({ "org_info": org_info }))
+    }
+
+    #[tokio::test]
+    async fn shutdown_covers_accepted_response_tasks_even_without_a_log_worker() {
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .build()
+            .await
+            .unwrap();
+        let response = client
+            .inner
+            .execution
+            .response::<(), BraintrustError, _>(std::future::pending());
+        assert!(response.is_ok());
+        let shutdown = client.shutdown(Duration::from_millis(10));
+        assert!(matches!(
+            shutdown.await,
+            Err(crate::ShutdownError::Execution(
+                crate::ExecutionError::TimedOut
+            ))
+        ));
+        assert!(matches!(
+            response.await,
+            Err(BraintrustError::Execution(crate::ExecutionError::TimedOut))
+        ));
+        assert_eq!(client.inner.execution.outstanding_responses(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdowns_share_the_first_deadline_and_reject_both_admission_domains() {
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .build()
+            .await
+            .unwrap();
+        let response = client
+            .inner
+            .execution
+            .response::<(), BraintrustError, _>(std::future::pending());
+        let first = client.shutdown(Duration::from_millis(10));
+        let concurrent = client.clone().shutdown(Duration::from_secs(60));
+        assert!(matches!(
+            client
+                .inner
+                .execution
+                .response::<(), BraintrustError, _>(async { Ok(()) })
+                .await,
+            Err(BraintrustError::Admission(crate::EnqueueError::Closed))
+        ));
+        let span = client
+            .span_builder_with_credentials("token", "org")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "project".into(),
+            })
+            .build();
+        assert!(matches!(
+            span.end().await,
+            Err(crate::WriteError::Admission(crate::EnqueueError::Closed))
+        ));
+        for token in [first, concurrent, client.shutdown(Duration::ZERO)] {
+            assert!(matches!(
+                token.await,
+                Err(crate::ShutdownError::Execution(
+                    crate::ExecutionError::TimedOut
+                ))
+            ));
+        }
+        assert!(matches!(
+            response.await,
+            Err(BraintrustError::Execution(crate::ExecutionError::TimedOut))
+        ));
+        assert_eq!(client.inner.execution.outstanding_responses(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_failure_does_not_short_circuit_draining_response_tasks() {
+        use futures::FutureExt;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .runtime(crate::current_runtime())
+            .api_url(server.uri())
+            .app_url(server.uri())
+            .build()
+            .await
+            .unwrap();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let work_gate = gate.clone();
+        let response = client
+            .inner
+            .execution
+            .response::<(), BraintrustError, _>(async move {
+                work_gate.acquire().await.unwrap().forget();
+                Ok(())
+            });
+        let span = client
+            .span_builder_with_credentials("token", "org")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "project".into(),
+            })
+            .build();
+        let write = span.end();
+        let shutdown = client.shutdown(Duration::from_secs(5));
+        assert!(write.await.is_err());
+        let mut shutdown = Box::pin(std::future::IntoFuture::into_future(shutdown));
+        assert!(shutdown.as_mut().now_or_never().is_none());
+        gate.add_permits(1);
+        response.await.unwrap();
+        assert!(
+            matches!(shutdown.await, Err(crate::ShutdownError::Delivery(failure)) if failure.failed == 1)
+        );
+        assert_eq!(client.inner.execution.outstanding_responses(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_has_reserved_control_capacity_when_response_admission_is_full() {
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .runtime(crate::current_runtime())
+            .build()
+            .await
+            .unwrap();
+        let responses = (0..crate::internal::response_tasks::MAX_RESPONSE_TASKS)
+            .map(|_| {
+                let response = client
+                    .inner
+                    .execution
+                    .response::<(), BraintrustError, _>(std::future::pending());
+                assert!(response.is_ok());
+                response
+            })
+            .collect::<Vec<_>>();
+        let shutdown = client.shutdown(Duration::from_millis(10));
+        assert!(shutdown.is_ok());
+        assert!(matches!(
+            shutdown.await,
+            Err(crate::ShutdownError::Execution(
+                crate::ExecutionError::TimedOut
+            ))
+        ));
+        for response in responses {
+            assert!(matches!(
+                response.await,
+                Err(BraintrustError::Execution(crate::ExecutionError::TimedOut))
+            ));
+        }
+        assert_eq!(client.inner.execution.outstanding_responses(), 0);
+    }
+
+    #[tokio::test]
+    async fn response_operation_errors_stay_on_their_tokens_instead_of_a_shutdown_failure_ledger() {
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .runtime(crate::current_runtime())
+            .build()
+            .await
+            .unwrap();
+        let response = client
+            .inner
+            .execution
+            .response::<(), BraintrustError, _>(async {
+                Err(BraintrustError::Api {
+                    status: 503,
+                    message: "operation failed".into(),
+                })
+            });
+        let shutdown = client.shutdown(Duration::from_secs(1));
+        assert!(matches!(
+            response.await,
+            Err(BraintrustError::Api { status: 503, .. })
+        ));
+        assert_eq!(shutdown.await.unwrap().delivered, 0);
+        assert_eq!(client.inner.execution.outstanding_responses(), 0);
+    }
+
+    #[tokio::test]
+    async fn reads_and_empty_lifecycle_calls_do_not_start_a_log_worker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/api/dataset/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"project":{"id":"project","name":"p"},"dataset":{"id":"dataset","name":"d"}})))
+            .expect(1).mount(&server).await;
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .build()
+            .await
+            .unwrap();
+        assert!(!client.inner.queue.is_started());
+        client.flush().await.unwrap();
+        let dataset = client
+            .dataset_builder_with_credentials("token", "tenant")
+            .project_name("p")
+            .dataset_name("d")
+            .build()
+            .unwrap();
+        assert_eq!(dataset.dataset_id().await.unwrap(), "dataset");
+        assert!(!client.inner.queue.is_started());
+        client.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert!(!client.inner.queue.is_started());
+        let span = client
+            .span_builder_with_credentials("token", "org")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "project".into(),
+            })
+            .build();
+        assert!(span.log(SpanLog::default()).is_err());
+        assert!(!client.inner.queue.is_started());
     }
 
     #[tokio::test]
