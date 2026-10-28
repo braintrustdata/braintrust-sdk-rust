@@ -473,9 +473,8 @@ mod tests {
             .find(|(key, _)| key.as_str() == "content-type")
             .unwrap()
             .1
-            .get(0)
-            .unwrap()
-            .as_str();
+            .to_str()
+            .unwrap();
         assert!(content_type.starts_with("multipart/form-data; boundary="));
         let body = String::from_utf8(requests[0].body.clone()).unwrap();
         assert!(body.contains("name=\"file\""));
