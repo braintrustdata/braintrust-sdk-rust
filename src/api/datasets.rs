@@ -1,5 +1,5 @@
 //! Dataset registration, row mutation, and summary endpoint contracts.
-use super::{Client, Error, Plane};
+use super::{Client, Error, Plane, Transport};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -129,42 +129,70 @@ pub struct Datasets {
     pub(crate) client: Client,
 }
 impl Datasets {
+    /// Register one dataset on the control plane.
+    /// Submission is immediate; dropping the token does not cancel accepted work.
+    pub fn register(
+        &self,
+        request: DatasetRegisterRequest,
+    ) -> crate::Completion<DatasetRegisterResponse, Error> {
+        self.client
+            .submit(move |transport| async move { transport.register_dataset(request).await })
+    }
+    /// Submit exactly these dataset mutations once, without buffering or splitting.
+    /// Submission is immediate; dropping the token does not cancel accepted work.
+    pub fn write(&self, rows: &[DatasetWrite]) -> crate::Completion<(), Error> {
+        self.client.submit(move |transport| {
+            let rows = rows.to_vec();
+            async move { transport.write_dataset(&rows).await }
+        })
+    }
+    /// Fetch one dataset summary.
+    /// Submission is immediate; dropping the token does not cancel accepted work.
+    pub fn summarize(&self, dataset_id: &str) -> crate::Completion<DatasetSummaryResponse, Error> {
+        self.client.submit(move |transport| {
+            let dataset_id = dataset_id.to_owned();
+            async move { transport.summarize_dataset(&dataset_id).await }
+        })
+    }
+}
+
+impl Transport {
     /// Register once on the control plane; no resolution cache or retry.
-    pub async fn register(
+    pub(crate) async fn register_dataset(
         &self,
         request: DatasetRegisterRequest,
     ) -> Result<DatasetRegisterResponse, Error> {
-        self.client
-            .post_json(Plane::Control, "api/dataset/register", &request)
+        self.post_json(Plane::Control, "api/dataset/register", &request)
             .await
     }
     /// Send exactly one typed dataset mutation request on the data plane.
     /// No retry, buffering, splitting, or overflow upload is performed.
-    pub async fn write(&self, rows: &[DatasetWrite]) -> Result<(), Error> {
+    pub(crate) async fn write_dataset(&self, rows: &[DatasetWrite]) -> Result<(), Error> {
         #[derive(Serialize)]
         struct Request<'a> {
             rows: &'a [DatasetWrite],
             api_version: u8,
         }
-        self.client
-            .post_empty(
-                Plane::Data,
-                "logs3",
-                &Request {
-                    rows,
-                    api_version: crate::types::LOGS_API_VERSION,
-                },
-            )
-            .await
+        self.post_empty(
+            Plane::Data,
+            "logs3",
+            &Request {
+                rows,
+                api_version: crate::types::LOGS_API_VERSION,
+            },
+        )
+        .await
     }
 
-    pub async fn summarize(&self, dataset_id: &str) -> Result<DatasetSummaryResponse, Error> {
-        self.client
-            .get_json(
-                Plane::Data,
-                "dataset-summary",
-                &[("dataset_id", dataset_id)],
-            )
-            .await
+    pub(crate) async fn summarize_dataset(
+        &self,
+        dataset_id: &str,
+    ) -> Result<DatasetSummaryResponse, Error> {
+        self.get_json(
+            Plane::Data,
+            "dataset-summary",
+            &[("dataset_id", dataset_id)],
+        )
+        .await
     }
 }

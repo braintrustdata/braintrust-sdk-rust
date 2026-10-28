@@ -47,8 +47,8 @@ impl CredentialScope {
         identity.org_name = Some(org_name);
         Self(Arc::new(identity))
     }
-    pub fn api(&self, http: &reqwest::Client) -> crate::error::Result<crate::api::Client> {
-        crate::api::Client::for_scope(
+    pub fn api(&self, http: &reqwest::Client) -> crate::error::Result<crate::api::Transport> {
+        crate::api::Transport::for_scope(
             http.clone(),
             &self.0.api_url,
             &self.0.app_url,

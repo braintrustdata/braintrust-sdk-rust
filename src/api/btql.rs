@@ -1,5 +1,5 @@
 //! BTQL dataset readback, independent of SDK ingestion.
-use super::{Client, Error, Plane};
+use super::{Client, Error, Plane, Transport};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -63,8 +63,23 @@ pub struct Btql {
     pub(crate) client: Client,
 }
 impl Btql {
+    /// Read one dataset page without pagination loops or visibility polling.
+    /// Submission is immediate; dropping the token does not cancel accepted work.
+    pub fn query_dataset_records(
+        &self,
+        query: BTQLQuery,
+    ) -> crate::Completion<BTQLResponse, Error> {
+        self.client
+            .submit(move |transport| async move { transport.query_dataset_records(query).await })
+    }
+}
+
+impl Transport {
     /// Execute one dataset page request; no visibility polling or pagination loop.
-    pub async fn query_dataset_records(&self, query: BTQLQuery) -> Result<BTQLResponse, Error> {
-        self.client.post_json(Plane::Data, "btql", &query).await
+    pub(crate) async fn query_dataset_records(
+        &self,
+        query: BTQLQuery,
+    ) -> Result<BTQLResponse, Error> {
+        self.post_json(Plane::Data, "btql", &query).await
     }
 }

@@ -11,6 +11,10 @@ pub struct Config {
     pub app_url: String,
     pub org_name: Option<String>,
     pub timeout: Duration,
+    /// Explicit execution context. None owns a dedicated runtime; ambient Tokio
+    /// contexts are never selected automatically. A supplied runtime must remain
+    /// alive and driven until its accepted operations and shutdown complete.
+    pub runtime: Option<tokio::runtime::Handle>,
     pub user_agent: Option<String>,
     /// An explicit PEM file; mutually exclusive with `custom_ca_bundle_pem`.
     pub custom_ca_bundle_path: Option<PathBuf>,
@@ -25,6 +29,7 @@ impl Config {
             app_url: DEFAULT_APP_URL.into(),
             org_name: None,
             timeout: Duration::from_secs(30),
+            runtime: None,
             user_agent: None,
             custom_ca_bundle_path: None,
             custom_ca_bundle_pem: None,

@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
-use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -678,12 +676,6 @@ impl SpanHandle {
             .end_time
     }
 
-    /// Trigger a non-blocking background flush.
-    /// Useful for streaming writes to get partial updates visible immediately.
-    pub async fn trigger_flush(&self) -> Result<()> {
-        self.submitter.trigger_flush().await
-    }
-
     /// Export the span as SpanComponents for passing to other systems or SDKs.
     /// This creates a serializable representation that can be used as a parent span
     /// in another context (e.g., across service boundaries via HTTP headers).
@@ -1118,7 +1110,6 @@ mod tests {
             reject: AtomicBool,
             accepted: Mutex<Vec<SpanPayload>>,
         }
-        #[async_trait]
         impl SpanSubmitter for Submitter {
             fn operation(
                 &self,
@@ -1154,15 +1145,11 @@ mod tests {
                 completion
             }
         }
-        #[async_trait]
         impl crate::internal::ports::DeliveryControl for Submitter {
             fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
                 let (sender, completion) = crate::Completion::pair();
                 let _ = sender.send(Ok(crate::FlushReport::default()));
                 completion
-            }
-            async fn trigger_flush(&self) -> Result<()> {
-                Ok(())
             }
         }
         let submitter = Arc::new(Submitter {
@@ -1199,18 +1186,13 @@ mod tests {
     async fn concurrent_ends_share_one_snapshot_and_one_delivery_result() {
         use crate::internal::shared_outcome::WriteResponder;
         struct Submitter(Mutex<Vec<(SpanPayload, WriteResponder)>>);
-        #[async_trait]
         impl crate::internal::ports::DeliveryControl for Submitter {
             fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
                 let (sender, completion) = crate::Completion::pair();
                 let _ = sender.send(Ok(crate::FlushReport::default()));
                 completion
             }
-            async fn trigger_flush(&self) -> Result<()> {
-                Ok(())
-            }
         }
-        #[async_trait]
         impl SpanSubmitter for Submitter {
             fn operation(
                 &self,

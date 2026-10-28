@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
-use serde_json::{Map, Value};
 use tokio::sync::Notify;
 use url::Url;
 
@@ -26,7 +24,6 @@ use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType
 // The TypeScript SDK applies no explicit timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_QUEUE_SIZE: usize = 256;
 pub use crate::api::{DEFAULT_API_URL, DEFAULT_APP_URL};
 
 use crate::api::login::LoginResponse;
@@ -175,18 +172,14 @@ pub struct BraintrustClientBuilder {
     org_name: Option<String>,
     default_project: Option<String>,
     ca_bundle: Option<CaBundleConfig>,
-    queue_size: usize,
     blocking_login: bool,
     skip_login: bool,
     /// Maximum items per HTTP batch.
     batch_max_items: Option<usize>,
     /// Maximum bytes per HTTP batch.
     batch_max_bytes: Option<usize>,
-    /// Maximum queue capacity (None = unlimited).
+    /// Maximum accepted writes, including in-flight work (None uses environment defaults).
     queue_max_size: Option<usize>,
-    /// Whether the queue should enforce `queue_max_size`.
-    enforce_queue_size_limit: bool,
-    checked_delivery: bool,
     environment: Option<SpanOriginEnvironment>,
     span_origin: Option<SpanOrigin>,
     user_agent: Option<String>,
@@ -211,14 +204,11 @@ impl BraintrustClientBuilder {
             org_name: std::env::var("BRAINTRUST_ORG_NAME").ok(),
             default_project: std::env::var("BRAINTRUST_DEFAULT_PROJECT").ok(),
             ca_bundle: CaBundleConfig::from_environment(),
-            queue_size: DEFAULT_QUEUE_SIZE,
             blocking_login: false,
             skip_login: false,
             batch_max_items: None,
             batch_max_bytes: None,
             queue_max_size: None,
-            enforce_queue_size_limit: true,
-            checked_delivery: false,
             environment: None,
             span_origin: None,
             user_agent: None,
@@ -255,26 +245,11 @@ impl BraintrustClientBuilder {
         self
     }
 
-    /// Set the maximum queue capacity.
-    /// When full, the newest arriving events are dropped.
+    /// Set the maximum accepted writes, including in-flight work.
+    /// When full, new writes return `EnqueueError::Full` at issuance.
     /// Default: 15,000 (or `BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE` env var).
     pub fn with_queue_max_size(mut self, max_size: usize) -> Self {
         self.queue_max_size = Some(max_size);
-        self
-    }
-
-    /// Legacy compatibility setting. Delivery admission is always bounded by
-    /// `with_queue_max_size`, including in-flight writes. This value is ignored.
-    pub fn enforce_queue_size_limit(mut self, enforce: bool) -> Self {
-        self.enforce_queue_size_limit = enforce;
-        self
-    }
-
-    /// Legacy compatibility setting. Delivery is always automatic and flush
-    /// reports failures in covered active work. This value is ignored. Await a
-    /// write completion to observe that write's result independently of flush.
-    pub fn checked_delivery(mut self, checked: bool) -> Self {
-        self.checked_delivery = checked;
         self
     }
 
@@ -313,12 +288,6 @@ impl BraintrustClientBuilder {
     /// This overrides `BRAINTRUST_CUSTOM_CA_BUNDLE`.
     pub fn custom_ca_bundle_pem(mut self, pem: impl AsRef<[u8]>) -> Self {
         self.ca_bundle = Some(CaBundleConfig::from_pem(pem, "custom CA bundle"));
-        self
-    }
-
-    /// Set the internal queue size for buffering log events.
-    pub fn queue_size(mut self, size: usize) -> Self {
-        self.queue_size = size;
         self
     }
 
@@ -416,17 +385,10 @@ impl BraintrustClientBuilder {
             .maybe_batch_max_items(self.batch_max_items)
             .maybe_batch_max_bytes(self.batch_max_bytes)
             .maybe_queue_max_size(self.queue_max_size)
-            .enforce_queue_size_limit(self.enforce_queue_size_limit)
-            .checked_delivery(self.checked_delivery)
             .build();
 
         // Commands carry their own immutable scope; the worker has no session fallback.
-        let queue = LogQueue::new(
-            log_config,
-            http_client.clone(),
-            self.queue_size,
-            execution.clone(),
-        );
+        let queue = LogQueue::new(log_config, http_client.clone(), execution.clone());
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
@@ -524,7 +486,6 @@ impl SpanUpdate {
 struct ClientInner {
     lifecycle: Lifecycle,
     execution: ExecutionBinding,
-    #[allow(dead_code)]
     api_url: Url,
     app_url: Url,
     queue: LogQueue,
@@ -1086,164 +1047,6 @@ impl BraintrustClient {
     pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         self.inner.queue.flush()
     }
-
-    /// Trigger a non-blocking background flush.
-    /// Does not wait for completion - useful for streaming writes.
-    pub async fn trigger_flush(&self) -> Result<()> {
-        self.inner.queue.trigger_flush_command().await
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Default)]
-struct MutableSpanEvent {
-    input: Option<Value>,
-    output: Option<Value>,
-    expected: Option<Value>,
-    error: Option<Value>,
-    scores: Option<HashMap<String, f64>>,
-    metadata: Option<Map<String, Value>>,
-    metrics: Option<HashMap<String, f64>>,
-    tags: Option<Vec<String>>,
-    context: Option<Value>,
-    span_attributes: Option<crate::types::SpanAttributes>,
-    extra: HashMap<String, Value>,
-}
-
-#[allow(dead_code)]
-#[derive(Serialize)]
-struct SerializableSpanEvent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expected: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scores: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<Map<String, Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metrics: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tags: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    span_attributes: Option<Value>,
-    #[serde(flatten)]
-    extra: HashMap<String, Value>,
-}
-
-impl MutableSpanEvent {
-    fn to_event_map(&self) -> Map<String, Value> {
-        let serialized = SerializableSpanEvent {
-            input: self.input.clone(),
-            output: self.output.clone(),
-            expected: self.expected.clone(),
-            error: self.error.clone(),
-            scores: self.scores.as_ref().map(numeric_map_to_value),
-            metadata: self.metadata.clone(),
-            metrics: self.metrics.as_ref().map(numeric_map_to_value),
-            tags: self.tags.clone(),
-            context: self.context.clone(),
-            span_attributes: self
-                .span_attributes
-                .clone()
-                .and_then(|value| serde_json::to_value(value).ok()),
-            extra: self.extra.clone(),
-        };
-        serde_json::to_value(serialized)
-            .ok()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default()
-    }
-
-    fn apply_merged_event_map(&mut self, mut event: Map<String, Value>) {
-        self.input = event.remove("input");
-        self.output = event.remove("output");
-        self.expected = event.remove("expected");
-        self.error = event.remove("error");
-        self.scores = event.remove("scores").and_then(parse_numeric_map);
-        self.metadata = event.remove("metadata").and_then(|value| match value {
-            Value::Object(map) => Some(map),
-            _ => None,
-        });
-        self.metrics = event.remove("metrics").and_then(parse_numeric_map);
-        self.tags = event.remove("tags").and_then(parse_string_array);
-        self.context = event.remove("context");
-        self.span_attributes = event
-            .remove("span_attributes")
-            .and_then(|value| serde_json::from_value(value).ok());
-        self.extra = HashMap::from_iter(event);
-    }
-}
-
-#[allow(dead_code)]
-fn numeric_map_to_value(map: &HashMap<String, f64>) -> Value {
-    Value::Object(Map::from_iter(
-        map.iter()
-            .map(|(key, value)| (key.clone(), Value::from(*value))),
-    ))
-}
-
-#[allow(dead_code)]
-fn apply_propagated_event(
-    propagated_event: &Map<String, Value>,
-    event_fields: &mut MutableSpanEvent,
-) {
-    let mut event = event_fields.to_event_map();
-    merge_event_maps(&mut event, propagated_event);
-    event_fields.apply_merged_event_map(event);
-}
-
-#[allow(dead_code)]
-fn merge_event_maps(merge_into: &mut Map<String, Value>, merge_from: &Map<String, Value>) {
-    for (key, merge_from_value) in merge_from {
-        match (merge_into.get_mut(key), merge_from_value) {
-            (Some(Value::Object(merge_into_object)), Value::Object(merge_from_object)) => {
-                merge_event_maps(merge_into_object, merge_from_object);
-            }
-            (Some(Value::Array(merge_into_array)), Value::Array(merge_from_array))
-                if key == "tags" =>
-            {
-                for item in merge_from_array {
-                    if !merge_into_array.iter().any(|existing| existing == item) {
-                        merge_into_array.push(item.clone());
-                    }
-                }
-            }
-            _ => {
-                merge_into.insert(key.clone(), merge_from_value.clone());
-            }
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn parse_numeric_map(value: Value) -> Option<HashMap<String, f64>> {
-    match value {
-        Value::Object(map) => Some(HashMap::from_iter(
-            map.into_iter()
-                .filter_map(|(key, value)| value.as_f64().map(|number| (key, number))),
-        )),
-        _ => None,
-    }
-}
-
-#[allow(dead_code)]
-fn parse_string_array(value: Value) -> Option<Vec<String>> {
-    match value {
-        Value::Array(values) => Some(
-            values
-                .into_iter()
-                .filter_map(|value| value.as_str().map(ToString::to_string))
-                .collect(),
-        ),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -1619,13 +1422,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_capacity_is_enforced_even_with_the_legacy_unbounded_setting() {
+    async fn builder_capacity_is_always_bounded() {
         let client = BraintrustClient::builder()
+            .runtime(crate::current_runtime())
             .app_url("https://example.com")
             .api_url("https://example.com")
             .skip_login(true)
             .with_queue_max_size(1)
-            .enforce_queue_size_limit(false)
             .build()
             .await
             .expect("client");
