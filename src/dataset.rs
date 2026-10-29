@@ -19,7 +19,7 @@
 //!     DatasetInsert::builder()
 //!         .input(json!({"question": "What is 2+2?"}))
 //!         .expected(json!({"answer": "4"}))
-//!         .build()?
+//!         .build()
 //! ).await?;
 //! ```
 
@@ -32,7 +32,8 @@ use serde_json::{Map, Value};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use crate::api::datasets::{DatasetFields, DatasetWrite};
+pub use crate::api::datasets::DatasetFields;
+use crate::api::datasets::DatasetWrite;
 use crate::error::Result;
 use crate::internal::ports::{DatasetApi, DeliveryControl};
 use crate::internal::session::CredentialScope;
@@ -41,112 +42,65 @@ use crate::internal::session::CredentialScope;
 // Dataset Insert Types
 // ============================================================================
 
-/// Error type for DatasetInsert builder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum DatasetInsertBuilderError {
-    /// Input is required but was not provided.
-    MissingInput,
-}
-
-impl fmt::Display for DatasetInsertBuilderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingInput => write!(f, "input is required but was not provided"),
-        }
-    }
-}
-
-impl std::error::Error for DatasetInsertBuilderError {}
-
-/// Data to insert into a dataset.
-#[derive(Clone, Default)]
-#[non_exhaustive]
+/// Data to insert into a dataset. Input is required, including when its value is JSON null.
+///
+/// ```
+/// use braintrust_sdk_rust::DatasetInsert;
+/// use serde_json::json;
+/// let record = DatasetInsert::builder().input(json!(null)).build();
+/// assert_eq!(record.input(), &json!(null));
+/// ```
+///
+/// Missing input is rejected at compile time:
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::DatasetInsert;
+/// let record = DatasetInsert::builder().expected(serde_json::json!(4)).build();
+/// ```
+///
+/// There is no default record that bypasses the required input:
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::DatasetInsert;
+/// let record = DatasetInsert::default();
+/// ```
+#[derive(bon::Builder, Debug, Clone)]
 pub struct DatasetInsert {
-    pub(crate) input: Option<Value>,
-    pub(crate) expected: Option<Value>,
-    pub(crate) metadata: Option<Map<String, Value>>,
-    pub(crate) tags: Option<Vec<String>>,
+    #[builder(into)]
+    input: Value,
+    #[builder(into)]
+    expected: Option<Value>,
+    metadata: Option<Map<String, Value>>,
+    tags: Option<Vec<String>>,
 }
 
 impl DatasetInsert {
-    /// Create a new DatasetInsert builder.
-    pub fn builder() -> DatasetInsertBuilder {
-        DatasetInsertBuilder::new()
+    /// Return the input, including an explicit JSON null.
+    pub fn input(&self) -> &Value {
+        &self.input
+    }
+    /// Return the expected output, if supplied.
+    pub fn expected(&self) -> Option<&Value> {
+        self.expected.as_ref()
+    }
+    /// Return the metadata entries, if supplied.
+    pub fn metadata(&self) -> Option<&Map<String, Value>> {
+        self.metadata.as_ref()
+    }
+    /// Return the tags, if supplied.
+    pub fn tags(&self) -> Option<&[String]> {
+        self.tags.as_deref()
     }
 }
 
 impl From<DatasetInsert> for DatasetFields {
     fn from(record: DatasetInsert) -> Self {
         Self {
-            input: record.input,
+            input: Some(record.input),
             expected: record.expected,
             metadata: record.metadata,
             tags: record.tags,
         }
-    }
-}
-
-/// Builder for DatasetInsert.
-#[derive(Clone, Default)]
-pub struct DatasetInsertBuilder {
-    inner: DatasetInsert,
-}
-
-impl DatasetInsertBuilder {
-    /// Create a new DatasetInsertBuilder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the input data (required).
-    pub fn input(mut self, input: impl Into<Value>) -> Self {
-        self.inner.input = Some(input.into());
-        self
-    }
-
-    /// Set the expected output for evaluation.
-    pub fn expected(mut self, expected: impl Into<Value>) -> Self {
-        self.inner.expected = Some(expected.into());
-        self
-    }
-
-    /// Set the metadata map.
-    pub fn metadata(mut self, metadata: Map<String, Value>) -> Self {
-        self.inner.metadata = Some(metadata);
-        self
-    }
-
-    /// Add a single metadata entry.
-    pub fn metadata_entry(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
-        self.inner
-            .metadata
-            .get_or_insert_with(Map::new)
-            .insert(key.into(), value.into());
-        self
-    }
-
-    /// Set multiple tags at once.
-    pub fn tags(mut self, tags: Vec<String>) -> Self {
-        self.inner.tags = Some(tags);
-        self
-    }
-
-    /// Add a single tag.
-    pub fn tag(mut self, tag: impl Into<String>) -> Self {
-        self.inner
-            .tags
-            .get_or_insert_with(Vec::new)
-            .push(tag.into());
-        self
-    }
-
-    /// Build the DatasetInsert.
-    pub fn build(self) -> std::result::Result<DatasetInsert, DatasetInsertBuilderError> {
-        if self.inner.input.is_none() {
-            return Err(DatasetInsertBuilderError::MissingInput);
-        }
-        Ok(self.inner)
     }
 }
 
@@ -462,13 +416,19 @@ impl Dataset {
     }
 
     /// Merge supplied fields into a record, returning after API acknowledgement.
-    pub async fn update(&self, id: &str, record: DatasetInsert) -> Result<()> {
+    /// Omitted fields remain unchanged; explicit JSON null values are sent as null.
+    ///
+    /// ```no_run
+    /// use braintrust_sdk_rust::{Dataset, DatasetFields};
+    /// # async fn update(dataset: &Dataset) -> braintrust_sdk_rust::Result<()> {
+    /// dataset.update("record-id", DatasetFields::builder().expected(4).build()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn update(&self, id: &str, fields: DatasetFields) -> Result<()> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         self.api
-            .write_dataset_record(
-                &self.scope,
-                DatasetWrite::update(dataset_id, id, record.into()),
-            )
+            .write_dataset_record(&self.scope, DatasetWrite::update(dataset_id, id, fields))
             .await
     }
 
@@ -612,35 +572,6 @@ impl DatasetIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_dataset_insert_builder_requires_input() {
-        let result = DatasetInsert::builder()
-            .expected(serde_json::json!({"answer": "4"}))
-            .build();
-
-        assert!(matches!(
-            result,
-            Err(DatasetInsertBuilderError::MissingInput)
-        ));
-    }
-
-    #[test]
-    fn test_dataset_insert_builder_works() {
-        let result = DatasetInsert::builder()
-            .input(serde_json::json!({"question": "What is 2+2?"}))
-            .expected(serde_json::json!({"answer": "4"}))
-            .tag("math")
-            .tag("addition")
-            .metadata_entry("difficulty", serde_json::json!("easy"))
-            .build();
-
-        assert!(result.is_ok());
-        let insert = result.unwrap();
-        assert!(insert.input.is_some());
-        assert!(insert.expected.is_some());
-        assert_eq!(insert.tags.as_ref().map(|t| t.len()), Some(2));
-    }
 
     #[test]
     fn test_dataset_summary_getters() {

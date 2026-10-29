@@ -1,6 +1,6 @@
 //! Integration tests for Datasets API.
 
-use braintrust_sdk_rust::{BraintrustClient, DatasetInsert};
+use braintrust_sdk_rust::{BraintrustClient, DatasetFields, DatasetInsert};
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -133,8 +133,7 @@ async fn dataset_insert_is_acknowledged_without_flush() {
             DatasetInsert::builder()
                 .input(json!({"question": "What is 2+2?"}))
                 .expected(json!({"answer": "4"}))
-                .build()
-                .expect("record"),
+                .build(),
         )
         .await
         .expect("insert");
@@ -525,10 +524,7 @@ async fn a_non_advancing_cursor_is_reported_and_does_not_poison_a_later_retry() 
 }
 
 fn record(value: i32) -> DatasetInsert {
-    DatasetInsert::builder()
-        .input(json!(value))
-        .build()
-        .unwrap()
+    DatasetInsert::builder().input(json!(value)).build()
 }
 
 #[tokio::test]
@@ -553,14 +549,16 @@ async fn mutations_have_dataset_wire_shapes_and_share_registration_across_clones
             DatasetInsert::builder()
                 .input(json!(1))
                 .expected(json!(2))
-                .metadata_entry("source", "test")
-                .tag("sample")
-                .build()
-                .unwrap(),
+                .metadata(serde_json::Map::from_iter([(
+                    "source".into(),
+                    json!("test"),
+                )]))
+                .tags(vec!["sample".into()])
+                .build(),
         )
         .await
         .unwrap();
-    dataset.clone().update(&id, record(3)).await.unwrap();
+    dataset.clone().update(&id, record(3).into()).await.unwrap();
     dataset.delete(&id).await.unwrap();
     // Neither barrier registers or replays dataset work.
     dataset.flush().await.unwrap();
@@ -583,6 +581,104 @@ async fn mutations_have_dataset_wire_shapes_and_share_registration_across_clones
         assert_eq!(request_header(&request, "authorization"), "Bearer token");
         assert_eq!(request_header(&request, "x-bt-org-name"), "tenant");
     }
+}
+
+#[tokio::test]
+async fn partial_updates_send_only_supplied_fields_and_preserve_null_and_empty_values() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/dataset/register"))
+        .respond_with(registration())
+        .expect(1)
+        .mount(&server)
+        .await;
+    let patches = [
+        (
+            DatasetFields::builder().expected(4).build(),
+            json!({"expected":4}),
+        ),
+        (
+            DatasetFields::builder()
+                .metadata(serde_json::Map::from_iter([(
+                    "source".into(),
+                    json!("reviewed"),
+                )]))
+                .build(),
+            json!({"metadata":{"source":"reviewed"}}),
+        ),
+        (
+            DatasetFields::builder()
+                .tags(vec!["reviewed".into()])
+                .build(),
+            json!({"tags":["reviewed"]}),
+        ),
+        (
+            DatasetFields::builder().expected(json!(null)).build(),
+            json!({"expected":null}),
+        ),
+        (
+            DatasetFields::builder().input(json!(null)).build(),
+            json!({"input":null}),
+        ),
+        (
+            DatasetFields::builder().tags(vec![]).build(),
+            json!({"tags":[]}),
+        ),
+        (
+            DatasetFields::builder()
+                .metadata(serde_json::Map::new())
+                .build(),
+            json!({"metadata":{}}),
+        ),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(patches.len() as u64)
+        .mount(&server)
+        .await;
+    let client = isolated_client(&server).await;
+    let dataset = dataset(&client);
+    for (fields, expected_fields) in patches {
+        dataset.update("existing", fields).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        let mut row = expected_fields;
+        row["dataset_id"] = json!("dataset");
+        row["id"] = json!("existing");
+        row["_is_merge"] = json!(true);
+        assert_eq!(body, json!({"api_version":2,"rows":[row]}));
+    }
+}
+
+#[tokio::test]
+async fn inserts_preserve_explicit_null_input() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/dataset/register"))
+        .respond_with(registration())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = isolated_client(&server).await;
+    let dataset = dataset(&client);
+    let id = dataset
+        .insert(DatasetInsert::builder().input(json!(null)).build())
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+    assert_eq!(
+        body,
+        json!({"api_version":2,"rows":[{"dataset_id":"dataset","id":id,"input":null}]})
+    );
 }
 
 #[tokio::test]
@@ -613,7 +709,7 @@ async fn mutation_errors_are_direct_and_do_not_replay_or_poison_later_operations
         let client = isolated_client(&server).await;
         let dataset = dataset(&client);
         let insert = dataset.insert(record(1)).await.map(|_| ());
-        let update = dataset.update("old", record(2)).await;
+        let update = dataset.update("old", record(2).into()).await;
         let delete = dataset.delete("old").await;
         for result in [insert, update, delete] {
             match result {
@@ -655,7 +751,7 @@ async fn registration_failure_prevents_mutation_and_flush_does_not_register_a_da
     dataset.flush().await.unwrap();
     assert!(server.received_requests().await.unwrap().is_empty());
     assert!(dataset.insert(record(1)).await.is_err());
-    assert!(dataset.update("old", record(2)).await.is_err());
+    assert!(dataset.update("old", record(2).into()).await.is_err());
     assert!(dataset.delete("old").await.is_err());
     assert!(server
         .received_requests()

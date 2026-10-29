@@ -11,7 +11,7 @@ fn registration() -> ResponseTemplate {
     )
 }
 fn record() -> DatasetInsert {
-    DatasetInsert::builder().input(json!(1)).build().unwrap()
+    DatasetInsert::builder().input(json!(1)).build()
 }
 
 #[tokio::test]

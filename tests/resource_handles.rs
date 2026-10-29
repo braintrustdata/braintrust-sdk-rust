@@ -88,7 +88,7 @@ async fn resources_and_detached_span_builders_work_after_the_client_is_dropped()
     child.log(SpanLog::default()).await.unwrap();
     resources
         .dataset
-        .insert(DatasetInsert::builder().input(json!(1)).build().unwrap())
+        .insert(DatasetInsert::builder().input(json!(1)).build())
         .await
         .unwrap();
     let records: DatasetIterator = resources.dataset.fetch(None).await.unwrap();

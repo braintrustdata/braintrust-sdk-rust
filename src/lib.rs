@@ -23,8 +23,8 @@ mod types;
 
 pub use completion::{Completion, CompletionFuture};
 pub use dataset::{
-    Dataset, DatasetBuilder, DatasetBuilderError, DatasetInsert, DatasetInsertBuilder,
-    DatasetInsertBuilderError, DatasetIterator, DatasetRecord, DatasetSummary,
+    Dataset, DatasetBuilder, DatasetBuilderError, DatasetFields, DatasetInsert,
+    DatasetInsertBuilder, DatasetIterator, DatasetRecord, DatasetSummary,
 };
 pub use delivery::{
     DeliveryError, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushFailure,
