@@ -1090,7 +1090,7 @@ mod tests {
                     completion.record_issuance(Err(crate::EnqueueError::Full.into()));
                 } else {
                     self.accepted.lock().unwrap().push(payload);
-                    let _ = sender.send(Ok(crate::DeliveryReceipt));
+                    let _ = sender.send(Ok(crate::DeliveryReceipt::new()));
                 }
                 completion
             }

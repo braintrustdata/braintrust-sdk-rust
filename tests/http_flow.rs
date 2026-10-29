@@ -178,5 +178,5 @@ async fn submission_and_flush_can_be_issued_without_a_call_site_runtime() {
     .join()
     .unwrap();
     write.await.unwrap();
-    assert_eq!(flush.await.unwrap().delivered, 1);
+    assert_eq!(flush.await.unwrap().delivered(), 1);
 }

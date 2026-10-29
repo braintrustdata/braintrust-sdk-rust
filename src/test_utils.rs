@@ -70,7 +70,7 @@ impl SpanSubmitter for MockBraintrustClient {
             parent: parent_info,
         });
         let (sender, completion) = crate::Completion::pair();
-        let _ = sender.send(Ok(crate::DeliveryReceipt));
+        let _ = sender.send(Ok(crate::DeliveryReceipt::new()));
         completion
     }
 

@@ -47,7 +47,7 @@ impl BatchCompletion {
     fn finish(&self, result: &Result<(), BatchError>) {
         if let Some(writes) = lock(&self.senders).take() {
             let write_result = match result {
-                Ok(()) => Ok(DeliveryReceipt),
+                Ok(()) => Ok(DeliveryReceipt::new()),
                 Err(BatchError::Delivery(error)) => Err(WriteError::Delivery(error.clone())),
                 Err(BatchError::Execution(error)) => Err(WriteError::Execution(*error)),
             };
