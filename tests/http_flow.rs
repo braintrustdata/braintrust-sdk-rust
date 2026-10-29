@@ -143,6 +143,45 @@ async fn automatic_delivery_reports_backend_rejection_through_completion() {
 }
 
 #[tokio::test]
+async fn tracked_stateless_update_reports_automatic_delivery_failure() {
+    use braintrust_sdk_rust::{SpanComponents, SpanObjectType, WriteError};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build()
+        .await
+        .unwrap();
+    let exported = SpanComponents {
+        object_type: SpanObjectType::ProjectLogs,
+        object_id: Some("project".into()),
+        compute_object_metadata_args: None,
+        row_id: Some("row".into()),
+        span_id: Some("span".into()),
+        root_span_id: Some("root".into()),
+        span_parents: None,
+        propagated_event: None,
+    }
+    .to_str();
+    let completion = client
+        .update_span_with_credentials_tracked(
+            "token",
+            "org",
+            &exported,
+            SpanLog::builder().input(json!("input")).build().unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(completion.await, Err(WriteError::Delivery(_))));
+    client.flush().await.expect("completed failure is retired");
+}
+
+#[tokio::test]
 async fn submission_and_flush_can_be_issued_without_a_call_site_runtime() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

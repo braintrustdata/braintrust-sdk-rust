@@ -610,6 +610,7 @@ impl BraintrustClient {
             .org_id()
             .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
         self.update_span_internal(api_key, org_id, login_state.org_name(), exported, event)
+            .map(|_| ())
     }
 
     /// Update an existing span using explicit credentials instead of shared login state.
@@ -628,6 +629,21 @@ impl BraintrustClient {
         let org_id = org_id.into();
 
         self.update_span_internal(token, org_id, None, exported, event)
+            .map(|_| ())
+    }
+
+    /// Update an existing span and retain its eventual delivery result.
+    ///
+    /// Validation and admission are performed before this method returns. The
+    /// returned completion observes delivery even if it finishes before a flush.
+    pub fn update_span_with_credentials_tracked(
+        &self,
+        token: impl Into<String>,
+        org_id: impl Into<String>,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
+        self.update_span_internal(token.into(), org_id.into(), None, exported, event)
     }
 
     fn update_span_internal(
@@ -637,7 +653,7 @@ impl BraintrustClient {
         org_name: Option<String>,
         exported: &str,
         event: crate::span::SpanLog,
-    ) -> Result<()> {
+    ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
         let components = SpanComponents::parse(exported)?;
         let row_id = components.row_id.clone().ok_or_else(|| {
             BraintrustError::InvalidConfig("Exported span must have a row_id".into())
@@ -734,7 +750,7 @@ impl BraintrustClient {
         if let Err(error) = &*completion {
             return Err(BraintrustError::Background(error.to_string()));
         }
-        Ok(())
+        Ok(completion)
     }
 
     /// Perform login synchronously.
