@@ -5,16 +5,23 @@ use serde_json::{Map, Value};
 
 /// Request body for dataset registration.
 ///
-/// Create the request with its required names, then set optional fields:
+/// Create the request with its required names and optional fields:
 ///
 /// ```
 /// use braintrust_sdk_rust::api::datasets::DatasetRegisterRequest;
-/// let mut request = DatasetRegisterRequest::new("project", "organization", "dataset");
-/// request.set_description(Some("Evaluation cases".into()));
+/// let request = DatasetRegisterRequest::builder()
+///     .project_name("project").org_name("organization").dataset_name("dataset")
+///     .description("Evaluation cases").build();
 /// ```
 ///
 /// Struct literals are intentionally unavailable outside this crate, allowing
 /// additional fields to be introduced without breaking existing callers.
+/// The builder also requires the three identifying names:
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::api::datasets::DatasetRegisterRequest;
+/// let _ = DatasetRegisterRequest::builder().project_name("project").build();
+/// ```
 ///
 /// ```compile_fail
 /// use braintrust_sdk_rust::api::datasets::DatasetRegisterRequest;
@@ -23,13 +30,17 @@ use serde_json::{Map, Value};
 ///     dataset_name: "dataset".into(), description: None, metadata: None,
 /// };
 /// ```
-#[derive(Debug, Clone, Serialize)]
+#[derive(bon::Builder, Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct DatasetRegisterRequest {
+    #[builder(into)]
     pub(crate) project_name: String,
+    #[builder(into)]
     pub(crate) org_name: String,
+    #[builder(into)]
     pub(crate) dataset_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) metadata: Option<Map<String, Value>>,
@@ -126,46 +137,21 @@ impl DatasetRegisterRequest {
     pub fn project_name(&self) -> &str {
         &self.project_name
     }
-    /// Set the project name.
-    pub fn set_project_name(&mut self, value: impl Into<String>) -> &mut Self {
-        self.project_name = value.into();
-        self
-    }
     /// Return the org name.
     pub fn org_name(&self) -> &str {
         &self.org_name
-    }
-    /// Set the org name.
-    pub fn set_org_name(&mut self, value: impl Into<String>) -> &mut Self {
-        self.org_name = value.into();
-        self
     }
     /// Return the dataset name.
     pub fn dataset_name(&self) -> &str {
         &self.dataset_name
     }
-    /// Set the dataset name.
-    pub fn set_dataset_name(&mut self, value: impl Into<String>) -> &mut Self {
-        self.dataset_name = value.into();
-        self
-    }
     /// Return the description.
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
-    /// Set the description.
-    pub fn set_description(&mut self, value: Option<String>) -> &mut Self {
-        self.description = value;
-        self
-    }
     /// Return the metadata.
     pub fn metadata(&self) -> Option<&Map<String, Value>> {
         self.metadata.as_ref()
-    }
-    /// Set the metadata.
-    pub fn set_metadata(&mut self, value: Option<Map<String, Value>>) -> &mut Self {
-        self.metadata = value;
-        self
     }
 }
 

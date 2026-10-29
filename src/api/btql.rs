@@ -30,23 +30,25 @@ pub struct DatasetRecord {
 }
 
 /// BTQL query for fetching dataset records.
-#[derive(Debug, Clone, Serialize)]
+#[derive(bon::Builder, Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct BTQLQuery {
     pub(crate) query: BTQLQueryInner,
 }
 
 /// Inner BTQL query structure.
-#[derive(Debug, Clone, Serialize)]
+#[derive(bon::Builder, Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct BTQLQueryInner {
     /// Dataset reference: dataset('id')
+    #[builder(into)]
     pub(crate) from: String,
     /// Maximum records per page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) limit: Option<usize>,
     /// Pagination cursor token.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) cursor: Option<String>,
 }
 
@@ -127,11 +129,6 @@ impl BTQLQuery {
     pub fn query(&self) -> &BTQLQueryInner {
         &self.query
     }
-    /// Set the query.
-    pub fn set_query(&mut self, value: BTQLQueryInner) -> &mut Self {
-        self.query = value;
-        self
-    }
 }
 
 impl BTQLQueryInner {
@@ -139,28 +136,13 @@ impl BTQLQueryInner {
     pub fn from(&self) -> &str {
         &self.from
     }
-    /// Set the from.
-    pub fn set_from(&mut self, value: impl Into<String>) -> &mut Self {
-        self.from = value.into();
-        self
-    }
     /// Return the limit.
     pub fn limit(&self) -> Option<&usize> {
         self.limit.as_ref()
     }
-    /// Set the limit.
-    pub fn set_limit(&mut self, value: Option<usize>) -> &mut Self {
-        self.limit = value;
-        self
-    }
     /// Return the cursor.
     pub fn cursor(&self) -> Option<&str> {
         self.cursor.as_deref()
-    }
-    /// Set the cursor.
-    pub fn set_cursor(&mut self, value: Option<String>) -> &mut Self {
-        self.cursor = value;
-        self
     }
 }
 

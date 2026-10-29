@@ -15,20 +15,59 @@ use wiremock::{
 };
 
 fn config(api: &MockServer, app: &MockServer, token: &str) -> api::Config {
-    let mut config = api::Config::new(token);
-    config.set_api_url(api.uri());
-    config.set_app_url(app.uri());
-    config.set_org_name(Some("isolated-org".into()));
-    config.set_timeout(Duration::from_secs(3));
-    config
+    api::Config::builder()
+        .api_key(token)
+        .api_url(api.uri())
+        .app_url(app.uri())
+        .org_name("isolated-org")
+        .timeout(Duration::from_secs(3))
+        .build()
+}
+
+#[test]
+fn builders_preserve_defaults_and_optional_fields() {
+    let config = api::Config::builder().api_key("token").build();
+    assert_eq!(config.api_url(), api::DEFAULT_API_URL);
+    assert_eq!(config.app_url(), api::DEFAULT_APP_URL);
+    assert_eq!(config.timeout(), Duration::from_secs(30));
+
+    let request = DatasetRegisterRequest::builder()
+        .project_name("project")
+        .org_name("organization")
+        .dataset_name("dataset")
+        .description("cases")
+        .build();
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        json!({
+            "project_name": "project", "org_name": "organization",
+            "dataset_name": "dataset", "description": "cases"
+        })
+    );
+
+    let insert = InsertRows::builder()
+        .rows(vec![json!({"id": "row"})])
+        .build();
+    assert_eq!(
+        serde_json::to_value(insert).unwrap(),
+        json!({
+            "rows": [{"id": "row"}], "api_version": 2
+        })
+    );
 }
 
 #[tokio::test]
 async fn explicit_scope_works_without_login_and_login_does_not_mutate_it() {
     let api = MockServer::start().await;
     let app = MockServer::start().await;
-    let mut settings = config(&api, &app, "explicit-token");
-    settings.set_user_agent(Some("manual-ingest/1".into()));
+    let settings = api::Config::builder()
+        .api_key("explicit-token")
+        .api_url(api.uri())
+        .app_url(app.uri())
+        .org_name("isolated-org")
+        .timeout(Duration::from_secs(3))
+        .user_agent("manual-ingest/1")
+        .build();
     let client = api::Client::new(settings).unwrap();
     assert!(api.received_requests().await.unwrap().is_empty());
     assert!(app.received_requests().await.unwrap().is_empty());
@@ -146,11 +185,12 @@ async fn btql_readback_preserves_cursor_and_request_errors() {
     let page = client
         .btql()
         .query_dataset_records({
-            let mut inner = BTQLQueryInner::new("dataset('id')");
-            inner.set_limit(Some(5)).set_cursor(Some("next".into()));
-            let mut query = BTQLQuery::new("dataset('id')");
-            query.set_query(inner);
-            query
+            let inner = BTQLQueryInner::builder()
+                .from("dataset('id')")
+                .limit(5)
+                .cursor("next")
+                .build();
+            BTQLQuery::builder().query(inner).build()
         })
         .await
         .unwrap();
@@ -228,9 +268,10 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
         client
             .projects()
             .register({
-                let mut request = ProjectRegisterRequest::new("p");
-                request.set_org_id(Some("org".into()));
-                request
+                ProjectRegisterRequest::builder()
+                    .project_name("p")
+                    .org_id("org")
+                    .build()
             })
             .await
             .unwrap()
@@ -252,9 +293,11 @@ async fn selected_resource_endpoints_keep_their_wire_contracts_and_planes() {
         client
             .experiments()
             .register({
-                let mut request = ExperimentRegisterRequest::new("p", "org");
-                request.set_experiment_name(Some("e".into()));
-                request
+                ExperimentRegisterRequest::builder()
+                    .project_name("p")
+                    .org_id("org")
+                    .experiment_name("e")
+                    .build()
             })
             .await
             .unwrap()
@@ -341,8 +384,10 @@ async fn overflow_grant_is_explicit_and_does_not_upload_or_commit() {
 
 #[test]
 fn config_rejects_ambiguous_routes_and_redacts_credentials() {
-    let mut settings = api::Config::new("do-not-print-token");
-    settings.set_api_url("https://user:secret@example.test");
+    let settings = api::Config::builder()
+        .api_key("do-not-print-token")
+        .api_url("https://user:secret@example.test")
+        .build();
     assert!(!format!("{settings:?}").contains("do-not-print-token"));
     for url in [
         "file:///tmp/foo",
@@ -350,7 +395,10 @@ fn config_rejects_ambiguous_routes_and_redacts_credentials() {
         "https://example.test/?key=secret",
         "https://example.test/#fragment",
     ] {
-        settings.set_api_url(url);
+        let settings = api::Config::builder()
+            .api_key("do-not-print-token")
+            .api_url(url)
+            .build();
         assert!(matches!(
             api::Client::new(settings.clone()),
             Err(api::Error::Config(_))
@@ -361,13 +409,15 @@ fn config_rejects_ambiguous_routes_and_redacts_credentials() {
 
 #[test]
 fn config_debug_shows_settings_and_redacts_api_key() {
-    let mut settings = api::Config::new("do-not-print-token");
-    settings.set_api_url("https://api.example.test");
-    settings.set_app_url("https://app.example.test");
-    settings.set_org_name(Some("example-org".into()));
-    settings.set_user_agent(Some("example-agent".into()));
-    settings.set_custom_ca_bundle_path(Some("example.pem".into()));
-    settings.set_custom_ca_bundle_pem(Some(vec![1, 2, 3]));
+    let settings = api::Config::builder()
+        .api_key("do-not-print-token")
+        .api_url("https://api.example.test")
+        .app_url("https://app.example.test")
+        .org_name("example-org")
+        .user_agent("example-agent")
+        .custom_ca_bundle_path("example.pem".into())
+        .custom_ca_bundle_pem(vec![1, 2, 3])
+        .build();
 
     let debug = format!("{settings:?}");
     for expected in [
@@ -395,8 +445,10 @@ async fn base_path_is_preserved_without_a_trailing_slash() {
         .expect(1)
         .mount(&server)
         .await;
-    let mut settings = config(&server, &server, "token");
-    settings.set_api_url(format!("{}/prefix", server.uri()));
+    let settings = api::Config::builder()
+        .api_key("token")
+        .api_url(format!("{}/prefix", server.uri()))
+        .build();
     assert!(api::Client::new(settings)
         .unwrap()
         .logs3()

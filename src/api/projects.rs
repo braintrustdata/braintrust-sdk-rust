@@ -2,13 +2,16 @@
 use super::{Client, Error, Plane};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(bon::Builder, Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct ProjectRegisterRequest {
+    #[builder(into)]
     pub(crate) project_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) org_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) org_name: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize)]
@@ -54,28 +57,13 @@ impl ProjectRegisterRequest {
     pub fn project_name(&self) -> &str {
         &self.project_name
     }
-    /// Set the project name.
-    pub fn set_project_name(&mut self, value: impl Into<String>) -> &mut Self {
-        self.project_name = value.into();
-        self
-    }
     /// Return the org id.
     pub fn org_id(&self) -> Option<&str> {
         self.org_id.as_deref()
     }
-    /// Set the org id.
-    pub fn set_org_id(&mut self, value: Option<String>) -> &mut Self {
-        self.org_id = value;
-        self
-    }
     /// Return the org name.
     pub fn org_name(&self) -> Option<&str> {
         self.org_name.as_deref()
-    }
-    /// Set the org name.
-    pub fn set_org_name(&mut self, value: Option<String>) -> &mut Self {
-        self.org_name = value;
-        self
     }
 }
 

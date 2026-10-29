@@ -5,46 +5,58 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 /// Repository information for experiment tracking.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(bon::Builder, Debug, Clone, Default, Serialize)]
 #[non_exhaustive]
 pub struct RepoInfo {
     /// Git commit SHA.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) commit: Option<String>,
     /// Current branch name.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) branch: Option<String>,
     /// Current tag (if any).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) tag: Option<String>,
     /// Whether the working directory has uncommitted changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) dirty: Option<bool>,
     /// Git author name.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) author_name: Option<String>,
     /// Git author email.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) author_email: Option<String>,
     /// Git commit message.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) commit_message: Option<String>,
     /// Git commit timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) commit_time: Option<String>,
 }
 
 /// Request body for experiment registration.
-#[derive(Debug, Clone, Serialize)]
+#[derive(bon::Builder, Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct ExperimentRegisterRequest {
+    #[builder(into)]
     pub(crate) project_name: String,
+    #[builder(into)]
     pub(crate) org_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) experiment_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     pub(crate) base_experiment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) metadata: Option<Map<String, Value>>,
@@ -191,73 +203,33 @@ impl RepoInfo {
     pub fn commit(&self) -> Option<&str> {
         self.commit.as_deref()
     }
-    /// Set the commit.
-    pub fn set_commit(&mut self, value: Option<String>) -> &mut Self {
-        self.commit = value;
-        self
-    }
     /// Return the branch.
     pub fn branch(&self) -> Option<&str> {
         self.branch.as_deref()
-    }
-    /// Set the branch.
-    pub fn set_branch(&mut self, value: Option<String>) -> &mut Self {
-        self.branch = value;
-        self
     }
     /// Return the tag.
     pub fn tag(&self) -> Option<&str> {
         self.tag.as_deref()
     }
-    /// Set the tag.
-    pub fn set_tag(&mut self, value: Option<String>) -> &mut Self {
-        self.tag = value;
-        self
-    }
     /// Return the dirty.
     pub fn dirty(&self) -> Option<&bool> {
         self.dirty.as_ref()
-    }
-    /// Set the dirty.
-    pub fn set_dirty(&mut self, value: Option<bool>) -> &mut Self {
-        self.dirty = value;
-        self
     }
     /// Return the author name.
     pub fn author_name(&self) -> Option<&str> {
         self.author_name.as_deref()
     }
-    /// Set the author name.
-    pub fn set_author_name(&mut self, value: Option<String>) -> &mut Self {
-        self.author_name = value;
-        self
-    }
     /// Return the author email.
     pub fn author_email(&self) -> Option<&str> {
         self.author_email.as_deref()
-    }
-    /// Set the author email.
-    pub fn set_author_email(&mut self, value: Option<String>) -> &mut Self {
-        self.author_email = value;
-        self
     }
     /// Return the commit message.
     pub fn commit_message(&self) -> Option<&str> {
         self.commit_message.as_deref()
     }
-    /// Set the commit message.
-    pub fn set_commit_message(&mut self, value: Option<String>) -> &mut Self {
-        self.commit_message = value;
-        self
-    }
     /// Return the commit time.
     pub fn commit_time(&self) -> Option<&str> {
         self.commit_time.as_deref()
-    }
-    /// Set the commit time.
-    pub fn set_commit_time(&mut self, value: Option<String>) -> &mut Self {
-        self.commit_time = value;
-        self
     }
 }
 
@@ -266,82 +238,37 @@ impl ExperimentRegisterRequest {
     pub fn project_name(&self) -> &str {
         &self.project_name
     }
-    /// Set the project name.
-    pub fn set_project_name(&mut self, value: impl Into<String>) -> &mut Self {
-        self.project_name = value.into();
-        self
-    }
     /// Return the org id.
     pub fn org_id(&self) -> &str {
         &self.org_id
-    }
-    /// Set the org id.
-    pub fn set_org_id(&mut self, value: impl Into<String>) -> &mut Self {
-        self.org_id = value.into();
-        self
     }
     /// Return the experiment name.
     pub fn experiment_name(&self) -> Option<&str> {
         self.experiment_name.as_deref()
     }
-    /// Set the experiment name.
-    pub fn set_experiment_name(&mut self, value: Option<String>) -> &mut Self {
-        self.experiment_name = value;
-        self
-    }
     /// Return the description.
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
-    }
-    /// Set the description.
-    pub fn set_description(&mut self, value: Option<String>) -> &mut Self {
-        self.description = value;
-        self
     }
     /// Return the base experiment.
     pub fn base_experiment(&self) -> Option<&str> {
         self.base_experiment.as_deref()
     }
-    /// Set the base experiment.
-    pub fn set_base_experiment(&mut self, value: Option<String>) -> &mut Self {
-        self.base_experiment = value;
-        self
-    }
     /// Return the metadata.
     pub fn metadata(&self) -> Option<&Map<String, Value>> {
         self.metadata.as_ref()
-    }
-    /// Set the metadata.
-    pub fn set_metadata(&mut self, value: Option<Map<String, Value>>) -> &mut Self {
-        self.metadata = value;
-        self
     }
     /// Return the public.
     pub fn public(&self) -> Option<&bool> {
         self.public.as_ref()
     }
-    /// Set the public.
-    pub fn set_public(&mut self, value: Option<bool>) -> &mut Self {
-        self.public = value;
-        self
-    }
     /// Return the update.
     pub fn update(&self) -> Option<&bool> {
         self.update.as_ref()
     }
-    /// Set the update.
-    pub fn set_update(&mut self, value: Option<bool>) -> &mut Self {
-        self.update = value;
-        self
-    }
     /// Return the repo info.
     pub fn repo_info(&self) -> Option<&RepoInfo> {
         self.repo_info.as_ref()
-    }
-    /// Set the repo info.
-    pub fn set_repo_info(&mut self, value: Option<RepoInfo>) -> &mut Self {
-        self.repo_info = value;
-        self
     }
 }
 
