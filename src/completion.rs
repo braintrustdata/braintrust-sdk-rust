@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 
 /// A synchronously recorded issuance result and an eventual operation result.
 ///
-/// Inspect `&*completion` to check admission without waiting. Awaiting returns
+/// Inspect [`Completion::submission`] to check admission without waiting. Awaiting returns
 /// that error, or the accepted operation's result. Dropping this token does not
 /// cancel accepted work. No work is started by polling the token.
 ///
@@ -21,7 +21,7 @@ use tokio::sync::oneshot;
 /// # async fn example(client: &BraintrustClient, span: &SpanHandle<BraintrustClient>)
 /// # -> Result<(), Box<dyn std::error::Error>> {
 /// let completion = span.log(SpanLog::default()); // admission happens now
-/// if let Err(error) = &*completion {
+/// if let Err(error) = completion.submission() {
 ///     eprintln!("submission rejected: {error}");
 /// }
 /// completion.await?; // observes admission failure or full batch delivery
@@ -35,6 +35,14 @@ pub struct Completion<T, E> {
     receiver: oneshot::Receiver<Result<T, E>>,
 }
 impl<T, E> Completion<T, E> {
+    /// Borrow the immediate submission result without waiting for delivery.
+    ///
+    /// An accepted submission may still fail during delivery. Await this
+    /// completion to observe the final result.
+    pub fn submission(&self) -> &Result<(), E> {
+        &self.issued
+    }
+
     pub(crate) fn pair() -> (oneshot::Sender<Result<T, E>>, Self) {
         let (sender, receiver) = oneshot::channel();
         (
@@ -114,7 +122,8 @@ mod tests {
         }
         let (sender, mut token) = Completion::<(), Error>::pair();
         token.record_issuance(Err(Error::Admission));
-        assert_eq!(&*token, &Err(Error::Admission));
+        assert_eq!(token.submission(), &Err(Error::Admission));
+        assert_eq!(&*token, token.submission());
         drop(sender);
         assert_eq!(token.await, Err(Error::Admission));
     }
@@ -122,6 +131,7 @@ mod tests {
     async fn successful_issuance_stays_successful_after_operation_failure() {
         let (sender, token) = Completion::<(), ExecutionError>::pair();
         sender.send(Err(ExecutionError::TimedOut)).unwrap();
+        assert!(token.submission().is_ok());
         assert!(token.is_ok());
         assert_eq!(token.await, Err(ExecutionError::TimedOut));
         let (sender, token) = Completion::<(), ExecutionError>::pair();

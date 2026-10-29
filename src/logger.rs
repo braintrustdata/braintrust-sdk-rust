@@ -747,7 +747,7 @@ impl BraintrustClient {
         };
 
         let completion = self.submit_payload(token, payload, None);
-        if let Err(error) = &*completion {
+        if let Err(error) = completion.submission() {
             return Err(BraintrustError::Background(error.to_string()));
         }
         Ok(completion)
