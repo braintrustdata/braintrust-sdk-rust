@@ -33,31 +33,28 @@ type FlushSender = oneshot::Sender<Result<FlushReport, FlushError>>;
 /// no completed-outcome registry: a batch owns its write senders until all its
 /// physical requests finish, and barriers summarize only active work.
 pub(crate) struct WriteService<C> {
-    inner: Arc<Inner<C>>,
-    owners: Arc<ProducerOwner<C>>,
-    abort: AbortHandle,
-    runtime: Handle,
-    exit: Shared<BoxFuture<'static, Result<(), ExecutionError>>>,
+    producer: Arc<Producer<C>>,
 }
 impl<C> Clone for WriteService<C> {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
-            owners: self.owners.clone(),
-            abort: self.abort.clone(),
-            runtime: self.runtime.clone(),
-            exit: self.exit.clone(),
+            producer: self.producer.clone(),
         }
     }
 }
-struct ProducerOwner<C> {
-    inner: std::sync::Weak<Inner<C>>,
+/// Only producer handles retain this owner. The worker retains `Inner` alone,
+/// so dropping the last producer closes admission while queued work can drain.
+struct Producer<C> {
+    inner: Arc<Inner<C>>,
+    abort: AbortHandle,
+    runtime: Handle,
+    exit: Shared<BoxFuture<'static, Result<(), ExecutionError>>>,
+    control_limit: usize,
+    shutdown_controls: Arc<Semaphore>,
 }
-impl<C> Drop for ProducerOwner<C> {
+impl<C> Drop for Producer<C> {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.upgrade() {
-            inner.close();
-        }
+        self.inner.close();
     }
 }
 impl<C: Send + 'static> WriteService<C> {
@@ -84,8 +81,6 @@ impl<C: Send + 'static> WriteService<C> {
             depth_warned: AtomicBool::new(false),
             wake: Wake::new(),
             capacity,
-            control_limit,
-            shutdown_controls: Arc::new(Semaphore::new(control_limit)),
             #[cfg(test)]
             after_take: Mutex::new(None),
         });
@@ -100,15 +95,15 @@ impl<C: Send + 'static> WriteService<C> {
             exit: Some(sender),
         };
         let task = runtime.spawn(async move { run(guard, process).await });
-        let owners = Arc::new(ProducerOwner {
-            inner: Arc::downgrade(&inner),
-        });
         Self {
-            inner,
-            owners,
-            abort: task.abort_handle(),
-            runtime,
-            exit,
+            producer: Arc::new(Producer {
+                inner,
+                abort: task.abort_handle(),
+                runtime,
+                exit,
+                control_limit,
+                shutdown_controls: Arc::new(Semaphore::new(control_limit)),
+            }),
         }
     }
 
@@ -122,13 +117,9 @@ impl<C: Send + 'static> WriteService<C> {
         command: C,
         rejected: impl FnOnce(C, EnqueueError),
     ) -> Completion<DeliveryReceipt, WriteError> {
+        let producer = &self.producer;
         let (sender, mut completion) = Completion::pair();
-        let reservation = self.inner.begin_publication().and_then(|()| {
-            self.inner
-                .reserve()
-                .inspect_err(|_| self.inner.end_publication())
-        });
-        match reservation {
+        match producer.inner.admit() {
             Err(error) => {
                 completion.record_issuance(Err(error.into()));
                 rejected(command, error);
@@ -136,13 +127,13 @@ impl<C: Send + 'static> WriteService<C> {
             Ok(depth) => {
                 // Publication is the linearization point: completed submissions
                 // appear in FIFO order before a later flush snapshots the queue.
-                self.inner.publish(Accepted { command, sender });
-                if depth >= self.inner.capacity - self.inner.capacity / 5
-                    && !self.inner.depth_warned.swap(true, Ordering::Relaxed)
+                producer.inner.publish(Accepted { command, sender });
+                if depth >= producer.inner.capacity - producer.inner.capacity / 5
+                    && !producer.inner.depth_warned.swap(true, Ordering::Relaxed)
                 {
                     warn!(
                         outstanding = depth,
-                        capacity = self.inner.capacity,
+                        capacity = producer.inner.capacity,
                         "delivery queue has reached 80% of capacity"
                     );
                 }
@@ -152,50 +143,45 @@ impl<C: Send + 'static> WriteService<C> {
     }
 
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
+        let producer = &self.producer;
         let (sender, mut completion) = Completion::pair();
-        let mut state = lock(&self.inner.state);
-        if let Some(error) = self.inner.terminal_error() {
+        let mut state = lock(&producer.inner.state);
+        if let Some(error) = producer.inner.terminal_error() {
             completion.record_issuance(Err(error.into()));
-        } else if self.inner.publishers.load(Ordering::SeqCst) & CLOSED != 0 {
+        } else if producer.inner.publishers.load(Ordering::SeqCst) & CLOSED != 0 {
             completion.record_issuance(Err(EnqueueError::Closed.into()));
-        } else if state
-            .barriers
-            .iter()
-            .filter(|barrier| !barrier.shutdown)
-            .count()
-            >= self.inner.control_limit
-        {
+        } else if state.barriers.len() >= producer.control_limit {
             completion.record_issuance(Err(EnqueueError::Full.into()));
         } else {
-            let through = self.inner.detach(&mut state);
-            state.barrier(sender, false, through);
-            self.inner.wake.notify_one();
+            let through = producer.inner.detach(&mut state);
+            state.barrier(sender, through);
+            producer.inner.wake.notify_one();
         }
         completion
     }
 
     pub fn shutdown(&self, timeout: Duration) -> Completion<ShutdownReport, ShutdownError> {
+        let producer = &self.producer;
         let (sender, mut completion) = Completion::pair();
-        let Ok(permit) = self.inner.shutdown_controls.clone().try_acquire_owned() else {
+        let Ok(permit) = producer.shutdown_controls.clone().try_acquire_owned() else {
             completion.record_issuance(Err(EnqueueError::Full.into()));
             return completion;
         };
         let (barrier_sender, barrier) = Completion::pair();
         {
-            let mut state = lock(&self.inner.state);
-            if let Some(error) = self.inner.terminal_error() {
+            let mut state = lock(&producer.inner.state);
+            if let Some(error) = producer.inner.terminal_error() {
                 completion.record_issuance(Err(error.into()));
                 return completion;
             }
-            self.inner.publishers.fetch_or(CLOSED, Ordering::SeqCst);
+            producer.inner.close();
             state.shutdown_pending.push(barrier_sender);
-            self.inner.register_shutdowns(&mut state);
+            producer.inner.register_shutdowns(&mut state);
         }
-        let inner = self.inner.clone();
-        let abort = self.abort.clone();
-        let exit = self.exit.clone();
-        self.inner.wake.notify_one();
-        self.runtime.spawn(async move {
+        let inner = producer.inner.clone();
+        let abort = producer.abort.clone();
+        let exit = producer.exit.clone();
+        producer.runtime.spawn(async move {
             let _permit = permit;
             let work = async {
                 let report = barrier.await;
@@ -221,11 +207,11 @@ impl<C: Send + 'static> WriteService<C> {
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.inner.outstanding.load(Ordering::Acquire) == 0
+        self.producer.inner.outstanding.load(Ordering::Acquire) == 0
     }
     #[cfg(test)]
     fn outstanding(&self) -> usize {
-        self.inner.outstanding.load(Ordering::Acquire)
+        self.producer.inner.outstanding.load(Ordering::Acquire)
     }
 }
 
@@ -319,7 +305,6 @@ struct Barrier<C> {
     sender: FlushSender,
     delivered: u64,
     failure: Option<FlushFailure>,
-    shutdown: bool,
 }
 impl<C> Barrier<C> {
     fn record(&mut self, count: u64, result: &Result<(), Arc<DeliveryError>>) {
@@ -353,13 +338,12 @@ struct State<C> {
     shutdown_pending: Vec<FlushSender>,
 }
 impl<C> State<C> {
-    fn barrier(&mut self, sender: FlushSender, shutdown: bool, through: Arc<QueueEpoch<C>>) {
+    fn barrier(&mut self, sender: FlushSender, through: Arc<QueueEpoch<C>>) {
         self.barriers.push_back(Barrier {
             through,
             sender,
             delivered: 0,
             failure: None,
-            shutdown,
         });
     }
     fn finish(&mut self, result: &Result<(), Arc<DeliveryError>>) -> usize {
@@ -392,8 +376,6 @@ struct Inner<C> {
     depth_warned: AtomicBool,
     wake: Wake,
     capacity: usize,
-    control_limit: usize,
-    shutdown_controls: Arc<Semaphore>,
     #[cfg(test)]
     after_take: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
@@ -406,25 +388,25 @@ impl<C> Inner<C> {
         }
     }
 
-    fn begin_publication(&self) -> Result<(), EnqueueError> {
-        enter(&self.publishers)
-            .then_some(())
-            .ok_or(EnqueueError::Closed)
-    }
-
     fn end_publication(&self) {
         self.publishers.fetch_sub(1, Ordering::SeqCst);
         self.wake.notify_one();
     }
 
     #[allow(deprecated, reason = "try_update requires Rust 1.95")]
-    fn reserve(&self) -> Result<usize, EnqueueError> {
+    fn admit(&self) -> Result<usize, EnqueueError> {
+        if !enter(&self.publishers) {
+            return Err(EnqueueError::Closed);
+        }
         self.outstanding
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |depth| {
                 (depth < self.capacity).then(|| depth + 1)
             })
             .map(|previous| previous + 1)
-            .map_err(|_| EnqueueError::Full)
+            .map_err(|_| {
+                self.end_publication();
+                EnqueueError::Full
+            })
     }
 
     fn release(&self, count: usize) {
@@ -449,7 +431,7 @@ impl<C> Inner<C> {
         }
         let through = self.detach(state);
         for sender in std::mem::take(&mut state.shutdown_pending) {
-            state.barrier(sender, true, through.clone());
+            state.barrier(sender, through.clone());
         }
         true
     }

@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admission_does_not_wait_for_coordinator_lock() {
     let (service, mut entered, gate) = gated(4);
-    let coordinator = lock(&service.inner.state);
+    let coordinator = lock(&service.producer.inner.state);
     let producer = service.clone();
     let (sent, received) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
@@ -30,8 +30,7 @@ async fn shutdown_includes_a_publisher_already_in_progress() {
     let first = service.enqueue(1);
     assert_eq!(entered.recv().await.unwrap(), vec![1]);
 
-    service.inner.begin_publication().unwrap();
-    service.inner.reserve().unwrap();
+    service.producer.inner.admit().unwrap();
     let (sender, second) = Completion::pair();
     let shutdown = service.shutdown(Duration::from_secs(2));
     let mut shutdown = Box::pin(shutdown.into_future());
@@ -40,7 +39,10 @@ async fn shutdown_includes_a_publisher_already_in_progress() {
             .await
             .is_err()
     );
-    service.inner.publish(Accepted { command: 2, sender });
+    service
+        .producer
+        .inner
+        .publish(Accepted { command: 2, sender });
     gate.add_permits(1);
     assert!(first.await.is_ok());
     assert_eq!(entered.recv().await.unwrap(), vec![2]);
@@ -55,15 +57,18 @@ async fn flush_swaps_generation_and_waits_for_its_late_publisher() {
     let first = service.enqueue(1);
     assert_eq!(entered.recv().await.unwrap(), vec![1]);
 
-    service.inner.begin_publication().unwrap();
-    service.inner.reserve().unwrap();
-    let old_epoch = service.inner.ingress.load_full();
+    service.producer.inner.admit().unwrap();
+    let old_epoch = service.producer.inner.ingress.load_full();
     assert!(old_epoch.enter());
     let (sender, before) = Completion::pair();
     let mut flush = Box::pin(service.flush().into_future());
-    assert!(!Arc::ptr_eq(&old_epoch, &service.inner.ingress.load_full()));
+    assert!(!Arc::ptr_eq(
+        &old_epoch,
+        &service.producer.inner.ingress.load_full()
+    ));
     let after = service.enqueue(3);
     service
+        .producer
         .inner
         .publish_to_epoch(&old_epoch, Accepted { command: 2, sender });
 
@@ -84,9 +89,12 @@ async fn flush_swaps_generation_and_waits_for_its_late_publisher() {
 async fn flush_detaches_without_draining_the_queue() {
     let (service, mut entered, gate) = gated(8);
     let writes: Vec<_> = (0..4).map(|item| service.enqueue(item)).collect();
-    let old_epoch = service.inner.ingress.load_full();
+    let old_epoch = service.producer.inner.ingress.load_full();
     let flush = service.flush();
-    assert!(!Arc::ptr_eq(&old_epoch, &service.inner.ingress.load_full()));
+    assert!(!Arc::ptr_eq(
+        &old_epoch,
+        &service.producer.inner.ingress.load_full()
+    ));
     // On the current-thread runtime, the worker has not run yet. Flush
     // must not have taken the first item out of the detached queue.
     assert!(old_epoch.queue.peek(&sdd::Guard::new()).is_some());
@@ -104,17 +112,17 @@ async fn worker_failure_completes_a_late_publisher() {
     let (service, mut entered, _gate) = gated(4);
     let first = service.enqueue(1);
     assert_eq!(entered.recv().await.unwrap(), vec![1]);
-    service.inner.begin_publication().unwrap();
-    service.inner.reserve().unwrap();
-    let old_epoch = service.inner.ingress.load_full();
+    service.producer.inner.admit().unwrap();
+    let old_epoch = service.producer.inner.ingress.load_full();
     assert!(old_epoch.enter());
     let (sender, late) = Completion::pair();
-    service.abort.abort();
+    service.producer.abort.abort();
     assert!(matches!(
         first.await,
         Err(WriteError::Execution(ExecutionError::WorkerLost))
     ));
     service
+        .producer
         .inner
         .publish_to_epoch(&old_epoch, Accepted { command: 2, sender });
     assert!(matches!(
@@ -129,8 +137,8 @@ async fn timeout_fails_items_taken_and_not_yet_taken_by_worker() {
     let (service, _entered, _gate) = gated(4);
     let (taken, wait_taken) = std::sync::mpsc::channel();
     let (resume, wait_resume) = std::sync::mpsc::channel();
-    *lock(&service.inner.after_take) = Some((taken, wait_resume));
-    let coordinator = lock(&service.inner.state);
+    *lock(&service.producer.inner.after_take) = Some((taken, wait_resume));
+    let coordinator = lock(&service.producer.inner.state);
     let first = service.enqueue(1);
     let second = service.enqueue(2);
     drop(coordinator);
@@ -147,7 +155,7 @@ async fn timeout_fails_items_taken_and_not_yet_taken_by_worker() {
             Err(WriteError::Execution(ExecutionError::TimedOut))
         ));
     }
-    let _ = service.exit.clone().await;
+    let _ = service.producer.exit.clone().await;
     assert!(service.is_empty());
 }
 
@@ -159,7 +167,7 @@ async fn terminal_stop_is_preserved_when_the_processor_returns_success() {
     let pending = service.enqueue(2);
     let flush = service.flush();
 
-    service.inner.stop(ExecutionError::TimedOut);
+    service.producer.inner.stop(ExecutionError::TimedOut);
     gate.add_permits(1); // The processor returns Ok after its batch was failed.
     for write in [active, pending] {
         assert!(matches!(
@@ -171,7 +179,10 @@ async fn terminal_stop_is_preserved_when_the_processor_returns_success() {
         flush.await,
         Err(FlushError::Execution(ExecutionError::TimedOut))
     ));
-    assert_eq!(service.exit.clone().await, Err(ExecutionError::TimedOut));
+    assert_eq!(
+        service.producer.exit.clone().await,
+        Err(ExecutionError::TimedOut)
+    );
     assert!(service.is_empty());
     assert!(matches!(
         service.flush().submission(),
@@ -440,14 +451,14 @@ async fn shutdown_timeout_also_retires_batches_queued_behind_active_work() {
         Err(FlushError::Execution(ExecutionError::TimedOut))
     ));
     assert_eq!(service.outstanding(), 0);
-    assert!(lock(&service.inner.state).barriers.is_empty());
-    assert!(lock(&service.inner.state).ready.is_empty());
+    assert!(lock(&service.producer.inner.state).barriers.is_empty());
+    assert!(lock(&service.producer.inner.state).ready.is_empty());
 }
 
 #[tokio::test]
 async fn very_large_write_capacity_does_not_overflow_lifecycle_control_limits() {
     let (service, _, _) = gated(usize::MAX);
-    assert_eq!(service.inner.control_limit, 1024);
+    assert_eq!(service.producer.control_limit, 1024);
     service.shutdown(Duration::from_secs(1)).await.unwrap();
 }
 
@@ -457,7 +468,7 @@ async fn worker_cancellation_before_first_poll_completes_every_accepted_sender()
     let first = service.enqueue(1);
     let second = service.enqueue(2);
     let flush = service.flush();
-    service.abort.abort();
+    service.producer.abort.abort();
     for completion in [first, second] {
         assert!(matches!(
             completion.await,
@@ -513,7 +524,7 @@ async fn dropping_the_last_producers_drains_work_and_stops_the_worker() {
         let (service, mut entered, gate) = gated(4);
         let write = service.enqueue(1);
         let clone = service.clone();
-        let exit = service.exit.clone();
+        let exit = service.producer.exit.clone();
         std::thread::scope(|scope| {
             scope.spawn(move || drop(service));
             scope.spawn(move || drop(clone));
