@@ -220,7 +220,7 @@ async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
         .api_url(server.uri())
         .app_url(server.uri())
         .environment("ci", Some("test"))
-        .span_origin(SpanOrigin::new().name("client-origin"))
+        .span_origin(SpanOrigin::builder().name("client-origin").build())
         .build()
         .await
         .expect("client");
@@ -256,7 +256,7 @@ async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
         .to_str();
         let mut event = SpanLog::builder()
             .skip_span_origin()
-            .span_origin(SpanOrigin::new().name("event-origin"))
+            .span_origin(SpanOrigin::builder().name("event-origin").build())
             .output(json!({"status": "updated"}));
         if let Some(context) = context {
             event = event.context(context.clone());
@@ -305,7 +305,7 @@ async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
         .api_url(server.uri())
         .app_url(server.uri())
         .environment("ci", Some("test"))
-        .span_origin(SpanOrigin::new().name("client-origin"))
+        .span_origin(SpanOrigin::builder().name("client-origin").build())
         .build()
         .await
         .expect("client");
@@ -319,10 +319,10 @@ async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
             .parent_info(ParentSpanInfo::ProjectLogs {
                 object_id: "proj-id".to_string(),
             })
-            .span_origin(SpanOrigin::new().name("builder-origin"))
+            .span_origin(SpanOrigin::builder().name("builder-origin").build())
             .build();
         let mut event = SpanLog::builder()
-            .span_origin(SpanOrigin::new().name("event-origin"))
+            .span_origin(SpanOrigin::builder().name("event-origin").build())
             .skip_span_origin()
             .input(json!("input"));
         if let Some(context) = context {

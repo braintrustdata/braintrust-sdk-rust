@@ -7,21 +7,16 @@ use serde_json::{Map, Value};
 use tokio::sync::Notify;
 use url::Url;
 
-use crate::dataset::{
-    BTQLQuery, BTQLResponse, DatasetBuilder, DatasetFetcher, DatasetRegisterRequest,
-    DatasetRegisterResponse, DatasetRegistrar, DatasetSummarizer, DatasetSummaryResponse,
-};
+use crate::dataset::{Dataset, DatasetBuilder};
 use crate::error::{BraintrustError, Result};
-use crate::experiments::api::{
-    BaseExperimentFetcher, BaseExperimentRequest, BaseExperimentResponse,
-    ExperimentComparisonFetcher, ExperimentComparisonResponse, ExperimentRegisterRequest,
-    ExperimentRegisterResponse, ExperimentRegistrar,
-};
-use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
+use crate::experiments::{Experiment, ExperimentBuilder};
 use crate::http::{build_http_client, CaBundleConfig};
+use crate::internal::ports::SpanSubmitter;
+use crate::internal::resources::ResourceTransport;
 use crate::internal::retry::{exponential, RetryExecutor};
+use crate::internal::session::CredentialScope;
 use crate::log_queue::{LogQueue, LogQueueConfig};
-use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
+use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
 
@@ -42,7 +37,7 @@ pub struct LoginState {
     inner: Arc<std::sync::OnceLock<LoginStateInner>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct LoginStateInner {
     api_key: String,
     org_id: String,
@@ -86,6 +81,25 @@ impl LoginState {
             .is_ok()
     }
 
+    /// Capture the selected organization and routes together, without fallback.
+    fn scope(&self) -> Result<CredentialScope> {
+        let state = self
+            .inner
+            .get()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        let api_url = Url::parse(&state.api_url)
+            .map_err(|_| BraintrustError::InvalidConfig("invalid login API URL".into()))?;
+        let app_url = Url::parse(&state.app_url)
+            .map_err(|_| BraintrustError::InvalidConfig("invalid login app URL".into()))?;
+        Ok(CredentialScope::new(
+            state.api_key.clone(),
+            state.org_id.clone(),
+            Some(state.org_name.clone()),
+            api_url,
+            app_url,
+        ))
+    }
+
     /// Check if logged in.
     pub fn is_logged_in(&self) -> bool {
         self.inner.get().is_some()
@@ -119,13 +133,11 @@ impl LoginState {
 
 impl std::fmt::Debug for LoginState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.inner.get() {
-            Some(inner) => f.debug_struct("LoginState").field("inner", inner).finish(),
-            None => f
-                .debug_struct("LoginState")
-                .field("inner", &"<not logged in>")
-                .finish(),
-        }
+        f.debug_struct("LoginState")
+            .field("is_logged_in", &self.is_logged_in())
+            .field("org_id", &self.org_id())
+            .field("org_name", &self.org_name())
+            .finish_non_exhaustive()
     }
 }
 
@@ -375,17 +387,8 @@ impl BraintrustClientBuilder {
             .checked_delivery(self.checked_delivery)
             .build();
 
-        // LogQueue owns the background worker. It is given the client-configured
-        // URLs so that flushes with per-request credentials work without relying on
-        // the shared (set-once) login state to hold URLs.
-        let queue = LogQueue::new(
-            log_config,
-            login_state.clone(),
-            http_client.clone(),
-            self.queue_size,
-            api_url.clone(),
-            app_url.clone(),
-        );
+        // Commands carry their own immutable scope; the worker has no session fallback.
+        let queue = LogQueue::new(log_config, http_client.clone(), self.queue_size);
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
@@ -459,6 +462,29 @@ impl std::fmt::Debug for ClientInner {
 }
 
 impl BraintrustClient {
+    fn resource_transport(&self) -> ResourceTransport {
+        ResourceTransport::new(self.inner.http_client.clone())
+    }
+
+    fn span_submitter(&self) -> Arc<dyn SpanSubmitter> {
+        Arc::new(self.inner.queue.clone())
+    }
+
+    fn explicit_scope(
+        &self,
+        token: String,
+        org_id: String,
+        org_name: Option<String>,
+    ) -> CredentialScope {
+        CredentialScope::new(
+            token,
+            org_id,
+            org_name,
+            self.inner.api_url.clone(),
+            self.inner.app_url.clone(),
+        )
+    }
+
     /// Create a new builder for configuring the client.
     ///
     /// # Example
@@ -520,20 +546,14 @@ impl BraintrustClient {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder<Self>> {
+    pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder> {
         if self.inner.login_skipped {
             return Err(BraintrustError::InvalidConfig(
                 "span_builder() requires login; use span_builder_with_credentials() when skip_login is enabled".into(),
             ));
         }
         let state = self.wait_for_login_state().await?;
-        let api_key = state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_id = state
-            .org_id()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let mut builder = crate::span::SpanBuilder::new(Arc::new(self.clone()), &api_key, &org_id);
+        let mut builder = crate::span::SpanBuilder::new(self.span_submitter(), state.scope()?);
         if let Some(environment) = &self.inner.environment {
             builder = builder.span_origin_environment(environment.clone());
         }
@@ -549,37 +569,49 @@ impl BraintrustClient {
     /// Create a dataset builder using the logged-in state.
     ///
     /// This waits for login to complete if it hasn't already.
-    pub async fn dataset_builder(&self) -> Result<DatasetBuilder<Self>> {
+    pub async fn dataset_builder(&self) -> Result<DatasetBuilder> {
+        if self.inner.login_skipped {
+            return Err(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
+        }
         let state = self.wait_for_login_state().await?;
-        let api_key = state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_name = state
-            .org_name()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        Ok(DatasetBuilder::new(
-            Arc::new(self.clone()),
-            api_key,
-            org_name,
+        Ok(Dataset::new(
+            self.resource_transport(),
+            Arc::new(self.inner.queue.clone()),
+            state.scope()?,
         ))
+    }
+
+    /// Create a dataset builder with immutable explicit credentials, without
+    /// logging in or changing the client's shared session.
+    pub fn dataset_builder_with_credentials(
+        &self,
+        token: impl Into<String>,
+        org_name: impl Into<String>,
+    ) -> DatasetBuilder {
+        Dataset::new(
+            self.resource_transport(),
+            Arc::new(self.inner.queue.clone()),
+            self.explicit_scope(token.into(), String::new(), Some(org_name.into())),
+        )
     }
 
     /// Create a span builder with explicit token and org_id.
     ///
     /// Use this for per-session / multi-tenant logging: the supplied credentials
-    /// travel with each span through the upload pipeline and are NOT written into
-    /// the client's shared login state. Spans created from the same client with
+    /// and configured endpoint routes are captured by the builder and travel with
+    /// each span. They do not change the client's shared login state. Spans created from the same client with
     /// different `(token, org_id)` pairs each upload with their own credentials.
     pub fn span_builder_with_credentials(
         &self,
         token: impl Into<String>,
         org_id: impl Into<String>,
-    ) -> crate::span::SpanBuilder<Self> {
+    ) -> crate::span::SpanBuilder {
         let token = token.into();
         let org_id = org_id.into();
 
-        let submitter = Arc::new(self.clone());
-        let mut builder = crate::span::SpanBuilder::new(submitter, token, org_id);
+        let submitter = self.span_submitter();
+        let mut builder =
+            crate::span::SpanBuilder::new(submitter, self.explicit_scope(token, org_id, None));
         if let Some(environment) = &self.inner.environment {
             builder = builder.span_origin_environment(environment.clone());
         }
@@ -597,19 +629,13 @@ impl BraintrustClient {
             self.inner.login_state.clone()
         } else if self.inner.login_skipped {
             return Err(BraintrustError::InvalidConfig(
-                "update_span() requires credentials; call span_builder_with_credentials() or experiment_builder_with_credentials() first when skip_login is enabled".into(),
+                "update_span() requires a logged-in client; use update_span_with_credentials() when skip_login is enabled".into(),
             ));
         } else {
             self.wait_for_login_state().await?
         };
 
-        let api_key = login_state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_id = login_state
-            .org_id()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        self.update_span_internal(api_key, org_id, login_state.org_name(), exported, event)
+        self.update_span_internal(login_state.scope()?, exported, event)
             .map(|_| ())
     }
 
@@ -628,7 +654,7 @@ impl BraintrustClient {
         let token = token.into();
         let org_id = org_id.into();
 
-        self.update_span_internal(token, org_id, None, exported, event)
+        self.update_span_internal(self.explicit_scope(token, org_id, None), exported, event)
             .map(|_| ())
     }
 
@@ -643,14 +669,16 @@ impl BraintrustClient {
         exported: &str,
         event: crate::span::SpanLog,
     ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
-        self.update_span_internal(token.into(), org_id.into(), None, exported, event)
+        self.update_span_internal(
+            self.explicit_scope(token.into(), org_id.into(), None),
+            exported,
+            event,
+        )
     }
 
     fn update_span_internal(
         &self,
-        token: String,
-        org_id: String,
-        org_name: Option<String>,
+        scope: CredentialScope,
         exported: &str,
         event: crate::span::SpanLog,
     ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
@@ -730,8 +758,8 @@ impl BraintrustClient {
             span_id,
             is_merge: true,
             span_components: Some(components),
-            org_id,
-            org_name,
+            org_id: scope.org_id().to_owned(),
+            org_name: scope.org_name().map(str::to_owned),
             project_name: None,
             input: event_data.input,
             output: event_data.output,
@@ -746,7 +774,7 @@ impl BraintrustClient {
             extra: event_data.extra,
         };
 
-        let completion = self.submit_payload(token, payload, None);
+        let completion = self.submit_payload(scope, payload, None);
         if let Err(error) = completion.submission() {
             return Err(BraintrustError::Background(error.to_string()));
         }
@@ -893,8 +921,7 @@ impl BraintrustClient {
 
     /// Create an experiment builder with explicit credentials.
     ///
-    /// Note: This will be deprecated in favor of `experiment_builder()` once
-    /// the login-flow branch lands and credentials are stored in the client.
+    /// Credentials belong to this resource and never populate shared login state.
     ///
     /// # Example
     ///
@@ -903,37 +930,32 @@ impl BraintrustClient {
     ///     .experiment_builder_with_credentials(&api_key, &org_id)
     ///     .project_name("my-project")
     ///     .experiment_name("baseline")
-    ///     .build()?;
+    ///     .build();
     /// ```
     pub fn experiment_builder_with_credentials(
         &self,
         token: impl Into<String>,
         org_id: impl Into<String>,
-    ) -> ExperimentBuilder<Self> {
+    ) -> ExperimentBuilder {
         let token = token.into();
         let org_id = org_id.into();
 
-        // Populate login state with explicit credentials so flush_internal() can send data.
-        let _ = self.inner.login_state.set(
-            token.clone(),
-            org_id.clone(),
-            String::new(), // org_name unknown without login
-            self.inner.api_url.to_string(),
-            self.inner.app_url.to_string(),
-        );
-
-        let submitter = Arc::new(self.clone());
-        ExperimentBuilder::new(submitter, token, org_id)
+        let submitter = self.span_submitter();
+        Experiment::builder(
+            self.resource_transport(),
+            submitter,
+            self.explicit_scope(token, org_id, None),
+        )
     }
 
     /// Submit immediately; the token observes admission and full batch delivery.
     pub(crate) fn submit_payload(
         &self,
-        token: impl Into<String>,
+        scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
-        self.inner.queue.submit(token, payload, parent_info)
+        self.inner.queue.submit(scope, payload, parent_info)
     }
 
     /// Stop accepting writes, drain accepted work and stop the delivery worker.
@@ -955,298 +977,6 @@ impl BraintrustClient {
     /// Does not wait for completion - useful for streaming writes.
     pub async fn trigger_flush(&self) -> Result<()> {
         self.inner.queue.trigger_flush_command().await
-    }
-}
-
-#[async_trait::async_trait]
-impl SpanSubmitter for BraintrustClient {
-    fn submit(
-        &self,
-        token: String,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
-        self.submit_payload(token, payload, parent_info)
-    }
-
-    fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
-        BraintrustClient::flush(self)
-    }
-
-    async fn trigger_flush(&self) -> Result<()> {
-        BraintrustClient::trigger_flush(self).await
-    }
-}
-
-// Experiment trait implementations for BraintrustClient
-#[async_trait::async_trait]
-impl ExperimentRegistrar for BraintrustClient {
-    async fn register_experiment(
-        &self,
-        token: &str,
-        request: ExperimentRegisterRequest,
-    ) -> Result<ExperimentRegisterResponse> {
-        let url = self
-            .inner
-            .app_url
-            .join("api/experiment/register")
-            .map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid experiment register url: {e}"))
-            })?;
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: format!("register experiment failed: {text}"),
-            });
-        }
-
-        let register_response: ExperimentRegisterResponse = response.json().await.map_err(|e| {
-            BraintrustError::Background(format!(
-                "failed to parse experiment registration response: {e}"
-            ))
-        })?;
-
-        Ok(register_response)
-    }
-}
-
-#[async_trait::async_trait]
-impl BaseExperimentFetcher for BraintrustClient {
-    async fn fetch_base_experiment(
-        &self,
-        token: &str,
-        experiment_id: &str,
-    ) -> Result<Option<BaseExperimentInfo>> {
-        let url = self
-            .inner
-            .app_url
-            .join("api/base_experiment/get_id")
-            .map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid base experiment url: {e}"))
-            })?;
-
-        let request = BaseExperimentRequest {
-            id: experiment_id.to_string(),
-        };
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-
-        let status = response.status();
-
-        // 400 means no base experiment - return None
-        if status.as_u16() == 400 {
-            return Ok(None);
-        }
-
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: format!("fetch base experiment failed: {text}"),
-            });
-        }
-
-        let base_response: BaseExperimentResponse = response.json().await.map_err(|e| {
-            BraintrustError::Background(format!("failed to parse base experiment response: {e}"))
-        })?;
-
-        match (base_response.base_exp_id, base_response.base_exp_name) {
-            (Some(id), Some(name)) => Ok(Some(BaseExperimentInfo { id, name })),
-            _ => Ok(None),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ExperimentComparisonFetcher for BraintrustClient {
-    async fn fetch_experiment_comparison(
-        &self,
-        token: &str,
-        experiment_id: &str,
-        base_experiment_id: Option<&str>,
-    ) -> Result<ExperimentComparisonResponse> {
-        let mut url = self
-            .inner
-            .app_url
-            .join("experiment-comparison2")
-            .map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid experiment comparison url: {e}"))
-            })?;
-
-        url.query_pairs_mut()
-            .append_pair("experiment_id", experiment_id);
-
-        if let Some(base_id) = base_experiment_id {
-            url.query_pairs_mut()
-                .append_pair("base_experiment_id", base_id);
-        }
-
-        let response = self
-            .inner
-            .http_client
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: format!("fetch experiment comparison failed: {text}"),
-            });
-        }
-
-        let comparison: ExperimentComparisonResponse = response.json().await.map_err(|e| {
-            BraintrustError::Background(format!(
-                "failed to parse experiment comparison response: {e}"
-            ))
-        })?;
-
-        Ok(comparison)
-    }
-}
-
-// Dataset trait implementations for BraintrustClient
-#[async_trait::async_trait]
-impl DatasetRegistrar for BraintrustClient {
-    async fn register_dataset(
-        &self,
-        token: &str,
-        request: DatasetRegisterRequest,
-    ) -> Result<DatasetRegisterResponse> {
-        let url = self
-            .inner
-            .app_url
-            .join("api/dataset/register")
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| BraintrustError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        response
-            .json::<DatasetRegisterResponse>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("Failed to parse dataset register response: {}", e),
-            })
-    }
-}
-
-#[async_trait::async_trait]
-impl DatasetFetcher for BraintrustClient {
-    async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse> {
-        let url = self
-            .inner
-            .api_url
-            .join("btql")
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&query)
-            .send()
-            .await
-            .map_err(|e| BraintrustError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        response
-            .json::<BTQLResponse>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("Failed to parse BTQL response: {}", e),
-            })
-    }
-}
-
-#[async_trait::async_trait]
-impl DatasetSummarizer for BraintrustClient {
-    async fn fetch_dataset_summary(
-        &self,
-        token: &str,
-        dataset_id: &str,
-    ) -> Result<DatasetSummaryResponse> {
-        let mut url = self
-            .inner
-            .api_url
-            .join("dataset-summary")
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
-        url.query_pairs_mut().append_pair("dataset_id", dataset_id);
-
-        let response = self
-            .inner
-            .http_client
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| BraintrustError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        response
-            .json::<DatasetSummaryResponse>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("Failed to parse dataset summary response: {}", e),
-            })
     }
 }
 
@@ -1404,6 +1134,23 @@ fn parse_string_array(value: Value) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn login_state_debug_never_exposes_tokens_or_unvalidated_endpoints() {
+        let state = super::LoginState::new();
+        state.set(
+            "private-token".into(),
+            "org".into(),
+            "tenant".into(),
+            "https://user:password@example.com/?api_key=secret".into(),
+            "https://example.com/?token=secret".into(),
+        );
+        let debug = format!("{state:?}");
+        assert!(debug.contains("tenant"));
+        for secret in ["private-token", "password", "secret"] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
     use super::*;
     use crate::span::SpanLog;
     use serde_json::Value;
@@ -1417,6 +1164,32 @@ mod tests {
             .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
             .collect();
         ResponseTemplate::new(200).set_body_json(serde_json::json!({ "org_info": org_info }))
+    }
+
+    #[tokio::test]
+    async fn resource_dependencies_do_not_retain_the_whole_client_or_login_state() {
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .build()
+            .await
+            .unwrap();
+        let weak = Arc::downgrade(&client.inner);
+        let span = client.span_builder_with_credentials("token", "org");
+        let dataset = client
+            .dataset_builder_with_credentials("token", "tenant")
+            .project_name("p")
+            .dataset_name("d");
+        let experiment = client
+            .experiment_builder_with_credentials("token", "org")
+            .project_name("p");
+        drop(client);
+        assert!(
+            weak.upgrade().is_none(),
+            "resource dependencies must not retain ClientInner"
+        );
+        let _span = span.build();
+        let _dataset = dataset.build();
+        let _experiment = experiment.build();
     }
 
     #[tokio::test]

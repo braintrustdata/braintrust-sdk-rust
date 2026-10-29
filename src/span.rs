@@ -5,11 +5,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::internal::ports::SpanSubmitter;
+use crate::internal::session::CredentialScope;
 use crate::span_components::SpanComponents;
 use crate::types::{
     ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
@@ -247,30 +250,11 @@ impl SpanLogBuilder {
     }
 }
 
-#[async_trait]
-pub(crate) trait SpanSubmitter: Send + Sync {
-    /// Attempt admission immediately and observe the logical batch outcome.
-    fn submit(
-        &self,
-        token: String,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
-
-    /// Flush all queued span data through to the server.
-    fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError>;
-
-    /// Trigger a non-blocking background flush.
-    async fn trigger_flush(&self) -> Result<()>;
-}
-
-#[derive(Debug)]
-#[allow(private_bounds)]
-pub struct SpanBuilder<S: SpanSubmitter> {
-    submitter: Arc<S>,
-    token: String,
-    org_id: String,
-    org_name: Option<String>,
+#[derive(Clone)]
+pub struct SpanBuilder {
+    name: Option<String>,
+    submitter: Arc<dyn SpanSubmitter>,
+    scope: CredentialScope,
     project_name: Option<String>,
     parent_info: Option<ParentSpanInfo>,
     span_type: SpanType,
@@ -283,28 +267,32 @@ pub struct SpanBuilder<S: SpanSubmitter> {
     span_attributes_extra: HashMap<String, Value>,
 }
 
-impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
-    fn clone(&self) -> Self {
-        Self {
-            submitter: Arc::clone(&self.submitter),
-            token: self.token.clone(),
-            org_id: self.org_id.clone(),
-            org_name: self.org_name.clone(),
-            project_name: self.project_name.clone(),
-            parent_info: self.parent_info.clone(),
-            span_type: self.span_type,
-            purpose: self.purpose.clone(),
-            start_time_override: self.start_time_override,
-            environment: self.environment.clone(),
-            span_id_override: self.span_id_override.clone(),
-            row_id_override: self.row_id_override.clone(),
-            span_origin: self.span_origin.clone(),
-            span_attributes_extra: self.span_attributes_extra.clone(),
-        }
+impl fmt::Debug for SpanBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpanBuilder")
+            .field("scope", &self.scope)
+            .field("project_name", &self.project_name)
+            .field("parent_info", &self.parent_info)
+            .finish_non_exhaustive()
     }
 }
 
+/// Small options bag identifying the environment that produced a span.
+///
+/// Use the constructor so future options can be added:
+///
+/// ```
+/// use braintrust_sdk_rust::SpanOriginEnvironment;
+/// let environment = SpanOriginEnvironment::new("test", Some("test-environment"));
+/// assert_eq!(environment.environment_type.as_deref(), Some("test"));
+/// ```
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::SpanOriginEnvironment;
+/// let _ = SpanOriginEnvironment { environment_type: Some("test".into()), name: None };
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SpanOriginEnvironment {
     pub environment_type: Option<String>,
     pub name: Option<String>,
@@ -329,61 +317,72 @@ impl SpanOriginEnvironment {
 /// Any explicit `span_origin` values already present in a span's `context` take
 /// precedence over these overrides, which in turn take precedence over the
 /// built-in defaults.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// ```
+/// use braintrust_sdk_rust::{SpanOrigin, SpanOriginEnvironment};
+/// let origin = SpanOrigin::builder()
+///     .name("test-instrumentation").version("1.0")
+///     .instrumentation("test-plugin")
+///     .environment(SpanOriginEnvironment::new("test", Some("test-environment")))
+///     .build();
+/// assert_eq!(origin.name(), Some("test-instrumentation"));
+/// assert_eq!(origin.version(), Some("1.0"));
+/// assert_eq!(origin.instrumentation(), Some("test-plugin"));
+/// assert!(origin.environment().is_some());
+/// assert_eq!(SpanOrigin::builder().build(), SpanOrigin::default());
+/// ```
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::SpanOrigin;
+/// let mut origin = SpanOrigin::default();
+/// origin.name = Some("other".into());
+/// ```
+#[derive(bon::Builder, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpanOrigin {
     /// Overrides `span_origin.name` (e.g. `"braintrust.plugin.codex"`).
-    pub name: Option<String>,
+    #[builder(into)]
+    name: Option<String>,
     /// Overrides `span_origin.version` (e.g. a plugin version).
-    pub version: Option<String>,
+    #[builder(into)]
+    version: Option<String>,
     /// Overrides `span_origin.instrumentation.name`.
-    pub instrumentation: Option<String>,
+    #[builder(into)]
+    instrumentation: Option<String>,
     /// Overrides `span_origin.environment`.
-    pub environment: Option<SpanOriginEnvironment>,
+    environment: Option<SpanOriginEnvironment>,
 }
 
 impl SpanOrigin {
-    /// Create an empty override (all defaults preserved).
-    pub fn new() -> Self {
-        Self::default()
+    /// Return the name override.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
+    /// Return the version override.
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+    /// Return the instrumentation name override.
+    pub fn instrumentation(&self) -> Option<&str> {
+        self.instrumentation.as_deref()
+    }
+    /// Return the environment override.
+    pub fn environment(&self) -> Option<&SpanOriginEnvironment> {
+        self.environment.as_ref()
+    }
+}
 
-    /// Set the `span_origin.name` override.
+impl SpanBuilder {
+    /// Set the span name.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
-    /// Set the `span_origin.version` override.
-    pub fn version(mut self, version: impl Into<String>) -> Self {
-        self.version = Some(version.into());
-        self
-    }
-
-    /// Set the `span_origin.instrumentation.name` override.
-    pub fn instrumentation(mut self, instrumentation: impl Into<String>) -> Self {
-        self.instrumentation = Some(instrumentation.into());
-        self
-    }
-
-    /// Set the `span_origin.environment` override.
-    pub fn with_environment(mut self, environment: SpanOriginEnvironment) -> Self {
-        self.environment = Some(environment);
-        self
-    }
-}
-
-#[allow(private_bounds)]
-impl<S: SpanSubmitter> SpanBuilder<S> {
-    pub(crate) fn new(
-        submitter: Arc<S>,
-        token: impl Into<String>,
-        org_id: impl Into<String>,
-    ) -> Self {
+    pub(crate) fn new(submitter: Arc<dyn SpanSubmitter>, scope: CredentialScope) -> Self {
         Self {
+            name: None,
             submitter,
-            token: token.into(),
-            org_id: org_id.into(),
-            org_name: None,
+            scope,
             project_name: None,
             parent_info: None,
             span_type: SpanType::default(),
@@ -450,7 +449,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
     }
 
     pub fn org_name(mut self, org_name: impl Into<String>) -> Self {
-        self.org_name = Some(org_name.into());
+        self.scope = self.scope.with_org_name(org_name.into());
         self
     }
 
@@ -488,7 +487,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
         self
     }
 
-    pub fn build(self) -> SpanHandle<S> {
+    pub fn build(self) -> SpanHandle {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         // Generate both IDs ONCE at span creation - reused for all flushes.
@@ -521,15 +520,16 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
 
         SpanHandle {
             submitter: Arc::clone(&self.submitter),
-            token: self.token,
+            scope: self.scope.clone(),
             parent_info: self.parent_info,
             row_id: row_id.clone(),
             inner: Arc::new(Mutex::new(SpanData {
+                name: self.name,
                 row_id,
                 span_id,
                 has_flushed: false,
-                org_id: self.org_id,
-                org_name: self.org_name,
+                org_id: self.scope.org_id().to_owned(),
+                org_name: self.scope.org_name().map(str::to_owned),
                 project_name: self.project_name,
                 start_time,
                 span_type: self.span_type,
@@ -544,30 +544,17 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
     }
 }
 
-#[allow(private_bounds)]
-pub struct SpanHandle<S: SpanSubmitter> {
-    submitter: Arc<S>,
-    token: String,
+#[derive(Clone)]
+pub struct SpanHandle {
+    submitter: Arc<dyn SpanSubmitter>,
+    scope: CredentialScope,
     parent_info: Option<ParentSpanInfo>,
     /// Stable identifier set at creation, accessible without locking.
     row_id: String,
     inner: Arc<Mutex<SpanData>>,
 }
 
-impl<S: SpanSubmitter> Clone for SpanHandle<S> {
-    fn clone(&self) -> Self {
-        Self {
-            submitter: Arc::clone(&self.submitter),
-            token: self.token.clone(),
-            parent_info: self.parent_info.clone(),
-            row_id: self.row_id.clone(),
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-#[allow(private_bounds)]
-impl<S: SpanSubmitter> SpanHandle<S> {
+impl SpanHandle {
     /// Return the stable row ID for this span, usable with `log_feedback()` and `update_span()`.
     pub fn row_id(&self) -> &str {
         &self.row_id
@@ -589,7 +576,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         let payload = current_span_payload(&mut inner);
         let completion =
             self.submitter
-                .submit(self.token.clone(), payload, self.parent_info.clone());
+                .submit(self.scope.clone(), payload, self.parent_info.clone());
         if completion.is_ok() {
             inner.has_flushed = true;
         }
@@ -629,7 +616,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         let payload = current_span_payload(&mut inner);
         let completion =
             self.submitter
-                .submit(self.token.clone(), payload, self.parent_info.clone());
+                .submit(self.scope.clone(), payload, self.parent_info.clone());
         if completion.is_ok() {
             inner.has_flushed = true;
             inner.end_submitted = true;
@@ -1081,7 +1068,7 @@ mod tests {
         impl SpanSubmitter for Submitter {
             fn submit(
                 &self,
-                _: String,
+                _: CredentialScope,
                 payload: SpanPayload,
                 _: Option<ParentSpanInfo>,
             ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
@@ -1094,6 +1081,9 @@ mod tests {
                 }
                 completion
             }
+        }
+        #[async_trait]
+        impl crate::internal::ports::DeliveryControl for Submitter {
             fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
                 let (sender, completion) = crate::Completion::pair();
                 let _ = sender.send(Ok(crate::FlushReport::default()));
@@ -1107,7 +1097,8 @@ mod tests {
             reject: AtomicBool::new(true),
             accepted: Mutex::new(Vec::new()),
         });
-        let span = SpanBuilder::new(submitter.clone(), "token", "org").build();
+        let span =
+            SpanBuilder::new(submitter.clone(), CredentialScope::test("token", "org")).build();
         assert!(span.log(SpanLog::default()).is_err());
         submitter.reject.store(false, Ordering::Relaxed);
         assert!(span.log(SpanLog::default()).is_ok());
@@ -1515,10 +1506,11 @@ mod tests {
         span.log(
             SpanLog::builder()
                 .span_origin(
-                    SpanOrigin::new()
+                    SpanOrigin::builder()
                         .name("braintrust.plugin.codex")
                         .version("9.9.9")
-                        .instrumentation("codex-plugin"),
+                        .instrumentation("codex-plugin")
+                        .build(),
                 )
                 .span_attribute("session_id", json!("sess-1"))
                 .build()
@@ -1551,7 +1543,11 @@ mod tests {
         // Builder-level default applies when the SpanLog does not override.
         let (builder, collector) = mock_span_builder();
         let span = builder
-            .span_origin(SpanOrigin::new().name("braintrust.plugin.default"))
+            .span_origin(
+                SpanOrigin::builder()
+                    .name("braintrust.plugin.default")
+                    .build(),
+            )
             .build();
         span.log(SpanLog::builder().input(json!("x")).build().expect("build"));
         span.flush().await.expect("flush");

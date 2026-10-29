@@ -458,3 +458,41 @@ async fn base_path_is_preserved_without_a_trailing_slash() {
         .logs3_payload_max_bytes()
         .is_none());
 }
+
+#[tokio::test]
+async fn typed_dataset_mutations_use_the_data_plane_once_without_trace_fields() {
+    use api::datasets::{DatasetFields, DatasetWrite};
+    let data = MockServer::start().await;
+    let control = MockServer::start().await;
+    let client = api::Client::new(config(&data, &control, "token")).unwrap();
+    let writes = [
+        DatasetWrite::insert(
+            "dataset",
+            "row",
+            DatasetFields::builder().input(json!(null)).build(),
+        ),
+        DatasetWrite::update(
+            "dataset",
+            "row",
+            DatasetFields::builder().expected(json!(42)).build(),
+        ),
+        DatasetWrite::delete("dataset", "row"),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(body_json(json!({"api_version":2,"rows":[
+            {"dataset_id":"dataset","id":"row","input":null},
+            {"dataset_id":"dataset","id":"row","expected":42,"_is_merge":true},
+            {"dataset_id":"dataset","id":"row","_object_delete":true}
+        ]})))
+        .respond_with(ResponseTemplate::new(413).set_body_string("too large"))
+        .expect(1)
+        .mount(&data)
+        .await;
+    assert!(matches!(
+        client.datasets().write(&writes).await,
+        Err(api::Error::Http { status: 413, .. })
+    ));
+    assert_eq!(data.received_requests().await.unwrap().len(), 1);
+    assert!(control.received_requests().await.unwrap().is_empty());
+}

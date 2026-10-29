@@ -13,132 +13,95 @@
 //!     .await?
 //!     .project_name("my-project")
 //!     .dataset_name("test-cases")
-//!     .build()?;
+//!     .build();
 //!
 //! let id = dataset.insert(
 //!     DatasetInsert::builder()
 //!         .input(json!({"question": "What is 2+2?"}))
 //!         .expected(json!({"answer": "4"}))
-//!         .build()?
-//! ).await;
-//!
-//! dataset.flush().await?;
+//!         .build()
+//! ).await?;
 //! ```
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+pub use crate::api::datasets::DatasetFields;
+use crate::api::datasets::DatasetWrite;
 use crate::error::Result;
-use crate::span::SpanSubmitter;
-use crate::types::{ParentSpanInfo, SpanPayload};
+use crate::internal::ports::DeliveryControl;
+use crate::internal::resources::ResourceTransport;
+use crate::internal::session::CredentialScope;
 
 // ============================================================================
 // Dataset Insert Types
 // ============================================================================
 
-/// Error type for DatasetInsert builder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum DatasetInsertBuilderError {
-    /// Input is required but was not provided.
-    MissingInput,
-}
-
-impl fmt::Display for DatasetInsertBuilderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingInput => write!(f, "input is required but was not provided"),
-        }
-    }
-}
-
-impl std::error::Error for DatasetInsertBuilderError {}
-
-/// Data to insert into a dataset.
-#[derive(Clone, Default)]
-#[non_exhaustive]
+/// Data to insert into a dataset. Input is required, including when its value is JSON null.
+///
+/// ```
+/// use braintrust_sdk_rust::DatasetInsert;
+/// use serde_json::json;
+/// let record = DatasetInsert::builder().input(json!(null)).build();
+/// assert_eq!(record.input(), &json!(null));
+/// ```
+///
+/// Missing input is rejected at compile time:
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::DatasetInsert;
+/// let record = DatasetInsert::builder().expected(serde_json::json!(4)).build();
+/// ```
+///
+/// There is no default record that bypasses the required input:
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::DatasetInsert;
+/// let record = DatasetInsert::default();
+/// ```
+#[derive(bon::Builder, Debug, Clone)]
 pub struct DatasetInsert {
-    pub(crate) input: Option<Value>,
-    pub(crate) expected: Option<Value>,
-    pub(crate) metadata: Option<Map<String, Value>>,
-    pub(crate) tags: Option<Vec<String>>,
+    #[builder(into)]
+    input: Value,
+    #[builder(into)]
+    expected: Option<Value>,
+    metadata: Option<Map<String, Value>>,
+    tags: Option<Vec<String>>,
 }
 
 impl DatasetInsert {
-    /// Create a new DatasetInsert builder.
-    pub fn builder() -> DatasetInsertBuilder {
-        DatasetInsertBuilder::new()
+    /// Return the input, including an explicit JSON null.
+    pub fn input(&self) -> &Value {
+        &self.input
+    }
+    /// Return the expected output, if supplied.
+    pub fn expected(&self) -> Option<&Value> {
+        self.expected.as_ref()
+    }
+    /// Return the metadata entries, if supplied.
+    pub fn metadata(&self) -> Option<&Map<String, Value>> {
+        self.metadata.as_ref()
+    }
+    /// Return the tags, if supplied.
+    pub fn tags(&self) -> Option<&[String]> {
+        self.tags.as_deref()
     }
 }
 
-/// Builder for DatasetInsert.
-#[derive(Clone, Default)]
-pub struct DatasetInsertBuilder {
-    inner: DatasetInsert,
-}
-
-impl DatasetInsertBuilder {
-    /// Create a new DatasetInsertBuilder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the input data (required).
-    pub fn input(mut self, input: impl Into<Value>) -> Self {
-        self.inner.input = Some(input.into());
-        self
-    }
-
-    /// Set the expected output for evaluation.
-    pub fn expected(mut self, expected: impl Into<Value>) -> Self {
-        self.inner.expected = Some(expected.into());
-        self
-    }
-
-    /// Set the metadata map.
-    pub fn metadata(mut self, metadata: Map<String, Value>) -> Self {
-        self.inner.metadata = Some(metadata);
-        self
-    }
-
-    /// Add a single metadata entry.
-    pub fn metadata_entry(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
-        self.inner
-            .metadata
-            .get_or_insert_with(Map::new)
-            .insert(key.into(), value.into());
-        self
-    }
-
-    /// Set multiple tags at once.
-    pub fn tags(mut self, tags: Vec<String>) -> Self {
-        self.inner.tags = Some(tags);
-        self
-    }
-
-    /// Add a single tag.
-    pub fn tag(mut self, tag: impl Into<String>) -> Self {
-        self.inner
-            .tags
-            .get_or_insert_with(Vec::new)
-            .push(tag.into());
-        self
-    }
-
-    /// Build the DatasetInsert.
-    pub fn build(self) -> std::result::Result<DatasetInsert, DatasetInsertBuilderError> {
-        if self.inner.input.is_none() {
-            return Err(DatasetInsertBuilderError::MissingInput);
+impl From<DatasetInsert> for DatasetFields {
+    fn from(record: DatasetInsert) -> Self {
+        Self {
+            input: Some(record.input),
+            expected: record.expected,
+            metadata: record.metadata,
+            tags: record.tags,
         }
-        Ok(self.inner)
     }
 }
 
@@ -228,205 +191,48 @@ pub(crate) struct DatasetMetadata {
     pub project_id: String,
 }
 
-pub(crate) use crate::api::btql::{BTQLQuery, BTQLQueryInner, BTQLResponse};
-pub(crate) use crate::api::datasets::{
-    DatasetRegisterRequest, DatasetRegisterResponse, DatasetSummaryResponse,
-};
-
-// ============================================================================
-// Traits for API Operations
-// ============================================================================
-
-/// Trait for registering datasets.
-#[async_trait]
-pub(crate) trait DatasetRegistrar: Send + Sync {
-    /// Register a dataset with the API.
-    async fn register_dataset(
-        &self,
-        token: &str,
-        request: DatasetRegisterRequest,
-    ) -> Result<DatasetRegisterResponse>;
-}
-
-/// Trait for fetching dataset records via BTQL.
-#[async_trait]
-pub(crate) trait DatasetFetcher: Send + Sync {
-    /// Fetch dataset records via BTQL query.
-    async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse>;
-}
-
-/// Trait for fetching dataset summary.
-#[async_trait]
-pub(crate) trait DatasetSummarizer: Send + Sync {
-    /// Fetch dataset summary.
-    async fn fetch_dataset_summary(
-        &self,
-        token: &str,
-        dataset_id: &str,
-    ) -> Result<DatasetSummaryResponse>;
-}
-
-// ============================================================================
-// DatasetBuilder Error Types
-// ============================================================================
-
-/// Error type for DatasetBuilder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum DatasetBuilderError {
-    /// Project name is required but was not provided.
-    MissingProjectName,
-    /// Dataset name is required but was not provided.
-    MissingDatasetName,
-}
-
-impl fmt::Display for DatasetBuilderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingProjectName => {
-                write!(f, "project_name is required but was not provided")
-            }
-            Self::MissingDatasetName => {
-                write!(f, "dataset_name is required but was not provided")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DatasetBuilderError {}
-
-// ============================================================================
-// DatasetBuilder
-// ============================================================================
-
-/// Builder for creating datasets with lazy registration.
-#[allow(private_bounds)]
-pub struct DatasetBuilder<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer>
-{
-    submitter: Arc<S>,
-    token: String,
-    org_name: String,
-    project_name: Option<String>,
-    dataset_name: Option<String>,
-    description: Option<String>,
-    metadata: Option<Map<String, Value>>,
-}
-
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> Clone
-    for DatasetBuilder<S>
-{
-    fn clone(&self) -> Self {
-        Self {
-            submitter: Arc::clone(&self.submitter),
-            token: self.token.clone(),
-            org_name: self.org_name.clone(),
-            project_name: self.project_name.clone(),
-            dataset_name: self.dataset_name.clone(),
-            description: self.description.clone(),
-            metadata: self.metadata.clone(),
-        }
-    }
-}
-
-#[allow(private_bounds)]
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 'static>
-    DatasetBuilder<S>
-{
-    /// Create a new DatasetBuilder (internal use).
-    pub(crate) fn new(
-        submitter: Arc<S>,
-        token: impl Into<String>,
-        org_name: impl Into<String>,
-    ) -> Self {
-        Self {
-            submitter,
-            token: token.into(),
-            org_name: org_name.into(),
-            project_name: None,
-            dataset_name: None,
-            description: None,
-            metadata: None,
-        }
-    }
-
-    /// Set the project name (required).
-    pub fn project_name(mut self, project_name: impl Into<String>) -> Self {
-        self.project_name = Some(project_name.into());
-        self
-    }
-
-    /// Set the dataset name (required).
-    pub fn dataset_name(mut self, dataset_name: impl Into<String>) -> Self {
-        self.dataset_name = Some(dataset_name.into());
-        self
-    }
-
-    /// Set the dataset description.
-    pub fn description(mut self, description: impl Into<String>) -> Self {
-        self.description = Some(description.into());
-        self
-    }
-
-    /// Set the dataset metadata.
-    pub fn metadata(mut self, metadata: Map<String, Value>) -> Self {
-        self.metadata = Some(metadata);
-        self
-    }
-
-    /// Add a single metadata entry.
-    pub fn metadata_entry(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
-        self.metadata
-            .get_or_insert_with(Map::new)
-            .insert(key.into(), value.into());
-        self
-    }
-
-    /// Build the dataset (lazy registration).
-    pub fn build(self) -> std::result::Result<Dataset<S>, DatasetBuilderError> {
-        let project_name = self
-            .project_name
-            .ok_or(DatasetBuilderError::MissingProjectName)?;
-        let dataset_name = self
-            .dataset_name
-            .ok_or(DatasetBuilderError::MissingDatasetName)?;
-
-        Ok(Dataset {
-            submitter: self.submitter,
-            token: self.token,
-            org_name: self.org_name,
-            project_name,
-            dataset_name,
-            description: self.description,
-            metadata: self.metadata,
-            lazy_metadata: OnceCell::new(),
-            pending_rows: Arc::new(Mutex::new(Vec::new())),
-        })
-    }
-}
-
-// ============================================================================
-// Dataset
-// ============================================================================
+use crate::api::btql::{BTQLQuery, BTQLQueryInner};
+use crate::api::datasets::DatasetRegisterRequest;
 
 /// A dataset for storing test/evaluation data.
 ///
 /// Datasets are lazily registered with the API on first use.
-#[allow(private_bounds)]
-pub struct Dataset<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> {
-    submitter: Arc<S>,
-    token: String,
-    org_name: String,
+/// The builder requires both a project name and a dataset name:
+///
+/// ```compile_fail
+/// # fn missing_project(client: &braintrust_sdk_rust::BraintrustClient) {
+/// client.dataset_builder_with_credentials("token", "tenant").dataset_name("d").build();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn missing_dataset(client: &braintrust_sdk_rust::BraintrustClient) {
+/// client.dataset_builder_with_credentials("token", "tenant").project_name("p").build();
+/// # }
+/// ```
+#[derive(bon::Builder, Clone)]
+#[builder(start_fn(name = new, vis = "pub(crate)"), derive(Clone))]
+pub struct Dataset {
+    #[builder(start_fn)]
+    api: ResourceTransport,
+    #[builder(start_fn)]
+    lifecycle: Arc<dyn DeliveryControl>,
+    #[builder(start_fn)]
+    scope: CredentialScope,
+    /// Project containing the dataset (required).
+    #[builder(into)]
     project_name: String,
+    /// Dataset name (required).
+    #[builder(into)]
     dataset_name: String,
+    #[builder(into)]
     description: Option<String>,
     metadata: Option<Map<String, Value>>,
-    lazy_metadata: OnceCell<std::result::Result<DatasetMetadata, String>>,
-    pending_rows: Arc<Mutex<Vec<PendingDatasetRow>>>,
+    #[builder(skip)]
+    lazy_metadata: Arc<OnceCell<DatasetMetadata>>,
 }
 
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> fmt::Debug
-    for Dataset<S>
-{
+impl fmt::Debug for Dataset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Dataset")
             .field("project_name", &self.project_name)
@@ -436,44 +242,25 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> f
     }
 }
 
-/// A pending dataset row waiting to be submitted.
-struct PendingDatasetRow {
-    id: String,
-    input: Option<Value>,
-    expected: Option<Value>,
-    metadata: Option<Map<String, Value>>,
-    tags: Option<Vec<String>>,
-    is_merge: bool,
-    is_delete: bool,
-}
-
-#[allow(private_bounds)]
-impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 'static>
-    Dataset<S>
-{
+impl Dataset {
     /// Ensure the dataset is registered, returning cached metadata.
     async fn ensure_registered(&self) -> Result<&DatasetMetadata> {
         self.lazy_metadata
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 let request = DatasetRegisterRequest {
                     project_name: self.project_name.clone(),
-                    org_name: self.org_name.clone(),
+                    org_name: self.scope.org_name().unwrap_or_default().to_owned(),
                     dataset_name: self.dataset_name.clone(),
                     description: self.description.clone(),
                     metadata: self.metadata.clone(),
                 };
-
-                match self.submitter.register_dataset(&self.token, request).await {
-                    Ok(response) => Ok(DatasetMetadata {
-                        dataset_id: response.dataset.id,
-                        project_id: response.project.id,
-                    }),
-                    Err(e) => Err(e.to_string()),
-                }
+                let response = self.api.register_dataset(&self.scope, request).await?;
+                Ok(DatasetMetadata {
+                    dataset_id: response.dataset.id,
+                    project_id: response.project.id,
+                })
             })
             .await
-            .as_ref()
-            .map_err(|e| crate::error::BraintrustError::InvalidConfig(e.clone()))
     }
 
     /// Get the dataset ID (triggers registration if needed).
@@ -491,82 +278,65 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         &self.project_name
     }
 
-    /// Insert a new record into the dataset.
-    ///
-    /// Returns the auto-generated record ID.
-    pub async fn insert(&self, record: DatasetInsert) -> String {
+    /// Insert a record and return its generated ID after the API acknowledges it.
+    pub async fn insert(&self, record: DatasetInsert) -> Result<String> {
+        let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         let id = Uuid::new_v4().to_string();
-
-        let row = PendingDatasetRow {
-            id: id.clone(),
-            input: record.input,
-            expected: record.expected,
-            metadata: record.metadata,
-            tags: record.tags,
-            is_merge: false,
-            is_delete: false,
-        };
-
-        self.pending_rows.lock().await.push(row);
-        id
+        self.api
+            .write_dataset_record(
+                &self.scope,
+                DatasetWrite::insert(dataset_id, id.clone(), record.into()),
+            )
+            .await?;
+        Ok(id)
     }
 
-    /// Update an existing record by ID (merge semantics).
+    /// Merge supplied fields into a record, returning after API acknowledgement.
+    /// Omitted fields remain unchanged; explicit JSON null values are sent as null.
     ///
-    /// Unspecified fields are preserved.
-    pub async fn update(&self, id: &str, record: DatasetInsert) {
-        let row = PendingDatasetRow {
-            id: id.to_string(),
-            input: record.input,
-            expected: record.expected,
-            metadata: record.metadata,
-            tags: record.tags,
-            is_merge: true,
-            is_delete: false,
-        };
-
-        self.pending_rows.lock().await.push(row);
+    /// ```no_run
+    /// use braintrust_sdk_rust::{Dataset, DatasetFields};
+    /// # async fn update(dataset: &Dataset) -> braintrust_sdk_rust::Result<()> {
+    /// dataset.update("record-id", DatasetFields::builder().expected(4).build()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn update(&self, id: &str, fields: DatasetFields) -> Result<()> {
+        let dataset_id = self.ensure_registered().await?.dataset_id.clone();
+        self.api
+            .write_dataset_record(&self.scope, DatasetWrite::update(dataset_id, id, fields))
+            .await
     }
 
-    /// Delete a record by ID.
-    pub async fn delete(&self, id: &str) {
-        let row = PendingDatasetRow {
-            id: id.to_string(),
-            input: None,
-            expected: None,
-            metadata: None,
-            tags: None,
-            is_merge: false,
-            is_delete: true,
-        };
-
-        self.pending_rows.lock().await.push(row);
+    /// Delete a record, returning after API acknowledgement.
+    pub async fn delete(&self, id: &str) -> Result<()> {
+        let dataset_id = self.ensure_registered().await?.dataset_id.clone();
+        self.api
+            .write_dataset_record(&self.scope, DatasetWrite::delete(dataset_id, id))
+            .await
     }
 
     /// Fetch records with pagination.
     ///
     /// Returns an iterator that fetches records in batches.
-    pub async fn fetch(&self, batch_size: Option<usize>) -> Result<DatasetIterator<S>> {
+    pub async fn fetch(&self, batch_size: Option<usize>) -> Result<DatasetIterator> {
         let metadata = self.ensure_registered().await?;
         Ok(DatasetIterator::new(
-            Arc::clone(&self.submitter),
-            self.token.clone(),
+            self.api.clone(),
+            self.scope.clone(),
             metadata.dataset_id.clone(),
-            batch_size.unwrap_or(1000),
+            batch_size.unwrap_or(1000).max(1),
         ))
     }
 
     /// Get dataset summary statistics.
     pub async fn summarize(&self) -> Result<DatasetSummary> {
-        // Flush pending operations first
-        self.flush().await?;
-
         let metadata = self.ensure_registered().await?;
 
         // Fetch summary from API
         let response = self
-            .submitter
-            .fetch_dataset_summary(&self.token, &metadata.dataset_id)
+            .api
+            .fetch_dataset_summary(&self.scope, &metadata.dataset_id)
             .await?;
 
         Ok(DatasetSummary {
@@ -580,70 +350,10 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         })
     }
 
-    /// Flush all pending operations.
-    pub async fn flush(&self) -> Result<()> {
-        let metadata = self.ensure_registered().await?;
-        let rows = {
-            let mut pending = self.pending_rows.lock().await;
-            std::mem::take(&mut *pending)
-        };
-
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        // Submit each row
-        for row in rows {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-
-            let payload = SpanPayload {
-                row_id: row.id.clone(),
-                span_id: row.id,
-                is_merge: row.is_merge,
-                span_components: None,
-                org_id: String::new(),
-                org_name: Some(self.org_name.clone()),
-                project_name: Some(self.project_name.clone()),
-                input: row.input,
-                output: None,
-                expected: row.expected,
-                error: None,
-                scores: None,
-                metadata: row.metadata,
-                metrics: None,
-                tags: row.tags,
-                context: Some(serde_json::json!({
-                    "calendar_time": now,
-                })),
-                span_attributes: if row.is_delete {
-                    Some(crate::types::SpanAttributes {
-                        name: None,
-                        span_type: None,
-                        purpose: None,
-                        extra: {
-                            let mut map = std::collections::HashMap::new();
-                            map.insert("_object_delete".to_string(), Value::Bool(true));
-                            map
-                        },
-                    })
-                } else {
-                    None
-                },
-                extra: std::collections::HashMap::new(),
-            };
-
-            let parent_info = ParentSpanInfo::Dataset {
-                object_id: metadata.dataset_id.clone(),
-            };
-
-            self.submitter
-                .submit(self.token.clone(), payload, Some(parent_info));
-        }
-
-        Ok(())
+    /// Flush the client's shared trace queue. Dataset mutations are already
+    /// acknowledged when their individual operation completes.
+    pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+        self.lifecycle.flush()
     }
 }
 
@@ -652,10 +362,20 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 // ============================================================================
 
 /// Iterator for fetching dataset records with pagination.
-#[allow(private_bounds)]
-pub struct DatasetIterator<S: DatasetFetcher> {
-    fetcher: Arc<S>,
-    token: String,
+///
+/// ```no_run
+/// use braintrust_sdk_rust::{BraintrustError, Dataset};
+/// # async fn read(dataset: &Dataset) -> Result<(), BraintrustError> {
+/// let mut records = dataset.fetch(Some(100)).await?;
+/// while let Some(record) = records.next().await? {
+///     println!("{}", record.id());
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct DatasetIterator {
+    fetcher: ResourceTransport,
+    scope: CredentialScope,
     dataset_id: String,
     batch_size: usize,
     cursor: Option<String>,
@@ -663,12 +383,16 @@ pub struct DatasetIterator<S: DatasetFetcher> {
     done: bool,
 }
 
-#[allow(private_bounds)]
-impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
-    fn new(fetcher: Arc<S>, token: String, dataset_id: String, batch_size: usize) -> Self {
+impl DatasetIterator {
+    fn new(
+        fetcher: ResourceTransport,
+        scope: CredentialScope,
+        dataset_id: String,
+        batch_size: usize,
+    ) -> Self {
         Self {
             fetcher,
-            token,
+            scope,
             dataset_id,
             batch_size,
             cursor: None,
@@ -678,88 +402,52 @@ impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
     }
 
     /// Get the next record, fetching a new batch if needed.
-    pub async fn next(&mut self) -> Option<DatasetRecord> {
-        // Return buffered record if available
-        if let Some(record) = self.buffer.pop_front() {
-            return Some(record);
-        }
-
-        // If we've exhausted all pages, return None
-        if self.done {
-            return None;
-        }
-
-        // Fetch next batch
-        let query = BTQLQuery {
-            query: BTQLQueryInner {
-                from: format!("dataset('{}')", self.dataset_id),
-                limit: Some(self.batch_size),
-                cursor: self.cursor.take(),
-            },
-        };
-
-        match self.fetcher.fetch_dataset_records(&self.token, query).await {
-            Ok(response) => {
-                // Update cursor for next page
-                self.cursor = response.cursor;
-                self.done = self.cursor.is_none();
-
-                // Buffer the records
-                self.buffer.extend(response.data);
-
-                // Return first record
-                self.buffer.pop_front()
+    pub async fn next(&mut self) -> Result<Option<DatasetRecord>> {
+        loop {
+            if let Some(record) = self.buffer.pop_front() {
+                return Ok(Some(record));
             }
-            Err(e) => {
-                tracing::warn!("failed to fetch dataset records: {}", e);
-                self.done = true;
-                None
+            if self.done {
+                return Ok(None);
             }
+            let previous_cursor = self.cursor.clone();
+            let query = BTQLQuery {
+                query: BTQLQueryInner {
+                    from: format!("dataset('{}')", self.dataset_id),
+                    limit: Some(self.batch_size),
+                    cursor: previous_cursor.clone(),
+                },
+            };
+            // A failed request leaves the cursor and EOF state untouched.
+            let response = self
+                .fetcher
+                .fetch_dataset_records(&self.scope, query)
+                .await?;
+            if response.cursor.is_some() && response.cursor == previous_cursor {
+                return Err(crate::BraintrustError::Background(
+                    "dataset pagination cursor did not advance".into(),
+                ));
+            }
+            self.cursor = response.cursor;
+            self.done = self.cursor.is_none();
+            self.buffer.extend(response.data);
+            // Empty pages with a continuation are not end-of-data.
         }
     }
 
-    /// Collect all remaining records into a Vec.
-    pub async fn collect(mut self) -> Vec<DatasetRecord> {
+    /// Collect all remaining records, preserving any page failure as an error.
+    pub async fn collect(mut self) -> Result<Vec<DatasetRecord>> {
         let mut records = Vec::new();
-        while let Some(record) = self.next().await {
+        while let Some(record) = self.next().await? {
             records.push(record);
         }
-        records
+        Ok(records)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_dataset_insert_builder_requires_input() {
-        let result = DatasetInsert::builder()
-            .expected(serde_json::json!({"answer": "4"}))
-            .build();
-
-        assert!(matches!(
-            result,
-            Err(DatasetInsertBuilderError::MissingInput)
-        ));
-    }
-
-    #[test]
-    fn test_dataset_insert_builder_works() {
-        let result = DatasetInsert::builder()
-            .input(serde_json::json!({"question": "What is 2+2?"}))
-            .expected(serde_json::json!({"answer": "4"}))
-            .tag("math")
-            .tag("addition")
-            .metadata_entry("difficulty", serde_json::json!("easy"))
-            .build();
-
-        assert!(result.is_ok());
-        let insert = result.unwrap();
-        assert!(insert.input.is_some());
-        assert!(insert.expected.is_some());
-        assert_eq!(insert.tags.as_ref().map(|t| t.len()), Some(2));
-    }
 
     #[test]
     fn test_dataset_summary_getters() {

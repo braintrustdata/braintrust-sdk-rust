@@ -1,4 +1,4 @@
-//! Dataset registration and summary endpoint contracts.
+//! Dataset registration, row mutation, and summary endpoint contracts.
 use super::{Client, Error, Plane};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -70,6 +70,126 @@ pub struct DatasetInfo {
     pub(crate) name: String,
 }
 
+/// Fields stored in a dataset record. Absent fields are omitted from the wire.
+///
+/// ```
+/// use braintrust_sdk_rust::api::datasets::DatasetFields;
+/// use serde_json::json;
+/// let fields = DatasetFields::builder().input(json!(null)).tags(vec!["test".into()]).build();
+/// assert_eq!(fields.input(), Some(&json!(null)));
+/// assert!(fields.expected().is_none());
+/// ```
+///
+/// Construct fields through the builder rather than depending on their layout:
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::api::datasets::DatasetFields;
+/// let mut fields = DatasetFields::default();
+/// fields.input = Some(serde_json::json!(1));
+/// ```
+#[derive(bon::Builder, Debug, Clone, Default, Serialize)]
+pub struct DatasetFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
+    pub(crate) input: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
+    pub(crate) expected: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) metadata: Option<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tags: Option<Vec<String>>,
+}
+impl DatasetFields {
+    /// Return the supplied input, including an explicit JSON null.
+    pub fn input(&self) -> Option<&Value> {
+        self.input.as_ref()
+    }
+    /// Return the expected output, if supplied.
+    pub fn expected(&self) -> Option<&Value> {
+        self.expected.as_ref()
+    }
+    /// Return the metadata entries, if supplied.
+    pub fn metadata(&self) -> Option<&Map<String, Value>> {
+        self.metadata.as_ref()
+    }
+    /// Return the tags, if supplied.
+    pub fn tags(&self) -> Option<&[String]> {
+        self.tags.as_deref()
+    }
+}
+
+/// A dataset row mutation, independent of tracing/span payloads.
+///
+/// Use [`Self::insert`], [`Self::update`], or [`Self::delete`] to select the
+/// operation. Its private fields keep wire flags and payload layout extensible.
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::api::datasets::DatasetWrite;
+/// let mut write = DatasetWrite::delete("dataset", "row");
+/// write.id = "other".into();
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct DatasetWrite {
+    dataset_id: String,
+    id: String,
+    #[serde(flatten)]
+    fields: Option<DatasetFields>,
+    #[serde(rename = "_is_merge", skip_serializing_if = "Option::is_none")]
+    is_merge: Option<bool>,
+    #[serde(rename = "_object_delete", skip_serializing_if = "Option::is_none")]
+    is_delete: Option<bool>,
+}
+impl DatasetWrite {
+    /// Insert a record with the supplied ID and fields.
+    pub fn insert(
+        dataset_id: impl Into<String>,
+        id: impl Into<String>,
+        fields: DatasetFields,
+    ) -> Self {
+        Self {
+            dataset_id: dataset_id.into(),
+            id: id.into(),
+            fields: Some(fields),
+            is_merge: None,
+            is_delete: None,
+        }
+    }
+    /// Merge only the supplied fields into an existing record.
+    pub fn update(
+        dataset_id: impl Into<String>,
+        id: impl Into<String>,
+        fields: DatasetFields,
+    ) -> Self {
+        Self {
+            is_merge: Some(true),
+            ..Self::insert(dataset_id, id, fields)
+        }
+    }
+    /// Delete a record without sending record fields.
+    pub fn delete(dataset_id: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            dataset_id: dataset_id.into(),
+            id: id.into(),
+            fields: None,
+            is_merge: None,
+            is_delete: Some(true),
+        }
+    }
+    /// Return the dataset receiving this mutation.
+    pub fn dataset_id(&self) -> &str {
+        &self.dataset_id
+    }
+    /// Return the record ID.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    /// Return the supplied record fields. Deletes have no fields.
+    pub fn fields(&self) -> Option<&DatasetFields> {
+        self.fields.as_ref()
+    }
+}
+
 /// Response from dataset summary API.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
@@ -104,6 +224,26 @@ impl Datasets {
             .post_json(Plane::Control, "api/dataset/register", &request)
             .await
     }
+    /// Send exactly one typed dataset mutation request on the data plane.
+    /// No retry, buffering, splitting, or overflow upload is performed.
+    pub async fn write(&self, rows: &[DatasetWrite]) -> Result<(), Error> {
+        #[derive(Serialize)]
+        struct Request<'a> {
+            rows: &'a [DatasetWrite],
+            api_version: u8,
+        }
+        self.client
+            .post_empty(
+                Plane::Data,
+                "logs3",
+                &Request {
+                    rows,
+                    api_version: crate::types::LOGS_API_VERSION,
+                },
+            )
+            .await
+    }
+
     pub async fn summarize(&self, dataset_id: &str) -> Result<DatasetSummaryResponse, Error> {
         self.client
             .get_json(

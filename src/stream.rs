@@ -66,7 +66,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::span::{SpanHandle, SpanLog, SpanSubmitter};
+use crate::span::{SpanHandle, SpanLog};
 use crate::types::{usage_metrics_to_map, UsageMetrics};
 
 // =============================================================================
@@ -1021,16 +1021,13 @@ impl BraintrustStream {
 /// # Type Parameters
 /// - `S`: The stream type yielding `Result<Value, E>`
 /// - `E`: The error type (allows use with any error type)
-/// - `Sub`: The span submitter type
-#[allow(private_bounds)]
-pub fn wrap_stream_with_span<S, E, Sub>(
+pub fn wrap_stream_with_span<S, E>(
     stream: S,
-    span: SpanHandle<Sub>,
+    span: SpanHandle,
 ) -> Pin<Box<dyn Stream<Item = std::result::Result<Value, E>> + Send>>
 where
     S: Stream<Item = std::result::Result<Value, E>> + Send + Unpin + 'static,
     E: Send + 'static,
-    Sub: SpanSubmitter + 'static,
 {
     use futures::StreamExt;
 
@@ -1150,18 +1147,15 @@ enum FinalizeState {
 }
 
 /// A wrapper stream that logs aggregated output when the stream is exhausted.
-struct SpanCompleteWrapper<S, Sub: SpanSubmitter> {
+struct SpanCompleteWrapper<S> {
     inner: S,
-    span: Option<SpanHandle<Sub>>,
+    span: Option<SpanHandle>,
     aggregator: Option<Arc<Mutex<BraintrustStream>>>,
     finalize_state: FinalizeState,
 }
 
 /// Finalize the stream by logging and flushing the span.
-async fn finalize_span<Sub: SpanSubmitter>(
-    span: SpanHandle<Sub>,
-    aggregator: Arc<Mutex<BraintrustStream>>,
-) {
+async fn finalize_span(span: SpanHandle, aggregator: Arc<Mutex<BraintrustStream>>) {
     let mut agg = aggregator.lock().await;
     if !agg.is_empty() {
         match agg.final_value() {
@@ -1204,11 +1198,10 @@ async fn finalize_span<Sub: SpanSubmitter>(
     }
 }
 
-impl<S, E, Sub> Stream for SpanCompleteWrapper<S, Sub>
+impl<S, E> Stream for SpanCompleteWrapper<S>
 where
     S: Stream<Item = std::result::Result<Value, E>> + Unpin,
     E: Send + 'static,
-    Sub: SpanSubmitter + 'static,
 {
     type Item = std::result::Result<Value, E>;
 
