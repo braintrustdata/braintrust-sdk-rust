@@ -33,10 +33,13 @@ impl Config {
 }
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Endpoints may be invalid and contain credentials before validation.
         f.debug_struct("Config")
             .field("api_key", &"[redacted]")
+            .field("api_url", &self.api_url)
+            .field("app_url", &self.app_url)
+            .field("org_name", &self.org_name)
             .field("timeout", &self.timeout)
+            .field("user_agent", &self.user_agent)
             .finish_non_exhaustive()
     }
 }

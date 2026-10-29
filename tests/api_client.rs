@@ -343,7 +343,6 @@ async fn overflow_grant_is_explicit_and_does_not_upload_or_commit() {
 fn config_rejects_ambiguous_routes_and_redacts_credentials() {
     let mut settings = api::Config::new("do-not-print-token");
     settings.set_api_url("https://user:secret@example.test");
-    assert!(!format!("{settings:?}").contains("secret"));
     assert!(!format!("{settings:?}").contains("do-not-print-token"));
     for url in [
         "file:///tmp/foo",
@@ -358,6 +357,33 @@ fn config_rejects_ambiguous_routes_and_redacts_credentials() {
         ));
     }
     assert!(api::Client::new(api::Config::new("\ninvalid-token")).is_err());
+}
+
+#[test]
+fn config_debug_shows_settings_and_redacts_api_key() {
+    let mut settings = api::Config::new("do-not-print-token");
+    settings.set_api_url("https://api.example.test");
+    settings.set_app_url("https://app.example.test");
+    settings.set_org_name(Some("example-org".into()));
+    settings.set_user_agent(Some("example-agent".into()));
+    settings.set_custom_ca_bundle_path(Some("example.pem".into()));
+    settings.set_custom_ca_bundle_pem(Some(vec![1, 2, 3]));
+
+    let debug = format!("{settings:?}");
+    for expected in [
+        "api_key: \"[redacted]\"",
+        "api_url: \"https://api.example.test\"",
+        "app_url: \"https://app.example.test\"",
+        "org_name: Some(\"example-org\")",
+        "timeout: 30s",
+        "user_agent: Some(\"example-agent\")",
+    ] {
+        assert!(debug.contains(expected), "missing {expected} in {debug}");
+    }
+    assert!(!debug.contains("do-not-print-token"));
+    assert!(!debug.contains("custom_ca_bundle"));
+    assert!(!debug.contains("example.pem"));
+    assert!(!debug.contains("[1, 2, 3]"));
 }
 
 #[tokio::test]
