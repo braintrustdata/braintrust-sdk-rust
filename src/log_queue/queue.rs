@@ -27,8 +27,8 @@ use crate::api::projects::{ProjectRegisterRequest, ProjectRegisterResponse};
 
 /// A raw span payload queued for deferred preparation and flushing.
 ///
-/// Fields are private — construction and destructuring happen only within this
-/// module. `worker.rs` never touches the fields directly.
+/// Only the span batch processor interprets these fields; the delivery worker
+/// treats commands as opaque values.
 struct SubmitCommand {
     token: String,
     payload: SpanPayload,

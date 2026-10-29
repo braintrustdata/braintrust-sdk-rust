@@ -1,4 +1,6 @@
-//! Lock-free admission, atomic queue snapshots and batch outcome ownership.
+//! Producers publish into a lock-free FIFO generation. Flush swaps that generation
+//! into the worker's ready list; one worker drains and processes batches in order.
+//! The coordinator owns active write senders and flush cutoffs under one mutex.
 use crate::{
     Completion, DeliveryError, DeliveryReceipt, EnqueueError, ExecutionError, FlushError,
     FlushFailure, FlushReport, ShutdownError, ShutdownReport, WriteError,
@@ -60,11 +62,6 @@ impl Wake {
         .await
     }
 }
-#[derive(Clone)]
-enum BatchError {
-    Delivery(Arc<DeliveryError>),
-    Execution(ExecutionError),
-}
 struct Accepted<C> {
     command: C,
     sender: WriteSender,
@@ -73,14 +70,12 @@ type IngressItem<C> = AtomicCell<Option<Box<Accepted<C>>>>;
 struct QueueEpoch<C> {
     queue: sdd::Queue<IngressItem<C>>,
     publishers: AtomicUsize,
-    active: AtomicBool,
 }
 impl<C> QueueEpoch<C> {
     fn new() -> Self {
         Self {
             queue: sdd::Queue::new(),
             publishers: AtomicUsize::new(0),
-            active: AtomicBool::new(false),
         }
     }
     fn enter(&self) -> bool {
@@ -109,49 +104,33 @@ impl<C> QueueEpoch<C> {
 }
 struct Batch<C> {
     epoch: Arc<QueueEpoch<C>>,
-    completion: Arc<BatchCompletion>,
-}
-struct BatchCompletion {
-    count: AtomicUsize,
-    senders: Mutex<Option<Vec<WriteSender>>>,
-}
-struct ActiveBatch<C> {
-    epoch: Arc<QueueEpoch<C>>,
-    completion: Arc<BatchCompletion>,
+    senders: Vec<WriteSender>,
 }
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-impl BatchCompletion {
-    fn finish(&self, result: &Result<(), BatchError>) {
-        if let Some(writes) = lock(&self.senders).take() {
-            let write_result = match result {
-                Ok(()) => Ok(DeliveryReceipt::new()),
-                Err(BatchError::Delivery(error)) => Err(WriteError::Delivery(error.clone())),
-                Err(BatchError::Execution(error)) => Err(WriteError::Execution(*error)),
-            };
-            for sender in writes {
-                let _ = sender.send(write_result.clone());
-            }
-        }
+fn finish_writes(writes: Vec<WriteSender>, result: Result<(), WriteError>) {
+    let write_result = result.map(|()| DeliveryReceipt::new());
+    for sender in writes {
+        let _ = sender.send(write_result.clone());
     }
 }
 /// One bounded summary per active flush, rather than cloning every covered
 /// batch into each observer. Its cutoff is the last batch present at admission.
-struct Barrier {
-    through: Arc<BatchCompletion>,
+struct Barrier<C> {
+    through: Arc<QueueEpoch<C>>,
     sender: Option<FlushSender>,
     delivered: u64,
     failure: Option<FlushFailure>,
     shutdown: bool,
 }
-impl Barrier {
-    fn record(&mut self, count: u64, result: &Result<(), BatchError>) {
+impl<C> Barrier<C> {
+    fn record(&mut self, count: u64, result: &Result<(), Arc<DeliveryError>>) {
         match result {
             Ok(()) => self.delivered += count,
-            Err(BatchError::Delivery(error)) => match &mut self.failure {
+            Err(error) => match &mut self.failure {
                 Some(failure) => failure.failed += count,
                 None => {
                     self.failure = Some(FlushFailure {
@@ -160,11 +139,6 @@ impl Barrier {
                     })
                 }
             },
-            Err(BatchError::Execution(error)) => {
-                if let Some(sender) = self.sender.take() {
-                    let _ = sender.send(Err((*error).into()));
-                }
-            }
         }
     }
     fn finish(&mut self) {
@@ -180,15 +154,13 @@ impl Barrier {
     }
 }
 struct State<C> {
-    ready: VecDeque<Batch<C>>,
-    active: Option<ActiveBatch<C>>,
-    barriers: Vec<Barrier>,
-    accepting: bool,
-    terminal: Option<ExecutionError>,
+    ready: VecDeque<Arc<QueueEpoch<C>>>,
+    active: Option<Batch<C>>,
+    barriers: Vec<Barrier<C>>,
     shutdown_pending: Vec<FlushSender>,
 }
 impl<C> State<C> {
-    fn barrier(&mut self, sender: FlushSender, shutdown: bool, through: Arc<BatchCompletion>) {
+    fn barrier(&mut self, sender: FlushSender, shutdown: bool, through: Arc<QueueEpoch<C>>) {
         self.barriers.push(Barrier {
             through,
             sender: Some(sender),
@@ -197,29 +169,22 @@ impl<C> State<C> {
             shutdown,
         });
     }
-    fn finish(&mut self, batch: &Arc<BatchCompletion>, result: Result<(), BatchError>) -> usize {
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(&active.completion, batch))
-        {
-            self.active = None;
-            batch.finish(&result);
-            // Every registered barrier covers this batch: completed cutoffs
-            // are removed here, before admitting any subsequent flush.
-            let count = batch.count.load(Ordering::Acquire);
-            self.barriers.retain_mut(|barrier| {
-                barrier.record(count as u64, &result);
-                if Arc::ptr_eq(&barrier.through, batch) {
-                    barrier.finish();
-                    false
-                } else {
-                    true
-                }
-            });
-            return count;
-        }
-        0
+    fn finish(&mut self, result: &Result<(), Arc<DeliveryError>>) -> usize {
+        let active = self.active.take().expect("active batch");
+        let count = active.senders.len();
+        finish_writes(active.senders, result.clone().map_err(WriteError::Delivery));
+        // Every registered barrier covers this batch: completed cutoffs
+        // are removed here, before admitting any subsequent flush.
+        self.barriers.retain_mut(|barrier| {
+            barrier.record(count as u64, result);
+            if Arc::ptr_eq(&barrier.through, &active.epoch) {
+                barrier.finish();
+                false
+            } else {
+                true
+            }
+        });
+        count
     }
 }
 struct Inner<C> {
@@ -238,6 +203,14 @@ struct Inner<C> {
     after_take: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 impl<C> Inner<C> {
+    fn terminal_error(&self) -> Option<ExecutionError> {
+        match self.terminal.load(Ordering::SeqCst) {
+            0 => None,
+            2 => Some(ExecutionError::TimedOut),
+            _ => Some(ExecutionError::WorkerLost),
+        }
+    }
+
     fn begin_publication(&self) -> Result<(), EnqueueError> {
         let mut current = self.publishers.load(Ordering::SeqCst);
         loop {
@@ -285,18 +258,11 @@ impl<C> Inner<C> {
         }
     }
 
-    fn detach(&self, state: &mut State<C>) -> Arc<BatchCompletion> {
+    fn detach(&self, state: &mut State<C>) -> Arc<QueueEpoch<C>> {
         let epoch = self.ingress.swap(Arc::new(QueueEpoch::new()));
         epoch.close();
-        let completion = Arc::new(BatchCompletion {
-            count: AtomicUsize::new(0),
-            senders: Mutex::new(None),
-        });
-        state.ready.push_back(Batch {
-            epoch,
-            completion: completion.clone(),
-        });
-        completion
+        state.ready.push_back(epoch.clone());
+        epoch
     }
 
     fn register_shutdowns(&self, state: &mut State<C>) -> bool {
@@ -335,13 +301,7 @@ impl<C> Inner<C> {
                 self.publish_to_epoch(&epoch, accepted.take().unwrap());
                 return;
             }
-            let terminal = self.terminal.load(Ordering::SeqCst);
-            if terminal != 0 {
-                let error = if terminal == 2 {
-                    ExecutionError::TimedOut
-                } else {
-                    ExecutionError::WorkerLost
-                };
+            if let Some(error) = self.terminal_error() {
                 let _ = accepted.take().unwrap().sender.send(Err(error.into()));
                 self.release(1);
                 self.end_publication();
@@ -354,56 +314,41 @@ impl<C> Inner<C> {
     where
         C: 'static,
     {
-        epoch.active.store(true, Ordering::Release);
         epoch.queue.push(AtomicCell::new(Some(Box::new(accepted))));
         epoch.publishers.fetch_sub(1, Ordering::SeqCst);
-        let terminal = self.terminal.load(Ordering::SeqCst);
+        let terminal = self.terminal_error();
         self.end_publication();
-        if terminal != 0 {
-            self.fail_epoch(
-                epoch,
-                if terminal == 2 {
-                    ExecutionError::TimedOut
-                } else {
-                    ExecutionError::WorkerLost
-                },
-            );
+        if let Some(error) = terminal {
+            self.fail_epoch(epoch, error);
         }
     }
 
-    fn stop(&self, error: ExecutionError) {
+    fn stop(&self, error: ExecutionError) -> ExecutionError {
         let code = match error {
             ExecutionError::WorkerLost => 1,
             ExecutionError::TimedOut => 2,
         };
-        let error =
-            match self
-                .terminal
-                .compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => error,
-                Err(2) => ExecutionError::TimedOut,
-                Err(_) => ExecutionError::WorkerLost,
-            };
-        self.publishers.fetch_or(CLOSED, Ordering::SeqCst);
         let mut state = lock(&self.state);
-        state.accepting = false;
-        if state.terminal.is_some() {
-            return;
+        if let Some(error) = self.terminal_error() {
+            return error;
         }
-        state.terminal = Some(error);
-        let result = Err(BatchError::Execution(error));
+        // Serialize the first terminal transition with batch completion so a
+        // returning processor cannot report success after shutdown has failed it.
+        self.terminal.store(code, Ordering::SeqCst);
+        self.publishers.fetch_or(CLOSED, Ordering::SeqCst);
         if let Some(active) = state.active.take() {
-            active.completion.finish(&result);
-            self.release(active.completion.count.load(Ordering::Acquire));
+            let count = active.senders.len();
+            finish_writes(active.senders, Err(error.into()));
+            self.release(count);
             self.fail_epoch(&active.epoch, error);
         }
-        for batch in state.ready.drain(..) {
-            batch.epoch.close();
-            self.fail_epoch(&batch.epoch, error);
+        for epoch in state.ready.drain(..) {
+            self.fail_epoch(&epoch, error);
         }
         for mut barrier in state.barriers.drain(..) {
-            barrier.record(0, &result);
+            if let Some(sender) = barrier.sender.take() {
+                let _ = sender.send(Err(error.into()));
+            }
         }
         for sender in state.shutdown_pending.drain(..) {
             let _ = sender.send(Err(error.into()));
@@ -413,10 +358,10 @@ impl<C> Inner<C> {
         current.close();
         self.fail_epoch(&current, error);
         self.wake.notify_one();
+        error
     }
     fn close(&self) {
         self.publishers.fetch_or(CLOSED, Ordering::SeqCst);
-        lock(&self.state).accepting = false;
         self.wake.notify_one();
     }
 }
@@ -465,8 +410,6 @@ impl<C: Send + 'static> WriteService<C> {
                 ready: VecDeque::new(),
                 active: None,
                 barriers: Vec::new(),
-                accepting: true,
-                terminal: None,
                 shutdown_pending: Vec::new(),
             }),
             ingress: ArcSwap::from_pointee(QueueEpoch::new()),
@@ -550,7 +493,9 @@ impl<C: Send + 'static> WriteService<C> {
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
         let (sender, mut completion) = Completion::pair();
         let mut state = lock(&self.inner.state);
-        if !state.accepting {
+        if let Some(error) = self.inner.terminal_error() {
+            completion.record_issuance(Err(error.into()));
+        } else if self.inner.publishers.load(Ordering::SeqCst) & CLOSED != 0 {
             completion.record_issuance(Err(EnqueueError::Closed.into()));
         } else if state
             .barriers
@@ -577,12 +522,11 @@ impl<C: Send + 'static> WriteService<C> {
         let (barrier_sender, barrier) = Completion::pair();
         {
             let mut state = lock(&self.inner.state);
-            if let Some(error) = state.terminal {
+            if let Some(error) = self.inner.terminal_error() {
                 completion.record_issuance(Err(error.into()));
                 return completion;
             }
             self.inner.publishers.fetch_or(CLOSED, Ordering::SeqCst);
-            state.accepting = false;
             state.shutdown_pending.push(barrier_sender);
             self.inner.register_shutdowns(&mut state);
         }
@@ -631,10 +575,7 @@ struct WorkerGuard<C> {
 impl<C> Drop for WorkerGuard<C> {
     fn drop(&mut self) {
         if let Some(exit) = self.exit.take() {
-            let error = lock(&self.inner.state)
-                .terminal
-                .unwrap_or(ExecutionError::WorkerLost);
-            self.inner.stop(error);
+            let error = self.inner.stop(ExecutionError::WorkerLost);
             let _ = exit.send(Err(error));
         }
     }
@@ -648,48 +589,37 @@ where
         let wake = guard.inner.wake.notified();
         let next = {
             let mut state = lock(&guard.inner.state);
-            if state.terminal.is_some() {
+            if guard.inner.terminal_error().is_some() {
                 break;
             } else if !guard.inner.register_shutdowns(&mut state) {
                 None
             } else {
-                if state.ready.is_empty()
-                    && guard.inner.ingress.load().active.load(Ordering::Acquire)
-                {
+                // Check closure before queue contents: if the last producer
+                // finishes after this snapshot, its wake triggers another pass.
+                let closed = guard.inner.publishers.load(Ordering::SeqCst) == CLOSED;
+                if state.ready.is_empty() && !guard.inner.ingress.load().queue.is_empty() {
                     guard.inner.detach(&mut state);
                 }
-                let settled = state
-                    .ready
-                    .front()
-                    .is_some_and(|batch| batch.epoch.settled());
-                match if settled {
-                    state.ready.pop_front()
+                if state.ready.front().is_some_and(|epoch| epoch.settled()) {
+                    let epoch = state.ready.pop_front().expect("checked above");
+                    state.active = Some(Batch {
+                        epoch: epoch.clone(),
+                        senders: Vec::new(),
+                    });
+                    Some(epoch)
+                } else if state.ready.is_empty() && closed {
+                    break;
                 } else {
                     None
-                } {
-                    Some(batch) => {
-                        state.active = Some(ActiveBatch {
-                            epoch: batch.epoch.clone(),
-                            completion: batch.completion.clone(),
-                        });
-                        Some(batch)
-                    }
-                    None if state.ready.is_empty()
-                        && !state.accepting
-                        && guard.inner.publishers.load(Ordering::SeqCst) & !CLOSED == 0 =>
-                    {
-                        break
-                    }
-                    None => None,
                 }
             }
         };
-        if let Some(batch) = next {
+        if let Some(epoch) = next {
             // The generation has been detached. Drain it without holding the
             // coordinator lock, so concurrent flushes can establish cutoffs.
             let mut commands = Vec::new();
             let mut senders = Vec::new();
-            while let Some(entry) = batch.epoch.queue.pop() {
+            while let Some(entry) = epoch.queue.pop() {
                 let accepted = entry.take().expect("each queue entry is taken once");
                 commands.push(accepted.command);
                 senders.push(accepted.sender);
@@ -699,45 +629,36 @@ where
                     resume.recv().unwrap();
                 }
             }
-            let mut senders = Some(senders);
-            let terminal = {
-                let state = lock(&guard.inner.state);
-                if let Some(error) = state.terminal {
-                    Some(error)
-                } else {
-                    batch
-                        .completion
-                        .count
-                        .store(commands.len(), Ordering::Release);
-                    *lock(&batch.completion.senders) = senders.take();
-                    None
+            {
+                let mut state = lock(&guard.inner.state);
+                if let Some(error) = guard.inner.terminal_error() {
+                    drop(state);
+                    // stop() drains the rest of the epoch; these entries were
+                    // already taken and remain the worker's responsibility.
+                    finish_writes(senders, Err(error.into()));
+                    guard.inner.release(commands.len());
+                    break;
                 }
-            };
-            if let Some(error) = terminal {
-                // stop() drains the rest of the epoch; these entries were
-                // already taken by this worker and remain its responsibility.
-                for sender in senders.take().unwrap_or_default() {
-                    let _ = sender.send(Err(error.into()));
-                }
-                guard.inner.release(commands.len());
-                break;
+                state.active.as_mut().expect("active batch").senders = senders;
             }
             let result = if commands.is_empty() {
                 Ok(())
             } else {
                 process(commands)
                     .await
-                    .map_err(|source| BatchError::Delivery(Arc::new(DeliveryError { source })))
+                    .map_err(|source| Arc::new(DeliveryError { source }))
             };
-            if let Err(BatchError::Delivery(error)) = &result {
+            if let Err(error) = &result {
                 warn!(%error, "delivery batch failed");
             }
             loop {
                 let wake = guard.inner.wake.notified();
                 let finished = {
                     let mut state = lock(&guard.inner.state);
-                    if guard.inner.register_shutdowns(&mut state) {
-                        let count = state.finish(&batch.completion, result.clone());
+                    if guard.inner.terminal_error().is_some() {
+                        break;
+                    } else if guard.inner.register_shutdowns(&mut state) {
+                        let count = state.finish(&result);
                         guard.inner.release(count);
                         true
                     } else {
@@ -754,7 +675,8 @@ where
         }
     }
     if let Some(exit) = guard.exit.take() {
-        let _ = exit.send(Ok(()));
+        let result = guard.inner.terminal_error().map_or(Ok(()), Err);
+        let _ = exit.send(result);
     }
 }
 #[cfg(test)]
@@ -910,6 +832,38 @@ mod tests {
         }
         let _ = service.exit.clone().await;
         assert!(service.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_stop_is_preserved_when_the_processor_returns_success() {
+        let (service, mut entered, gate) = gated(4);
+        let active = service.enqueue(1);
+        assert_eq!(entered.recv().await.unwrap(), vec![1]);
+        let pending = service.enqueue(2);
+        let flush = service.flush();
+
+        service.inner.stop(ExecutionError::TimedOut);
+        gate.add_permits(1); // The processor returns Ok after its batch was failed.
+        for write in [active, pending] {
+            assert!(matches!(
+                write.await,
+                Err(WriteError::Execution(ExecutionError::TimedOut))
+            ));
+        }
+        assert!(matches!(
+            flush.await,
+            Err(FlushError::Execution(ExecutionError::TimedOut))
+        ));
+        assert_eq!(service.exit.clone().await, Err(ExecutionError::TimedOut));
+        assert!(service.is_empty());
+        assert!(matches!(
+            service.flush().submission(),
+            Err(FlushError::Execution(ExecutionError::TimedOut))
+        ));
+        assert!(matches!(
+            service.shutdown(Duration::from_secs(1)).await,
+            Err(ShutdownError::Execution(ExecutionError::TimedOut))
+        ));
     }
 
     fn gated(
@@ -1236,23 +1190,25 @@ mod tests {
         assert!(service.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_the_last_producers_drains_work_and_stops_the_worker() {
-        let (service, mut entered, gate) = gated(4);
-        let write = service.enqueue(1);
-        let clone = service.clone();
-        let exit = service.exit.clone();
-        std::thread::scope(|scope| {
-            scope.spawn(move || drop(service));
-            scope.spawn(move || drop(clone));
-        });
-        entered.recv().await.unwrap();
-        gate.add_permits(1);
-        write.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), exit)
-            .await
-            .unwrap()
-            .unwrap();
+        for _ in 0..64 {
+            let (service, mut entered, gate) = gated(4);
+            let write = service.enqueue(1);
+            let clone = service.clone();
+            let exit = service.exit.clone();
+            std::thread::scope(|scope| {
+                scope.spawn(move || drop(service));
+                scope.spawn(move || drop(clone));
+            });
+            entered.recv().await.unwrap();
+            gate.add_permits(1);
+            write.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), exit)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
