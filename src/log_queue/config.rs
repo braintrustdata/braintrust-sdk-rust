@@ -122,13 +122,12 @@ pub struct LogQueueConfig {
     #[builder(default = default_num_retries())]
     num_retries: usize,
 
-    /// Sync flush mode (BRAINTRUST_SYNC_FLUSH, default: false)
+    /// Legacy compatibility value. Delivery is always automatic; ignored.
     #[builder(default = default_sync_flush())]
     sync_flush: bool,
 
-    /// Return preparation and HTTP failures to an explicit flush caller.
-    /// Checked clients also disable automatic flushing so no failure can be
-    /// consumed before that caller observes it.
+    /// Legacy compatibility value. Flush reports covered active failures and
+    /// delivery remains automatic; ignored.
     #[builder(default = false)]
     checked_delivery: bool,
 
@@ -144,11 +143,9 @@ pub struct LogQueueConfig {
     /// Debug: save all payloads (BRAINTRUST_ALL_PUBLISH_PAYLOADS_DIR)
     all_publish_payloads_dir: Option<PathBuf>,
 
-    /// When true, the queue drops new items once it reaches `queue_max_size`.
-    /// Defaults to false (unbounded), matching the TypeScript SDK's default behavior where
-    /// data loss via queue overflow is opt-in. Set to true to apply a hard cap and protect
-    /// against runaway memory growth in high-throughput scenarios.
-    #[builder(default = false)]
+    /// Legacy compatibility value. Admission is always bounded by queue_max_size,
+    /// including in-flight work; ignored.
+    #[builder(default = true)]
     enforce_queue_size_limit: bool,
 }
 
@@ -220,7 +217,7 @@ mod tests {
         assert_eq!(config.batch_max_bytes(), DEFAULT_BATCH_MAX_BYTES);
         assert_eq!(config.num_retries(), DEFAULT_NUM_RETRIES);
         assert!(!config.sync_flush());
-        assert!(!config.enforce_queue_size_limit()); // unbounded by default (matches TS SDK)
+        assert!(config.enforce_queue_size_limit());
     }
 
     #[test]

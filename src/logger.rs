@@ -202,7 +202,7 @@ impl BraintrustClientBuilder {
             batch_max_items: None,
             batch_max_bytes: None,
             queue_max_size: None,
-            enforce_queue_size_limit: false,
+            enforce_queue_size_limit: true,
             checked_delivery: false,
             environment: None,
             span_origin: None,
@@ -247,17 +247,16 @@ impl BraintrustClientBuilder {
         self
     }
 
-    /// Enable or disable enforcement of the queue size limit.
-    ///
-    /// When enabled, the queue drops newly arriving events once it reaches
-    /// `queue_max_size`. Defaults to false, leaving the queue unbounded.
+    /// Legacy compatibility setting. Delivery admission is always bounded by
+    /// `with_queue_max_size`, including in-flight writes. This value is ignored.
     pub fn enforce_queue_size_limit(mut self, enforce: bool) -> Self {
         self.enforce_queue_size_limit = enforce;
         self
     }
 
-    /// Make `flush` report preparation and HTTP delivery failures. Automatic
-    /// flushing is disabled so the explicit caller observes every result.
+    /// Legacy compatibility setting. Delivery is always automatic and flush
+    /// reports failures in covered active work. This value is ignored. Await a
+    /// write completion to observe that write's result independently of flush.
     pub fn checked_delivery(mut self, checked: bool) -> Self {
         self.checked_delivery = checked;
         self
@@ -374,7 +373,6 @@ impl BraintrustClientBuilder {
             .maybe_queue_max_size(self.queue_max_size)
             .enforce_queue_size_limit(self.enforce_queue_size_limit)
             .checked_delivery(self.checked_delivery)
-            .maybe_sync_flush(self.checked_delivery.then_some(true))
             .build();
 
         // LogQueue owns the background worker. It is given the client-configured
@@ -612,6 +610,7 @@ impl BraintrustClient {
             .org_id()
             .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
         self.update_span_internal(api_key, org_id, login_state.org_name(), exported, event)
+            .map(|_| ())
     }
 
     /// Update an existing span using explicit credentials instead of shared login state.
@@ -630,6 +629,21 @@ impl BraintrustClient {
         let org_id = org_id.into();
 
         self.update_span_internal(token, org_id, None, exported, event)
+            .map(|_| ())
+    }
+
+    /// Update an existing span and retain its eventual delivery result.
+    ///
+    /// Validation and admission are performed before this method returns. The
+    /// returned completion observes delivery even if it finishes before a flush.
+    pub fn update_span_with_credentials_tracked(
+        &self,
+        token: impl Into<String>,
+        org_id: impl Into<String>,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
+        self.update_span_internal(token.into(), org_id.into(), None, exported, event)
     }
 
     fn update_span_internal(
@@ -639,7 +653,7 @@ impl BraintrustClient {
         org_name: Option<String>,
         exported: &str,
         event: crate::span::SpanLog,
-    ) -> Result<()> {
+    ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
         let components = SpanComponents::parse(exported)?;
         let row_id = components.row_id.clone().ok_or_else(|| {
             BraintrustError::InvalidConfig("Exported span must have a row_id".into())
@@ -732,8 +746,11 @@ impl BraintrustClient {
             extra: event_data.extra,
         };
 
-        self.submit_payload(token, payload, None);
-        Ok(())
+        let completion = self.submit_payload(token, payload, None);
+        if let Err(error) = completion.submission() {
+            return Err(BraintrustError::Background(error.to_string()));
+        }
+        Ok(completion)
     }
 
     /// Perform login synchronously.
@@ -909,24 +926,29 @@ impl BraintrustClient {
         ExperimentBuilder::new(submitter, token, org_id)
     }
 
-    /// Submit a span payload for logging (fire-and-forget).
-    ///
-    /// Returns immediately after queuing. HTTP submission happens in the background.
-    /// Errors are logged as warnings but not propagated to callers.
-    /// Submit a span payload synchronously (fire-and-forget).
-    /// The payload is queued internally and processed by a background worker.
+    /// Submit immediately; the token observes admission and full batch delivery.
     pub(crate) fn submit_payload(
         &self,
         token: impl Into<String>,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
-    ) {
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         self.inner.queue.submit(token, payload, parent_info)
     }
 
-    /// Flush all pending log events.
-    pub async fn flush(&self) -> Result<()> {
-        self.inner.queue.flush_all().await
+    /// Stop accepting writes, drain accepted work and stop the delivery worker.
+    /// A timeout fails remaining completions and discards active SDK state.
+    pub fn shutdown(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::Completion<crate::ShutdownReport, crate::ShutdownError> {
+        self.inner.queue.shutdown(timeout)
+    }
+
+    /// Capture a cutoff immediately and observe delivery of the covered batch.
+    /// New writes belong to later work; completed failures are never replayed.
+    pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+        self.inner.queue.flush()
     }
 
     /// Trigger a non-blocking background flush.
@@ -936,53 +958,19 @@ impl BraintrustClient {
     }
 }
 
-impl Drop for BraintrustClient {
-    fn drop(&mut self) {
-        // Only flush on the last client reference, and only when there is pending
-        // data. `strong_count == 1` means no other `BraintrustClient` clones are
-        // alive. We check queue emptiness rather than login state so that
-        // per-request-credential (skip_login / multi-tenant) callers, which never
-        // populate the shared login state, still get their pending spans flushed.
-        if Arc::strong_count(&self.inner) != 1 || self.inner.queue.is_empty() {
-            return;
-        }
-
-        // Flush via flush_all(), which routes through the background worker's mpsc channel.
-        // This ensures any Submit commands still sitting in the worker's backlog are processed
-        // before the flush begins — resolving the race in LogQueue::Drop where is_empty() only
-        // inspects the lock-free crossbeam queue, not the worker channel.
-        // After this flush completes, LogQueue::Drop will find an empty queue and exit early.
-        //
-        // block_in_place panics on current-thread runtimes (e.g. #[tokio::test] default).
-        // In that case we skip the flush here; LogQueue::Drop provides a best-effort fallback
-        // for the lock-free queue, and tests should always call flush() explicitly.
-        let inner = self.inner.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async move {
-                        let _ = inner.queue.flush_all().await;
-                    });
-                });
-            }
-        } else {
-            // No async runtime available — spin up a temporary one.
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                let _ = inner.queue.flush_all().await;
-            });
-        }
-    }
-}
-
 #[async_trait::async_trait]
 impl SpanSubmitter for BraintrustClient {
-    fn submit(&self, token: String, payload: SpanPayload, parent_info: Option<ParentSpanInfo>) {
+    fn submit(
+        &self,
+        token: String,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         self.submit_payload(token, payload, parent_info)
     }
 
-    async fn flush(&self) -> Result<()> {
-        BraintrustClient::flush(self).await
+    fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+        BraintrustClient::flush(self)
     }
 
     async fn trigger_flush(&self) -> Result<()> {
@@ -1530,17 +1518,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_configures_queue_size_limit_enforcement() {
+    async fn builder_capacity_is_enforced_even_with_the_legacy_unbounded_setting() {
         let client = BraintrustClient::builder()
             .app_url("https://example.com")
             .api_url("https://example.com")
             .skip_login(true)
-            .enforce_queue_size_limit(true)
+            .with_queue_max_size(1)
+            .enforce_queue_size_limit(false)
             .build()
             .await
             .expect("client");
 
-        assert!(client.inner.queue.enforces_queue_size_limit());
+        let span = client.span_builder_with_credentials("token", "org").build();
+        assert!(span.log(crate::SpanLog::default()).is_ok());
+        assert!(matches!(
+            &*span.log(crate::SpanLog::default()),
+            Err(crate::WriteError::Admission(crate::EnqueueError::Full))
+        ));
     }
 
     #[tokio::test]

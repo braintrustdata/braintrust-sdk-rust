@@ -6,20 +6,20 @@ use super::config::LogQueueConfig;
 use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry};
 use super::merge::merge_row_into;
 use super::row_key::RowKey;
-use super::worker::LogCommand;
 use crate::error::{BraintrustError, Result};
+use crate::internal::delivery::WriteService;
 use crate::logger::LoginState;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
-use arc_swap::ArcSwap;
-use crossbeam::channel::{unbounded, Receiver, Sender, TrySendError};
+use crate::{
+    Completion, DeliveryReceipt, FlushError, FlushReport, ShutdownError, ShutdownReport, WriteError,
+};
 use futures::future::join_all;
 use indexmap::IndexMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, OnceCell};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex as TokioMutex, OnceCell};
 use tracing::warn;
 use url::Url;
 
@@ -27,86 +27,25 @@ use crate::api::projects::{ProjectRegisterRequest, ProjectRegisterResponse};
 
 /// A raw span payload queued for deferred preparation and flushing.
 ///
-/// Fields are private — construction and destructuring happen only within this
-/// module. `worker.rs` never touches the fields directly.
+/// Only the span batch processor interprets these fields; the delivery worker
+/// treats commands as opaque values.
 struct SubmitCommand {
     token: String,
     payload: SpanPayload,
     parent_info: Option<ParentSpanInfo>,
 }
 
-struct CmdChannel {
-    sender: Sender<SubmitCommand>,
-    receiver: Receiver<SubmitCommand>,
-    queued_count: AtomicUsize,
-}
-
-fn make_cmd_channel() -> CmdChannel {
-    let (sender, receiver) = unbounded();
-    CmdChannel {
-        sender,
-        receiver,
-        queued_count: AtomicUsize::new(0),
-    }
-}
-
-fn reserve_queue_slot(
-    queued_count: &AtomicUsize,
-    queue_max_size: usize,
-    enforce_queue_size_limit: bool,
-) -> bool {
-    let mut current = queued_count.load(Ordering::Relaxed);
-    loop {
-        if enforce_queue_size_limit && current >= queue_max_size {
-            return false;
-        }
-
-        match queued_count.compare_exchange_weak(
-            current,
-            current + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return true,
-            Err(next) => current = next,
-        }
-    }
-}
-
-/// All state shared between `LogQueue` and the background worker.
-///
-/// Always accessed through `Arc<LogQueueCore>`. Fields no longer need their own `Arc`
-/// wrappers — the outer `Arc` provides shared ownership and the field types provide
-/// their own interior mutability where needed.
-pub(super) struct LogQueueCore {
-    /// Lock-free queue channel (sender, receiver) pair, atomically swappable.
-    /// Holds unprocessed `SubmitCommand`s; preparation (project registration, row
-    /// building) happens during `flush_internal`.
-    channel: ArcSwap<CmdChannel>,
-    dropped_count: AtomicUsize,
-    last_drop_log_time: AtomicU64,
-    queue_depth_warning_emitted: AtomicBool,
+/// Preparation and protocol orchestration, independent of admission/lifecycle.
+struct SpanBatchProcessor {
     config: LogQueueConfig,
     login_state: LoginState,
     client: reqwest::Client,
-    /// Client-configured data-plane URL. Used as a fallback for flushing when the
-    /// shared login state has no URL (e.g. per-request-credential callers that
-    /// never log in).
     api_url: Url,
-    /// Client-configured control-plane URL. Fallback for project registration
-    /// when the shared login state has no URL.
     app_url: Url,
-    /// Cache of (org_id:project_name) → project_id to avoid redundant HTTP calls.
     project_cache: TokioMutex<IndexMap<String, String>>,
-    /// Handle to the currently in-progress flush task, if any.
-    /// Using JoinHandle allows checking completion status and awaiting the result.
-    flush_handle: TokioMutex<Option<JoinHandle<std::result::Result<(), anyhow::Error>>>>,
-    /// Lazily cached (max_request_size, can_use_overflow) from GET /version.
-    /// Fetched once on first flush and reused thereafter.
     version_info: OnceCell<(usize, bool)>,
 }
-
-impl LogQueueCore {
+impl SpanBatchProcessor {
     fn new(
         config: LogQueueConfig,
         login_state: LoginState,
@@ -114,129 +53,15 @@ impl LogQueueCore {
         api_url: Url,
         app_url: Url,
     ) -> Arc<Self> {
-        let channel = make_cmd_channel();
         Arc::new(Self {
-            channel: ArcSwap::from_pointee(channel),
-            dropped_count: AtomicUsize::new(0),
-            last_drop_log_time: AtomicU64::new(0),
-            queue_depth_warning_emitted: AtomicBool::new(false),
             config,
             login_state,
             client,
             api_url,
             app_url,
             project_cache: TokioMutex::new(IndexMap::new()),
-            flush_handle: TokioMutex::new(None),
             version_info: OnceCell::new(),
         })
-    }
-
-    /// Push a submit command directly to the lock-free queue.
-    ///
-    /// This is called by `LogQueue::submit` so that ALL drops (queue-full and
-    /// channel-closed) are handled uniformly here — with drop count tracking,
-    /// throttled warnings, and optional debug dumps.
-    fn push(self: &Arc<Self>, cmd: SubmitCommand) {
-        let channel = self.channel.load();
-        if !reserve_queue_slot(
-            &channel.queued_count,
-            self.config.queue_max_size(),
-            self.config.enforce_queue_size_limit(),
-        ) {
-            self.dropped_count.fetch_add(1, Ordering::Relaxed);
-            self.log_drop_warning();
-            self.dump_dropped_row_if_configured(cmd);
-            return;
-        }
-
-        match channel.sender.try_send(cmd) {
-            Ok(()) => self.log_queue_depth_warning(channel.queued_count.load(Ordering::Relaxed)),
-            Err(TrySendError::Full(_)) => unreachable!("the log queue is unbounded"),
-            Err(TrySendError::Disconnected(_)) => {
-                channel.queued_count.fetch_sub(1, Ordering::Relaxed);
-                self.dropped_count.fetch_add(1, Ordering::Relaxed);
-                self.log_drop_warning();
-            }
-        }
-    }
-
-    /// Trigger a background flush if none is in progress.
-    /// Non-blocking — spawns a tokio task if needed.
-    /// No-op if no tokio runtime is available (e.g. in sync test contexts).
-    async fn trigger_flush_background(self: &Arc<Self>) {
-        let mut guard = self.flush_handle.lock().await;
-
-        // Check if there's an existing flush in progress
-        if let Some(handle) = guard.as_ref() {
-            if !handle.is_finished() {
-                // Flush already in progress
-                return;
-            }
-        }
-
-        // Consume the finished handle to surface any panic or error from the task.
-        if let Some(handle) = guard.take() {
-            if let Err(err) = handle.await {
-                warn!("background flush task failed: {:?}", err);
-            }
-        }
-
-        // No flush in progress, spawn a new one
-        let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
-            // No runtime available
-            return;
-        };
-
-        let core = self.clone();
-        let join_handle = runtime_handle.spawn(async move { core.flush_internal().await });
-
-        *guard = Some(join_handle);
-    }
-
-    /// Flush all rows in the lock-free queue and wait for completion.
-    ///
-    /// If a flush is already in progress, waits for it to complete and then
-    /// flushes any remaining items (matches TypeScript SDK behavior).
-    ///
-    /// Called by the background worker in response to `LogCommand::Flush` /
-    /// `LogCommand::TriggerFlush`. Does NOT drain the worker's mpsc channel —
-    /// callers that need that should use `LogQueue::flush_all()`.
-    pub(super) async fn flush(self: &Arc<Self>) -> std::result::Result<(), anyhow::Error> {
-        loop {
-            // Trigger a flush (no-op if one already running)
-            self.trigger_flush_background().await;
-
-            // Wait for the current flush to complete, if any
-            let handle = {
-                let mut guard = self.flush_handle.lock().await;
-                guard.take()
-            };
-
-            if let Some(handle) = handle {
-                // Wait for the flush task to complete and propagate any errors
-                match handle.await {
-                    Ok(Ok(())) => {
-                        // Flush succeeded
-                    }
-                    Ok(Err(e)) => {
-                        // Flush failed
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        // Task panicked or was cancelled
-                        return Err(anyhow::anyhow!("flush task failed: {}", e));
-                    }
-                }
-            }
-
-            // Check if queue is now empty
-            if self.is_empty() {
-                return Ok(());
-            }
-
-            // Queue is non-empty — items arrived while the flush was running.
-            // Loop back to the top, which calls trigger_flush_background() again.
-        }
     }
 
     /// Get the cached (max_request_size, can_use_overflow) from GET /version.
@@ -255,14 +80,16 @@ impl LogQueueCore {
             .await
     }
 
-    /// Internal flush implementation: drain → prepare → chunk → merge → batch → send.
+    /// Process one detached logical batch: prepare → merge → encode → upload.
     ///
-    /// Commands are drained atomically. Each command is prepared (project
-    /// registration, row building) before batching. Rows are then processed in
+    /// The write service owns membership and the fixed cutoff. Each command is
+    /// prepared (project registration, row building) before batching. Rows are then processed in
     /// sequential chunks of `min(batch_max_items, flush_chunk_size)`.
     /// Within each chunk, batches are sent concurrently.
-    async fn flush_internal(self: &Arc<Self>) -> std::result::Result<(), anyhow::Error> {
-        let cmds = self.drain_all();
+    async fn process(
+        self: &Arc<Self>,
+        cmds: Vec<SubmitCommand>,
+    ) -> std::result::Result<(), anyhow::Error> {
         if cmds.is_empty() {
             return Ok(());
         }
@@ -280,11 +107,7 @@ impl LogQueueCore {
             Ok(url) => url,
             Err(e) => {
                 warn!(error = %e, "Invalid API URL");
-                return if self.config.checked_delivery() {
-                    Err(e.into())
-                } else {
-                    Ok(())
-                };
+                return Err(e.into());
             }
         };
 
@@ -320,11 +143,7 @@ impl LogQueueCore {
         }
 
         if groups.is_empty() {
-            return if self.config.checked_delivery() {
-                first_error.map_or(Ok(()), Err)
-            } else {
-                Ok(())
-            };
+            return first_error.map_or(Ok(()), Err);
         }
 
         // Version info reflects a server-wide limit, so it is fetched once and
@@ -423,11 +242,7 @@ impl LogQueueCore {
                 }
             }
         }
-        if self.config.checked_delivery() {
-            first_error.map_or(Ok(()), Err)
-        } else {
-            Ok(())
-        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Prepare a `Logs3Row` from a submit command's token, payload, and parent info.
@@ -725,40 +540,16 @@ impl LogQueueCore {
         }
         Ok(register_response.project.id)
     }
+}
 
-    /// Drain all commands from the queue with precise flush boundaries.
-    ///
-    /// Atomically swaps in a new channel using lock-free CAS, then drains the old channel.
-    fn drain_all(&self) -> Vec<SubmitCommand> {
-        // A new channel starts a new fill cycle, so it may emit the high-water warning.
-        self.queue_depth_warning_emitted
-            .store(false, Ordering::Relaxed);
-        let old_channel = self.channel.swap(Arc::new(make_cmd_channel()));
-        let mut items = Vec::new();
-        while let Ok(item) = old_channel.receiver.try_recv() {
-            old_channel.queued_count.fetch_sub(1, Ordering::Relaxed);
-            items.push(item);
-        }
-        items
-    }
+/// Reports rejected submissions without coupling admission to batch processing.
+struct RejectionReporter {
+    dropped_count: AtomicUsize,
+    last_drop_log_time: AtomicU64,
+    config: LogQueueConfig,
+}
 
-    /// Check if the queue is approximately empty.
-    pub fn is_empty(&self) -> bool {
-        self.channel.load().receiver.is_empty()
-    }
-
-    /// Get the approximate number of items in the queue (tests only).
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.channel.load().receiver.len()
-    }
-
-    /// Get the total number of dropped items (tests only).
-    #[cfg(test)]
-    pub fn dropped_count(&self) -> usize {
-        self.dropped_count.load(Ordering::Relaxed)
-    }
-
+impl RejectionReporter {
     /// Log a drop warning with throttling.
     ///
     /// Reports the number of items dropped since the last warning was emitted,
@@ -787,23 +578,6 @@ impl LogQueueCore {
                     count
                 );
             }
-        }
-    }
-
-    /// Warn once per fill cycle when the queue reaches 80% of its configured maximum.
-    fn log_queue_depth_warning(&self, queue_size: usize) {
-        let queue_max_size = self.config.queue_max_size();
-        let warning_threshold = queue_max_size.saturating_mul(4).div_ceil(5);
-
-        if queue_size >= warning_threshold
-            && !self
-                .queue_depth_warning_emitted
-                .swap(true, Ordering::Relaxed)
-        {
-            warn!(
-                queue_size,
-                queue_max_size, "Log queue has reached 80% of the configured maximum depth"
-            );
         }
     }
 
@@ -942,405 +716,232 @@ impl LogQueueCore {
     }
 }
 
-/// Lock-free log queue with batching and HTTP dispatch.
-///
-/// This is the complete log processing system:
-/// - Owns the background worker for flush coordination
-/// - Lock-free queue for accumulating submit commands (bounded or unbounded)
-/// - Row preparation (project registration, destination resolution) deferred to flush time
-/// - Automatic batching and serialization via spawn_blocking
-/// - HTTP dispatch with retry logic (concurrent per-chunk batches)
-/// - Atomic drain for precise flush boundaries
-/// - Matches TypeScript SDK `activeFlush` pattern: only one flush runs at a time
-/// - Lazy version fetch for dynamic maxRequestSize and overflow support
+/// Compatibility adapter connecting span preparation to the bounded write service.
 #[derive(Clone)]
 pub struct LogQueue {
-    /// All shared state, also held by the background worker via Arc.
-    core: Arc<LogQueueCore>,
-    /// Channel to the background worker (for flush commands only).
-    worker_sender: mpsc::Sender<LogCommand>,
-    /// Handle to the background worker task.
-    #[allow(dead_code)]
-    worker_handle: Arc<JoinHandle<()>>,
+    rejections: Arc<RejectionReporter>,
+    writes: WriteService<SubmitCommand>,
 }
-
 impl LogQueue {
-    /// Create a new log queue that spawns and owns the background worker.
-    ///
-    /// The worker handles flush coordination; row preparation (project registration,
-    /// destination resolution) happens inside `flush_internal` at flush time.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: LogQueueConfig,
         login_state: LoginState,
         client: reqwest::Client,
-        worker_queue_size: usize,
+        _worker_queue_size: usize,
         api_url: Url,
         app_url: Url,
     ) -> Self {
-        let core = LogQueueCore::new(
-            config,
-            login_state.clone(),
-            client.clone(),
-            api_url,
-            app_url,
+        let capacity = config.queue_max_size();
+        let rejections = Arc::new(RejectionReporter {
+            dropped_count: AtomicUsize::new(0),
+            last_drop_log_time: AtomicU64::new(0),
+            config: config.clone(),
+        });
+        let processor = SpanBatchProcessor::new(config, login_state, client, api_url, app_url);
+        let writes = WriteService::new(
+            capacity,
+            tokio::runtime::Handle::current(),
+            move |commands| {
+                let processor = processor.clone();
+                Box::pin(async move { processor.process(commands).await })
+            },
         );
-
-        let (worker_sender, worker_receiver) = mpsc::channel(worker_queue_size.max(32));
-
-        let worker_handle = Arc::new(tokio::spawn(super::worker::run_worker(
-            worker_receiver,
-            core.clone(),
-        )));
-
-        Self {
-            core,
-            worker_sender,
-            worker_handle,
-        }
+        Self { rejections, writes }
     }
 
-    #[cfg(test)]
-    pub(crate) fn enforces_queue_size_limit(&self) -> bool {
-        self.core.config.enforce_queue_size_limit()
-    }
-
-    /// Submit a span payload for processing.
-    ///
-    /// The command is pushed directly into the lock-free queue. All drops
-    /// (queue-full and channel-closed) go through `LogQueueCore::push`, which
-    /// handles drop counting, throttled warnings, and optional debug dumps
-    /// uniformly. Row preparation (project registration, destination resolution)
-    /// is deferred to flush time.
     pub fn submit(
         &self,
         token: impl Into<String>,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
-    ) {
-        self.core.push(SubmitCommand {
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        let command = SubmitCommand {
             token: token.into(),
             payload,
             parent_info,
-        });
-        // Signal the worker to flush. try_send is non-blocking and best-effort:
-        // if the channel is full the worker already has a flush pending.
-        if !self.core.config.sync_flush() {
-            let _ = self.worker_sender.try_send(LogCommand::TriggerFlush);
-        }
-    }
-
-    /// Flush all pending data through the worker, waiting for completion.
-    ///
-    /// Sends a `Flush` command through the worker channel, which ensures any
-    /// previously submitted rows (still in the worker's mpsc queue) are processed
-    /// before the flush begins. This is the correct flush path for external callers.
-    pub async fn flush_all(&self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.worker_sender
-            .send(LogCommand::Flush(tx))
-            .await
-            .map_err(|_| BraintrustError::ChannelClosed)?;
-        rx.await
-            .map_err(|_| BraintrustError::ChannelClosed)?
-            .map_err(|error| {
-                error.downcast::<BraintrustError>().unwrap_or_else(|error| {
-                    error
-                        .downcast::<reqwest::Error>()
-                        .map(BraintrustError::Http)
-                        .unwrap_or_else(|error| BraintrustError::Background(error.to_string()))
-                })
+        };
+        self.writes
+            .enqueue_with_rejection(command, |command, error| {
+                self.rejections
+                    .dropped_count
+                    .fetch_add(1, Ordering::Relaxed);
+                if matches!(error, crate::EnqueueError::Full) {
+                    self.rejections.log_drop_warning();
+                } else {
+                    warn!(%error, "span submission rejected");
+                }
+                self.rejections.dump_dropped_row_if_configured(command);
             })
     }
 
-    /// Return true if the lock-free row queue is approximately empty.
-    ///
-    /// Note: this inspects only the lock-free queue, not the worker's mpsc backlog,
-    /// so it may briefly report empty while a submit is in flight to the worker.
+    pub fn flush(&self) -> Completion<FlushReport, FlushError> {
+        self.writes.flush()
+    }
+    pub fn shutdown(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Completion<ShutdownReport, ShutdownError> {
+        self.writes.shutdown(timeout)
+    }
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.core.is_empty()
+        self.writes.is_empty()
     }
-
-    /// Trigger a non-blocking background flush via the worker.
     pub async fn trigger_flush_command(&self) -> Result<()> {
-        self.worker_sender
-            .send(LogCommand::TriggerFlush)
-            .await
-            .map_err(|_| BraintrustError::ChannelClosed)
-    }
-}
-
-impl Drop for LogQueue {
-    fn drop(&mut self) {
-        // Skip if the lock-free queue is visibly empty. Credentials travel with each
-        // queued row, so a flush works regardless of shared login state.
-        //
-        // Note: `is_empty()` only inspects the lock-free row queue, not the worker's
-        // mpsc channel. Items submitted but not yet processed by the worker would be
-        // missed by this guard. In practice the window is very small (a race between
-        // Drop and the worker task), and when it does occur the worker's own "channel
-        // closed" handler performs a final flush. Callers that need a hard guarantee
-        // should call `flush_all()` before dropping.
-        if self.core.is_empty() {
-            return;
+        let token = self.flush();
+        if let Err(error) = token.submission() {
+            return Err(error.clone().into());
         }
-
-        // Use flush_all() rather than core.flush() directly. Routing through the
-        // worker ensures any Submit commands ahead of this Drop in the mpsc queue are
-        // processed before the flush begins.
-        //
-        // block_in_place panics on current-thread runtimes (e.g. #[tokio::test]
-        // default). In that case we skip the flush here — callers on a current-thread
-        // runtime should call flush_all() explicitly before dropping.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            // `block_in_place` panics on a current-thread runtime. In that case,
-            // skip the synchronous flush; dropping `worker_sender` closes the
-            // command channel and the worker performs a final flush.
-            if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
-                return;
-            }
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    let _ = self.flush_all().await;
-                });
-            });
-        } else {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let _ = self.flush_all().await;
-            });
-        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log_queue::config::LogQueueConfig;
+    use serde_json::{json, Value};
+    use wiremock::{
+        matchers::{header, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
-    fn make_test_cmd(id: &str) -> SubmitCommand {
-        SubmitCommand {
-            token: "test-token".to_string(),
-            payload: SpanPayload {
-                row_id: id.to_string(),
-                span_id: id.to_string(),
-                is_merge: false,
-                span_components: None,
-                org_id: "org".to_string(),
-                org_name: Some("test-org".to_string()),
-                project_name: None,
-                input: None,
-                output: None,
-                expected: None,
-                error: None,
-                scores: None,
-                metadata: None,
-                metrics: None,
-                tags: None,
-                context: None,
-                span_attributes: None,
-                extra: std::collections::HashMap::new(),
-            },
-            parent_info: Some(ParentSpanInfo::Experiment {
-                object_id: "exp-test".to_string(),
-            }),
+    fn payload(id: &str, merge: bool) -> SpanPayload {
+        SpanPayload {
+            row_id: id.into(),
+            span_id: id.into(),
+            is_merge: merge,
+            span_components: None,
+            org_id: "org".into(),
+            org_name: Some("tenant".into()),
+            project_name: None,
+            input: Some(json!({"value": if merge { 2 } else { 1 }})),
+            output: None,
+            expected: None,
+            error: None,
+            scores: None,
+            metadata: None,
+            metrics: None,
+            tags: None,
+            context: None,
+            span_attributes: None,
+            extra: std::collections::HashMap::new(),
         }
     }
-
-    fn make_queue(max_size: usize) -> LogQueue {
-        // No login state set - prevents background flushes from making real HTTP calls
-        // which would hang tests waiting for connections to non-existent servers.
-        let config = LogQueueConfig::builder()
-            .queue_max_size(max_size)
-            .enforce_queue_size_limit(true) // Enable bounding so drop tests work correctly
-            .sync_flush(true) // Disable auto-flush to avoid background HTTP calls
-            .build();
-        let login_state = LoginState::new();
+    fn queue(server: &MockServer) -> LogQueue {
         LogQueue::new(
-            config,
-            login_state,
+            LogQueueConfig::builder().num_retries(0).build(),
+            LoginState::new(),
             reqwest::Client::new(),
-            256,
-            Url::parse("http://localhost").unwrap(),
-            Url::parse("http://localhost").unwrap(),
+            32,
+            Url::parse(&server.uri()).unwrap(),
+            Url::parse(&server.uri()).unwrap(),
         )
     }
-
-    #[tokio::test]
-    async fn test_drop_does_not_panic_on_current_thread_runtime() {
-        let config = LogQueueConfig::builder()
-            .queue_max_size(10)
-            .enforce_queue_size_limit(true)
-            .sync_flush(true)
-            .build();
-        let login_state = LoginState::new();
-        login_state.set(
-            "test-key".to_string(),
-            "org".to_string(),
-            "test-org".to_string(),
-            "http://127.0.0.1:9".to_string(),
-            "http://127.0.0.1:9".to_string(),
-        );
-        let queue = LogQueue::new(
-            config,
-            login_state,
-            reqwest::Client::new(),
-            256,
-            Url::parse("http://localhost").unwrap(),
-            Url::parse("http://localhost").unwrap(),
-        );
-        queue.core.push(make_test_cmd("1"));
-        // Logged in + non-empty queue: Drop takes the flush path. `#[tokio::test]`
-        // runs on a current-thread runtime, where this previously panicked in
-        // `block_in_place`.
-        drop(queue);
+    fn parent() -> Option<ParentSpanInfo> {
+        Some(ParentSpanInfo::Experiment {
+            object_id: "experiment".into(),
+        })
     }
 
     #[tokio::test]
-    async fn test_push_queues_item() {
-        let queue = make_queue(10);
-        assert!(queue.core.is_empty());
-        queue.core.push(make_test_cmd("1"));
-        assert_eq!(queue.core.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_queue_depth_warning_emits_at_eighty_percent_once_per_fill_cycle() {
-        let queue = make_queue(10);
-
-        for id in 1..8 {
-            queue.core.push(make_test_cmd(&id.to_string()));
+    async fn late_route_failure_fails_merged_members_and_successful_siblings_then_retires() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .and(header("authorization", "Bearer good"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .and(header("authorization", "Bearer bad"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let queue = queue(&server);
+        let first = queue.submit("good", payload("merged", false), parent());
+        let update = queue.submit("good", payload("merged", true), parent());
+        let last = queue.submit("bad", payload("other", false), parent());
+        let Err(FlushError::Delivery(failure)) = queue.flush().await else {
+            panic!("expected failed flush");
+        };
+        assert_eq!(
+            failure.failed, 3,
+            "count accepted operations before merging"
+        );
+        for token in [first, update, last] {
+            let Err(WriteError::Delivery(error)) = token.await else {
+                panic!("expected batch error");
+            };
+            assert!(Arc::ptr_eq(&error, &failure.cause));
         }
-        assert!(!queue
-            .core
-            .queue_depth_warning_emitted
-            .load(Ordering::Relaxed));
-
-        queue.core.push(make_test_cmd("8"));
-        assert!(queue
-            .core
-            .queue_depth_warning_emitted
-            .load(Ordering::Relaxed));
-
-        queue.core.push(make_test_cmd("9"));
-        assert!(queue
-            .core
-            .queue_depth_warning_emitted
-            .load(Ordering::Relaxed));
-
-        queue.core.drain_all();
-        assert!(!queue
-            .core
-            .queue_depth_warning_emitted
-            .load(Ordering::Relaxed));
+        assert!(queue.is_empty());
+        assert_eq!(queue.flush().await.unwrap().delivered, 0);
+        let requests = server.received_requests().await.unwrap();
+        let uploads: Vec<_> = requests
+            .iter()
+            .filter(|req| req.url.path() == "/logs3")
+            .collect();
+        assert_eq!(uploads.len(), 2);
+        let first_body: Value = serde_json::from_slice(&uploads[0].body).unwrap();
+        assert_eq!(first_body["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(first_body["rows"][0]["input"]["value"], 2);
+        let fresh = queue.submit("good", payload("fresh", false), parent());
+        assert_eq!(queue.flush().await.unwrap().delivered, 1);
+        fresh.await.unwrap();
+        queue
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn test_push_drops_when_full() {
-        let queue = make_queue(2);
-        queue.core.push(make_test_cmd("1"));
-        queue.core.push(make_test_cmd("2"));
-        assert_eq!(queue.core.len(), 2);
-
-        // This push should be dropped since the queue is full
-        queue.core.push(make_test_cmd("3"));
-        assert_eq!(queue.core.len(), 2);
-        // The throttled warning fires immediately on the first drop (last_drop_log_time
-        // starts at 0, which is well beyond the throttle window), resetting the counter.
-        assert_eq!(queue.core.dropped_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_drop_count_accumulates_within_throttle_window() {
-        // With a very long logging period the counter accumulates across multiple drops
-        // without resetting (the throttle hasn't expired yet after the first warning fires).
-        let config = LogQueueConfig::builder()
-            .queue_max_size(1)
-            .enforce_queue_size_limit(true)
-            .sync_flush(true)
-            .build();
-        let login_state = LoginState::new();
-        let queue = LogQueue::new(
-            config,
-            login_state,
-            reqwest::Client::new(),
-            256,
-            Url::parse("http://localhost").unwrap(),
-            Url::parse("http://localhost").unwrap(),
-        );
-
-        queue.core.push(make_test_cmd("1")); // fills queue
-
-        // First drop: warning fires (last_drop_log_time=0 is always past throttle),
-        // resets counter to 0 and records timestamp.
-        queue.core.push(make_test_cmd("2")); // dropped, count reset to 0 after warning
-        assert_eq!(queue.core.dropped_count(), 0);
-
-        // Subsequent drops within the same throttle window accumulate without reset.
-        queue.core.push(make_test_cmd("3")); // dropped, counter now 1
-        queue.core.push(make_test_cmd("4")); // dropped, counter now 2
-        assert_eq!(queue.core.dropped_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_unbounded_queue_never_drops() {
-        let config = LogQueueConfig::builder()
-            .enforce_queue_size_limit(false)
-            .sync_flush(true)
-            .build();
-        let login_state = LoginState::new();
-        let queue = LogQueue::new(
-            config,
-            login_state,
-            reqwest::Client::new(),
-            256,
-            Url::parse("http://localhost").unwrap(),
-            Url::parse("http://localhost").unwrap(),
-        );
-
-        // Push many more items than the default queue_max_size
-        for i in 0..20_000 {
-            queue.core.push(make_test_cmd(&i.to_string()));
+    async fn rejected_split_sibling_fails_every_member_despite_an_earlier_committed_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let rows = body["rows"].as_array().unwrap();
+                ResponseTemplate::new(if rows.len() > 1 {
+                    413
+                } else if rows[0]["id"] == "late-failure" {
+                    400
+                } else {
+                    200
+                })
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        let queue = queue(&server);
+        let first = queue.submit("token", payload("committed", false), parent());
+        let last = queue.submit("token", payload("late-failure", false), parent());
+        let Err(FlushError::Delivery(failure)) = queue.flush().await else {
+            panic!("expected failure");
+        };
+        assert_eq!(failure.failed, 2);
+        for token in [first, last] {
+            assert!(matches!(token.await, Err(WriteError::Delivery(_))));
         }
-        assert_eq!(queue.core.len(), 20_000);
-        assert_eq!(queue.core.dropped_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_drain_all_returns_all_items() {
-        let queue = make_queue(10);
-        queue.core.push(make_test_cmd("1"));
-        queue.core.push(make_test_cmd("2"));
-        queue.core.push(make_test_cmd("3"));
-
-        let drained = queue.core.drain_all();
-        assert_eq!(drained.len(), 3);
-        assert!(queue.core.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_drain_all_atomic_boundary() {
-        // Items pushed after drain starts should go to the new channel, not the drained batch
-        let queue = make_queue(10);
-        queue.core.push(make_test_cmd("1"));
-        queue.core.push(make_test_cmd("2"));
-
-        let drained = queue.core.drain_all();
-        assert_eq!(drained.len(), 2);
-
-        // Push after drain goes to the new channel
-        queue.core.push(make_test_cmd("3"));
-        assert_eq!(queue.core.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_push_no_auto_flush_in_sync_mode() {
-        // make_queue uses sync_flush=true, so push() should not trigger background flush
-        let queue = make_queue(10);
-
-        queue.core.push(make_test_cmd("1"));
-        // No flush should be in progress - in sync mode user calls flush() explicitly
-        assert!(queue.core.flush_handle.try_lock().unwrap().is_none());
-        assert_eq!(queue.core.len(), 1);
+        assert!(queue.is_empty());
+        queue.flush().await.unwrap();
+        queue
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 }

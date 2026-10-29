@@ -1,5 +1,7 @@
 pub mod api;
+mod completion;
 mod dataset;
+mod delivery;
 mod error;
 pub mod eval;
 mod experiments;
@@ -17,9 +19,14 @@ mod stream;
 pub(crate) mod test_utils;
 mod types;
 
+pub use completion::{Completion, CompletionFuture};
 pub use dataset::{
     DatasetBuilder, DatasetBuilderError, DatasetInsert, DatasetInsertBuilder,
     DatasetInsertBuilderError, DatasetIterator, DatasetRecord, DatasetSummary,
+};
+pub use delivery::{
+    DeliveryError, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushFailure,
+    FlushReport, ShutdownError, ShutdownReport, WriteError,
 };
 pub use error::{BraintrustError, Result};
 pub use experiments::{
