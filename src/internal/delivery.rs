@@ -1,26 +1,65 @@
-//! Atomic admission, fixed flush cutoffs and active-batch outcome ownership.
+//! Lock-free admission, atomic queue snapshots and batch outcome ownership.
 use crate::{
     Completion, DeliveryError, DeliveryReceipt, EnqueueError, ExecutionError, FlushError,
     FlushFailure, FlushReport, ShutdownError, ShutdownReport, WriteError,
 };
+use arc_swap::ArcSwap;
+use crossbeam_utils::atomic::AtomicCell;
 use futures::{
     future::{BoxFuture, Shared},
+    task::AtomicWaker,
     FutureExt,
 };
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::Duration,
 };
 use tokio::{
     runtime::Handle,
-    sync::{oneshot, Notify, Semaphore},
+    sync::{oneshot, Semaphore},
     task::AbortHandle,
 };
 use tracing::warn;
 
 type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
 type FlushSender = oneshot::Sender<Result<FlushReport, FlushError>>;
+const CLOSED: usize = 1 << (usize::BITS - 1);
+
+/// One worker consumes coalesced notifications; producers never lock a wait list.
+struct Wake {
+    ready: AtomicBool,
+    waker: AtomicWaker,
+}
+impl Wake {
+    fn new() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        }
+    }
+    fn notify_one(&self) {
+        self.ready.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+    async fn notified(&self) {
+        futures::future::poll_fn(|cx| {
+            if self.ready.swap(false, Ordering::AcqRel) {
+                return std::task::Poll::Ready(());
+            }
+            self.waker.register(cx.waker());
+            if self.ready.swap(false, Ordering::AcqRel) {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+}
 #[derive(Clone)]
 enum BatchError {
     Delivery(Arc<DeliveryError>),
@@ -30,13 +69,55 @@ struct Accepted<C> {
     command: C,
     sender: WriteSender,
 }
+type IngressItem<C> = AtomicCell<Option<Box<Accepted<C>>>>;
+struct QueueEpoch<C> {
+    queue: sdd::Queue<IngressItem<C>>,
+    publishers: AtomicUsize,
+    active: AtomicBool,
+}
+impl<C> QueueEpoch<C> {
+    fn new() -> Self {
+        Self {
+            queue: sdd::Queue::new(),
+            publishers: AtomicUsize::new(0),
+            active: AtomicBool::new(false),
+        }
+    }
+    fn enter(&self) -> bool {
+        let mut current = self.publishers.load(Ordering::SeqCst);
+        loop {
+            if current & CLOSED != 0 {
+                return false;
+            }
+            match self.publishers.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(next) => current = next,
+            }
+        }
+    }
+    fn close(&self) {
+        self.publishers.fetch_or(CLOSED, Ordering::SeqCst);
+    }
+    fn settled(&self) -> bool {
+        self.publishers.load(Ordering::SeqCst) & !CLOSED == 0
+    }
+}
 struct Batch<C> {
-    commands: Vec<C>,
+    epoch: Arc<QueueEpoch<C>>,
     completion: Arc<BatchCompletion>,
 }
 struct BatchCompletion {
-    count: usize,
+    count: AtomicUsize,
     senders: Mutex<Option<Vec<WriteSender>>>,
+}
+struct ActiveBatch<C> {
+    epoch: Arc<QueueEpoch<C>>,
+    completion: Arc<BatchCompletion>,
 }
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value
@@ -99,68 +180,36 @@ impl Barrier {
     }
 }
 struct State<C> {
-    pending: Vec<Accepted<C>>,
     ready: VecDeque<Batch<C>>,
-    active: Option<Arc<BatchCompletion>>,
+    active: Option<ActiveBatch<C>>,
     barriers: Vec<Barrier>,
-    outstanding: usize,
     accepting: bool,
     terminal: Option<ExecutionError>,
-    depth_warned: bool,
+    shutdown_pending: Vec<FlushSender>,
 }
 impl<C> State<C> {
-    fn seal(&mut self) {
-        if self.pending.is_empty() {
-            return;
-        }
-        let (commands, writes): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
-            .into_iter()
-            .map(|item| (item.command, item.sender))
-            .unzip();
-        let count = commands.len();
-        self.ready.push_back(Batch {
-            commands,
-            completion: Arc::new(BatchCompletion {
-                count,
-                senders: Mutex::new(Some(writes)),
-            }),
+    fn barrier(&mut self, sender: FlushSender, shutdown: bool, through: Arc<BatchCompletion>) {
+        self.barriers.push(Barrier {
+            through,
+            sender: Some(sender),
+            delivered: 0,
+            failure: None,
+            shutdown,
         });
     }
-    fn barrier(&mut self, sender: FlushSender, shutdown: bool) {
-        self.seal();
-        if let Some(through) = self
-            .ready
-            .back()
-            .map(|batch| batch.completion.clone())
-            .or_else(|| self.active.clone())
-        {
-            self.barriers.push(Barrier {
-                through,
-                sender: Some(sender),
-                delivered: 0,
-                failure: None,
-                shutdown,
-            });
-        } else {
-            let _ = sender.send(Ok(FlushReport::default()));
-        }
-    }
-    fn finish(&mut self, batch: &Arc<BatchCompletion>, result: Result<(), BatchError>) {
+    fn finish(&mut self, batch: &Arc<BatchCompletion>, result: Result<(), BatchError>) -> usize {
         if self
             .active
             .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(active, batch))
+            .is_some_and(|active| Arc::ptr_eq(&active.completion, batch))
         {
-            self.outstanding -= batch.count;
             self.active = None;
-            if self.outstanding == 0 {
-                self.depth_warned = false;
-            }
             batch.finish(&result);
             // Every registered barrier covers this batch: completed cutoffs
             // are removed here, before admitting any subsequent flush.
+            let count = batch.count.load(Ordering::Acquire);
             self.barriers.retain_mut(|barrier| {
-                barrier.record(batch.count as u64, &result);
+                barrier.record(count as u64, &result);
                 if Arc::ptr_eq(&barrier.through, batch) {
                     barrier.finish();
                     false
@@ -168,49 +217,210 @@ impl<C> State<C> {
                     true
                 }
             });
+            return count;
         }
+        0
     }
 }
 struct Inner<C> {
     state: Mutex<State<C>>,
-    wake: Notify,
+    ingress: ArcSwap<QueueEpoch<C>>,
+    outstanding: AtomicUsize,
+    publishers: AtomicUsize,
+    terminal: AtomicU8,
+    depth_warned: AtomicBool,
+    wake: Wake,
     capacity: usize,
     control_limit: usize,
     shutdown_controls: Arc<Semaphore>,
     abort: Mutex<Option<AbortHandle>>,
+    #[cfg(test)]
+    after_take: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 impl<C> Inner<C> {
+    fn begin_publication(&self) -> Result<(), EnqueueError> {
+        let mut current = self.publishers.load(Ordering::SeqCst);
+        loop {
+            if current & CLOSED != 0 {
+                return Err(EnqueueError::Closed);
+            }
+            match self.publishers.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn end_publication(&self) {
+        self.publishers.fetch_sub(1, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    fn reserve(&self) -> Result<usize, EnqueueError> {
+        let mut current = self.outstanding.load(Ordering::Relaxed);
+        loop {
+            if current >= self.capacity {
+                return Err(EnqueueError::Full);
+            }
+            match self.outstanding.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(current + 1),
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn release(&self, count: usize) {
+        if count != 0 && self.outstanding.fetch_sub(count, Ordering::AcqRel) == count {
+            self.depth_warned.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn detach(&self, state: &mut State<C>) -> Arc<BatchCompletion> {
+        let epoch = self.ingress.swap(Arc::new(QueueEpoch::new()));
+        epoch.close();
+        let completion = Arc::new(BatchCompletion {
+            count: AtomicUsize::new(0),
+            senders: Mutex::new(None),
+        });
+        state.ready.push_back(Batch {
+            epoch,
+            completion: completion.clone(),
+        });
+        completion
+    }
+
+    fn register_shutdowns(&self, state: &mut State<C>) -> bool {
+        if state.shutdown_pending.is_empty() {
+            return true;
+        }
+        if self.publishers.load(Ordering::SeqCst) & !CLOSED != 0 {
+            return false;
+        }
+        let through = self.detach(state);
+        for sender in std::mem::take(&mut state.shutdown_pending) {
+            state.barrier(sender, true, through.clone());
+        }
+        true
+    }
+
+    fn fail_epoch(&self, epoch: &QueueEpoch<C>, error: ExecutionError) {
+        while let Some(entry) = epoch.queue.pop() {
+            let accepted = entry.take().expect("each queue entry is taken once");
+            let _ = accepted.sender.send(Err(error.into()));
+            self.release(1);
+        }
+    }
+
+    fn publish(&self, accepted: Accepted<C>)
+    where
+        C: 'static,
+    {
+        let mut accepted = Some(accepted);
+        loop {
+            let epoch = self.ingress.load_full();
+            if epoch.enter() {
+                self.publish_to_epoch(&epoch, accepted.take().unwrap());
+                return;
+            }
+            let terminal = self.terminal.load(Ordering::SeqCst);
+            if terminal != 0 {
+                let error = if terminal == 2 {
+                    ExecutionError::TimedOut
+                } else {
+                    ExecutionError::WorkerLost
+                };
+                let _ = accepted.take().unwrap().sender.send(Err(error.into()));
+                self.release(1);
+                self.end_publication();
+                return;
+            }
+        }
+    }
+
+    fn publish_to_epoch(&self, epoch: &QueueEpoch<C>, accepted: Accepted<C>)
+    where
+        C: 'static,
+    {
+        epoch.active.store(true, Ordering::Release);
+        epoch.queue.push(AtomicCell::new(Some(Box::new(accepted))));
+        epoch.publishers.fetch_sub(1, Ordering::SeqCst);
+        let terminal = self.terminal.load(Ordering::SeqCst);
+        self.end_publication();
+        if terminal != 0 {
+            self.fail_epoch(
+                epoch,
+                if terminal == 2 {
+                    ExecutionError::TimedOut
+                } else {
+                    ExecutionError::WorkerLost
+                },
+            );
+        }
+    }
+
     fn stop(&self, error: ExecutionError) {
+        let code = match error {
+            ExecutionError::WorkerLost => 1,
+            ExecutionError::TimedOut => 2,
+        };
+        let error =
+            match self
+                .terminal
+                .compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => error,
+                Err(2) => ExecutionError::TimedOut,
+                Err(_) => ExecutionError::WorkerLost,
+            };
+        self.publishers.fetch_or(CLOSED, Ordering::SeqCst);
         let mut state = lock(&self.state);
         state.accepting = false;
         if state.terminal.is_some() {
             return;
         }
         state.terminal = Some(error);
-        for accepted in state.pending.drain(..) {
-            let _ = accepted.sender.send(Err(error.into()));
-        }
         let result = Err(BatchError::Execution(error));
         if let Some(active) = state.active.take() {
-            active.finish(&result);
+            active.completion.finish(&result);
+            self.release(active.completion.count.load(Ordering::Acquire));
+            self.fail_epoch(&active.epoch, error);
         }
         for batch in state.ready.drain(..) {
-            batch.completion.finish(&result);
+            batch.epoch.close();
+            self.fail_epoch(&batch.epoch, error);
         }
         for mut barrier in state.barriers.drain(..) {
             barrier.record(0, &result);
         }
-        state.outstanding = 0;
+        for sender in state.shutdown_pending.drain(..) {
+            let _ = sender.send(Err(error.into()));
+        }
+        drop(state);
+        let current = self.ingress.load_full();
+        current.close();
+        self.fail_epoch(&current, error);
         self.wake.notify_one();
     }
     fn close(&self) {
+        self.publishers.fetch_or(CLOSED, Ordering::SeqCst);
         lock(&self.state).accepting = false;
         self.wake.notify_one();
     }
 }
 
-/// Producers own no completed-outcome registry. A batch owns its write senders
-/// until all its physical requests finish; barriers summarize only active work.
+/// Generic delivery coordination for an injected batch processor. Producers own
+/// no completed-outcome registry: a batch owns its write senders until all its
+/// physical requests finish, and barriers summarize only active work.
 pub(crate) struct WriteService<C> {
     inner: Arc<Inner<C>>,
     owners: Arc<ProducerOwner<C>>,
@@ -242,23 +452,32 @@ impl<C: Send + 'static> WriteService<C> {
     where
         F: Fn(Vec<C>) -> BoxFuture<'static, anyhow::Result<()>> + Send + 'static,
     {
+        assert!(
+            IngressItem::<C>::is_lock_free(),
+            "delivery queue requires lock-free pointer-sized atomics"
+        );
         let control_limit = capacity.clamp(1, 1024);
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
-                pending: Vec::new(),
                 ready: VecDeque::new(),
                 active: None,
                 barriers: Vec::new(),
-                outstanding: 0,
                 accepting: true,
                 terminal: None,
-                depth_warned: false,
+                shutdown_pending: Vec::new(),
             }),
-            wake: Notify::new(),
+            ingress: ArcSwap::from_pointee(QueueEpoch::new()),
+            outstanding: AtomicUsize::new(0),
+            publishers: AtomicUsize::new(0),
+            terminal: AtomicU8::new(0),
+            depth_warned: AtomicBool::new(false),
+            wake: Wake::new(),
             capacity,
             control_limit,
             shutdown_controls: Arc::new(Semaphore::new(control_limit)),
             abort: Mutex::new(None),
+            #[cfg(test)]
+            after_take: Mutex::new(None),
         });
         let (sender, receiver) = oneshot::channel();
         let exit = async move { receiver.await.unwrap_or(Err(ExecutionError::WorkerLost)) }
@@ -294,33 +513,33 @@ impl<C: Send + 'static> WriteService<C> {
         rejected: impl FnOnce(C, EnqueueError),
     ) -> Completion<DeliveryReceipt, WriteError> {
         let (sender, mut completion) = Completion::pair();
-        let mut state = lock(&self.inner.state);
-        let error = if !state.accepting {
-            Some(EnqueueError::Closed)
-        } else if state.outstanding >= self.inner.capacity {
-            Some(EnqueueError::Full)
-        } else {
-            None
-        };
-        if let Some(error) = error {
+        let reservation =
+            self.inner
+                .begin_publication()
+                .and_then(|()| match self.inner.reserve() {
+                    Ok(depth) => Ok(depth),
+                    Err(error) => {
+                        self.inner.end_publication();
+                        Err(error)
+                    }
+                });
+        if let Err(error) = reservation {
             completion.record_issuance(Err(error.into()));
-            drop(state);
             rejected(command, error);
         } else {
-            // Sender registration and publication have one linearization point.
-            state.pending.push(Accepted { command, sender });
-            state.outstanding += 1;
-            if !state.depth_warned
-                && state.outstanding >= self.inner.capacity - self.inner.capacity / 5
+            let depth = reservation.expect("checked above");
+            // Publication is the linearization point: completed submissions
+            // appear in FIFO order before a later flush snapshots the queue.
+            self.inner.publish(Accepted { command, sender });
+            if depth >= self.inner.capacity - self.inner.capacity / 5
+                && !self.inner.depth_warned.swap(true, Ordering::Relaxed)
             {
-                state.depth_warned = true;
                 warn!(
-                    outstanding = state.outstanding,
+                    outstanding = depth,
                     capacity = self.inner.capacity,
                     "delivery queue has reached 80% of capacity"
                 );
             }
-            self.inner.wake.notify_one();
         }
         completion
     }
@@ -339,7 +558,8 @@ impl<C: Send + 'static> WriteService<C> {
         {
             completion.record_issuance(Err(EnqueueError::Full.into()));
         } else {
-            state.barrier(sender, false);
+            let through = self.inner.detach(&mut state);
+            state.barrier(sender, false, through);
             self.inner.wake.notify_one();
         }
         completion
@@ -358,8 +578,10 @@ impl<C: Send + 'static> WriteService<C> {
                 completion.record_issuance(Err(error.into()));
                 return completion;
             }
+            self.inner.publishers.fetch_or(CLOSED, Ordering::SeqCst);
             state.accepting = false;
-            state.barrier(barrier_sender, true);
+            state.shutdown_pending.push(barrier_sender);
+            self.inner.register_shutdowns(&mut state);
         }
         let inner = self.inner.clone();
         let exit = self.exit.clone();
@@ -392,11 +614,11 @@ impl<C: Send + 'static> WriteService<C> {
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        lock(&self.inner.state).outstanding == 0
+        self.inner.outstanding.load(Ordering::Acquire) == 0
     }
     #[cfg(test)]
     fn outstanding(&self) -> usize {
-        lock(&self.inner.state).outstanding
+        self.inner.outstanding.load(Ordering::Acquire)
     }
 }
 struct WorkerGuard<C> {
@@ -423,24 +645,107 @@ where
         let wake = guard.inner.wake.notified();
         let next = {
             let mut state = lock(&guard.inner.state);
-            state.seal();
-            match state.ready.pop_front() {
-                Some(batch) => {
-                    state.active = Some(batch.completion.clone());
-                    Some(batch)
+            if state.terminal.is_some() {
+                break;
+            } else if !guard.inner.register_shutdowns(&mut state) {
+                None
+            } else {
+                if state.ready.is_empty()
+                    && guard.inner.ingress.load().active.load(Ordering::Acquire)
+                {
+                    guard.inner.detach(&mut state);
                 }
-                None if !state.accepting => break,
-                None => None,
+                let settled = state
+                    .ready
+                    .front()
+                    .is_some_and(|batch| batch.epoch.settled());
+                match if settled {
+                    state.ready.pop_front()
+                } else {
+                    None
+                } {
+                    Some(batch) => {
+                        state.active = Some(ActiveBatch {
+                            epoch: batch.epoch.clone(),
+                            completion: batch.completion.clone(),
+                        });
+                        Some(batch)
+                    }
+                    None if state.ready.is_empty()
+                        && !state.accepting
+                        && guard.inner.publishers.load(Ordering::SeqCst) & !CLOSED == 0 =>
+                    {
+                        break
+                    }
+                    None => None,
+                }
             }
         };
         if let Some(batch) = next {
-            let result = process(batch.commands)
-                .await
-                .map_err(|source| BatchError::Delivery(Arc::new(DeliveryError { source })));
+            // The generation has been detached. Drain it without holding the
+            // coordinator lock, so concurrent flushes can establish cutoffs.
+            let mut commands = Vec::new();
+            let mut senders = Vec::new();
+            while let Some(entry) = batch.epoch.queue.pop() {
+                let accepted = entry.take().expect("each queue entry is taken once");
+                commands.push(accepted.command);
+                senders.push(accepted.sender);
+                #[cfg(test)]
+                if let Some((entered, resume)) = lock(&guard.inner.after_take).take() {
+                    entered.send(()).unwrap();
+                    resume.recv().unwrap();
+                }
+            }
+            let mut senders = Some(senders);
+            let terminal = {
+                let state = lock(&guard.inner.state);
+                if let Some(error) = state.terminal {
+                    Some(error)
+                } else {
+                    batch
+                        .completion
+                        .count
+                        .store(commands.len(), Ordering::Release);
+                    *lock(&batch.completion.senders) = senders.take();
+                    None
+                }
+            };
+            if let Some(error) = terminal {
+                // stop() drains the rest of the epoch; these entries were
+                // already taken by this worker and remain its responsibility.
+                for sender in senders.take().unwrap_or_default() {
+                    let _ = sender.send(Err(error.into()));
+                }
+                guard.inner.release(commands.len());
+                break;
+            }
+            let result = if commands.is_empty() {
+                Ok(())
+            } else {
+                process(commands)
+                    .await
+                    .map_err(|source| BatchError::Delivery(Arc::new(DeliveryError { source })))
+            };
             if let Err(BatchError::Delivery(error)) = &result {
                 warn!(%error, "delivery batch failed");
             }
-            lock(&guard.inner.state).finish(&batch.completion, result);
+            loop {
+                let wake = guard.inner.wake.notified();
+                let finished = {
+                    let mut state = lock(&guard.inner.state);
+                    if guard.inner.register_shutdowns(&mut state) {
+                        let count = state.finish(&batch.completion, result.clone());
+                        guard.inner.release(count);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if finished {
+                    break;
+                }
+                wake.await;
+            }
         } else {
             wake.await;
         }
@@ -457,6 +762,152 @@ mod tests {
         sync::atomic::{AtomicBool, Ordering},
     };
     use tokio::sync::mpsc;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_does_not_wait_for_coordinator_lock() {
+        let (service, mut entered, gate) = gated(4);
+        let coordinator = lock(&service.inner.state);
+        let producer = service.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let completion = producer.enqueue(7);
+            sent.send(completion.submission().is_ok()).unwrap();
+        });
+        let admitted = received.recv_timeout(Duration::from_secs(2));
+        drop(coordinator);
+        thread.join().unwrap();
+        assert!(admitted.unwrap());
+        assert_eq!(entered.recv().await.unwrap(), vec![7]);
+        gate.add_permits(1);
+        service.shutdown(Duration::from_secs(2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_includes_a_publisher_already_in_progress() {
+        let (service, mut entered, gate) = gated(4);
+        let first = service.enqueue(1);
+        assert_eq!(entered.recv().await.unwrap(), vec![1]);
+
+        service.inner.begin_publication().unwrap();
+        service.inner.reserve().unwrap();
+        let (sender, second) = Completion::pair();
+        let shutdown = service.shutdown(Duration::from_secs(2));
+        let mut shutdown = Box::pin(shutdown.into_future());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        service.inner.publish(Accepted { command: 2, sender });
+        gate.add_permits(1);
+        assert!(first.await.is_ok());
+        assert_eq!(entered.recv().await.unwrap(), vec![2]);
+        gate.add_permits(1);
+        assert!(second.await.is_ok());
+        assert_eq!(shutdown.await.unwrap().delivered(), 2);
+    }
+
+    #[tokio::test]
+    async fn flush_swaps_generation_and_waits_for_its_late_publisher() {
+        let (service, mut entered, gate) = gated(8);
+        let first = service.enqueue(1);
+        assert_eq!(entered.recv().await.unwrap(), vec![1]);
+
+        service.inner.begin_publication().unwrap();
+        service.inner.reserve().unwrap();
+        let old_epoch = service.inner.ingress.load_full();
+        assert!(old_epoch.enter());
+        let (sender, before) = Completion::pair();
+        let mut flush = Box::pin(service.flush().into_future());
+        assert!(!Arc::ptr_eq(&old_epoch, &service.inner.ingress.load_full()));
+        let after = service.enqueue(3);
+        service
+            .inner
+            .publish_to_epoch(&old_epoch, Accepted { command: 2, sender });
+
+        gate.add_permits(1);
+        first.await.unwrap();
+        assert_eq!(entered.recv().await.unwrap(), vec![2]);
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        gate.add_permits(1);
+        before.await.unwrap();
+        assert_eq!(flush.await.unwrap().delivered(), 2);
+        assert_eq!(entered.recv().await.unwrap(), vec![3]);
+        gate.add_permits(1);
+        after.await.unwrap();
+        service.shutdown(Duration::from_secs(2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_detaches_without_draining_the_queue() {
+        let (service, mut entered, gate) = gated(8);
+        let writes: Vec<_> = (0..4).map(|item| service.enqueue(item)).collect();
+        let old_epoch = service.inner.ingress.load_full();
+        let flush = service.flush();
+        assert!(!Arc::ptr_eq(&old_epoch, &service.inner.ingress.load_full()));
+        // On the current-thread runtime, the worker has not run yet. Flush
+        // must not have taken the first item out of the detached queue.
+        assert!(old_epoch.queue.peek(&sdd::Guard::new()).is_some());
+        assert_eq!(entered.recv().await.unwrap(), vec![0, 1, 2, 3]);
+        gate.add_permits(1);
+        assert_eq!(flush.await.unwrap().delivered(), 4);
+        for write in writes {
+            write.await.unwrap();
+        }
+        service.shutdown(Duration::from_secs(2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_failure_completes_a_late_publisher() {
+        let (service, mut entered, _gate) = gated(4);
+        let first = service.enqueue(1);
+        assert_eq!(entered.recv().await.unwrap(), vec![1]);
+        service.inner.begin_publication().unwrap();
+        service.inner.reserve().unwrap();
+        let old_epoch = service.inner.ingress.load_full();
+        assert!(old_epoch.enter());
+        let (sender, late) = Completion::pair();
+        lock(&service.inner.abort).as_ref().unwrap().abort();
+        assert!(matches!(
+            first.await,
+            Err(WriteError::Execution(ExecutionError::WorkerLost))
+        ));
+        service
+            .inner
+            .publish_to_epoch(&old_epoch, Accepted { command: 2, sender });
+        assert!(matches!(
+            late.await,
+            Err(WriteError::Execution(ExecutionError::WorkerLost))
+        ));
+        assert!(service.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_fails_items_taken_and_not_yet_taken_by_worker() {
+        let (service, _entered, _gate) = gated(4);
+        let (taken, wait_taken) = std::sync::mpsc::channel();
+        let (resume, wait_resume) = std::sync::mpsc::channel();
+        *lock(&service.inner.after_take) = Some((taken, wait_resume));
+        let coordinator = lock(&service.inner.state);
+        let first = service.enqueue(1);
+        let second = service.enqueue(2);
+        drop(coordinator);
+        wait_taken.recv_timeout(Duration::from_secs(2)).unwrap();
+        let shutdown = service.shutdown(Duration::from_millis(50));
+        assert!(matches!(
+            shutdown.await,
+            Err(ShutdownError::Execution(ExecutionError::TimedOut))
+        ));
+        resume.send(()).unwrap();
+        for completion in [first, second] {
+            assert!(matches!(
+                completion.await,
+                Err(WriteError::Execution(ExecutionError::TimedOut))
+            ));
+        }
+        let _ = service.exit.clone().await;
+        assert!(service.is_empty());
+    }
 
     fn gated(
         capacity: usize,

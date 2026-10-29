@@ -36,9 +36,7 @@ struct SubmitCommand {
 }
 
 /// Preparation and protocol orchestration, independent of admission/lifecycle.
-struct LogQueueCore {
-    dropped_count: AtomicUsize,
-    last_drop_log_time: AtomicU64,
+struct SpanBatchProcessor {
     config: LogQueueConfig,
     login_state: LoginState,
     client: reqwest::Client,
@@ -47,7 +45,7 @@ struct LogQueueCore {
     project_cache: TokioMutex<IndexMap<String, String>>,
     version_info: OnceCell<(usize, bool)>,
 }
-impl LogQueueCore {
+impl SpanBatchProcessor {
     fn new(
         config: LogQueueConfig,
         login_state: LoginState,
@@ -56,8 +54,6 @@ impl LogQueueCore {
         app_url: Url,
     ) -> Arc<Self> {
         Arc::new(Self {
-            dropped_count: AtomicUsize::new(0),
-            last_drop_log_time: AtomicU64::new(0),
             config,
             login_state,
             client,
@@ -544,7 +540,16 @@ impl LogQueueCore {
         }
         Ok(register_response.project.id)
     }
+}
 
+/// Reports rejected submissions without coupling admission to batch processing.
+struct RejectionReporter {
+    dropped_count: AtomicUsize,
+    last_drop_log_time: AtomicU64,
+    config: LogQueueConfig,
+}
+
+impl RejectionReporter {
     /// Log a drop warning with throttling.
     ///
     /// Reports the number of items dropped since the last warning was emitted,
@@ -714,7 +719,7 @@ impl LogQueueCore {
 /// Compatibility adapter connecting span preparation to the bounded write service.
 #[derive(Clone)]
 pub struct LogQueue {
-    core: Arc<LogQueueCore>,
+    rejections: Arc<RejectionReporter>,
     writes: WriteService<SubmitCommand>,
 }
 impl LogQueue {
@@ -727,8 +732,12 @@ impl LogQueue {
         app_url: Url,
     ) -> Self {
         let capacity = config.queue_max_size();
-        let core = LogQueueCore::new(config, login_state, client, api_url, app_url);
-        let processor = core.clone();
+        let rejections = Arc::new(RejectionReporter {
+            dropped_count: AtomicUsize::new(0),
+            last_drop_log_time: AtomicU64::new(0),
+            config: config.clone(),
+        });
+        let processor = SpanBatchProcessor::new(config, login_state, client, api_url, app_url);
         let writes = WriteService::new(
             capacity,
             tokio::runtime::Handle::current(),
@@ -737,7 +746,7 @@ impl LogQueue {
                 Box::pin(async move { processor.process(commands).await })
             },
         );
-        Self { core, writes }
+        Self { rejections, writes }
     }
 
     pub fn submit(
@@ -753,13 +762,15 @@ impl LogQueue {
         };
         self.writes
             .enqueue_with_rejection(command, |command, error| {
-                self.core.dropped_count.fetch_add(1, Ordering::Relaxed);
+                self.rejections
+                    .dropped_count
+                    .fetch_add(1, Ordering::Relaxed);
                 if matches!(error, crate::EnqueueError::Full) {
-                    self.core.log_drop_warning();
+                    self.rejections.log_drop_warning();
                 } else {
                     warn!(%error, "span submission rejected");
                 }
-                self.core.dump_dropped_row_if_configured(command);
+                self.rejections.dump_dropped_row_if_configured(command);
             })
     }
 
@@ -778,7 +789,7 @@ impl LogQueue {
     }
     pub async fn trigger_flush_command(&self) -> Result<()> {
         let token = self.flush();
-        if let Err(error) = &*token {
+        if let Err(error) = token.submission() {
             return Err(error.clone().into());
         }
         Ok(())
