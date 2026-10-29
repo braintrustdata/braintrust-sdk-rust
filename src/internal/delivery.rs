@@ -327,7 +327,10 @@ impl<C> Inner<C> {
     {
         let mut accepted = Some(accepted);
         loop {
-            let epoch = self.ingress.load_full();
+            // Keep the generation borrowed only for publication; unlike an
+            // owned load this avoids contending on its Arc reference count on
+            // every submission. A concurrent swap keeps the guard alive.
+            let epoch = self.ingress.load();
             if epoch.enter() {
                 self.publish_to_epoch(&epoch, accepted.take().unwrap());
                 return;
