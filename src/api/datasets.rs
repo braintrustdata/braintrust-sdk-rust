@@ -71,72 +71,122 @@ pub struct DatasetInfo {
 }
 
 /// Fields stored in a dataset record. Absent fields are omitted from the wire.
-#[derive(Debug, Clone, Default, Serialize)]
+///
+/// ```
+/// use braintrust_sdk_rust::api::datasets::DatasetFields;
+/// use serde_json::json;
+/// let fields = DatasetFields::builder().input(json!(null)).tags(vec!["test".into()]).build();
+/// assert_eq!(fields.input(), Some(&json!(null)));
+/// assert!(fields.expected().is_none());
+/// ```
+///
+/// Construct fields through the builder rather than depending on their layout:
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::api::datasets::DatasetFields;
+/// let mut fields = DatasetFields::default();
+/// fields.input = Some(serde_json::json!(1));
+/// ```
+#[derive(bon::Builder, Debug, Clone, Default, Serialize)]
 pub struct DatasetFields {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<Value>,
+    #[builder(into)]
+    pub(crate) input: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected: Option<Value>,
+    #[builder(into)]
+    pub(crate) expected: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Map<String, Value>>,
+    pub(crate) metadata: Option<Map<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,
+    pub(crate) tags: Option<Vec<String>>,
+}
+impl DatasetFields {
+    /// Return the supplied input, including an explicit JSON null.
+    pub fn input(&self) -> Option<&Value> {
+        self.input.as_ref()
+    }
+    /// Return the expected output, if supplied.
+    pub fn expected(&self) -> Option<&Value> {
+        self.expected.as_ref()
+    }
+    /// Return the metadata entries, if supplied.
+    pub fn metadata(&self) -> Option<&Map<String, Value>> {
+        self.metadata.as_ref()
+    }
+    /// Return the tags, if supplied.
+    pub fn tags(&self) -> Option<&[String]> {
+        self.tags.as_deref()
+    }
 }
 
 /// A dataset row mutation, independent of tracing/span payloads.
-#[derive(Debug, Clone)]
-pub enum DatasetWrite {
-    Insert {
-        dataset_id: String,
-        id: String,
-        fields: DatasetFields,
-    },
-    /// Merge only the supplied fields into an existing record.
-    Update {
-        dataset_id: String,
-        id: String,
-        fields: DatasetFields,
-    },
-    Delete {
-        dataset_id: String,
-        id: String,
-    },
+///
+/// Use [`Self::insert`], [`Self::update`], or [`Self::delete`] to select the
+/// operation. Its private fields keep wire flags and payload layout extensible.
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::api::datasets::DatasetWrite;
+/// let mut write = DatasetWrite::delete("dataset", "row");
+/// write.id = "other".into();
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct DatasetWrite {
+    dataset_id: String,
+    id: String,
+    #[serde(flatten)]
+    fields: Option<DatasetFields>,
+    #[serde(rename = "_is_merge", skip_serializing_if = "Option::is_none")]
+    is_merge: Option<bool>,
+    #[serde(rename = "_object_delete", skip_serializing_if = "Option::is_none")]
+    is_delete: Option<bool>,
 }
-
-impl Serialize for DatasetWrite {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Row<'a> {
-            dataset_id: &'a str,
-            id: &'a str,
-            #[serde(flatten)]
-            fields: Option<&'a DatasetFields>,
-            #[serde(rename = "_is_merge", skip_serializing_if = "Option::is_none")]
-            is_merge: Option<bool>,
-            #[serde(rename = "_object_delete", skip_serializing_if = "Option::is_none")]
-            is_delete: Option<bool>,
+impl DatasetWrite {
+    /// Insert a record with the supplied ID and fields.
+    pub fn insert(
+        dataset_id: impl Into<String>,
+        id: impl Into<String>,
+        fields: DatasetFields,
+    ) -> Self {
+        Self {
+            dataset_id: dataset_id.into(),
+            id: id.into(),
+            fields: Some(fields),
+            is_merge: None,
+            is_delete: None,
         }
-        let (dataset_id, id, fields, is_merge, is_delete) = match self {
-            Self::Insert {
-                dataset_id,
-                id,
-                fields,
-            } => (dataset_id, id, Some(fields), None, None),
-            Self::Update {
-                dataset_id,
-                id,
-                fields,
-            } => (dataset_id, id, Some(fields), Some(true), None),
-            Self::Delete { dataset_id, id } => (dataset_id, id, None, None, Some(true)),
-        };
-        Row {
-            dataset_id,
-            id,
-            fields,
-            is_merge,
-            is_delete,
+    }
+    /// Merge only the supplied fields into an existing record.
+    pub fn update(
+        dataset_id: impl Into<String>,
+        id: impl Into<String>,
+        fields: DatasetFields,
+    ) -> Self {
+        Self {
+            is_merge: Some(true),
+            ..Self::insert(dataset_id, id, fields)
         }
-        .serialize(serializer)
+    }
+    /// Delete a record without sending record fields.
+    pub fn delete(dataset_id: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            dataset_id: dataset_id.into(),
+            id: id.into(),
+            fields: None,
+            is_merge: None,
+            is_delete: Some(true),
+        }
+    }
+    /// Return the dataset receiving this mutation.
+    pub fn dataset_id(&self) -> &str {
+        &self.dataset_id
+    }
+    /// Return the record ID.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    /// Return the supplied record fields. Deletes have no fields.
+    pub fn fields(&self) -> Option<&DatasetFields> {
+        self.fields.as_ref()
     }
 }
 

@@ -455,11 +455,7 @@ impl Dataset {
         self.api
             .write_dataset_record(
                 &self.scope,
-                DatasetWrite::Insert {
-                    dataset_id,
-                    id: id.clone(),
-                    fields: record.into(),
-                },
+                DatasetWrite::insert(dataset_id, id.clone(), record.into()),
             )
             .await?;
         Ok(id)
@@ -471,11 +467,7 @@ impl Dataset {
         self.api
             .write_dataset_record(
                 &self.scope,
-                DatasetWrite::Update {
-                    dataset_id,
-                    id: id.to_owned(),
-                    fields: record.into(),
-                },
+                DatasetWrite::update(dataset_id, id, record.into()),
             )
             .await
     }
@@ -484,13 +476,7 @@ impl Dataset {
     pub async fn delete(&self, id: &str) -> Result<()> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         self.api
-            .write_dataset_record(
-                &self.scope,
-                DatasetWrite::Delete {
-                    dataset_id,
-                    id: id.to_owned(),
-                },
-            )
+            .write_dataset_record(&self.scope, DatasetWrite::delete(dataset_id, id))
             .await
     }
 

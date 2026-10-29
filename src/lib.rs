@@ -34,8 +34,7 @@ pub use error::{BraintrustError, Result};
 pub use experiments::{
     BaseExperimentInfo, Experiment, ExperimentBuilder, ExperimentBuilderError, ExperimentLog,
     ExperimentLogBuilder, ExperimentSpanBuilder, ExperimentSummary, ExportedExperiment, Feedback,
-    FeedbackBuilder, FeedbackBuilderError, GitMetadataCollect, GitMetadataField,
-    GitMetadataSettings, MetricSummary, ProjectMetadata, RepoInfo, ScoreSummary,
+    FeedbackBuilder, FeedbackBuilderError, MetricSummary, ProjectMetadata, RepoInfo, ScoreSummary,
 };
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
 pub use log_queue::LogQueueConfig;

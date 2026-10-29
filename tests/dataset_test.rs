@@ -620,6 +620,7 @@ async fn mutation_errors_are_direct_and_do_not_replay_or_poison_later_operations
                 Err(braintrust_sdk_rust::BraintrustError::Api {
                     status: actual,
                     message,
+                    ..
                 }) => {
                     assert_eq!(actual, status);
                     assert_eq!(message, "rejected");

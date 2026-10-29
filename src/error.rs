@@ -1,6 +1,20 @@
 use thiserror::Error;
 
+/// SDK failures. Match known cases with a fallback for future variants.
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::BraintrustError;
+/// fn consume(error: BraintrustError) {
+///     match error {
+///         BraintrustError::InvalidConfig(_) | BraintrustError::Network(_)
+///         | BraintrustError::Background(_) | BraintrustError::StreamAggregation(_)
+///         | BraintrustError::Http(_) | BraintrustError::Api { .. }
+///         | BraintrustError::ChannelClosed => {}
+///     }
+/// }
+/// ```
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BraintrustError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
@@ -8,7 +22,18 @@ pub enum BraintrustError {
     Http(#[from] reqwest::Error),
     #[error("network error: {0}")]
     Network(String),
+    /// API failures may gain additional diagnostic fields.
+    ///
+    /// ```compile_fail
+    /// use braintrust_sdk_rust::BraintrustError;
+    /// fn consume(error: BraintrustError) {
+    ///     if let BraintrustError::Api { status, message } = error {
+    ///         let _ = (status, message);
+    ///     }
+    /// }
+    /// ```
     #[error("API error ({status}): {message}")]
+    #[non_exhaustive]
     Api { status: u16, message: String },
     #[error("internal channel closed")]
     ChannelClosed,

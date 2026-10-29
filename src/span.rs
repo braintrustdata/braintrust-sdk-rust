@@ -294,7 +294,22 @@ impl Clone for SpanBuilder {
     }
 }
 
+/// Small options bag identifying the environment that produced a span.
+///
+/// Use the constructor so future options can be added:
+///
+/// ```
+/// use braintrust_sdk_rust::SpanOriginEnvironment;
+/// let environment = SpanOriginEnvironment::new("test", Some("test-environment"));
+/// assert_eq!(environment.environment_type.as_deref(), Some("test"));
+/// ```
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::SpanOriginEnvironment;
+/// let _ = SpanOriginEnvironment { environment_type: Some("test".into()), name: None };
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SpanOriginEnvironment {
     pub environment_type: Option<String>,
     pub name: Option<String>,
@@ -319,46 +334,57 @@ impl SpanOriginEnvironment {
 /// Any explicit `span_origin` values already present in a span's `context` take
 /// precedence over these overrides, which in turn take precedence over the
 /// built-in defaults.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// ```
+/// use braintrust_sdk_rust::{SpanOrigin, SpanOriginEnvironment};
+/// let origin = SpanOrigin::builder()
+///     .name("test-instrumentation").version("1.0")
+///     .instrumentation("test-plugin")
+///     .environment(SpanOriginEnvironment::new("test", Some("test-environment")))
+///     .build();
+/// assert_eq!(origin.name(), Some("test-instrumentation"));
+/// assert_eq!(origin.version(), Some("1.0"));
+/// assert_eq!(origin.instrumentation(), Some("test-plugin"));
+/// assert!(origin.environment().is_some());
+/// assert_eq!(SpanOrigin::builder().build(), SpanOrigin::default());
+/// ```
+///
+/// ```compile_fail
+/// use braintrust_sdk_rust::SpanOrigin;
+/// let mut origin = SpanOrigin::default();
+/// origin.name = Some("other".into());
+/// ```
+#[derive(bon::Builder, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpanOrigin {
     /// Overrides `span_origin.name` (e.g. `"braintrust.plugin.codex"`).
-    pub name: Option<String>,
+    #[builder(into)]
+    name: Option<String>,
     /// Overrides `span_origin.version` (e.g. a plugin version).
-    pub version: Option<String>,
+    #[builder(into)]
+    version: Option<String>,
     /// Overrides `span_origin.instrumentation.name`.
-    pub instrumentation: Option<String>,
+    #[builder(into)]
+    instrumentation: Option<String>,
     /// Overrides `span_origin.environment`.
-    pub environment: Option<SpanOriginEnvironment>,
+    environment: Option<SpanOriginEnvironment>,
 }
 
 impl SpanOrigin {
-    /// Create an empty override (all defaults preserved).
-    pub fn new() -> Self {
-        Self::default()
+    /// Return the name override.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
-
-    /// Set the `span_origin.name` override.
-    pub fn name(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
-        self
+    /// Return the version override.
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
     }
-
-    /// Set the `span_origin.version` override.
-    pub fn version(mut self, version: impl Into<String>) -> Self {
-        self.version = Some(version.into());
-        self
+    /// Return the instrumentation name override.
+    pub fn instrumentation(&self) -> Option<&str> {
+        self.instrumentation.as_deref()
     }
-
-    /// Set the `span_origin.instrumentation.name` override.
-    pub fn instrumentation(mut self, instrumentation: impl Into<String>) -> Self {
-        self.instrumentation = Some(instrumentation.into());
-        self
-    }
-
-    /// Set the `span_origin.environment` override.
-    pub fn with_environment(mut self, environment: SpanOriginEnvironment) -> Self {
-        self.environment = Some(environment);
-        self
+    /// Return the environment override.
+    pub fn environment(&self) -> Option<&SpanOriginEnvironment> {
+        self.environment.as_ref()
     }
 }
 
@@ -1500,10 +1526,11 @@ mod tests {
         span.log(
             SpanLog::builder()
                 .span_origin(
-                    SpanOrigin::new()
+                    SpanOrigin::builder()
                         .name("braintrust.plugin.codex")
                         .version("9.9.9")
-                        .instrumentation("codex-plugin"),
+                        .instrumentation("codex-plugin")
+                        .build(),
                 )
                 .span_attribute("session_id", json!("sess-1"))
                 .build()
@@ -1536,7 +1563,11 @@ mod tests {
         // Builder-level default applies when the SpanLog does not override.
         let (builder, collector) = mock_span_builder();
         let span = builder
-            .span_origin(SpanOrigin::new().name("braintrust.plugin.default"))
+            .span_origin(
+                SpanOrigin::builder()
+                    .name("braintrust.plugin.default")
+                    .build(),
+            )
             .build();
         span.log(SpanLog::builder().input(json!("x")).build().expect("build"));
         span.flush().await.expect("flush");

@@ -40,9 +40,6 @@ pub use builder::{ExperimentBuilder, ExperimentBuilderError};
 pub use event_log::{ExperimentLog, ExperimentLogBuilder};
 pub use experiment::Experiment;
 pub use feedback::{Feedback, FeedbackBuilder, FeedbackBuilderError};
-pub use metadata::{
-    BaseExperimentInfo, ExportedExperiment, GitMetadataCollect, GitMetadataField,
-    GitMetadataSettings, ProjectMetadata, RepoInfo,
-};
+pub use metadata::{BaseExperimentInfo, ExportedExperiment, ProjectMetadata, RepoInfo};
 pub use span_builder::ExperimentSpanBuilder;
 pub use summary::{ExperimentSummary, MetricSummary, ScoreSummary};

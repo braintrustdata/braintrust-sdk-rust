@@ -292,12 +292,12 @@ async fn registration_failure_has_no_invented_id_and_clones_share_a_successful_r
     assert_eq!(experiment.experiment_id(), None);
     assert_eq!(clone.experiment_id(), None);
     let (first, second) = tokio::join!(experiment.project(), clone.project());
-    assert_eq!(first.unwrap().id, "project");
-    assert_eq!(second.unwrap().id, "project");
+    assert_eq!(first.unwrap().id(), "project");
+    assert_eq!(second.unwrap().id(), "project");
     assert_eq!(experiment.experiment_id().as_deref(), Some("experiment"));
     assert_eq!(clone.experiment_id().as_deref(), Some("experiment"));
     assert_eq!(
-        experiment.clone().export().await.unwrap().object_id,
+        experiment.clone().export().await.unwrap().object_id(),
         "experiment"
     );
     experiment
@@ -468,7 +468,7 @@ async fn explicit_experiment_credentials_never_prime_the_shared_session() {
     assert!(!client.is_logged_in().await);
     assert!(client.dataset_builder().await.is_err());
     let exported = experiment.export().await.unwrap();
-    assert_eq!(exported.object_id, "experiment");
+    assert_eq!(exported.object_id(), "experiment");
     assert!(!state.is_logged_in());
 }
 

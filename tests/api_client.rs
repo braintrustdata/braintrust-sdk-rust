@@ -466,26 +466,17 @@ async fn typed_dataset_mutations_use_the_data_plane_once_without_trace_fields() 
     let control = MockServer::start().await;
     let client = api::Client::new(config(&data, &control, "token")).unwrap();
     let writes = [
-        DatasetWrite::Insert {
-            dataset_id: "dataset".into(),
-            id: "row".into(),
-            fields: DatasetFields {
-                input: Some(json!(null)),
-                ..Default::default()
-            },
-        },
-        DatasetWrite::Update {
-            dataset_id: "dataset".into(),
-            id: "row".into(),
-            fields: DatasetFields {
-                expected: Some(json!(42)),
-                ..Default::default()
-            },
-        },
-        DatasetWrite::Delete {
-            dataset_id: "dataset".into(),
-            id: "row".into(),
-        },
+        DatasetWrite::insert(
+            "dataset",
+            "row",
+            DatasetFields::builder().input(json!(null)).build(),
+        ),
+        DatasetWrite::update(
+            "dataset",
+            "row",
+            DatasetFields::builder().expected(json!(42)).build(),
+        ),
+        DatasetWrite::delete("dataset", "row"),
     ];
     Mock::given(method("POST"))
         .and(path("/logs3"))
