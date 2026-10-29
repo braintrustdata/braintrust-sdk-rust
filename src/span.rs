@@ -250,7 +250,9 @@ impl SpanLogBuilder {
     }
 }
 
+#[derive(Clone)]
 pub struct SpanBuilder {
+    name: Option<String>,
     submitter: Arc<dyn SpanSubmitter>,
     scope: CredentialScope,
     project_name: Option<String>,
@@ -272,25 +274,6 @@ impl fmt::Debug for SpanBuilder {
             .field("project_name", &self.project_name)
             .field("parent_info", &self.parent_info)
             .finish_non_exhaustive()
-    }
-}
-
-impl Clone for SpanBuilder {
-    fn clone(&self) -> Self {
-        Self {
-            submitter: Arc::clone(&self.submitter),
-            scope: self.scope.clone(),
-            project_name: self.project_name.clone(),
-            parent_info: self.parent_info.clone(),
-            span_type: self.span_type,
-            purpose: self.purpose.clone(),
-            start_time_override: self.start_time_override,
-            environment: self.environment.clone(),
-            span_id_override: self.span_id_override.clone(),
-            row_id_override: self.row_id_override.clone(),
-            span_origin: self.span_origin.clone(),
-            span_attributes_extra: self.span_attributes_extra.clone(),
-        }
     }
 }
 
@@ -389,8 +372,15 @@ impl SpanOrigin {
 }
 
 impl SpanBuilder {
+    /// Set the span name.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
     pub(crate) fn new(submitter: Arc<dyn SpanSubmitter>, scope: CredentialScope) -> Self {
         Self {
+            name: None,
             submitter,
             scope,
             project_name: None,
@@ -534,6 +524,7 @@ impl SpanBuilder {
             parent_info: self.parent_info,
             row_id: row_id.clone(),
             inner: Arc::new(Mutex::new(SpanData {
+                name: self.name,
                 row_id,
                 span_id,
                 has_flushed: false,
@@ -553,6 +544,7 @@ impl SpanBuilder {
     }
 }
 
+#[derive(Clone)]
 pub struct SpanHandle {
     submitter: Arc<dyn SpanSubmitter>,
     scope: CredentialScope,
@@ -560,18 +552,6 @@ pub struct SpanHandle {
     /// Stable identifier set at creation, accessible without locking.
     row_id: String,
     inner: Arc<Mutex<SpanData>>,
-}
-
-impl Clone for SpanHandle {
-    fn clone(&self) -> Self {
-        Self {
-            submitter: Arc::clone(&self.submitter),
-            scope: self.scope.clone(),
-            parent_info: self.parent_info.clone(),
-            row_id: self.row_id.clone(),
-            inner: Arc::clone(&self.inner),
-        }
-    }
 }
 
 impl SpanHandle {

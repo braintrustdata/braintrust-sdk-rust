@@ -13,7 +13,7 @@
 //!     .await?
 //!     .project_name("my-project")
 //!     .dataset_name("test-cases")
-//!     .build()?;
+//!     .build();
 //!
 //! let id = dataset.insert(
 //!     DatasetInsert::builder()
@@ -35,7 +35,8 @@ use uuid::Uuid;
 pub use crate::api::datasets::DatasetFields;
 use crate::api::datasets::DatasetWrite;
 use crate::error::Result;
-use crate::internal::ports::{DatasetApi, DeliveryControl};
+use crate::internal::ports::DeliveryControl;
+use crate::internal::resources::ResourceTransport;
 use crate::internal::session::CredentialScope;
 
 // ============================================================================
@@ -193,167 +194,42 @@ pub(crate) struct DatasetMetadata {
 use crate::api::btql::{BTQLQuery, BTQLQueryInner};
 use crate::api::datasets::DatasetRegisterRequest;
 
-// ============================================================================
-// DatasetBuilder Error Types
-// ============================================================================
-
-/// Error type for DatasetBuilder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum DatasetBuilderError {
-    /// Project name is required but was not provided.
-    MissingProjectName,
-    /// Dataset name is required but was not provided.
-    MissingDatasetName,
-}
-
-impl fmt::Display for DatasetBuilderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingProjectName => {
-                write!(f, "project_name is required but was not provided")
-            }
-            Self::MissingDatasetName => {
-                write!(f, "dataset_name is required but was not provided")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DatasetBuilderError {}
-
-// ============================================================================
-// DatasetBuilder
-// ============================================================================
-
-/// Builder for creating datasets with lazy registration.
-pub struct DatasetBuilder {
-    api: Arc<dyn DatasetApi>,
-    lifecycle: Arc<dyn DeliveryControl>,
-    scope: CredentialScope,
-    project_name: Option<String>,
-    dataset_name: Option<String>,
-    description: Option<String>,
-    metadata: Option<Map<String, Value>>,
-}
-
-impl Clone for DatasetBuilder {
-    fn clone(&self) -> Self {
-        Self {
-            api: self.api.clone(),
-            lifecycle: self.lifecycle.clone(),
-            scope: self.scope.clone(),
-            project_name: self.project_name.clone(),
-            dataset_name: self.dataset_name.clone(),
-            description: self.description.clone(),
-            metadata: self.metadata.clone(),
-        }
-    }
-}
-
-impl DatasetBuilder {
-    /// Create a new DatasetBuilder (internal use).
-    pub(crate) fn new(
-        api: Arc<dyn DatasetApi>,
-        lifecycle: Arc<dyn DeliveryControl>,
-        scope: CredentialScope,
-    ) -> Self {
-        Self {
-            api,
-            lifecycle,
-            scope,
-            project_name: None,
-            dataset_name: None,
-            description: None,
-            metadata: None,
-        }
-    }
-
-    /// Set the project name (required).
-    pub fn project_name(mut self, project_name: impl Into<String>) -> Self {
-        self.project_name = Some(project_name.into());
-        self
-    }
-
-    /// Set the dataset name (required).
-    pub fn dataset_name(mut self, dataset_name: impl Into<String>) -> Self {
-        self.dataset_name = Some(dataset_name.into());
-        self
-    }
-
-    /// Set the dataset description.
-    pub fn description(mut self, description: impl Into<String>) -> Self {
-        self.description = Some(description.into());
-        self
-    }
-
-    /// Set the dataset metadata.
-    pub fn metadata(mut self, metadata: Map<String, Value>) -> Self {
-        self.metadata = Some(metadata);
-        self
-    }
-
-    /// Add a single metadata entry.
-    pub fn metadata_entry(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
-        self.metadata
-            .get_or_insert_with(Map::new)
-            .insert(key.into(), value.into());
-        self
-    }
-
-    /// Build the dataset (lazy registration).
-    pub fn build(self) -> std::result::Result<Dataset, DatasetBuilderError> {
-        let project_name = self
-            .project_name
-            .ok_or(DatasetBuilderError::MissingProjectName)?;
-        let dataset_name = self
-            .dataset_name
-            .ok_or(DatasetBuilderError::MissingDatasetName)?;
-
-        Ok(Dataset {
-            api: self.api,
-            lifecycle: self.lifecycle,
-            scope: self.scope,
-            project_name,
-            dataset_name,
-            description: self.description,
-            metadata: self.metadata,
-            lazy_metadata: Arc::new(OnceCell::new()),
-        })
-    }
-}
-
-// ============================================================================
-// Dataset
-// ============================================================================
-
 /// A dataset for storing test/evaluation data.
 ///
 /// Datasets are lazily registered with the API on first use.
+/// The builder requires both a project name and a dataset name:
+///
+/// ```compile_fail
+/// # fn missing_project(client: &braintrust_sdk_rust::BraintrustClient) {
+/// client.dataset_builder_with_credentials("token", "tenant").dataset_name("d").build();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn missing_dataset(client: &braintrust_sdk_rust::BraintrustClient) {
+/// client.dataset_builder_with_credentials("token", "tenant").project_name("p").build();
+/// # }
+/// ```
+#[derive(bon::Builder, Clone)]
+#[builder(start_fn(name = new, vis = "pub(crate)"), derive(Clone))]
 pub struct Dataset {
-    api: Arc<dyn DatasetApi>,
+    #[builder(start_fn)]
+    api: ResourceTransport,
+    #[builder(start_fn)]
     lifecycle: Arc<dyn DeliveryControl>,
+    #[builder(start_fn)]
     scope: CredentialScope,
+    /// Project containing the dataset (required).
+    #[builder(into)]
     project_name: String,
+    /// Dataset name (required).
+    #[builder(into)]
     dataset_name: String,
+    #[builder(into)]
     description: Option<String>,
     metadata: Option<Map<String, Value>>,
+    #[builder(skip)]
     lazy_metadata: Arc<OnceCell<DatasetMetadata>>,
-}
-
-impl Clone for Dataset {
-    fn clone(&self) -> Self {
-        Self {
-            api: self.api.clone(),
-            lifecycle: self.lifecycle.clone(),
-            scope: self.scope.clone(),
-            project_name: self.project_name.clone(),
-            dataset_name: self.dataset_name.clone(),
-            description: self.description.clone(),
-            metadata: self.metadata.clone(),
-            lazy_metadata: self.lazy_metadata.clone(),
-        }
-    }
 }
 
 impl fmt::Debug for Dataset {
@@ -498,7 +374,7 @@ impl Dataset {
 /// # }
 /// ```
 pub struct DatasetIterator {
-    fetcher: Arc<dyn DatasetApi>,
+    fetcher: ResourceTransport,
     scope: CredentialScope,
     dataset_id: String,
     batch_size: usize,
@@ -509,7 +385,7 @@ pub struct DatasetIterator {
 
 impl DatasetIterator {
     fn new(
-        fetcher: Arc<dyn DatasetApi>,
+        fetcher: ResourceTransport,
         scope: CredentialScope,
         dataset_id: String,
         batch_size: usize,

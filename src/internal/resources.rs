@@ -1,6 +1,5 @@
-//! Resource ports adapt SDK policy to the shared one-attempt API contracts.
+//! Concrete resource HTTP adapter over the shared one-attempt API contracts.
 use crate::internal::session::CredentialScope;
-use async_trait::async_trait;
 
 use crate::api::{
     btql::{BTQLQuery, BTQLResponse},
@@ -14,7 +13,6 @@ use crate::api::{
 };
 use crate::error::{BraintrustError, Result};
 use crate::experiments::BaseExperimentInfo;
-use crate::internal::ports::{DatasetApi, ExperimentApi};
 
 /// Shared HTTP pool without retaining client/session/delivery state.
 #[derive(Clone)]
@@ -28,11 +26,8 @@ impl ResourceTransport {
     fn resource_api(&self, scope: &CredentialScope) -> Result<crate::api::Client> {
         scope.api(&self.http)
     }
-}
 
-#[async_trait]
-impl ExperimentApi for ResourceTransport {
-    async fn register_experiment(
+    pub async fn register_experiment(
         &self,
         scope: &CredentialScope,
         request: ExperimentRegisterRequest,
@@ -44,7 +39,7 @@ impl ExperimentApi for ResourceTransport {
             .map_err(Into::into)
     }
 
-    async fn fetch_base_experiment(
+    pub async fn fetch_base_experiment(
         &self,
         scope: &CredentialScope,
         experiment_id: &str,
@@ -67,7 +62,7 @@ impl ExperimentApi for ResourceTransport {
         })
     }
 
-    async fn fetch_experiment_comparison(
+    pub async fn fetch_experiment_comparison(
         &self,
         scope: &CredentialScope,
         experiment_id: &str,
@@ -79,11 +74,8 @@ impl ExperimentApi for ResourceTransport {
             .await
             .map_err(Into::into)
     }
-}
 
-#[async_trait]
-impl DatasetApi for ResourceTransport {
-    async fn register_dataset(
+    pub async fn register_dataset(
         &self,
         scope: &CredentialScope,
         request: DatasetRegisterRequest,
@@ -95,7 +87,7 @@ impl DatasetApi for ResourceTransport {
             .map_err(Into::into)
     }
 
-    async fn fetch_dataset_records(
+    pub async fn fetch_dataset_records(
         &self,
         scope: &CredentialScope,
         query: BTQLQuery,
@@ -107,7 +99,7 @@ impl DatasetApi for ResourceTransport {
             .map_err(Into::into)
     }
 
-    async fn fetch_dataset_summary(
+    pub async fn fetch_dataset_summary(
         &self,
         scope: &CredentialScope,
         dataset_id: &str,
@@ -119,7 +111,11 @@ impl DatasetApi for ResourceTransport {
             .map_err(Into::into)
     }
 
-    async fn write_dataset_record(&self, scope: &CredentialScope, row: DatasetWrite) -> Result<()> {
+    pub async fn write_dataset_record(
+        &self,
+        scope: &CredentialScope,
+        row: DatasetWrite,
+    ) -> Result<()> {
         self.resource_api(scope)?
             .datasets()
             .write(&[row])

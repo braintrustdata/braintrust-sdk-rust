@@ -23,8 +23,8 @@ mod types;
 
 pub use completion::{Completion, CompletionFuture};
 pub use dataset::{
-    Dataset, DatasetBuilder, DatasetBuilderError, DatasetFields, DatasetInsert,
-    DatasetInsertBuilder, DatasetIterator, DatasetRecord, DatasetSummary,
+    Dataset, DatasetBuilder, DatasetFields, DatasetInsert, DatasetInsertBuilder, DatasetIterator,
+    DatasetRecord, DatasetSummary,
 };
 pub use delivery::{
     DeliveryError, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushFailure,
@@ -32,9 +32,9 @@ pub use delivery::{
 };
 pub use error::{BraintrustError, Result};
 pub use experiments::{
-    BaseExperimentInfo, Experiment, ExperimentBuilder, ExperimentBuilderError, ExperimentLog,
-    ExperimentLogBuilder, ExperimentSpanBuilder, ExperimentSummary, ExportedExperiment, Feedback,
-    FeedbackBuilder, FeedbackBuilderError, MetricSummary, ProjectMetadata, RepoInfo, ScoreSummary,
+    BaseExperimentInfo, Experiment, ExperimentBuilder, ExperimentLog, ExperimentLogBuilder,
+    ExperimentSpanBuilder, ExperimentSummary, ExportedExperiment, Feedback, FeedbackBuilder,
+    FeedbackBuilderError, MetricSummary, ProjectMetadata, RepoInfo, ScoreSummary,
 };
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
 pub use log_queue::LogQueueConfig;

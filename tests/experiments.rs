@@ -35,8 +35,7 @@ async fn experiment_log_flushes_to_logs_endpoint() {
         .experiment_builder_with_credentials("token", "org-id")
         .project_name("test-project")
         .experiment_name("test-experiment")
-        .build()
-        .expect("build experiment");
+        .build();
 
     let _id = experiment
         .log(
@@ -72,24 +71,6 @@ async fn experiment_log_flushes_to_logs_endpoint() {
 }
 
 #[tokio::test]
-async fn experiment_builder_requires_project_name() {
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_key("token")
-        .api_url("https://api.braintrust.dev")
-        .build()
-        .await
-        .expect("client");
-
-    let result = client
-        .experiment_builder_with_credentials("token", "org-id")
-        .experiment_name("test-experiment")
-        .build();
-
-    assert!(result.is_err());
-}
-
-#[tokio::test]
 async fn experiment_log_feedback_sends_merge_event() {
     let server = MockServer::start().await;
 
@@ -120,8 +101,7 @@ async fn experiment_log_feedback_sends_merge_event() {
     let experiment = client
         .experiment_builder_with_credentials("token", "org-id")
         .project_name("test-project")
-        .build()
-        .expect("build experiment");
+        .build();
 
     // Log an event
     let id = experiment
@@ -213,8 +193,7 @@ async fn experiment_summarize_returns_summary() {
         .experiment_builder_with_credentials("token", "org-id")
         .project_name("test-project")
         .experiment_name("my-experiment")
-        .build()
-        .expect("build experiment");
+        .build();
 
     // Log an event first
     experiment
@@ -285,8 +264,7 @@ async fn registration_failure_has_no_invented_id_and_clones_share_a_successful_r
     let experiment = client
         .experiment_builder_with_credentials("token", "org")
         .project_name("project")
-        .build()
-        .unwrap();
+        .build();
     let clone = experiment.clone();
     assert_api_error(experiment.project().await, 503);
     assert_eq!(experiment.experiment_id(), None);
@@ -336,8 +314,7 @@ async fn every_registration_dependent_operation_returns_the_real_failure() {
     let experiment = client
         .experiment_builder_with_credentials("token", "org")
         .project_name("project")
-        .build()
-        .unwrap();
+        .build();
     assert_api_error(experiment.start_span().await, 400);
     assert_api_error(
         experiment
@@ -394,8 +371,7 @@ async fn event_feedback_and_update_methods_propagate_delivery_rejection() {
     let experiment = client
         .experiment_builder_with_credentials("token", "org")
         .project_name("project")
-        .build()
-        .unwrap();
+        .build();
     assert_api_error(
         experiment
             .log(ExperimentLog::builder().input(json!("value")).build())
@@ -441,8 +417,7 @@ async fn comparison_setup_errors_are_not_silently_treated_as_no_base_experiment(
     let experiment = client
         .experiment_builder_with_credentials("token", "org")
         .project_name("project")
-        .build()
-        .unwrap();
+        .build();
     assert_api_error(experiment.summarize().await, 401);
 }
 
@@ -460,8 +435,7 @@ async fn explicit_experiment_credentials_never_prime_the_shared_session() {
     let experiment = client
         .experiment_builder_with_credentials("private-token", "tenant")
         .project_name("project")
-        .build()
-        .unwrap();
+        .build();
     assert!(!state.is_logged_in());
     experiment.project().await.unwrap();
     assert!(!state.is_logged_in());
@@ -491,8 +465,7 @@ async fn traced_propagates_final_flush_errors_instead_of_discarding_them() {
     let experiment = client
         .experiment_builder_with_credentials("token", "org")
         .project_name("project")
-        .build()
-        .unwrap();
+        .build();
     assert_api_error(experiment.traced(|_| async { 42 }).await, 401);
 }
 
@@ -509,8 +482,7 @@ async fn clones_share_the_selected_span_recording_interface() {
     let experiment = client
         .experiment_builder_with_credentials("token", "org")
         .project_name("project")
-        .build()
-        .unwrap();
+        .build();
     let clone = experiment.clone();
     experiment.start_span().await.unwrap();
     assert!(matches!(
@@ -557,8 +529,7 @@ async fn experiment_resource_adapters_use_the_control_plane_and_preserve_no_base
     let experiment = client
         .experiment_builder_with_credentials("explicit", "org")
         .project_name("project")
-        .build()
-        .unwrap();
+        .build();
     experiment.summarize().await.unwrap();
     let requests = control.received_requests().await.unwrap();
     assert_eq!(requests.len(), 3);
@@ -567,4 +538,83 @@ async fn experiment_resource_adapters_use_the_control_plane_and_preserve_no_base
         .query_pairs()
         .all(|(key, _)| key != "base_experiment_id"));
     assert!(data.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn experiment_builders_preserve_options_and_named_span_configuration() {
+    use braintrust_sdk_rust::{RepoInfo, SpanLog, SpanType};
+    use wiremock::matchers::{body_json, header};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/experiment/register"))
+        .and(header("x-bt-org-name", "tenant"))
+        .and(body_json(json!({
+            "project_name":"project", "org_id":"org", "experiment_name":"named",
+            "description":"description", "base_experiment":"baseline",
+            "metadata":{"source":"test"}, "public":true, "update":true,
+            "repo_info":{"commit":"abc"}
+        })))
+        .respond_with(registered_experiment())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(header("x-bt-org-name", "tenant"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = isolated_client(&server).await;
+    let builder = client
+        .experiment_builder_with_credentials("token", "org")
+        .project_name("project")
+        .experiment_name("named")
+        .description("description")
+        .base_experiment("baseline")
+        .metadata(serde_json::Map::from_iter([(
+            "source".into(),
+            json!("test"),
+        )]))
+        .public(true)
+        .update(true)
+        .repo_info(RepoInfo::builder().commit("abc").build())
+        .org_name("tenant");
+    let experiment = builder.clone().build();
+    experiment
+        .start_span()
+        .await
+        .unwrap()
+        .name("evaluation")
+        .build()
+        .log(SpanLog::default())
+        .await
+        .unwrap();
+    experiment
+        .clone()
+        .start_span()
+        .await
+        .unwrap()
+        .name("custom")
+        .span_type(SpanType::Task)
+        .build()
+        .log(SpanLog::default())
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let rows: Vec<Value> = requests
+        .iter()
+        .filter(|r| r.url.path() == "/logs3")
+        .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap()["rows"][0].clone())
+        .collect();
+    for (row, (name, span_type)) in rows
+        .iter()
+        .zip([("evaluation", "eval"), ("custom", "task")])
+    {
+        assert_eq!(row["experiment_id"], "experiment");
+        assert_eq!(row["span_attributes"]["name"], name);
+        assert_eq!(row["span_attributes"]["type"], span_type);
+    }
 }

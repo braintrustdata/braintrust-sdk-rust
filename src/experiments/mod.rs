@@ -12,7 +12,7 @@
 //!     .experiment_builder_with_credentials(&api_key, &org_id)
 //!     .project_name("my-project")
 //!     .experiment_name("gpt-4-baseline")
-//!     .build()?;
+//!     .build();
 //!
 //! let id = experiment.log(
 //!     ExperimentLog::builder()
@@ -27,7 +27,6 @@
 //! ```
 
 // Public modules
-mod builder;
 mod event_log;
 mod experiment;
 mod feedback;
@@ -36,9 +35,8 @@ mod span_builder;
 mod summary;
 
 // Public re-exports
-pub use builder::{ExperimentBuilder, ExperimentBuilderError};
 pub use event_log::{ExperimentLog, ExperimentLogBuilder};
-pub use experiment::Experiment;
+pub use experiment::{Experiment, ExperimentBuilder};
 pub use feedback::{Feedback, FeedbackBuilder, FeedbackBuilderError};
 pub use metadata::{BaseExperimentInfo, ExportedExperiment, ProjectMetadata, RepoInfo};
 pub use span_builder::ExperimentSpanBuilder;

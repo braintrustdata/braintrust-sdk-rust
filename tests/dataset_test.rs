@@ -15,74 +15,6 @@ fn mock_login_response(orgs: &[(&str, &str)]) -> ResponseTemplate {
 }
 
 #[tokio::test]
-async fn dataset_builder_requires_project_name() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/apikey/login"))
-        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
-        .mount(&server)
-        .await;
-
-    let client = BraintrustClient::builder()
-        .api_key("test-key")
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .blocking_login(true)
-        .build()
-        .await
-        .expect("client");
-
-    let result = client
-        .dataset_builder()
-        .await
-        .unwrap()
-        .dataset_name("test-dataset")
-        .build();
-
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "project_name is required but was not provided"
-    );
-}
-
-#[tokio::test]
-async fn dataset_builder_requires_dataset_name() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/apikey/login"))
-        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
-        .mount(&server)
-        .await;
-
-    let client = BraintrustClient::builder()
-        .api_key("test-key")
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .blocking_login(true)
-        .build()
-        .await
-        .expect("client");
-
-    let result = client
-        .dataset_builder()
-        .await
-        .unwrap()
-        .project_name("test-project")
-        .build();
-
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "dataset_name is required but was not provided"
-    );
-}
-
-#[tokio::test]
 async fn dataset_insert_is_acknowledged_without_flush() {
     let server = MockServer::start().await;
 
@@ -124,8 +56,7 @@ async fn dataset_insert_is_acknowledged_without_flush() {
         .unwrap()
         .project_name("test-project")
         .dataset_name("test-dataset")
-        .build()
-        .expect("dataset builder");
+        .build();
 
     // Insert a record
     let record_id = dataset
@@ -210,8 +141,7 @@ async fn dataset_fetch_returns_records() {
         .unwrap()
         .project_name("test-project")
         .dataset_name("test-dataset")
-        .build()
-        .expect("dataset builder");
+        .build();
 
     // Fetch records
     let iter = dataset.fetch(Some(10)).await.expect("fetch");
@@ -273,8 +203,7 @@ async fn dataset_summarize_returns_summary() {
         .unwrap()
         .project_name("test-project")
         .dataset_name("test-dataset")
-        .build()
-        .expect("dataset builder");
+        .build();
 
     let summary = dataset.summarize().await.expect("summarize");
 
@@ -303,7 +232,6 @@ fn dataset(client: &BraintrustClient) -> braintrust_sdk_rust::Dataset {
         .project_name("project")
         .dataset_name("dataset")
         .build()
-        .unwrap()
 }
 
 #[tokio::test]

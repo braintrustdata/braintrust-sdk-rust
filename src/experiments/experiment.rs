@@ -17,7 +17,8 @@ use crate::experiments::metadata::{
 };
 use crate::experiments::span_builder::ExperimentSpanBuilder;
 use crate::experiments::summary::{ExperimentSummary, MetricSummary, ScoreSummary};
-use crate::internal::ports::{ExperimentApi, SpanSubmitter};
+use crate::internal::ports::SpanSubmitter;
+use crate::internal::resources::ResourceTransport;
 use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle, SpanLog};
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanPayload, SpanType};
@@ -33,8 +34,16 @@ pub(crate) struct ExperimentMetadata {
 /// Handle to a Braintrust experiment.
 ///
 /// Use this to log evaluation events, create spans, log feedback, and get summaries.
+/// The builder requires a project name before it can build:
+///
+/// ```compile_fail
+/// # fn missing_project(client: &braintrust_sdk_rust::BraintrustClient) {
+/// client.experiment_builder_with_credentials("token", "org").experiment_name("e").build();
+/// # }
+/// ```
+#[derive(Clone)]
 pub struct Experiment {
-    pub(crate) api: Arc<dyn ExperimentApi>,
+    pub(crate) api: ResourceTransport,
     pub(crate) submitter: Arc<dyn SpanSubmitter>,
     pub(crate) scope: CredentialScope,
     pub(crate) project_name: String,
@@ -57,26 +66,48 @@ pub(crate) struct ExperimentState {
     called_start_span: AtomicBool,
 }
 
-impl Clone for Experiment {
-    fn clone(&self) -> Self {
+#[bon::bon]
+impl Experiment {
+    /// Create an experiment with shared lazy registration and immutable credentials.
+    #[builder(start_fn(name = builder, vis = "pub(crate)"), builder_type(vis = "pub"), derive(Clone))]
+    pub(crate) fn new(
+        #[builder(start_fn)] api: ResourceTransport,
+        #[builder(start_fn)] submitter: Arc<dyn SpanSubmitter>,
+        #[builder(start_fn)] scope: CredentialScope,
+        #[builder(into)] project_name: String,
+        #[builder(into)] experiment_name: Option<String>,
+        #[builder(into)] description: Option<String>,
+        #[builder(into)] base_experiment: Option<String>,
+        metadata: Option<Map<String, Value>>,
+        public: Option<bool>,
+        /// Continue an existing experiment with this name when true; otherwise create a new one.
+        update: Option<bool>,
+        /// Explicit repository metadata for this experiment.
+        repo_info: Option<RepoInfo>,
+        /// Organization header override for this resource, without changing the client session.
+        #[builder(into)]
+        org_name: Option<String>,
+    ) -> Self {
+        let scope = match org_name {
+            Some(name) => scope.with_org_name(name),
+            None => scope,
+        };
         Self {
-            api: self.api.clone(),
-            submitter: self.submitter.clone(),
-            scope: self.scope.clone(),
-            project_name: self.project_name.clone(),
-            experiment_name: self.experiment_name.clone(),
-            description: self.description.clone(),
-            base_experiment: self.base_experiment.clone(),
-            update: self.update,
-            repo_info: self.repo_info.clone(),
-            metadata: self.metadata.clone(),
-            public: self.public,
-            state: self.state.clone(),
+            api,
+            submitter,
+            scope,
+            project_name,
+            experiment_name,
+            description,
+            base_experiment,
+            metadata,
+            public,
+            update,
+            repo_info,
+            state: Arc::new(ExperimentState::default()),
         }
     }
-}
 
-impl Experiment {
     /// Log an event to the experiment, creating and ending a span internally.
     ///
     /// Returns the span ID which can be used with `log_feedback()`.
@@ -136,7 +167,7 @@ impl Experiment {
     pub async fn start_span(&self) -> Result<ExperimentSpanBuilder> {
         let metadata = self.ensure_registered().await?;
         self.state.called_start_span.store(true, Ordering::Release);
-        Ok(ExperimentSpanBuilder::new(self, metadata.clone()))
+        Ok(ExperimentSpanBuilder::new(self, &metadata.experiment_id))
     }
 
     /// Log feedback on an existing span/record.

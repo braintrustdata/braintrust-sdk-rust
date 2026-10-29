@@ -68,18 +68,18 @@ async fn resources_and_detached_span_builders_work_after_the_client_is_dropped()
         .parent_info(ParentSpanInfo::ProjectLogs {
             object_id: "project".into(),
         });
-    let experiment: ExperimentBuilder = client
+    let experiment = client
         .experiment_builder_with_credentials("token", "org")
         .project_name("p");
-    let dataset: DatasetBuilder = client
+    let dataset = client
         .dataset_builder_with_credentials("token", "tenant")
         .project_name("p")
         .dataset_name("d");
     drop(client);
     let resources = Resources {
         span: span.build(),
-        experiment: experiment.build().unwrap(),
-        dataset: dataset.build().unwrap(),
+        experiment: experiment.build(),
+        dataset: dataset.build(),
     };
     resources.span.log(SpanLog::default()).await.unwrap();
     let child: ExperimentSpanBuilder = resources.experiment.start_span().await.unwrap();

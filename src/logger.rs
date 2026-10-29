@@ -7,9 +7,9 @@ use serde_json::{Map, Value};
 use tokio::sync::Notify;
 use url::Url;
 
-use crate::dataset::DatasetBuilder;
+use crate::dataset::{Dataset, DatasetBuilder};
 use crate::error::{BraintrustError, Result};
-use crate::experiments::ExperimentBuilder;
+use crate::experiments::{Experiment, ExperimentBuilder};
 use crate::http::{build_http_client, CaBundleConfig};
 use crate::internal::ports::SpanSubmitter;
 use crate::internal::resources::ResourceTransport;
@@ -462,8 +462,8 @@ impl std::fmt::Debug for ClientInner {
 }
 
 impl BraintrustClient {
-    fn resource_transport(&self) -> Arc<ResourceTransport> {
-        Arc::new(ResourceTransport::new(self.inner.http_client.clone()))
+    fn resource_transport(&self) -> ResourceTransport {
+        ResourceTransport::new(self.inner.http_client.clone())
     }
 
     fn span_submitter(&self) -> Arc<dyn SpanSubmitter> {
@@ -574,7 +574,7 @@ impl BraintrustClient {
             return Err(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
         }
         let state = self.wait_for_login_state().await?;
-        Ok(DatasetBuilder::new(
+        Ok(Dataset::new(
             self.resource_transport(),
             Arc::new(self.inner.queue.clone()),
             state.scope()?,
@@ -588,7 +588,7 @@ impl BraintrustClient {
         token: impl Into<String>,
         org_name: impl Into<String>,
     ) -> DatasetBuilder {
-        DatasetBuilder::new(
+        Dataset::new(
             self.resource_transport(),
             Arc::new(self.inner.queue.clone()),
             self.explicit_scope(token.into(), String::new(), Some(org_name.into())),
@@ -930,7 +930,7 @@ impl BraintrustClient {
     ///     .experiment_builder_with_credentials(&api_key, &org_id)
     ///     .project_name("my-project")
     ///     .experiment_name("baseline")
-    ///     .build()?;
+    ///     .build();
     /// ```
     pub fn experiment_builder_with_credentials(
         &self,
@@ -941,7 +941,7 @@ impl BraintrustClient {
         let org_id = org_id.into();
 
         let submitter = self.span_submitter();
-        ExperimentBuilder::new(
+        Experiment::builder(
             self.resource_transport(),
             submitter,
             self.explicit_scope(token, org_id, None),
@@ -1167,7 +1167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_ports_do_not_retain_the_whole_client_or_login_state() {
+    async fn resource_dependencies_do_not_retain_the_whole_client_or_login_state() {
         let client = BraintrustClient::builder()
             .skip_login(true)
             .build()
@@ -1188,8 +1188,8 @@ mod tests {
             "resource dependencies must not retain ClientInner"
         );
         let _span = span.build();
-        let _dataset = dataset.build().unwrap();
-        let _experiment = experiment.build().unwrap();
+        let _dataset = dataset.build();
+        let _experiment = experiment.build();
     }
 
     #[tokio::test]

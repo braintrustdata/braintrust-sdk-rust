@@ -110,14 +110,12 @@ async fn logged_in_resources_capture_the_org_route_while_explicit_resources_keep
         .unwrap()
         .project_name("p")
         .dataset_name("d")
-        .build()
-        .unwrap();
+        .build();
     let explicit = client
         .dataset_builder_with_credentials("explicit", "explicit-tenant")
         .project_name("p")
         .dataset_name("d")
-        .build()
-        .unwrap();
+        .build();
     for dataset in [session.clone(), explicit] {
         dataset.insert(record()).await.unwrap();
         assert_eq!(
@@ -330,8 +328,7 @@ async fn experiment_clones_and_child_spans_preserve_the_explicit_scope() {
         .experiment_builder_with_credentials("explicit", "org")
         .org_name("tenant")
         .project_name("p")
-        .build()
-        .unwrap();
+        .build();
     let span = experiment.start_span().await.unwrap().build();
     span.log(SpanLog::default()).await.unwrap();
     experiment.clone().summarize().await.unwrap();
