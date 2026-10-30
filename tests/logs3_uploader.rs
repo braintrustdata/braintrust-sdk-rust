@@ -113,6 +113,7 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
 
     Mock::given(method("GET"))
         .and(path("/version"))
+        .and(wiremock::matchers::header("x-bt-org-name", "my-org"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"logs3_payload_max_bytes": 512})),
         )
@@ -121,6 +122,7 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
 
     Mock::given(method("POST"))
         .and(path("/logs3/overflow"))
+        .and(wiremock::matchers::header("x-bt-org-name", "my-org"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "method": "PUT",
             "signedUrl": signed_upload_url,
@@ -132,17 +134,23 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
 
     Mock::given(method("PUT"))
         .and(path("/signed-upload"))
+        .and(|request: &wiremock::Request| {
+            !request.headers.contains_key("x-bt-org-name")
+                && !request.headers.contains_key("authorization")
+        })
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path("/logs3"))
+        .and(wiremock::matchers::header("x-bt-org-name", "my-org"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .mount(&server)
         .await;
 
-    let mut uploader = Logs3BatchUploader::new(server.uri(), "test-key", None).expect("uploader");
+    let mut uploader =
+        Logs3BatchUploader::new(server.uri(), "test-key", Some("my-org".into())).expect("uploader");
     let rows = vec![make_row("big", 8_000)];
 
     let result = uploader.upload_rows(&rows, 100).await.expect("upload");

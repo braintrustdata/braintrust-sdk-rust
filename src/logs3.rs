@@ -39,6 +39,7 @@ pub struct Logs3UploadResult {
 #[derive(Debug, Clone)]
 pub struct Logs3BatchUploader {
     client: crate::api::Client,
+    org_name: Option<String>,
     max_request_size_override: Option<usize>,
     payload_limits: Option<PayloadLimits>,
 }
@@ -106,6 +107,7 @@ impl Logs3BatchUploader {
         )?;
         Ok(Self {
             client,
+            org_name,
             max_request_size_override: None,
             payload_limits: None,
         })
@@ -288,10 +290,13 @@ impl Logs3BatchUploader {
     ) -> Result<Logs3OverflowUpload> {
         Ok(api_result(
             self.client
-                .logs3_overflow(&Logs3OverflowRequest {
-                    rows: rows.to_vec(),
-                    content_type: Some("application/json".to_owned()),
-                })
+                .logs3_overflow_with_org_name(
+                    &Logs3OverflowRequest {
+                        rows: rows.to_vec(),
+                        content_type: Some("application/json".to_owned()),
+                    },
+                    self.org_name.as_deref(),
+                )
                 .await,
         )
         .await?
