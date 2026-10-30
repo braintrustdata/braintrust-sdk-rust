@@ -2472,6 +2472,320 @@ impl<'a> EvalLaunchBuilder<'a> {
         self.client.eval_launch(self.request).await
     }
 }
+#[doc = concat!("Additive request builder for `", "evalLaunch", "`.")]
+#[must_use]
+pub struct EvalLaunchSseBuilder<'a> {
+    client: &'a HttpClient,
+    request: RunEval,
+}
+impl<'a> EvalLaunchSseBuilder<'a> {
+    /// Replace the complete request body.
+    #[must_use]
+    pub fn request(mut self, request: RunEval) -> Self {
+        self.request = request;
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "base_experiment_id", "`.")]
+    #[must_use]
+    pub fn base_experiment_id(mut self, base_experiment_id: String) -> Self {
+        self.request.base_experiment_id = Some(Some(base_experiment_id));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "base_experiment_id",
+        "` to JSON null."
+    )]
+    #[must_use]
+    pub fn base_experiment_id_null(mut self) -> Self {
+        self.request.base_experiment_id = Some(None);
+        self
+    }
+    #[doc = concat!(
+        "Omit the optional nullable request-body field `", "base_experiment_id", "`."
+    )]
+    #[must_use]
+    pub fn base_experiment_id_absent(mut self) -> Self {
+        self.request.base_experiment_id = None;
+        self
+    }
+    #[doc = concat!(
+        "Set the optional request-body field `", "base_experiment_name", "`."
+    )]
+    #[must_use]
+    pub fn base_experiment_name(mut self, base_experiment_name: String) -> Self {
+        self.request.base_experiment_name = Some(Some(base_experiment_name));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "base_experiment_name",
+        "` to JSON null."
+    )]
+    #[must_use]
+    pub fn base_experiment_name_null(mut self) -> Self {
+        self.request.base_experiment_name = Some(None);
+        self
+    }
+    #[doc = concat!(
+        "Omit the optional nullable request-body field `", "base_experiment_name", "`."
+    )]
+    #[must_use]
+    pub fn base_experiment_name_absent(mut self) -> Self {
+        self.request.base_experiment_name = None;
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "endpoint_name", "`.")]
+    #[must_use]
+    pub fn endpoint_name(mut self, endpoint_name: String) -> Self {
+        self.request.endpoint_name = Some(Some(endpoint_name));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "endpoint_name",
+        "` to JSON null."
+    )]
+    #[must_use]
+    pub fn endpoint_name_null(mut self) -> Self {
+        self.request.endpoint_name = Some(None);
+        self
+    }
+    #[doc = concat!(
+        "Omit the optional nullable request-body field `", "endpoint_name", "`."
+    )]
+    #[must_use]
+    pub fn endpoint_name_absent(mut self) -> Self {
+        self.request.endpoint_name = None;
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "experiment_name", "`.")]
+    #[must_use]
+    pub fn experiment_name(mut self, experiment_name: String) -> Self {
+        self.request.experiment_name = Some(experiment_name);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "extra_messages", "`.")]
+    #[must_use]
+    pub fn extra_messages(mut self, extra_messages: String) -> Self {
+        self.request.extra_messages = Some(extra_messages);
+        self
+    }
+    #[doc = concat!(
+        "Set the optional request-body field `", "git_metadata_settings", "`."
+    )]
+    #[must_use]
+    pub fn git_metadata_settings(
+        mut self,
+        git_metadata_settings: GitMetadataSettings,
+    ) -> Self {
+        self.request.git_metadata_settings = Some(Some(git_metadata_settings));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "git_metadata_settings",
+        "` to JSON null."
+    )]
+    #[must_use]
+    pub fn git_metadata_settings_null(mut self) -> Self {
+        self.request.git_metadata_settings = Some(None);
+        self
+    }
+    #[doc = concat!(
+        "Omit the optional nullable request-body field `", "git_metadata_settings", "`."
+    )]
+    #[must_use]
+    pub fn git_metadata_settings_absent(mut self) -> Self {
+        self.request.git_metadata_settings = None;
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "is_public", "`.")]
+    #[must_use]
+    pub fn is_public(mut self, is_public: bool) -> Self {
+        self.request.is_public = Some(Some(is_public));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "is_public", "` to JSON null."
+    )]
+    #[must_use]
+    pub fn is_public_null(mut self) -> Self {
+        self.request.is_public = Some(None);
+        self
+    }
+    #[doc = concat!(
+        "Omit the optional nullable request-body field `", "is_public", "`."
+    )]
+    #[must_use]
+    pub fn is_public_absent(mut self) -> Self {
+        self.request.is_public = None;
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "max_concurrency", "`.")]
+    #[must_use]
+    pub fn max_concurrency(mut self, max_concurrency: f64) -> Self {
+        self.request.max_concurrency = Some(Some(max_concurrency));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "max_concurrency",
+        "` to JSON null."
+    )]
+    #[must_use]
+    pub fn max_concurrency_null(mut self) -> Self {
+        self.request.max_concurrency = Some(None);
+        self
+    }
+    #[doc = concat!(
+        "Omit the optional nullable request-body field `", "max_concurrency", "`."
+    )]
+    #[must_use]
+    pub fn max_concurrency_absent(mut self) -> Self {
+        self.request.max_concurrency = None;
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "mcp_auth", "`.")]
+    #[must_use]
+    pub fn mcp_auth(mut self, mcp_auth: RunEvalMcpAuth) -> Self {
+        self.request.mcp_auth = Some(mcp_auth);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "metadata", "`.")]
+    #[must_use]
+    pub fn metadata(mut self, metadata: RunEvalMetadata) -> Self {
+        self.request.metadata = Some(metadata);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "name", "`.")]
+    #[must_use]
+    pub fn name(mut self, name: String) -> Self {
+        self.request.name = Some(name);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "parameters", "`.")]
+    #[must_use]
+    pub fn parameters(mut self, parameters: RunEvalParameters) -> Self {
+        self.request.parameters = Some(parameters);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "parent", "`.")]
+    #[must_use]
+    pub fn parent(mut self, parent: InvokeParent) -> Self {
+        self.request.parent = Some(parent);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "repo_info", "`.")]
+    #[must_use]
+    pub fn repo_info(mut self, repo_info: RepoInfo) -> Self {
+        self.request.repo_info = Some(repo_info);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "stop_token", "`.")]
+    #[must_use]
+    pub fn stop_token(mut self, stop_token: String) -> Self {
+        self.request.stop_token = Some(Some(stop_token));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "stop_token", "` to JSON null."
+    )]
+    #[must_use]
+    pub fn stop_token_null(mut self) -> Self {
+        self.request.stop_token = Some(None);
+        self
+    }
+    #[doc = concat!(
+        "Omit the optional nullable request-body field `", "stop_token", "`."
+    )]
+    #[must_use]
+    pub fn stop_token_absent(mut self) -> Self {
+        self.request.stop_token = None;
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "stream", "`.")]
+    #[must_use]
+    pub fn stream(mut self, stream: bool) -> Self {
+        self.request.stream = Some(stream);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "strict", "`.")]
+    #[must_use]
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.request.strict = Some(Some(strict));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "strict", "` to JSON null."
+    )]
+    #[must_use]
+    pub fn strict_null(mut self) -> Self {
+        self.request.strict = Some(None);
+        self
+    }
+    #[doc = concat!("Omit the optional nullable request-body field `", "strict", "`.")]
+    #[must_use]
+    pub fn strict_absent(mut self) -> Self {
+        self.request.strict = None;
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "tags", "`.")]
+    #[must_use]
+    pub fn tags(mut self, tags: Vec<String>) -> Self {
+        self.request.tags = Some(tags);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "timeout", "`.")]
+    #[must_use]
+    pub fn timeout(mut self, timeout: f64) -> Self {
+        self.request.timeout = Some(Some(timeout));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "timeout", "` to JSON null."
+    )]
+    #[must_use]
+    pub fn timeout_null(mut self) -> Self {
+        self.request.timeout = Some(None);
+        self
+    }
+    #[doc = concat!("Omit the optional nullable request-body field `", "timeout", "`.")]
+    #[must_use]
+    pub fn timeout_absent(mut self) -> Self {
+        self.request.timeout = None;
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "trial_count", "`.")]
+    #[must_use]
+    pub fn trial_count(mut self, trial_count: f64) -> Self {
+        self.request.trial_count = Some(Some(trial_count));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "trial_count",
+        "` to JSON null."
+    )]
+    #[must_use]
+    pub fn trial_count_null(mut self) -> Self {
+        self.request.trial_count = Some(None);
+        self
+    }
+    #[doc = concat!(
+        "Omit the optional nullable request-body field `", "trial_count", "`."
+    )]
+    #[must_use]
+    pub fn trial_count_absent(mut self) -> Self {
+        self.request.trial_count = None;
+        self
+    }
+    /// Send the request through the existing flat operation method.
+    pub async fn send(
+        self,
+    ) -> Result<
+        super::sse::BoxSseStream<
+            Result<super::sse::SseEvent<String>, super::sse::StreamingError>,
+        >,
+        ApiOpError<serde_json::Value>,
+    > {
+        self.client.eval_launch_sse(self.request).await
+    }
+}
 #[doc = concat!("Additive request builder for `", "getAcl", "`.")]
 #[must_use]
 pub struct GetAclBuilder<'a> {
@@ -8975,48 +9289,14 @@ impl<'a> PostFunctionIdInvokeBuilder<'a> {
     #[must_use]
     pub fn expected(mut self, expected: serde_json::Value) -> Self {
         let request = self.request.get_or_insert_with(Default::default);
-        request.expected = Some(Some(expected));
-        self
-    }
-    #[doc = concat!(
-        "Set the optional nullable request-body field `", "expected", "` to JSON null."
-    )]
-    #[must_use]
-    pub fn expected_null(mut self) -> Self {
-        let request = self.request.get_or_insert_with(Default::default);
-        request.expected = Some(None);
-        self
-    }
-    #[doc = concat!("Omit the optional nullable request-body field `", "expected", "`.")]
-    #[must_use]
-    pub fn expected_absent(mut self) -> Self {
-        if let Some(request) = self.request.as_mut() {
-            request.expected = None;
-        }
+        request.expected = Some(expected);
         self
     }
     #[doc = concat!("Set the optional request-body field `", "input", "`.")]
     #[must_use]
     pub fn input(mut self, input: serde_json::Value) -> Self {
         let request = self.request.get_or_insert_with(Default::default);
-        request.input = Some(Some(input));
-        self
-    }
-    #[doc = concat!(
-        "Set the optional nullable request-body field `", "input", "` to JSON null."
-    )]
-    #[must_use]
-    pub fn input_null(mut self) -> Self {
-        let request = self.request.get_or_insert_with(Default::default);
-        request.input = Some(None);
-        self
-    }
-    #[doc = concat!("Omit the optional nullable request-body field `", "input", "`.")]
-    #[must_use]
-    pub fn input_absent(mut self) -> Self {
-        if let Some(request) = self.request.as_mut() {
-            request.input = None;
-        }
+        request.input = Some(input);
         self
     }
     #[doc = concat!("Set the optional request-body field `", "mcp_auth", "`.")]
@@ -9205,6 +9485,254 @@ impl<'a> PostFunctionIdInvokeBuilder<'a> {
         self,
     ) -> Result<PostFunctionIdInvokeResponse, ApiOpError<serde_json::Value>> {
         self.client.post_function_id_invoke(self.function_id, self.request).await
+    }
+}
+#[doc = concat!("Additive request builder for `", "postFunctionIdInvoke", "`.")]
+#[must_use]
+pub struct PostFunctionIdInvokeSseBuilder<'a> {
+    client: &'a HttpClient,
+    function_id: String,
+    request: Option<InvokeApi>,
+}
+impl<'a> PostFunctionIdInvokeSseBuilder<'a> {
+    /// Replace the complete request body.
+    #[must_use]
+    pub fn request(mut self, request: InvokeApi) -> Self {
+        self.request = Some(request);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "endpoint_name", "`.")]
+    #[must_use]
+    pub fn endpoint_name(mut self, endpoint_name: String) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.endpoint_name = Some(Some(endpoint_name));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "endpoint_name",
+        "` to JSON null."
+    )]
+    #[must_use]
+    pub fn endpoint_name_null(mut self) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.endpoint_name = Some(None);
+        self
+    }
+    #[doc = concat!(
+        "Omit the optional nullable request-body field `", "endpoint_name", "`."
+    )]
+    #[must_use]
+    pub fn endpoint_name_absent(mut self) -> Self {
+        if let Some(request) = self.request.as_mut() {
+            request.endpoint_name = None;
+        }
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "expected", "`.")]
+    #[must_use]
+    pub fn expected(mut self, expected: serde_json::Value) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.expected = Some(expected);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "input", "`.")]
+    #[must_use]
+    pub fn input(mut self, input: serde_json::Value) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.input = Some(input);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "mcp_auth", "`.")]
+    #[must_use]
+    pub fn mcp_auth(mut self, mcp_auth: InvokeApiMcpAuth) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.mcp_auth = Some(mcp_auth);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "messages", "`.")]
+    #[must_use]
+    pub fn messages(mut self, messages: Vec<ChatCompletionMessageParam>) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.messages = Some(messages);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "metadata", "`.")]
+    #[must_use]
+    pub fn metadata(mut self, metadata: InvokeApiMetadata) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.metadata = Some(Some(metadata));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "metadata", "` to JSON null."
+    )]
+    #[must_use]
+    pub fn metadata_null(mut self) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.metadata = Some(None);
+        self
+    }
+    #[doc = concat!("Omit the optional nullable request-body field `", "metadata", "`.")]
+    #[must_use]
+    pub fn metadata_absent(mut self) -> Self {
+        if let Some(request) = self.request.as_mut() {
+            request.metadata = None;
+        }
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "mode", "`.")]
+    #[must_use]
+    pub fn mode(mut self, mode: StreamingMode) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.mode = Some(Some(mode));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "mode", "` to JSON null."
+    )]
+    #[must_use]
+    pub fn mode_null(mut self) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.mode = Some(None);
+        self
+    }
+    #[doc = concat!("Omit the optional nullable request-body field `", "mode", "`.")]
+    #[must_use]
+    pub fn mode_absent(mut self) -> Self {
+        if let Some(request) = self.request.as_mut() {
+            request.mode = None;
+        }
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "overrides", "`.")]
+    #[must_use]
+    pub fn overrides(mut self, overrides: InvokeApiOverrides) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.overrides = Some(Some(overrides));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "overrides", "` to JSON null."
+    )]
+    #[must_use]
+    pub fn overrides_null(mut self) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.overrides = Some(None);
+        self
+    }
+    #[doc = concat!(
+        "Omit the optional nullable request-body field `", "overrides", "`."
+    )]
+    #[must_use]
+    pub fn overrides_absent(mut self) -> Self {
+        if let Some(request) = self.request.as_mut() {
+            request.overrides = None;
+        }
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "parent", "`.")]
+    #[must_use]
+    pub fn parent(mut self, parent: InvokeParent) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.parent = Some(parent);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "request_source", "`.")]
+    #[must_use]
+    pub fn request_source(mut self, request_source: String) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.request_source = Some(request_source);
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "stream", "`.")]
+    #[must_use]
+    pub fn stream(mut self, stream: bool) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.stream = Some(Some(stream));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "stream", "` to JSON null."
+    )]
+    #[must_use]
+    pub fn stream_null(mut self) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.stream = Some(None);
+        self
+    }
+    #[doc = concat!("Omit the optional nullable request-body field `", "stream", "`.")]
+    #[must_use]
+    pub fn stream_absent(mut self) -> Self {
+        if let Some(request) = self.request.as_mut() {
+            request.stream = None;
+        }
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "strict", "`.")]
+    #[must_use]
+    pub fn strict(mut self, strict: bool) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.strict = Some(Some(strict));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "strict", "` to JSON null."
+    )]
+    #[must_use]
+    pub fn strict_null(mut self) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.strict = Some(None);
+        self
+    }
+    #[doc = concat!("Omit the optional nullable request-body field `", "strict", "`.")]
+    #[must_use]
+    pub fn strict_absent(mut self) -> Self {
+        if let Some(request) = self.request.as_mut() {
+            request.strict = None;
+        }
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "tags", "`.")]
+    #[must_use]
+    pub fn tags(mut self, tags: Vec<String>) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.tags = Some(Some(tags));
+        self
+    }
+    #[doc = concat!(
+        "Set the optional nullable request-body field `", "tags", "` to JSON null."
+    )]
+    #[must_use]
+    pub fn tags_null(mut self) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.tags = Some(None);
+        self
+    }
+    #[doc = concat!("Omit the optional nullable request-body field `", "tags", "`.")]
+    #[must_use]
+    pub fn tags_absent(mut self) -> Self {
+        if let Some(request) = self.request.as_mut() {
+            request.tags = None;
+        }
+        self
+    }
+    #[doc = concat!("Set the optional request-body field `", "version", "`.")]
+    #[must_use]
+    pub fn version(mut self, version: String) -> Self {
+        let request = self.request.get_or_insert_with(Default::default);
+        request.version = Some(version);
+        self
+    }
+    /// Send the request through the existing flat operation method.
+    pub async fn send(
+        self,
+    ) -> Result<
+        super::sse::BoxSseStream<
+            Result<super::sse::SseEvent<String>, super::sse::StreamingError>,
+        >,
+        ApiOpError<serde_json::Value>,
+    > {
+        self.client.post_function_id_invoke_sse(self.function_id, self.request).await
     }
 }
 #[doc = concat!("Additive request builder for `", "postGroup", "`.")]
@@ -16871,6 +17399,243 @@ impl HttpClient {
                 }),
             )
         } else {
+            let typed: Option<serde_json::Value>;
+            let parse_error: Option<String>;
+            match status_code {
+                _ => {
+                    match serde_json::from_str::<serde_json::Value>(&body_text) {
+                        Ok(v) => {
+                            typed = Some(v);
+                            parse_error = None;
+                        }
+                        Err(e) => {
+                            typed = None;
+                            parse_error = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+            Err(
+                ApiOpError::Api(ApiError {
+                    status: status_code,
+                    headers,
+                    body: body_text,
+                    raw_body,
+                    typed,
+                    parse_error,
+                }),
+            )
+        }
+    }
+    /// Launch an eval
+    ///
+    /// Launch an evaluation. This is the API-equivalent of the `Eval` function that is built into the Braintrust SDK. In the Eval API, you provide pointers to a dataset, task function, and scoring functions. The API will then run the evaluation, create an experiment, and return the results along with a link to the experiment. To learn more about evals, see the [Evals guide](https://www.braintrust.dev/docs/evaluate).
+    ///
+    /// `POST /v1/eval`
+    ///Select `text/event-stream` as parsed_sse; accepts response statuses 200. Other successful statuses and mismatched Content-Type values are returned as inspectable API errors.
+    pub async fn eval_launch_sse(
+        &self,
+        request: RunEval,
+    ) -> Result<
+        super::sse::BoxSseStream<
+            Result<super::sse::SseEvent<String>, super::sse::StreamingError>,
+        >,
+        ApiOpError<serde_json::Value>,
+    > {
+        let request_url = format!("{}{}", self.base_url, "/v1/eval");
+        let mut req = self.http_client.post(request_url);
+        req = req
+            .body(serde_json::to_vec(&request).map_err(HttpError::serialization_error)?)
+            .header("content-type", "application/json");
+        if let Some(api_key) = &self.api_key {
+            req = req.bearer_auth(api_key);
+        }
+        for (name, value) in &self.custom_headers {
+            if !name.eq_ignore_ascii_case("accept") {
+                req = req.header(name, value);
+            }
+        }
+        req = req.header(reqwest::header::ACCEPT, "text/event-stream");
+        let response = req.send().await?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        if false || status_code == 200u16 {
+            let actual = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let expected = "text/event-stream";
+            let parse_media = |value: &str| {
+                let mut parts = Vec::new();
+                let mut start = 0;
+                let mut quoted = false;
+                let mut escaped = false;
+                for (index, character) in value.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if character == '\\' && quoted {
+                        escaped = true;
+                        continue;
+                    }
+                    if character == '"' {
+                        quoted = !quoted;
+                    }
+                    if character == ';' && !quoted {
+                        parts.push(&value[start..index]);
+                        start = index + 1;
+                    }
+                }
+                if quoted || escaped {
+                    return None;
+                }
+                parts.push(&value[start..]);
+                let essence = parts
+                    .first()
+                    .copied()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let mut parameters = std::collections::BTreeMap::new();
+                for part in parts.into_iter().skip(1) {
+                    let (name, value) = part.split_once('=')?;
+                    let name = name.trim().to_ascii_lowercase();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let value = value.trim();
+                    let value = if let Some(quoted) = value.strip_prefix('"') {
+                        let inner = quoted.strip_suffix('"')?;
+                        let mut decoded = String::new();
+                        let mut escaped = false;
+                        for character in inner.chars() {
+                            if escaped {
+                                decoded.push(character);
+                                escaped = false;
+                            } else if character == '\\' {
+                                escaped = true;
+                            } else if character == '"' {
+                                return None
+                            } else {
+                                decoded.push(character);
+                            }
+                        }
+                        if escaped {
+                            return None;
+                        }
+                        decoded
+                    } else {
+                        if value.contains('"') {
+                            return None;
+                        }
+                        value.to_string()
+                    };
+                    if parameters.insert(name, value).is_some() {
+                        return None;
+                    }
+                }
+                Some((essence, parameters))
+            };
+            let matches = match (parse_media(&actual), parse_media(expected)) {
+                (
+                    Some((actual_essence, actual_parameters)),
+                    Some((expected_essence, expected_parameters)),
+                ) => {
+                    let essence_matches = if expected_essence == "*/*" {
+                        actual_essence.contains('/')
+                    } else if let Some(prefix) = expected_essence.strip_suffix("/*") {
+                        actual_essence.split('/').next() == Some(prefix)
+                    } else {
+                        actual_essence == expected_essence
+                    };
+                    essence_matches
+                        && expected_parameters
+                            .iter()
+                            .all(|(name, value)| {
+                                actual_parameters
+                                    .get(name)
+                                    .is_some_and(|actual| {
+                                        if name == "charset" {
+                                            actual.eq_ignore_ascii_case(value)
+                                        } else {
+                                            actual == value
+                                        }
+                                    })
+                            })
+                }
+                _ => false,
+            };
+            if !matches {
+                let headers = response.headers().clone();
+                let raw_body = Vec::new();
+                let body_text = String::from_utf8_lossy(&raw_body).into_owned();
+                let typed: Option<serde_json::Value>;
+                let parse_error: Option<String>;
+                match status_code {
+                    _ => {
+                        match serde_json::from_str::<serde_json::Value>(&body_text) {
+                            Ok(v) => {
+                                typed = Some(v);
+                                parse_error = None;
+                            }
+                            Err(e) => {
+                                typed = None;
+                                parse_error = Some(e.to_string());
+                            }
+                        }
+                    }
+                }
+                let _ = parse_error;
+                return Err(
+                    ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: body_text,
+                        raw_body,
+                        typed,
+                        parse_error: Some(
+                            format!(
+                                "unexpected response Content-Type `{}`; expected `{}`",
+                                actual, expected
+                            ),
+                        ),
+                    }),
+                );
+            }
+        }
+        let status = response.status();
+        let status_code = status.as_u16();
+        let headers = response.headers().clone();
+        if false || status_code == 200u16 {
+            Ok(super::sse::parse_sse_response(response))
+        } else {
+            if status.is_success() {
+                return Err(
+                    ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: String::new(),
+                        raw_body: Vec::new(),
+                        typed: None,
+                        parse_error: Some(
+                            format!(
+                                "unexpected successful status {}; generated return type selects `{}`; live response body was not buffered",
+                                status_code, "200",
+                            ),
+                        ),
+                    }),
+                );
+            }
+            let body_bytes = __read_bounded_response_body(
+                    response,
+                    self.max_response_body_bytes,
+                )
+                .await?;
+            let raw_body = body_bytes;
+            let body_text = String::from_utf8_lossy(&raw_body).into_owned();
             let typed: Option<serde_json::Value>;
             let parse_error: Option<String>;
             match status_code {
@@ -33315,6 +34080,253 @@ impl HttpClient {
             )
         }
     }
+    /// Invoke function
+    ///
+    /// Run the specified function with the provided input and return its result. Use `version` to select a specific function version, `parent` to attach the call to a trace, and `stream` to receive results in the Braintrust SSE format.
+    ///
+    /// `POST /v1/function/{function_id}/invoke`
+    ///Select `text/event-stream` as parsed_sse; accepts response statuses 200. Other successful statuses and mismatched Content-Type values are returned as inspectable API errors.
+    pub async fn post_function_id_invoke_sse(
+        &self,
+        function_id: impl AsRef<str>,
+        request: Option<InvokeApi>,
+    ) -> Result<
+        super::sse::BoxSseStream<
+            Result<super::sse::SseEvent<String>, super::sse::StreamingError>,
+        >,
+        ApiOpError<serde_json::Value>,
+    > {
+        let request_url = format!(
+            "{}{}", self.base_url, format!("/v1/function/{}/invoke",
+            __pct_encode_path_segment(function_id.as_ref()))
+        );
+        let mut req = self.http_client.post(request_url);
+        if let Some(request) = request {
+            req = req
+                .body(
+                    serde_json::to_vec(&request).map_err(HttpError::serialization_error)?,
+                )
+                .header("content-type", "application/json");
+        } else {
+            req = req.header(reqwest::header::CONTENT_LENGTH, "0");
+        }
+        if let Some(api_key) = &self.api_key {
+            req = req.bearer_auth(api_key);
+        }
+        for (name, value) in &self.custom_headers {
+            if !name.eq_ignore_ascii_case("accept") {
+                req = req.header(name, value);
+            }
+        }
+        req = req.header(reqwest::header::ACCEPT, "text/event-stream");
+        let response = req.send().await?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        if false || status_code == 200u16 {
+            let actual = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let expected = "text/event-stream";
+            let parse_media = |value: &str| {
+                let mut parts = Vec::new();
+                let mut start = 0;
+                let mut quoted = false;
+                let mut escaped = false;
+                for (index, character) in value.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if character == '\\' && quoted {
+                        escaped = true;
+                        continue;
+                    }
+                    if character == '"' {
+                        quoted = !quoted;
+                    }
+                    if character == ';' && !quoted {
+                        parts.push(&value[start..index]);
+                        start = index + 1;
+                    }
+                }
+                if quoted || escaped {
+                    return None;
+                }
+                parts.push(&value[start..]);
+                let essence = parts
+                    .first()
+                    .copied()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let mut parameters = std::collections::BTreeMap::new();
+                for part in parts.into_iter().skip(1) {
+                    let (name, value) = part.split_once('=')?;
+                    let name = name.trim().to_ascii_lowercase();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let value = value.trim();
+                    let value = if let Some(quoted) = value.strip_prefix('"') {
+                        let inner = quoted.strip_suffix('"')?;
+                        let mut decoded = String::new();
+                        let mut escaped = false;
+                        for character in inner.chars() {
+                            if escaped {
+                                decoded.push(character);
+                                escaped = false;
+                            } else if character == '\\' {
+                                escaped = true;
+                            } else if character == '"' {
+                                return None
+                            } else {
+                                decoded.push(character);
+                            }
+                        }
+                        if escaped {
+                            return None;
+                        }
+                        decoded
+                    } else {
+                        if value.contains('"') {
+                            return None;
+                        }
+                        value.to_string()
+                    };
+                    if parameters.insert(name, value).is_some() {
+                        return None;
+                    }
+                }
+                Some((essence, parameters))
+            };
+            let matches = match (parse_media(&actual), parse_media(expected)) {
+                (
+                    Some((actual_essence, actual_parameters)),
+                    Some((expected_essence, expected_parameters)),
+                ) => {
+                    let essence_matches = if expected_essence == "*/*" {
+                        actual_essence.contains('/')
+                    } else if let Some(prefix) = expected_essence.strip_suffix("/*") {
+                        actual_essence.split('/').next() == Some(prefix)
+                    } else {
+                        actual_essence == expected_essence
+                    };
+                    essence_matches
+                        && expected_parameters
+                            .iter()
+                            .all(|(name, value)| {
+                                actual_parameters
+                                    .get(name)
+                                    .is_some_and(|actual| {
+                                        if name == "charset" {
+                                            actual.eq_ignore_ascii_case(value)
+                                        } else {
+                                            actual == value
+                                        }
+                                    })
+                            })
+                }
+                _ => false,
+            };
+            if !matches {
+                let headers = response.headers().clone();
+                let raw_body = Vec::new();
+                let body_text = String::from_utf8_lossy(&raw_body).into_owned();
+                let typed: Option<serde_json::Value>;
+                let parse_error: Option<String>;
+                match status_code {
+                    _ => {
+                        match serde_json::from_str::<serde_json::Value>(&body_text) {
+                            Ok(v) => {
+                                typed = Some(v);
+                                parse_error = None;
+                            }
+                            Err(e) => {
+                                typed = None;
+                                parse_error = Some(e.to_string());
+                            }
+                        }
+                    }
+                }
+                let _ = parse_error;
+                return Err(
+                    ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: body_text,
+                        raw_body,
+                        typed,
+                        parse_error: Some(
+                            format!(
+                                "unexpected response Content-Type `{}`; expected `{}`",
+                                actual, expected
+                            ),
+                        ),
+                    }),
+                );
+            }
+        }
+        let status = response.status();
+        let status_code = status.as_u16();
+        let headers = response.headers().clone();
+        if false || status_code == 200u16 {
+            Ok(super::sse::parse_sse_response(response))
+        } else {
+            if status.is_success() {
+                return Err(
+                    ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: String::new(),
+                        raw_body: Vec::new(),
+                        typed: None,
+                        parse_error: Some(
+                            format!(
+                                "unexpected successful status {}; generated return type selects `{}`; live response body was not buffered",
+                                status_code, "200",
+                            ),
+                        ),
+                    }),
+                );
+            }
+            let body_bytes = __read_bounded_response_body(
+                    response,
+                    self.max_response_body_bytes,
+                )
+                .await?;
+            let raw_body = body_bytes;
+            let body_text = String::from_utf8_lossy(&raw_body).into_owned();
+            let typed: Option<serde_json::Value>;
+            let parse_error: Option<String>;
+            match status_code {
+                _ => {
+                    match serde_json::from_str::<serde_json::Value>(&body_text) {
+                        Ok(v) => {
+                            typed = Some(v);
+                            parse_error = None;
+                        }
+                        Err(e) => {
+                            typed = None;
+                            parse_error = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+            Err(
+                ApiOpError::Api(ApiError {
+                    status: status_code,
+                    headers,
+                    body: body_text,
+                    raw_body,
+                    typed,
+                    parse_error,
+                }),
+            )
+        }
+    }
     /// Create group
     ///
     /// Create a new group. If there is an existing group with the same name as the one specified in the request, will return the existing group unmodified
@@ -35909,6 +36921,243 @@ impl HttpClient {
             )
         }
     }
+    /// Proxy a model to chat/completions or completions automatically
+    ///
+    /// Proxy a request to either chat/completions or completions automatically based on the model. Will cache if temperature=0 or seed is set.
+    ///
+    /// `POST /v1/proxy/auto`
+    ///Select `text/event-stream` as parsed_sse; accepts response statuses 200. Other successful statuses and mismatched Content-Type values are returned as inspectable API errors.
+    pub async fn proxyauto_sse(
+        &self,
+        request: ProxyautoRequest,
+    ) -> Result<
+        super::sse::BoxSseStream<
+            Result<super::sse::SseEvent<String>, super::sse::StreamingError>,
+        >,
+        ApiOpError<serde_json::Value>,
+    > {
+        let request_url = format!("{}{}", self.base_url, "/v1/proxy/auto");
+        let mut req = self.http_client.post(request_url);
+        req = req
+            .body(serde_json::to_vec(&request).map_err(HttpError::serialization_error)?)
+            .header("content-type", "application/json");
+        if let Some(api_key) = &self.api_key {
+            req = req.bearer_auth(api_key);
+        }
+        for (name, value) in &self.custom_headers {
+            if !name.eq_ignore_ascii_case("accept") {
+                req = req.header(name, value);
+            }
+        }
+        req = req.header(reqwest::header::ACCEPT, "text/event-stream");
+        let response = req.send().await?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        if false || status_code == 200u16 {
+            let actual = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let expected = "text/event-stream";
+            let parse_media = |value: &str| {
+                let mut parts = Vec::new();
+                let mut start = 0;
+                let mut quoted = false;
+                let mut escaped = false;
+                for (index, character) in value.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if character == '\\' && quoted {
+                        escaped = true;
+                        continue;
+                    }
+                    if character == '"' {
+                        quoted = !quoted;
+                    }
+                    if character == ';' && !quoted {
+                        parts.push(&value[start..index]);
+                        start = index + 1;
+                    }
+                }
+                if quoted || escaped {
+                    return None;
+                }
+                parts.push(&value[start..]);
+                let essence = parts
+                    .first()
+                    .copied()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let mut parameters = std::collections::BTreeMap::new();
+                for part in parts.into_iter().skip(1) {
+                    let (name, value) = part.split_once('=')?;
+                    let name = name.trim().to_ascii_lowercase();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let value = value.trim();
+                    let value = if let Some(quoted) = value.strip_prefix('"') {
+                        let inner = quoted.strip_suffix('"')?;
+                        let mut decoded = String::new();
+                        let mut escaped = false;
+                        for character in inner.chars() {
+                            if escaped {
+                                decoded.push(character);
+                                escaped = false;
+                            } else if character == '\\' {
+                                escaped = true;
+                            } else if character == '"' {
+                                return None
+                            } else {
+                                decoded.push(character);
+                            }
+                        }
+                        if escaped {
+                            return None;
+                        }
+                        decoded
+                    } else {
+                        if value.contains('"') {
+                            return None;
+                        }
+                        value.to_string()
+                    };
+                    if parameters.insert(name, value).is_some() {
+                        return None;
+                    }
+                }
+                Some((essence, parameters))
+            };
+            let matches = match (parse_media(&actual), parse_media(expected)) {
+                (
+                    Some((actual_essence, actual_parameters)),
+                    Some((expected_essence, expected_parameters)),
+                ) => {
+                    let essence_matches = if expected_essence == "*/*" {
+                        actual_essence.contains('/')
+                    } else if let Some(prefix) = expected_essence.strip_suffix("/*") {
+                        actual_essence.split('/').next() == Some(prefix)
+                    } else {
+                        actual_essence == expected_essence
+                    };
+                    essence_matches
+                        && expected_parameters
+                            .iter()
+                            .all(|(name, value)| {
+                                actual_parameters
+                                    .get(name)
+                                    .is_some_and(|actual| {
+                                        if name == "charset" {
+                                            actual.eq_ignore_ascii_case(value)
+                                        } else {
+                                            actual == value
+                                        }
+                                    })
+                            })
+                }
+                _ => false,
+            };
+            if !matches {
+                let headers = response.headers().clone();
+                let raw_body = Vec::new();
+                let body_text = String::from_utf8_lossy(&raw_body).into_owned();
+                let typed: Option<serde_json::Value>;
+                let parse_error: Option<String>;
+                match status_code {
+                    _ => {
+                        match serde_json::from_str::<serde_json::Value>(&body_text) {
+                            Ok(v) => {
+                                typed = Some(v);
+                                parse_error = None;
+                            }
+                            Err(e) => {
+                                typed = None;
+                                parse_error = Some(e.to_string());
+                            }
+                        }
+                    }
+                }
+                let _ = parse_error;
+                return Err(
+                    ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: body_text,
+                        raw_body,
+                        typed,
+                        parse_error: Some(
+                            format!(
+                                "unexpected response Content-Type `{}`; expected `{}`",
+                                actual, expected
+                            ),
+                        ),
+                    }),
+                );
+            }
+        }
+        let status = response.status();
+        let status_code = status.as_u16();
+        let headers = response.headers().clone();
+        if false || status_code == 200u16 {
+            Ok(super::sse::parse_sse_response(response))
+        } else {
+            if status.is_success() {
+                return Err(
+                    ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: String::new(),
+                        raw_body: Vec::new(),
+                        typed: None,
+                        parse_error: Some(
+                            format!(
+                                "unexpected successful status {}; generated return type selects `{}`; live response body was not buffered",
+                                status_code, "200",
+                            ),
+                        ),
+                    }),
+                );
+            }
+            let body_bytes = __read_bounded_response_body(
+                    response,
+                    self.max_response_body_bytes,
+                )
+                .await?;
+            let raw_body = body_bytes;
+            let body_text = String::from_utf8_lossy(&raw_body).into_owned();
+            let typed: Option<serde_json::Value>;
+            let parse_error: Option<String>;
+            match status_code {
+                _ => {
+                    match serde_json::from_str::<serde_json::Value>(&body_text) {
+                        Ok(v) => {
+                            typed = Some(v);
+                            parse_error = None;
+                        }
+                        Err(e) => {
+                            typed = None;
+                            parse_error = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+            Err(
+                ApiOpError::Api(ApiError {
+                    status: status_code,
+                    headers,
+                    body: body_text,
+                    raw_body,
+                    typed,
+                    parse_error,
+                }),
+            )
+        }
+    }
     /// Proxy chat/completions
     ///
     /// Proxy a chat/completions request to the specified model, converting its format as needed. Will cache if temperature=0 or seed is set.
@@ -36006,6 +37255,243 @@ impl HttpClient {
             )
         }
     }
+    /// Proxy chat/completions
+    ///
+    /// Proxy a chat/completions request to the specified model, converting its format as needed. Will cache if temperature=0 or seed is set.
+    ///
+    /// `POST /v1/proxy/chat/completions`
+    ///Select `text/event-stream` as parsed_sse; accepts response statuses 200. Other successful statuses and mismatched Content-Type values are returned as inspectable API errors.
+    pub async fn proxychat_completions_sse(
+        &self,
+        request: ProxychatCompletionsRequest,
+    ) -> Result<
+        super::sse::BoxSseStream<
+            Result<super::sse::SseEvent<String>, super::sse::StreamingError>,
+        >,
+        ApiOpError<serde_json::Value>,
+    > {
+        let request_url = format!("{}{}", self.base_url, "/v1/proxy/chat/completions");
+        let mut req = self.http_client.post(request_url);
+        req = req
+            .body(serde_json::to_vec(&request).map_err(HttpError::serialization_error)?)
+            .header("content-type", "application/json");
+        if let Some(api_key) = &self.api_key {
+            req = req.bearer_auth(api_key);
+        }
+        for (name, value) in &self.custom_headers {
+            if !name.eq_ignore_ascii_case("accept") {
+                req = req.header(name, value);
+            }
+        }
+        req = req.header(reqwest::header::ACCEPT, "text/event-stream");
+        let response = req.send().await?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        if false || status_code == 200u16 {
+            let actual = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let expected = "text/event-stream";
+            let parse_media = |value: &str| {
+                let mut parts = Vec::new();
+                let mut start = 0;
+                let mut quoted = false;
+                let mut escaped = false;
+                for (index, character) in value.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if character == '\\' && quoted {
+                        escaped = true;
+                        continue;
+                    }
+                    if character == '"' {
+                        quoted = !quoted;
+                    }
+                    if character == ';' && !quoted {
+                        parts.push(&value[start..index]);
+                        start = index + 1;
+                    }
+                }
+                if quoted || escaped {
+                    return None;
+                }
+                parts.push(&value[start..]);
+                let essence = parts
+                    .first()
+                    .copied()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let mut parameters = std::collections::BTreeMap::new();
+                for part in parts.into_iter().skip(1) {
+                    let (name, value) = part.split_once('=')?;
+                    let name = name.trim().to_ascii_lowercase();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let value = value.trim();
+                    let value = if let Some(quoted) = value.strip_prefix('"') {
+                        let inner = quoted.strip_suffix('"')?;
+                        let mut decoded = String::new();
+                        let mut escaped = false;
+                        for character in inner.chars() {
+                            if escaped {
+                                decoded.push(character);
+                                escaped = false;
+                            } else if character == '\\' {
+                                escaped = true;
+                            } else if character == '"' {
+                                return None
+                            } else {
+                                decoded.push(character);
+                            }
+                        }
+                        if escaped {
+                            return None;
+                        }
+                        decoded
+                    } else {
+                        if value.contains('"') {
+                            return None;
+                        }
+                        value.to_string()
+                    };
+                    if parameters.insert(name, value).is_some() {
+                        return None;
+                    }
+                }
+                Some((essence, parameters))
+            };
+            let matches = match (parse_media(&actual), parse_media(expected)) {
+                (
+                    Some((actual_essence, actual_parameters)),
+                    Some((expected_essence, expected_parameters)),
+                ) => {
+                    let essence_matches = if expected_essence == "*/*" {
+                        actual_essence.contains('/')
+                    } else if let Some(prefix) = expected_essence.strip_suffix("/*") {
+                        actual_essence.split('/').next() == Some(prefix)
+                    } else {
+                        actual_essence == expected_essence
+                    };
+                    essence_matches
+                        && expected_parameters
+                            .iter()
+                            .all(|(name, value)| {
+                                actual_parameters
+                                    .get(name)
+                                    .is_some_and(|actual| {
+                                        if name == "charset" {
+                                            actual.eq_ignore_ascii_case(value)
+                                        } else {
+                                            actual == value
+                                        }
+                                    })
+                            })
+                }
+                _ => false,
+            };
+            if !matches {
+                let headers = response.headers().clone();
+                let raw_body = Vec::new();
+                let body_text = String::from_utf8_lossy(&raw_body).into_owned();
+                let typed: Option<serde_json::Value>;
+                let parse_error: Option<String>;
+                match status_code {
+                    _ => {
+                        match serde_json::from_str::<serde_json::Value>(&body_text) {
+                            Ok(v) => {
+                                typed = Some(v);
+                                parse_error = None;
+                            }
+                            Err(e) => {
+                                typed = None;
+                                parse_error = Some(e.to_string());
+                            }
+                        }
+                    }
+                }
+                let _ = parse_error;
+                return Err(
+                    ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: body_text,
+                        raw_body,
+                        typed,
+                        parse_error: Some(
+                            format!(
+                                "unexpected response Content-Type `{}`; expected `{}`",
+                                actual, expected
+                            ),
+                        ),
+                    }),
+                );
+            }
+        }
+        let status = response.status();
+        let status_code = status.as_u16();
+        let headers = response.headers().clone();
+        if false || status_code == 200u16 {
+            Ok(super::sse::parse_sse_response(response))
+        } else {
+            if status.is_success() {
+                return Err(
+                    ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: String::new(),
+                        raw_body: Vec::new(),
+                        typed: None,
+                        parse_error: Some(
+                            format!(
+                                "unexpected successful status {}; generated return type selects `{}`; live response body was not buffered",
+                                status_code, "200",
+                            ),
+                        ),
+                    }),
+                );
+            }
+            let body_bytes = __read_bounded_response_body(
+                    response,
+                    self.max_response_body_bytes,
+                )
+                .await?;
+            let raw_body = body_bytes;
+            let body_text = String::from_utf8_lossy(&raw_body).into_owned();
+            let typed: Option<serde_json::Value>;
+            let parse_error: Option<String>;
+            match status_code {
+                _ => {
+                    match serde_json::from_str::<serde_json::Value>(&body_text) {
+                        Ok(v) => {
+                            typed = Some(v);
+                            parse_error = None;
+                        }
+                        Err(e) => {
+                            typed = None;
+                            parse_error = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+            Err(
+                ApiOpError::Api(ApiError {
+                    status: status_code,
+                    headers,
+                    body: body_text,
+                    raw_body,
+                    typed,
+                    parse_error,
+                }),
+            )
+        }
+    }
     /// Proxy completions
     ///
     /// Proxy a completions request to the specified model, converting its format as needed. Will cache if temperature=0 or seed is set.
@@ -36075,6 +37561,243 @@ impl HttpClient {
                 }),
             )
         } else {
+            let typed: Option<serde_json::Value>;
+            let parse_error: Option<String>;
+            match status_code {
+                _ => {
+                    match serde_json::from_str::<serde_json::Value>(&body_text) {
+                        Ok(v) => {
+                            typed = Some(v);
+                            parse_error = None;
+                        }
+                        Err(e) => {
+                            typed = None;
+                            parse_error = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+            Err(
+                ApiOpError::Api(ApiError {
+                    status: status_code,
+                    headers,
+                    body: body_text,
+                    raw_body,
+                    typed,
+                    parse_error,
+                }),
+            )
+        }
+    }
+    /// Proxy completions
+    ///
+    /// Proxy a completions request to the specified model, converting its format as needed. Will cache if temperature=0 or seed is set.
+    ///
+    /// `POST /v1/proxy/completions`
+    ///Select `text/event-stream` as parsed_sse; accepts response statuses 200. Other successful statuses and mismatched Content-Type values are returned as inspectable API errors.
+    pub async fn proxycompletions_sse(
+        &self,
+        request: ProxycompletionsRequest,
+    ) -> Result<
+        super::sse::BoxSseStream<
+            Result<super::sse::SseEvent<String>, super::sse::StreamingError>,
+        >,
+        ApiOpError<serde_json::Value>,
+    > {
+        let request_url = format!("{}{}", self.base_url, "/v1/proxy/completions");
+        let mut req = self.http_client.post(request_url);
+        req = req
+            .body(serde_json::to_vec(&request).map_err(HttpError::serialization_error)?)
+            .header("content-type", "application/json");
+        if let Some(api_key) = &self.api_key {
+            req = req.bearer_auth(api_key);
+        }
+        for (name, value) in &self.custom_headers {
+            if !name.eq_ignore_ascii_case("accept") {
+                req = req.header(name, value);
+            }
+        }
+        req = req.header(reqwest::header::ACCEPT, "text/event-stream");
+        let response = req.send().await?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        if false || status_code == 200u16 {
+            let actual = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let expected = "text/event-stream";
+            let parse_media = |value: &str| {
+                let mut parts = Vec::new();
+                let mut start = 0;
+                let mut quoted = false;
+                let mut escaped = false;
+                for (index, character) in value.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if character == '\\' && quoted {
+                        escaped = true;
+                        continue;
+                    }
+                    if character == '"' {
+                        quoted = !quoted;
+                    }
+                    if character == ';' && !quoted {
+                        parts.push(&value[start..index]);
+                        start = index + 1;
+                    }
+                }
+                if quoted || escaped {
+                    return None;
+                }
+                parts.push(&value[start..]);
+                let essence = parts
+                    .first()
+                    .copied()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let mut parameters = std::collections::BTreeMap::new();
+                for part in parts.into_iter().skip(1) {
+                    let (name, value) = part.split_once('=')?;
+                    let name = name.trim().to_ascii_lowercase();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let value = value.trim();
+                    let value = if let Some(quoted) = value.strip_prefix('"') {
+                        let inner = quoted.strip_suffix('"')?;
+                        let mut decoded = String::new();
+                        let mut escaped = false;
+                        for character in inner.chars() {
+                            if escaped {
+                                decoded.push(character);
+                                escaped = false;
+                            } else if character == '\\' {
+                                escaped = true;
+                            } else if character == '"' {
+                                return None
+                            } else {
+                                decoded.push(character);
+                            }
+                        }
+                        if escaped {
+                            return None;
+                        }
+                        decoded
+                    } else {
+                        if value.contains('"') {
+                            return None;
+                        }
+                        value.to_string()
+                    };
+                    if parameters.insert(name, value).is_some() {
+                        return None;
+                    }
+                }
+                Some((essence, parameters))
+            };
+            let matches = match (parse_media(&actual), parse_media(expected)) {
+                (
+                    Some((actual_essence, actual_parameters)),
+                    Some((expected_essence, expected_parameters)),
+                ) => {
+                    let essence_matches = if expected_essence == "*/*" {
+                        actual_essence.contains('/')
+                    } else if let Some(prefix) = expected_essence.strip_suffix("/*") {
+                        actual_essence.split('/').next() == Some(prefix)
+                    } else {
+                        actual_essence == expected_essence
+                    };
+                    essence_matches
+                        && expected_parameters
+                            .iter()
+                            .all(|(name, value)| {
+                                actual_parameters
+                                    .get(name)
+                                    .is_some_and(|actual| {
+                                        if name == "charset" {
+                                            actual.eq_ignore_ascii_case(value)
+                                        } else {
+                                            actual == value
+                                        }
+                                    })
+                            })
+                }
+                _ => false,
+            };
+            if !matches {
+                let headers = response.headers().clone();
+                let raw_body = Vec::new();
+                let body_text = String::from_utf8_lossy(&raw_body).into_owned();
+                let typed: Option<serde_json::Value>;
+                let parse_error: Option<String>;
+                match status_code {
+                    _ => {
+                        match serde_json::from_str::<serde_json::Value>(&body_text) {
+                            Ok(v) => {
+                                typed = Some(v);
+                                parse_error = None;
+                            }
+                            Err(e) => {
+                                typed = None;
+                                parse_error = Some(e.to_string());
+                            }
+                        }
+                    }
+                }
+                let _ = parse_error;
+                return Err(
+                    ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: body_text,
+                        raw_body,
+                        typed,
+                        parse_error: Some(
+                            format!(
+                                "unexpected response Content-Type `{}`; expected `{}`",
+                                actual, expected
+                            ),
+                        ),
+                    }),
+                );
+            }
+        }
+        let status = response.status();
+        let status_code = status.as_u16();
+        let headers = response.headers().clone();
+        if false || status_code == 200u16 {
+            Ok(super::sse::parse_sse_response(response))
+        } else {
+            if status.is_success() {
+                return Err(
+                    ApiOpError::Api(ApiError {
+                        status: status_code,
+                        headers,
+                        body: String::new(),
+                        raw_body: Vec::new(),
+                        typed: None,
+                        parse_error: Some(
+                            format!(
+                                "unexpected successful status {}; generated return type selects `{}`; live response body was not buffered",
+                                status_code, "200",
+                            ),
+                        ),
+                    }),
+                );
+            }
+            let body_bytes = __read_bounded_response_body(
+                    response,
+                    self.max_response_body_bytes,
+                )
+                .await?;
+            let raw_body = body_bytes;
+            let body_text = String::from_utf8_lossy(&raw_body).into_owned();
             let typed: Option<serde_json::Value>;
             let parse_error: Option<String>;
             match status_code {
@@ -39136,6 +40859,19 @@ impl HttpClient {
             request: RunEval::new(data, project_id, scores, task),
         }
     }
+    #[doc = concat!("Start an additive builder for `", "evalLaunch", "`.")]
+    pub fn eval_launch_sse_builder(
+        &self,
+        data: RunEvalData,
+        project_id: String,
+        scores: Vec<FunctionId>,
+        task: FunctionId,
+    ) -> EvalLaunchSseBuilder<'_> {
+        EvalLaunchSseBuilder {
+            client: self,
+            request: RunEval::new(data, project_id, scores, task),
+        }
+    }
     #[doc = concat!("Start an additive builder for `", "getAcl", "`.")]
     pub fn get_acl_builder(
         &self,
@@ -39955,6 +41691,17 @@ impl HttpClient {
         function_id: impl Into<String>,
     ) -> PostFunctionIdInvokeBuilder<'_> {
         PostFunctionIdInvokeBuilder {
+            client: self,
+            function_id: function_id.into(),
+            request: None,
+        }
+    }
+    #[doc = concat!("Start an additive builder for `", "postFunctionIdInvoke", "`.")]
+    pub fn post_function_id_invoke_sse_builder(
+        &self,
+        function_id: impl Into<String>,
+    ) -> PostFunctionIdInvokeSseBuilder<'_> {
+        PostFunctionIdInvokeSseBuilder {
             client: self,
             function_id: function_id.into(),
             request: None,

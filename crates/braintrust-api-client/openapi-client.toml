@@ -10,7 +10,7 @@ threshold = 0
 
 [features]
 enable_async_client = true
-enable_sse_client = false
+enable_sse_client = true
 
 [http_client.tracing]
 enabled = false

@@ -68,6 +68,32 @@ Use `btql()` for JSONL or Parquet results, and `logs3_raw()` when your log paylo
 is already serialized. For buffered background logging, use the main SDK's
 logging APIs.
 
+## Stream function output
+
+Request a stream and process events as they arrive. Configure a timeout long
+enough for the function to finish:
+
+```rust,no_run
+# use braintrust_api_client::Client;
+use futures_util::StreamExt;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let client = Client::builder()
+    .http_client_builder(reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300)))
+    .build()?;
+let mut events = client.post_function_id_invoke_sse_builder("function-id")
+    .stream(true)
+    .send()
+    .await?;
+while let Some(event) = events.next().await {
+    let event = event?;
+    println!("{}: {}", event.event, event.data);
+}
+# Ok(())
+# }
+```
+
 ## Customize your connection
 
 Use `.api_url(url)` for a custom API endpoint and `.app_url(url)` for a custom

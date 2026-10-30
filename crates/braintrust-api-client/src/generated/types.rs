@@ -322,10 +322,7 @@ pub struct ScoreObjectMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SchemaBlockInline {
@@ -822,10 +819,7 @@ pub struct RunEvalParameters {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Optional experiment-level metadata to store about the evaluation. You can later use this to slice & dice across experiments.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -833,10 +827,7 @@ pub struct RunEvalMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct RunEvalMcpAuth {
@@ -1050,7 +1041,7 @@ pub struct ExperimentWhoseContent {
 ///Dataset rows
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DatasetRowsContent {
-    pub data: Vec<Option<serde_json::Value>>,
+    pub data: Vec<serde_json::Value>,
     ///The saved dataset these rows came from. Its project scopes saved simulated-user references; the caller must have read access to the dataset and source project.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_dataset_id: Option<String>,
@@ -1275,10 +1266,7 @@ pub struct PutEnvVarRequestMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Payload for requesting temporary credentials.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -1397,10 +1385,7 @@ pub struct ProjectContentInternalBtql {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProjectAutomationExportDefinitionVariant3 {
@@ -1536,7 +1521,7 @@ pub struct ProjectAutomationConfigVariant4 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProjectAutomationConfigVariant3 {
     ///The maximum number of result rows to write per async query batch
-    ///Constraint: minimum=0, maximum=100000
+    ///Constraint: maximum=100000, exclusiveMinimum=0
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -1856,10 +1841,7 @@ pub struct PostEnvVarRequestMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PatchView {
@@ -2463,7 +2445,7 @@ pub struct PatchProjectAutomationConfigVariant4 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PatchProjectAutomationConfigVariant3 {
     ///The maximum number of result rows to write per async query batch
-    ///Constraint: minimum=0, maximum=100000
+    ///Constraint: maximum=100000, exclusiveMinimum=0
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -6250,8 +6232,7 @@ impl<'de> Deserialize<'de> for PatchProjectAutomationConfigVariant2Credentials {
     }
 }
 ///The configuration for the automation rule
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum PatchProjectAutomationConfig {
     PatchProjectAutomationConfigVariant(PatchProjectAutomationConfigVariant),
     PatchProjectAutomationConfigVariant2(PatchProjectAutomationConfigVariant2),
@@ -6261,7 +6242,645 @@ pub enum PatchProjectAutomationConfig {
     WindowedAutomationConfig(WindowedAutomationConfig),
     TopicAutomationConfig(TopicAutomationConfig),
     TopicDigestAutomationConfig(TopicDigestAutomationConfig),
-    PatchProjectAutomationConfigVariant9(PatchProjectAutomationConfigVariant9),
+}
+impl Serialize for PatchProjectAutomationConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::PatchProjectAutomationConfigVariant(value) => {
+                serde::Serialize::serialize(value, serializer)
+            }
+            Self::PatchProjectAutomationConfigVariant2(value) => {
+                serde::Serialize::serialize(value, serializer)
+            }
+            Self::PatchProjectAutomationConfigVariant3(value) => {
+                serde::Serialize::serialize(value, serializer)
+            }
+            Self::PatchProjectAutomationConfigVariant4(value) => {
+                serde::Serialize::serialize(value, serializer)
+            }
+            Self::PatchProjectAutomationConfigVariant5(value) => {
+                serde::Serialize::serialize(value, serializer)
+            }
+            Self::WindowedAutomationConfig(value) => {
+                serde::Serialize::serialize(value, serializer)
+            }
+            Self::TopicAutomationConfig(value) => {
+                serde::Serialize::serialize(value, serializer)
+            }
+            Self::TopicDigestAutomationConfig(value) => {
+                serde::Serialize::serialize(value, serializer)
+            }
+        }
+    }
+}
+impl<'de> Deserialize<'de> for PatchProjectAutomationConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        fn exact_json_integer(number: &serde_json::Number) -> Option<i128> {
+            number.as_i64().map(i128::from).or_else(|| number.as_u64().map(i128::from))
+        }
+        fn json_numbers_have_same_value(
+            encoded: &serde_json::Number,
+            input: &serde_json::Number,
+        ) -> bool {
+            match (exact_json_integer(encoded), exact_json_integer(input)) {
+                (Some(encoded), Some(input)) => encoded == input,
+                (Some(encoded), None) => {
+                    input
+                        .as_f64()
+                        .is_some_and(|input| {
+                            input.is_finite() && input.fract() == 0.0
+                                && input as i128 == encoded
+                        })
+                }
+                (None, Some(input)) => {
+                    encoded
+                        .as_f64()
+                        .is_some_and(|encoded| {
+                            encoded.is_finite() && encoded.fract() == 0.0
+                                && encoded as i128 == input
+                        })
+                }
+                (None, None) => encoded.as_f64() == input.as_f64(),
+            }
+        }
+        /// `nulls_may_be_absent` also accepts an input `null` that the
+        /// branch omits, as a skipped `None` does. Extra encoded
+        /// keys are allowed only by the pre-existing anyOf match.
+        fn preserves_complete_json_input(
+            encoded: &serde_json::Value,
+            input: &serde_json::Value,
+            nulls_may_be_absent: bool,
+            encoded_keys_may_be_extra: bool,
+        ) -> bool {
+            match (encoded, input) {
+                (
+                    serde_json::Value::Object(encoded),
+                    serde_json::Value::Object(input),
+                ) => {
+                    (encoded_keys_may_be_extra
+                        || encoded.keys().all(|key| input.contains_key(key)))
+                        && input
+                            .iter()
+                            .all(|(key, value)| match encoded.get(key) {
+                                Some(encoded_value) => {
+                                    preserves_complete_json_input(
+                                        encoded_value,
+                                        value,
+                                        nulls_may_be_absent,
+                                        encoded_keys_may_be_extra,
+                                    )
+                                }
+                                None => nulls_may_be_absent && value.is_null(),
+                            })
+                }
+                (serde_json::Value::Array(encoded), serde_json::Value::Array(input)) => {
+                    encoded.len() == input.len()
+                        && encoded
+                            .iter()
+                            .zip(input)
+                            .all(|(encoded, input)| {
+                                preserves_complete_json_input(
+                                    encoded,
+                                    input,
+                                    nulls_may_be_absent,
+                                    encoded_keys_may_be_extra,
+                                )
+                            })
+                }
+                (
+                    serde_json::Value::Number(encoded),
+                    serde_json::Value::Number(input),
+                ) => json_numbers_have_same_value(encoded, input),
+                _ => encoded == input,
+            }
+        }
+        let input = <serde_json::Value as Deserialize>::deserialize(deserializer)?;
+        let mut matched = None;
+        let mut equivalent = None;
+        let mut equivalent_matches = 0usize;
+        if input
+            .as_object()
+            .is_some_and(|object| {
+                true
+                    && object
+                        .get("event_type")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(value.to_string().as_str(), "\"logs\"")
+                        })
+                    && object
+                        .get("status")
+                        .is_none_or(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"active\"" | "\"paused\""
+                                )
+                        })
+            })
+        {
+            if let Ok(candidate) = serde_json::from_value::<
+                PatchProjectAutomationConfigVariant,
+            >(input.clone()) {
+                match serde_json::to_value(&candidate) {
+                    Ok(encoded) if encoded == input => {
+                        if matched.is_some() {
+                            return Err(
+                                serde::de::Error::custom(
+                                    concat!(
+                                        "ambiguous oneOf value for ",
+                                        stringify!(PatchProjectAutomationConfig),
+                                        ": more than one branch preserved the complete input",
+                                    ),
+                                ),
+                            );
+                        }
+                        matched = Some(
+                            Self::PatchProjectAutomationConfigVariant(candidate),
+                        );
+                    }
+                    Ok(
+                        encoded,
+                    ) if preserves_complete_json_input(
+                        &encoded,
+                        &input,
+                        true,
+                        false,
+                    ) => {
+                        equivalent_matches += 1;
+                        equivalent
+                            .get_or_insert(
+                                Self::PatchProjectAutomationConfigVariant(candidate),
+                            );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if input
+            .as_object()
+            .is_some_and(|object| {
+                true
+                    && object
+                        .get("event_type")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(value.to_string().as_str(), "\"btql_export\"")
+                        })
+                    && object
+                        .get("format")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"jsonl\"" | "\"parquet\""
+                                )
+                        })
+                    && object
+                        .get("status")
+                        .is_none_or(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"active\"" | "\"paused\""
+                                )
+                        })
+            })
+        {
+            if let Ok(candidate) = serde_json::from_value::<
+                PatchProjectAutomationConfigVariant2,
+            >(input.clone()) {
+                match serde_json::to_value(&candidate) {
+                    Ok(encoded) if encoded == input => {
+                        if matched.is_some() {
+                            return Err(
+                                serde::de::Error::custom(
+                                    concat!(
+                                        "ambiguous oneOf value for ",
+                                        stringify!(PatchProjectAutomationConfig),
+                                        ": more than one branch preserved the complete input",
+                                    ),
+                                ),
+                            );
+                        }
+                        matched = Some(
+                            Self::PatchProjectAutomationConfigVariant2(candidate),
+                        );
+                    }
+                    Ok(
+                        encoded,
+                    ) if preserves_complete_json_input(
+                        &encoded,
+                        &input,
+                        true,
+                        false,
+                    ) => {
+                        equivalent_matches += 1;
+                        equivalent
+                            .get_or_insert(
+                                Self::PatchProjectAutomationConfigVariant2(candidate),
+                            );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if input
+            .as_object()
+            .is_some_and(|object| {
+                true
+                    && object
+                        .get("event_type")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(value.to_string().as_str(), "\"async_query\"")
+                        })
+                    && object
+                        .get("format")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(value.to_string().as_str(), "\"jsonl\"")
+                        })
+                    && object
+                        .get("object_type")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"project_logs\"" |
+                                    "\"experiment\"" | "\"dataset\"" | "\"playground_logs\""
+                                )
+                        })
+                    && object
+                        .get("status")
+                        .is_none_or(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"active\"" | "\"paused\""
+                                )
+                        })
+            })
+        {
+            if let Ok(candidate) = serde_json::from_value::<
+                PatchProjectAutomationConfigVariant3,
+            >(input.clone()) {
+                match serde_json::to_value(&candidate) {
+                    Ok(encoded) if encoded == input => {
+                        if matched.is_some() {
+                            return Err(
+                                serde::de::Error::custom(
+                                    concat!(
+                                        "ambiguous oneOf value for ",
+                                        stringify!(PatchProjectAutomationConfig),
+                                        ": more than one branch preserved the complete input",
+                                    ),
+                                ),
+                            );
+                        }
+                        matched = Some(
+                            Self::PatchProjectAutomationConfigVariant3(candidate),
+                        );
+                    }
+                    Ok(
+                        encoded,
+                    ) if preserves_complete_json_input(
+                        &encoded,
+                        &input,
+                        true,
+                        false,
+                    ) => {
+                        equivalent_matches += 1;
+                        equivalent
+                            .get_or_insert(
+                                Self::PatchProjectAutomationConfigVariant3(candidate),
+                            );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if input
+            .as_object()
+            .is_some_and(|object| {
+                true
+                    && object
+                        .get("event_type")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(value.to_string().as_str(), "\"retention\"")
+                        })
+                    && object
+                        .get("object_type")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"project_logs\"" |
+                                    "\"experiment\"" | "\"dataset\""
+                                )
+                        })
+            })
+        {
+            if let Ok(candidate) = serde_json::from_value::<
+                PatchProjectAutomationConfigVariant4,
+            >(input.clone()) {
+                match serde_json::to_value(&candidate) {
+                    Ok(encoded) if encoded == input => {
+                        if matched.is_some() {
+                            return Err(
+                                serde::de::Error::custom(
+                                    concat!(
+                                        "ambiguous oneOf value for ",
+                                        stringify!(PatchProjectAutomationConfig),
+                                        ": more than one branch preserved the complete input",
+                                    ),
+                                ),
+                            );
+                        }
+                        matched = Some(
+                            Self::PatchProjectAutomationConfigVariant4(candidate),
+                        );
+                    }
+                    Ok(
+                        encoded,
+                    ) if preserves_complete_json_input(
+                        &encoded,
+                        &input,
+                        true,
+                        false,
+                    ) => {
+                        equivalent_matches += 1;
+                        equivalent
+                            .get_or_insert(
+                                Self::PatchProjectAutomationConfigVariant4(candidate),
+                            );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if input
+            .as_object()
+            .is_some_and(|object| {
+                true
+                    && object
+                        .get("event_type")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"environment_update\""
+                                )
+                        })
+                    && object
+                        .get("status")
+                        .is_none_or(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"active\"" | "\"paused\""
+                                )
+                        })
+            })
+        {
+            if let Ok(candidate) = serde_json::from_value::<
+                PatchProjectAutomationConfigVariant5,
+            >(input.clone()) {
+                match serde_json::to_value(&candidate) {
+                    Ok(encoded) if encoded == input => {
+                        if matched.is_some() {
+                            return Err(
+                                serde::de::Error::custom(
+                                    concat!(
+                                        "ambiguous oneOf value for ",
+                                        stringify!(PatchProjectAutomationConfig),
+                                        ": more than one branch preserved the complete input",
+                                    ),
+                                ),
+                            );
+                        }
+                        matched = Some(
+                            Self::PatchProjectAutomationConfigVariant5(candidate),
+                        );
+                    }
+                    Ok(
+                        encoded,
+                    ) if preserves_complete_json_input(
+                        &encoded,
+                        &input,
+                        true,
+                        false,
+                    ) => {
+                        equivalent_matches += 1;
+                        equivalent
+                            .get_or_insert(
+                                Self::PatchProjectAutomationConfigVariant5(candidate),
+                            );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if input
+            .as_object()
+            .is_some_and(|object| {
+                true
+                    && object
+                        .get("event_type")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(value.to_string().as_str(), "\"windowed\"")
+                        })
+                    && object
+                        .get("product_origin")
+                        .is_none_or(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"patterns\"" | "\"dashboard\""
+                                    | "null"
+                                )
+                        })
+                    && object
+                        .get("status")
+                        .is_none_or(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"active\"" | "\"paused\""
+                                )
+                        })
+            })
+        {
+            if let Ok(candidate) = serde_json::from_value::<
+                WindowedAutomationConfig,
+            >(input.clone()) {
+                match serde_json::to_value(&candidate) {
+                    Ok(encoded) if encoded == input => {
+                        if matched.is_some() {
+                            return Err(
+                                serde::de::Error::custom(
+                                    concat!(
+                                        "ambiguous oneOf value for ",
+                                        stringify!(PatchProjectAutomationConfig),
+                                        ": more than one branch preserved the complete input",
+                                    ),
+                                ),
+                            );
+                        }
+                        matched = Some(Self::WindowedAutomationConfig(candidate));
+                    }
+                    Ok(
+                        encoded,
+                    ) if preserves_complete_json_input(
+                        &encoded,
+                        &input,
+                        true,
+                        false,
+                    ) => {
+                        equivalent_matches += 1;
+                        equivalent
+                            .get_or_insert(Self::WindowedAutomationConfig(candidate));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if input
+            .as_object()
+            .is_some_and(|object| {
+                true
+                    && object
+                        .get("event_type")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(value.to_string().as_str(), "\"topic\"")
+                        })
+                    && object
+                        .get("facet_model")
+                        .is_none_or(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"brain-facet-latest\"" |
+                                    "\"brain-facet-1\"" | "\"brain-facet-2\"" | "null"
+                                )
+                        })
+                    && object
+                        .get("status")
+                        .is_none_or(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"active\"" | "\"paused\""
+                                )
+                        })
+            })
+        {
+            if let Ok(candidate) = serde_json::from_value::<
+                TopicAutomationConfig,
+            >(input.clone()) {
+                match serde_json::to_value(&candidate) {
+                    Ok(encoded) if encoded == input => {
+                        if matched.is_some() {
+                            return Err(
+                                serde::de::Error::custom(
+                                    concat!(
+                                        "ambiguous oneOf value for ",
+                                        stringify!(PatchProjectAutomationConfig),
+                                        ": more than one branch preserved the complete input",
+                                    ),
+                                ),
+                            );
+                        }
+                        matched = Some(Self::TopicAutomationConfig(candidate));
+                    }
+                    Ok(
+                        encoded,
+                    ) if preserves_complete_json_input(
+                        &encoded,
+                        &input,
+                        true,
+                        false,
+                    ) => {
+                        equivalent_matches += 1;
+                        equivalent.get_or_insert(Self::TopicAutomationConfig(candidate));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if input
+            .as_object()
+            .is_some_and(|object| {
+                true
+                    && object
+                        .get("event_type")
+                        .is_some_and(|value| {
+                            value.is_null()
+                                || matches!(value.to_string().as_str(), "\"topic_digest\"")
+                        })
+                    && object
+                        .get("status")
+                        .is_none_or(|value| {
+                            value.is_null()
+                                || matches!(
+                                    value.to_string().as_str(), "\"active\"" | "\"paused\""
+                                )
+                        })
+            })
+        {
+            if let Ok(candidate) = serde_json::from_value::<
+                TopicDigestAutomationConfig,
+            >(input.clone()) {
+                match serde_json::to_value(&candidate) {
+                    Ok(encoded) if encoded == input => {
+                        if matched.is_some() {
+                            return Err(
+                                serde::de::Error::custom(
+                                    concat!(
+                                        "ambiguous oneOf value for ",
+                                        stringify!(PatchProjectAutomationConfig),
+                                        ": more than one branch preserved the complete input",
+                                    ),
+                                ),
+                            );
+                        }
+                        matched = Some(Self::TopicDigestAutomationConfig(candidate));
+                    }
+                    Ok(
+                        encoded,
+                    ) if preserves_complete_json_input(
+                        &encoded,
+                        &input,
+                        true,
+                        false,
+                    ) => {
+                        equivalent_matches += 1;
+                        equivalent
+                            .get_or_insert(Self::TopicDigestAutomationConfig(candidate));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(matched) = matched {
+            return Ok(matched);
+        }
+        if equivalent_matches > 1 {
+            return Err(
+                serde::de::Error::custom(
+                    concat!(
+                        "ambiguous oneOf value for ",
+                        stringify!(PatchProjectAutomationConfig),
+                        ": more than one branch preserved an equivalent input",
+                    ),
+                ),
+            );
+        }
+        equivalent
+            .ok_or_else(|| serde::de::Error::custom(
+                concat!(
+                    "no oneOf branch for ", stringify!(PatchProjectAutomationConfig),
+                    " preserved the complete input",
+                ),
+            ))
+    }
 }
 ///The type of action to take
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -6873,7 +7492,7 @@ pub struct PatchOrganizationMembersInviteUsers {
 pub struct PatchOrganizationMembersInviteUsersServiceAccountsItem {
     pub name: String,
     ///Number of seconds from now after which the initial service token should expire. If omitted, the token never expires.
-    ///Constraint: minimum=0
+    ///Constraint: exclusiveMinimum=0
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -7120,10 +7739,7 @@ pub struct PatchExperimentMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Braintrust-controlled metadata about the experiment.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -7138,10 +7754,7 @@ pub struct PatchExperimentInternalMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///BTQL filter payload used to evaluate a subset of a linked dataset.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -7149,10 +7762,7 @@ pub struct PatchExperimentInternalMetadataDatasetFilter {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PatchEnvVarIdRequest {
@@ -7285,10 +7895,7 @@ pub struct PatchEnvVarIdRequestMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PatchDataset {
@@ -7327,10 +7934,7 @@ pub struct PatchDatasetMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///An agent is a project-scoped durable object that identifies an AI agent or service emitting spans
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -7363,10 +7967,7 @@ pub struct PatchAgentMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PatchAISecret {
@@ -7401,10 +8002,7 @@ pub struct PatchAISecretMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NamedScore {
@@ -7429,10 +8027,7 @@ pub struct NamedScoreMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessagesBlockInline {
@@ -7534,19 +8129,11 @@ pub struct InvokeApi {
     )]
     pub endpoint_name: Option<Option<String>>,
     ///The expected output of the function
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub expected: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<serde_json::Value>,
     ///Argument to the function, which can be any JSON serializable value
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub input: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
     ///Map of MCP server URL to auth credentials
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_auth: Option<InvokeApiMcpAuth>,
@@ -7625,10 +8212,7 @@ pub struct SpanParentContentPropagatedEvent {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum SpanParentContentObjectType {
@@ -7665,10 +8249,7 @@ pub struct InvokeApiOverrides {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///The mode format of the returned value (defaults to 'auto')
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -7712,10 +8293,7 @@ pub struct InvokeApiMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Map of MCP server URL to auth credentials
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -8002,8 +8580,6 @@ pub enum ViewViewType {
     ForReviewExperiments,
     #[serde(rename = "for_review_datasets")]
     ForReviewDatasets,
-    #[serde(rename = "null")]
-    NullValue,
 }
 impl ViewViewType {
     pub fn as_str(&self) -> &'static str {
@@ -8026,7 +8602,6 @@ impl ViewViewType {
             Self::ForReviewProjectLog => "for_review_project_log",
             Self::ForReviewExperiments => "for_review_experiments",
             Self::ForReviewDatasets => "for_review_datasets",
-            Self::NullValue => "null",
         }
     }
 }
@@ -8340,10 +8915,7 @@ pub struct PromptMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///A literal 'p' which identifies the object as a project prompt
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -14879,10 +15451,7 @@ pub struct InlineFunctionContentInlineFunction {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InlineCodeContentInlineContext {
@@ -16247,10 +16816,7 @@ pub struct SchemaBlockInlineData {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///JSON Schema format for parameters
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -16300,10 +16866,7 @@ pub struct SchemaBlockInlineSchemaPropertiesAdditionalProperty {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum RemoteContentInlineType {
@@ -16333,10 +16896,7 @@ pub struct RemoteContentInlineParameters {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum FunctionDataNullishVariantType {
@@ -16452,10 +17012,7 @@ pub struct FunctionMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///A literal 'p' which identifies the object as a project prompt
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -16484,18 +17041,10 @@ impl AsRef<str> for FunctionLogId {
 ///JSON schema for the function's parameters and return type
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct FunctionFunctionSchema {
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub parameters: Option<Option<serde_json::Value>>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub returns: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returns: Option<serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FreezeColumnsBlock {
@@ -16527,13 +17076,8 @@ Pass this string directly as the `cursor` param to your next fetch request to ge
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProjectLogsEvent {
     ///The async scoring state for this event
-    #[serde(
-        rename = "_async_scoring_state",
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub async_scoring_state: Option<Option<serde_json::Value>>,
+    #[serde(rename = "_async_scoring_state", skip_serializing_if = "Option::is_none")]
+    pub async_scoring_state: Option<serde_json::Value>,
     ///A stable, time-ordered key that can be used to paginate over project logs events. This field is auto-generated by Braintrust and only exists in Brainstore.
     #[serde(
         rename = "_pagination_key",
@@ -16551,7 +17095,7 @@ pub struct ProjectLogsEvent {
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub audit_data: Option<Option<Vec<Option<serde_json::Value>>>>,
+    pub audit_data: Option<Option<Vec<serde_json::Value>>>,
     ///Classifications for this event (dictionary from classification name to items)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -16565,7 +17109,7 @@ pub struct ProjectLogsEvent {
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub comments: Option<Option<Vec<Option<serde_json::Value>>>>,
+    pub comments: Option<Option<Vec<serde_json::Value>>>,
     ///Context is additional information about the code that produced the project logs event. It is essentially the textual counterpart to `metrics`. Use the `caller_*` attributes to track the location in code which produced the project logs event
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -16576,19 +17120,11 @@ pub struct ProjectLogsEvent {
     ///The timestamp the project logs event was created
     pub created: chrono::DateTime<chrono::Utc>,
     ///The error that occurred, if any.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub error: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
     ///The ground truth value (an arbitrary, JSON serializable object) that you'd compare to `output` to determine if your `output` value is correct or not. Braintrust currently does not compare `output` to `expected` for you, since there are so many different ways to do that correctly. Instead, these values are just used to help you navigate while digging into analyses. However, we may later use these values to re-score outputs or fine-tune your models.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub expected: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<serde_json::Value>,
     ///Facets for categorization (dictionary from facet id to value)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -16599,12 +17135,8 @@ pub struct ProjectLogsEvent {
     ///A unique identifier for the project logs event. If you don't provide one, Braintrust will generate one for you
     pub id: String,
     ///The arguments that uniquely define a user input (an arbitrary, JSON serializable object).
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub input: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
     ///Whether this span is a root span
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -16637,12 +17169,8 @@ pub struct ProjectLogsEvent {
     )]
     pub origin: Option<Option<ObjectReferenceNullish>>,
     ///The output of your application, including post-processing (an arbitrary, JSON serializable object), that allows you to determine whether the result is correct or not. For example, in an app that generates SQL queries, the `output` should be the _result_ of the SQL query generated by the model, not the query itself, because there may be multiple valid queries that answer a single question.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub output: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
     ///Unique identifier for the project
     pub project_id: uuid::Uuid,
     ///A unique identifier for the trace this project logs event belongs to
@@ -16689,26 +17217,14 @@ pub struct ProjectLogsEventScores {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ProjectLogsEventMetrics {
     ///Deprecated. Use `context.caller_filename` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_filename: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_filename: Option<serde_json::Value>,
     ///Deprecated. Use `context.caller_functionname` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_functionname: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_functionname: Option<serde_json::Value>,
     ///Deprecated. Use `context.caller_lineno` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_lineno: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_lineno: Option<serde_json::Value>,
     ///The number of tokens in the completion generated by the model (only set if this is an LLM span)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -16762,10 +17278,7 @@ pub struct ProjectLogsEventMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///A literal 'g' which identifies the log as a project log
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -16826,10 +17339,7 @@ pub struct ProjectLogsEventContext {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Classifications for this event (dictionary from classification name to items)
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -16878,10 +17388,7 @@ pub struct ProjectLogsEventClassificationsAdditionalPropertyItemMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FetchExperimentEventsResponse {
@@ -17036,7 +17543,7 @@ pub struct ExperimentEvent {
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub audit_data: Option<Option<Vec<Option<serde_json::Value>>>>,
+    pub audit_data: Option<Option<Vec<serde_json::Value>>>,
     ///Classifications for this event (dictionary from classification name to items)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -17050,7 +17557,7 @@ pub struct ExperimentEvent {
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub comments: Option<Option<Vec<Option<serde_json::Value>>>>,
+    pub comments: Option<Option<Vec<serde_json::Value>>>,
     ///Context is additional information about the code that produced the experiment event. It is essentially the textual counterpart to `metrics`. Use the `caller_*` attributes to track the location in code which produced the experiment event
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -17061,19 +17568,11 @@ pub struct ExperimentEvent {
     ///The timestamp the experiment event was created
     pub created: chrono::DateTime<chrono::Utc>,
     ///The error that occurred, if any.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub error: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
     ///The ground truth value (an arbitrary, JSON serializable object) that you'd compare to `output` to determine if your `output` value is correct or not. Braintrust currently does not compare `output` to `expected` for you, since there are so many different ways to do that correctly. Instead, these values are just used to help you navigate your experiments while digging into analyses. However, we may later use these values to re-score outputs or fine-tune your models
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub expected: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<serde_json::Value>,
     ///Unique identifier for the experiment
     pub experiment_id: uuid::Uuid,
     ///Facets for categorization (dictionary from facet id to value)
@@ -17086,12 +17585,8 @@ pub struct ExperimentEvent {
     ///A unique identifier for the experiment event. If you don't provide one, Braintrust will generate one for you
     pub id: String,
     ///The arguments that uniquely define a test case (an arbitrary, JSON serializable object). Later on, Braintrust will use the `input` to know whether two test cases are the same between experiments, so they should not contain experiment-specific state. A simple rule of thumb is that if you run the same experiment twice, the `input` should be identical
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub input: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
     ///Whether this span is a root span
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -17120,12 +17615,8 @@ pub struct ExperimentEvent {
     )]
     pub origin: Option<Option<ObjectReferenceNullish>>,
     ///The output of your application, including post-processing (an arbitrary, JSON serializable object), that allows you to determine whether the result is correct or not. For example, in an app that generates SQL queries, the `output` should be the _result_ of the SQL query generated by the model, not the query itself, because there may be multiple valid queries that answer a single question
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub output: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
     ///Unique identifier for the project that the experiment belongs under
     pub project_id: uuid::Uuid,
     ///A unique identifier for the trace this experiment event belongs to
@@ -17172,26 +17663,14 @@ pub struct ExperimentEventScores {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ExperimentEventMetrics {
     ///Deprecated. Use `context.caller_filename` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_filename: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_filename: Option<serde_json::Value>,
     ///Deprecated. Use `context.caller_functionname` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_functionname: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_functionname: Option<serde_json::Value>,
     ///Deprecated. Use `context.caller_lineno` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_lineno: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_lineno: Option<serde_json::Value>,
     ///The number of tokens in the completion generated by the model (only set if this is an LLM span)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -17245,10 +17724,7 @@ pub struct ExperimentEventMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Facets for categorization (dictionary from facet id to value)
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -17285,10 +17761,7 @@ pub struct ExperimentEventContext {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Classifications for this event (dictionary from classification name to items)
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -17337,10 +17810,7 @@ pub struct ExperimentEventClassificationsAdditionalPropertyItemMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Experiment {
@@ -17456,10 +17926,7 @@ pub struct ExperimentMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Braintrust-controlled metadata about the experiment.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -17474,10 +17941,7 @@ pub struct ExperimentInternalMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///BTQL filter payload used to evaluate a subset of a linked dataset.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -17485,10 +17949,7 @@ pub struct ExperimentInternalMetadataDatasetFilter {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnvVar {
@@ -17625,10 +18086,7 @@ pub struct EnvVarMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EntrypointsBlockSandboxSpecVariant2 {
@@ -17641,7 +18099,7 @@ pub struct EntrypointsBlockSandboxSpecVariant {
     pub snapshot_ref: String,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DescriptionBlockInlineAE4F8A0DB26C279F {
+pub struct DescriptionBlockInlineD6CA662FC334ECD7 {
     ///The description of the node
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -17655,55 +18113,12 @@ pub struct DescriptionBlockInlineAE4F8A0DB26C279F {
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub position: Option<Option<DescriptionBlockInlineAE4F8A0DB26C279FPosition>>,
-    pub r#type: DescriptionBlockInlineAE4F8A0DB26C279FType,
-    ///A literal value to be returned
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub value: Option<Option<serde_json::Value>>,
-}
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DescriptionBlockInline7013A06FD3DC81AE {
-    ///The description of the node
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub description: Option<Option<String>>,
-    ///The position of the node
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub position: Option<Option<DescriptionBlockInline7013A06FD3DC81AEPosition>>,
-    pub r#type: DescriptionBlockInline7013A06FD3DC81AEType,
-}
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DescriptionBlockInline591523B40A593D3D {
-    ///The description of the node
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub description: Option<Option<String>>,
-    ///The position of the node
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub position: Option<Option<DescriptionBlockInline591523B40A593D3DPosition>>,
+    pub position: Option<Option<DescriptionBlockInlineD6CA662FC334ECD7Position>>,
     pub prompt: PromptBlockData,
-    pub r#type: DescriptionBlockInline591523B40A593D3DType,
+    pub r#type: DescriptionBlockInlineD6CA662FC334ECD7Type,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DescriptionBlockInline5382281D4E9E0AA4 {
+pub struct DescriptionBlockInline8A5ECEF8C399DFEC {
     ///The description of the node
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -17717,12 +18132,51 @@ pub struct DescriptionBlockInline5382281D4E9E0AA4 {
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub position: Option<Option<DescriptionBlockInline5382281D4E9E0AA4Position>>,
-    ///The output of the graph
-    pub r#type: DescriptionBlockInline5382281D4E9E0AA4Type,
+    pub position: Option<Option<DescriptionBlockInline8A5ECEF8C399DFECPosition>>,
+    pub r#type: DescriptionBlockInline8A5ECEF8C399DFECType,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DescriptionBlockInline2440BE94047D3434 {
+pub struct DescriptionBlockInline20A779B79A4C0922 {
+    ///The description of the node
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "tri_state_serde::deserialize"
+    )]
+    pub description: Option<Option<String>>,
+    ///The position of the node
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "tri_state_serde::deserialize"
+    )]
+    pub position: Option<Option<DescriptionBlockInline20A779B79A4C0922Position>>,
+    ///The output of the graph
+    pub r#type: DescriptionBlockInline20A779B79A4C0922Type,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DescriptionBlockInline0ACD4295CA4AF260 {
+    ///The description of the node
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "tri_state_serde::deserialize"
+    )]
+    pub description: Option<Option<String>>,
+    ///The position of the node
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "tri_state_serde::deserialize"
+    )]
+    pub position: Option<Option<DescriptionBlockInline0ACD4295CA4AF260Position>>,
+    pub r#type: DescriptionBlockInline0ACD4295CA4AF260Type,
+    ///A literal value to be returned
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DescriptionBlockInline07ACA48DEAF3E134 {
     ///The description of the node
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -17738,8 +18192,8 @@ pub struct DescriptionBlockInline2440BE94047D3434 {
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub position: Option<Option<DescriptionBlockInline2440BE94047D3434Position>>,
-    pub r#type: DescriptionBlockInline2440BE94047D3434Type,
+    pub position: Option<Option<DescriptionBlockInline07ACA48DEAF3E134Position>>,
+    pub r#type: DescriptionBlockInline07ACA48DEAF3E134Type,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DescriptionBlockInline {
@@ -17804,7 +18258,7 @@ pub struct DatasetEvent {
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub audit_data: Option<Option<Vec<Option<serde_json::Value>>>>,
+    pub audit_data: Option<Option<Vec<serde_json::Value>>>,
     ///Classifications for this event (dictionary from classification name to items)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -17818,18 +18272,14 @@ pub struct DatasetEvent {
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub comments: Option<Option<Vec<Option<serde_json::Value>>>>,
+    pub comments: Option<Option<Vec<serde_json::Value>>>,
     ///The timestamp the dataset event was created
     pub created: chrono::DateTime<chrono::Utc>,
     ///Unique identifier for the dataset
     pub dataset_id: uuid::Uuid,
     ///The output of your application, including post-processing (an arbitrary, JSON serializable object)
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub expected: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<serde_json::Value>,
     ///Facets for categorization (dictionary from facet id to value)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -17840,12 +18290,8 @@ pub struct DatasetEvent {
     ///A unique identifier for the dataset event. If you don't provide one, Braintrust will generate one for you
     pub id: String,
     ///The argument that uniquely define an input case (an arbitrary, JSON serializable object)
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub input: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
     ///Whether this span is a root span
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -17893,10 +18339,7 @@ pub struct DatasetEventMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Facets for categorization (dictionary from facet id to value)
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -18179,10 +18622,7 @@ pub struct DatasetEventClassificationsAdditionalPropertyItemMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Dataset id
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -18215,10 +18655,7 @@ pub struct DatasetContentInternalBtql {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Dataset {
@@ -18279,10 +18716,7 @@ pub struct DatasetMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DataBlockInline {
@@ -18685,19 +19119,11 @@ If the row is being merged into an existing row, this field will be ignored.*/
     )]
     pub created: Option<Option<chrono::DateTime<chrono::Utc>>>,
     ///The error that occurred, if any.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub error: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
     ///The ground truth value (an arbitrary, JSON serializable object) that you'd compare to `output` to determine if your `output` value is correct or not. Braintrust currently does not compare `output` to `expected` for you, since there are so many different ways to do that correctly. Instead, these values are just used to help you navigate while digging into analyses. However, we may later use these values to re-score outputs or fine-tune your models.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub expected: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<serde_json::Value>,
     ///Facets for categorization (dictionary from facet id to value)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -18713,12 +19139,8 @@ If the row is being merged into an existing row, this field will be ignored.*/
     )]
     pub id: Option<Option<String>>,
     ///The arguments that uniquely define a user input (an arbitrary, JSON serializable object).
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub input: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
     ///A dictionary with additional data about the test example, model outputs, or just about anything else that's relevant, that you can use to help find and analyze examples later. For example, you could log the `prompt`, example's `id`, or anything else that would be useful to slice/dice later. The values in `metadata` can be any JSON-serializable type, but its keys must be strings
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -18740,12 +19162,8 @@ If the row is being merged into an existing row, this field will be ignored.*/
     )]
     pub origin: Option<Option<ObjectReferenceNullish>>,
     ///The output of your application, including post-processing (an arbitrary, JSON serializable object), that allows you to determine whether the result is correct or not. For example, in an app that generates SQL queries, the `output` should be the _result_ of the SQL query generated by the model, not the query itself, because there may be multiple valid queries that answer a single question.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub output: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
     /**Use `span_id`, `root_span_id`, and `span_parents` instead of `_parent_id`, which is now deprecated. The span_id is a unique identifier describing the row's place in the a trace, and the root_span_id is a unique identifier for the whole trace. See the [guide](https://www.braintrust.dev/docs/instrument) for full details.
 
 For example, say we have logged a row `{"id": "abc", "span_id": "span0", "root_span_id": "root_span0", "input": "foo", "output": "bar", "expected": "boo", "scores": {"correctness": 0.33}}`. We can create a sub-span of the parent row by logging `{"id": "llm_call", "span_id": "span1", "root_span_id": "root_span0", "span_parents": ["span0"], "input": {"prompt": "What comes after foo?"}, "output": "bar", "metrics": {"tokens": 1}}`. In the webapp, only the root span row `"abc"` will show up in the summary view. You can view the full trace hierarchy (in this case, the `"llm_call"` row) by clicking on the "abc" row.
@@ -18812,26 +19230,14 @@ pub struct InsertProjectLogsEventScores {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct InsertProjectLogsEventMetrics {
     ///Deprecated. Use `context.caller_filename` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_filename: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_filename: Option<serde_json::Value>,
     ///Deprecated. Use `context.caller_functionname` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_functionname: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_functionname: Option<serde_json::Value>,
     ///Deprecated. Use `context.caller_lineno` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_lineno: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_lineno: Option<serde_json::Value>,
     ///The number of tokens in the completion generated by the model (only set if this is an LLM span)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -18885,10 +19291,7 @@ pub struct InsertProjectLogsEventMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Facets for categorization (dictionary from facet id to value)
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -18925,14 +19328,11 @@ pub struct InsertProjectLogsEventContext {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InsertProjectLogsEventArrayDeleteItem {
-    pub delete: Vec<Option<serde_json::Value>>,
+    pub delete: Vec<serde_json::Value>,
     pub path: Vec<String>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -18945,12 +19345,8 @@ pub struct FeedbackProjectLogsItem {
     )]
     pub comment: Option<Option<String>>,
     ///The ground truth value (an arbitrary, JSON serializable object) that you'd compare to `output` to determine if your `output` value is correct or not
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub expected: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<serde_json::Value>,
     ///The id of the project logs event to log feedback for. This is the row `id` returned by `POST /v1/project_logs/{project_id}/insert`
     pub id: String,
     ///A dictionary with additional data about the feedback. If you have a `user_id`, you can log it here and access it in the Braintrust UI. Note, this metadata does not correspond to the main event itself, but rather the audit log attached to the event.
@@ -19029,10 +19425,7 @@ pub struct FeedbackProjectLogsItemMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///A mapping from experiment id to a set of log events and feedback items to insert
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -19132,19 +19525,11 @@ If the row is being merged into an existing row, this field will be ignored.*/
     )]
     pub created: Option<Option<chrono::DateTime<chrono::Utc>>>,
     ///The error that occurred, if any.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub error: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
     ///The ground truth value (an arbitrary, JSON serializable object) that you'd compare to `output` to determine if your `output` value is correct or not. Braintrust currently does not compare `output` to `expected` for you, since there are so many different ways to do that correctly. Instead, these values are just used to help you navigate your experiments while digging into analyses. However, we may later use these values to re-score outputs or fine-tune your models
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub expected: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<serde_json::Value>,
     ///Facets for categorization (dictionary from facet id to value)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -19160,12 +19545,8 @@ If the row is being merged into an existing row, this field will be ignored.*/
     )]
     pub id: Option<Option<String>>,
     ///The arguments that uniquely define a test case (an arbitrary, JSON serializable object). Later on, Braintrust will use the `input` to know whether two test cases are the same between experiments, so they should not contain experiment-specific state. A simple rule of thumb is that if you run the same experiment twice, the `input` should be identical
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub input: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
     ///A dictionary with additional data about the test example, model outputs, or just about anything else that's relevant, that you can use to help find and analyze examples later. For example, you could log the `prompt`, example's `id`, or anything else that would be useful to slice/dice later. The values in `metadata` can be any JSON-serializable type, but its keys must be strings
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -19187,12 +19568,8 @@ If the row is being merged into an existing row, this field will be ignored.*/
     )]
     pub origin: Option<Option<ObjectReferenceNullish>>,
     ///The output of your application, including post-processing (an arbitrary, JSON serializable object), that allows you to determine whether the result is correct or not. For example, in an app that generates SQL queries, the `output` should be the _result_ of the SQL query generated by the model, not the query itself, because there may be multiple valid queries that answer a single question
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub output: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
     /**Use `span_id`, `root_span_id`, and `span_parents` instead of `_parent_id`, which is now deprecated. The span_id is a unique identifier describing the row's place in the a trace, and the root_span_id is a unique identifier for the whole trace. See the [guide](https://www.braintrust.dev/docs/instrument) for full details.
 
 For example, say we have logged a row `{"id": "abc", "span_id": "span0", "root_span_id": "root_span0", "input": "foo", "output": "bar", "expected": "boo", "scores": {"correctness": 0.33}}`. We can create a sub-span of the parent row by logging `{"id": "llm_call", "span_id": "span1", "root_span_id": "root_span0", "span_parents": ["span0"], "input": {"prompt": "What comes after foo?"}, "output": "bar", "metrics": {"tokens": 1}}`. In the webapp, only the root span row `"abc"` will show up in the summary view. You can view the full trace hierarchy (in this case, the `"llm_call"` row) by clicking on the "abc" row.
@@ -19280,10 +19657,7 @@ pub struct SpanAttributes {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Type of the span, for display purposes only
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -19432,26 +19806,14 @@ pub struct InsertExperimentEventScores {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct InsertExperimentEventMetrics {
     ///Deprecated. Use `context.caller_filename` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_filename: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_filename: Option<serde_json::Value>,
     ///Deprecated. Use `context.caller_functionname` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_functionname: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_functionname: Option<serde_json::Value>,
     ///Deprecated. Use `context.caller_lineno` instead.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub caller_lineno: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_lineno: Option<serde_json::Value>,
     ///The number of tokens in the completion generated by the model (only set if this is an LLM span)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -19505,10 +19867,7 @@ pub struct InsertExperimentEventMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Facets for categorization (dictionary from facet id to value)
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -19545,14 +19904,11 @@ pub struct InsertExperimentEventContext {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InsertExperimentEventArrayDeleteItem {
-    pub delete: Vec<Option<serde_json::Value>>,
+    pub delete: Vec<serde_json::Value>,
     pub path: Vec<String>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -19565,12 +19921,8 @@ pub struct FeedbackExperimentItem {
     )]
     pub comment: Option<Option<String>>,
     ///The ground truth value (an arbitrary, JSON serializable object) that you'd compare to `output` to determine if your `output` value is correct or not
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub expected: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<serde_json::Value>,
     ///The id of the experiment event to log feedback for. This is the row `id` returned by `POST /v1/experiment/{experiment_id}/insert`
     pub id: String,
     ///A dictionary with additional data about the feedback. If you have a `user_id`, you can log it here and access it in the Braintrust UI. Note, this metadata does not correspond to the main event itself, but rather the audit log attached to the event.
@@ -19649,10 +20001,7 @@ pub struct FeedbackExperimentItemMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///A mapping from dataset id to a set of log events and feedback items to insert
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -19745,12 +20094,8 @@ If the row is being merged into an existing row, this field will be ignored.*/
     )]
     pub created: Option<Option<chrono::DateTime<chrono::Utc>>>,
     ///The output of your application, including post-processing (an arbitrary, JSON serializable object)
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub expected: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<serde_json::Value>,
     ///Facets for categorization (dictionary from facet id to value)
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -19766,12 +20111,8 @@ If the row is being merged into an existing row, this field will be ignored.*/
     )]
     pub id: Option<Option<String>>,
     ///The argument that uniquely define an input case (an arbitrary, JSON serializable object)
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub input: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
     ///A dictionary with additional data about the test example, model outputs, or just about anything else that's relevant, that you can use to help find and analyze examples later. For example, you could log the `prompt`, example's `id`, or anything else that would be useful to slice/dice later. The values in `metadata` can be any JSON-serializable type, but its keys must be strings
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -19903,10 +20244,7 @@ pub struct InsertDatasetEventMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Facets for categorization (dictionary from facet id to value)
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -19918,7 +20256,7 @@ pub struct InsertDatasetEventFacets {
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InsertDatasetEventArrayDeleteItem {
-    pub delete: Vec<Option<serde_json::Value>>,
+    pub delete: Vec<serde_json::Value>,
     pub path: Vec<String>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -19993,10 +20331,7 @@ pub struct FeedbackDatasetItemMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateView {
@@ -20540,12 +20875,8 @@ pub struct FreezeColumnsBlockOptionsChartVisibility {
 ///The view definition
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ViewData {
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub custom_charts: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_charts: Option<serde_json::Value>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -20560,25 +20891,25 @@ pub struct ViewDataSearch {
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub filter: Option<Option<Vec<Option<serde_json::Value>>>>,
+    pub filter: Option<Option<Vec<serde_json::Value>>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub r#match: Option<Option<Vec<Option<serde_json::Value>>>>,
+    pub r#match: Option<Option<Vec<serde_json::Value>>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub sort: Option<Option<Vec<Option<serde_json::Value>>>>,
+    pub sort: Option<Option<Vec<serde_json::Value>>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub tag: Option<Option<Vec<Option<serde_json::Value>>>>,
+    pub tag: Option<Option<Vec<serde_json::Value>>>,
 }
 ///Type of object that the view corresponds to.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -20620,8 +20951,6 @@ pub enum CreateViewViewType {
     ForReviewExperiments,
     #[serde(rename = "for_review_datasets")]
     ForReviewDatasets,
-    #[serde(rename = "null")]
-    NullValue,
 }
 impl CreateViewViewType {
     pub fn as_str(&self) -> &'static str {
@@ -20644,7 +20973,6 @@ impl CreateViewViewType {
             Self::ForReviewProjectLog => "for_review_project_log",
             Self::ForReviewExperiments => "for_review_experiments",
             Self::ForReviewDatasets => "for_review_datasets",
-            Self::NullValue => "null",
         }
     }
 }
@@ -20731,7 +21059,7 @@ pub struct SimulatedUserVoiceConfig {
     ///Constraint: minLength=1
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
-    ///Constraint: minimum=0
+    ///Constraint: exclusiveMinimum=0
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaking_rate: Option<f64>,
     pub voice_id: uuid::Uuid,
@@ -22059,7 +22387,7 @@ pub struct CreateProjectAutomationConfigVariant4 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateProjectAutomationConfigVariant3 {
     ///The maximum number of result rows to write per async query batch
-    ///Constraint: minimum=0, maximum=100000
+    ///Constraint: maximum=100000, exclusiveMinimum=0
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -31296,18 +31624,10 @@ impl AsRef<str> for FunctionTypeEnumNullish {
 ///JSON schema for the function's parameters and return type
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct CreateFunctionFunctionSchema {
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub parameters: Option<Option<serde_json::Value>>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub returns: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returns: Option<serde_json::Value>,
 }
 #[derive(Debug, Clone)]
 pub enum FunctionData {
@@ -32625,10 +32945,7 @@ pub struct SchemaBlockData {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///JSON Schema format for parameters
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -32678,10 +32995,7 @@ pub struct SchemaBlockSchemaPropertiesAdditionalProperty {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum RemoteContentType {
@@ -32711,10 +33025,7 @@ pub struct RemoteContentParameters {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///This feature is preliminary and unsupported.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -32757,12 +33068,12 @@ pub struct GraphDataNodes {
 pub enum GraphNode {
     Function(DescriptionBlock),
     Input(DescriptionBlockInline),
-    Output(DescriptionBlockInline5382281D4E9E0AA4),
-    Literal(DescriptionBlockInlineAE4F8A0DB26C279F),
-    Btql(DescriptionBlockInline2440BE94047D3434),
+    Output(DescriptionBlockInline20A779B79A4C0922),
+    Literal(DescriptionBlockInline0ACD4295CA4AF260),
+    Btql(DescriptionBlockInline07ACA48DEAF3E134),
     Gate(ConditionBlock),
-    Aggregator(DescriptionBlockInline7013A06FD3DC81AE),
-    PromptTemplate(DescriptionBlockInline591523B40A593D3D),
+    Aggregator(DescriptionBlockInline8A5ECEF8C399DFEC),
+    PromptTemplate(DescriptionBlockInlineD6CA662FC334ECD7),
 }
 impl serde::Serialize for GraphNode {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -33184,17 +33495,17 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Input(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline5382281D4E9E0AA4,
+                            DescriptionBlockInline20A779B79A4C0922,
                         >(value.clone()) {
                             return Ok(Self::Output(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInlineAE4F8A0DB26C279F,
+                            DescriptionBlockInline0ACD4295CA4AF260,
                         >(value.clone()) {
                             return Ok(Self::Literal(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline2440BE94047D3434,
+                            DescriptionBlockInline07ACA48DEAF3E134,
                         >(value.clone()) {
                             return Ok(Self::Btql(payload));
                         }
@@ -33204,12 +33515,12 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Gate(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline7013A06FD3DC81AE,
+                            DescriptionBlockInline8A5ECEF8C399DFEC,
                         >(value.clone()) {
                             return Ok(Self::Aggregator(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline591523B40A593D3D,
+                            DescriptionBlockInlineD6CA662FC334ECD7,
                         >(value.clone()) {
                             return Ok(Self::PromptTemplate(payload));
                         }
@@ -33228,17 +33539,17 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Function(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline5382281D4E9E0AA4,
+                            DescriptionBlockInline20A779B79A4C0922,
                         >(value.clone()) {
                             return Ok(Self::Output(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInlineAE4F8A0DB26C279F,
+                            DescriptionBlockInline0ACD4295CA4AF260,
                         >(value.clone()) {
                             return Ok(Self::Literal(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline2440BE94047D3434,
+                            DescriptionBlockInline07ACA48DEAF3E134,
                         >(value.clone()) {
                             return Ok(Self::Btql(payload));
                         }
@@ -33248,12 +33559,12 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Gate(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline7013A06FD3DC81AE,
+                            DescriptionBlockInline8A5ECEF8C399DFEC,
                         >(value.clone()) {
                             return Ok(Self::Aggregator(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline591523B40A593D3D,
+                            DescriptionBlockInlineD6CA662FC334ECD7,
                         >(value.clone()) {
                             return Ok(Self::PromptTemplate(payload));
                         }
@@ -33261,7 +33572,7 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                     }
                     "output" => {
                         let primary_error = match serde_json::from_value::<
-                            DescriptionBlockInline5382281D4E9E0AA4,
+                            DescriptionBlockInline20A779B79A4C0922,
                         >(value.clone()) {
                             Ok(payload) => return Ok(Self::Output(payload)),
                             Err(error) => error,
@@ -33277,12 +33588,12 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Input(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInlineAE4F8A0DB26C279F,
+                            DescriptionBlockInline0ACD4295CA4AF260,
                         >(value.clone()) {
                             return Ok(Self::Literal(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline2440BE94047D3434,
+                            DescriptionBlockInline07ACA48DEAF3E134,
                         >(value.clone()) {
                             return Ok(Self::Btql(payload));
                         }
@@ -33292,12 +33603,12 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Gate(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline7013A06FD3DC81AE,
+                            DescriptionBlockInline8A5ECEF8C399DFEC,
                         >(value.clone()) {
                             return Ok(Self::Aggregator(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline591523B40A593D3D,
+                            DescriptionBlockInlineD6CA662FC334ECD7,
                         >(value.clone()) {
                             return Ok(Self::PromptTemplate(payload));
                         }
@@ -33305,7 +33616,7 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                     }
                     "literal" => {
                         let primary_error = match serde_json::from_value::<
-                            DescriptionBlockInlineAE4F8A0DB26C279F,
+                            DescriptionBlockInline0ACD4295CA4AF260,
                         >(value.clone()) {
                             Ok(payload) => return Ok(Self::Literal(payload)),
                             Err(error) => error,
@@ -33321,12 +33632,12 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Input(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline5382281D4E9E0AA4,
+                            DescriptionBlockInline20A779B79A4C0922,
                         >(value.clone()) {
                             return Ok(Self::Output(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline2440BE94047D3434,
+                            DescriptionBlockInline07ACA48DEAF3E134,
                         >(value.clone()) {
                             return Ok(Self::Btql(payload));
                         }
@@ -33336,12 +33647,12 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Gate(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline7013A06FD3DC81AE,
+                            DescriptionBlockInline8A5ECEF8C399DFEC,
                         >(value.clone()) {
                             return Ok(Self::Aggregator(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline591523B40A593D3D,
+                            DescriptionBlockInlineD6CA662FC334ECD7,
                         >(value.clone()) {
                             return Ok(Self::PromptTemplate(payload));
                         }
@@ -33349,7 +33660,7 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                     }
                     "btql" => {
                         let primary_error = match serde_json::from_value::<
-                            DescriptionBlockInline2440BE94047D3434,
+                            DescriptionBlockInline07ACA48DEAF3E134,
                         >(value.clone()) {
                             Ok(payload) => return Ok(Self::Btql(payload)),
                             Err(error) => error,
@@ -33365,12 +33676,12 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Input(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline5382281D4E9E0AA4,
+                            DescriptionBlockInline20A779B79A4C0922,
                         >(value.clone()) {
                             return Ok(Self::Output(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInlineAE4F8A0DB26C279F,
+                            DescriptionBlockInline0ACD4295CA4AF260,
                         >(value.clone()) {
                             return Ok(Self::Literal(payload));
                         }
@@ -33380,12 +33691,12 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Gate(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline7013A06FD3DC81AE,
+                            DescriptionBlockInline8A5ECEF8C399DFEC,
                         >(value.clone()) {
                             return Ok(Self::Aggregator(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline591523B40A593D3D,
+                            DescriptionBlockInlineD6CA662FC334ECD7,
                         >(value.clone()) {
                             return Ok(Self::PromptTemplate(payload));
                         }
@@ -33409,27 +33720,27 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Input(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline5382281D4E9E0AA4,
+                            DescriptionBlockInline20A779B79A4C0922,
                         >(value.clone()) {
                             return Ok(Self::Output(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInlineAE4F8A0DB26C279F,
+                            DescriptionBlockInline0ACD4295CA4AF260,
                         >(value.clone()) {
                             return Ok(Self::Literal(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline2440BE94047D3434,
+                            DescriptionBlockInline07ACA48DEAF3E134,
                         >(value.clone()) {
                             return Ok(Self::Btql(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline7013A06FD3DC81AE,
+                            DescriptionBlockInline8A5ECEF8C399DFEC,
                         >(value.clone()) {
                             return Ok(Self::Aggregator(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline591523B40A593D3D,
+                            DescriptionBlockInlineD6CA662FC334ECD7,
                         >(value.clone()) {
                             return Ok(Self::PromptTemplate(payload));
                         }
@@ -33437,7 +33748,7 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                     }
                     "aggregator" => {
                         let primary_error = match serde_json::from_value::<
-                            DescriptionBlockInline7013A06FD3DC81AE,
+                            DescriptionBlockInline8A5ECEF8C399DFEC,
                         >(value.clone()) {
                             Ok(payload) => return Ok(Self::Aggregator(payload)),
                             Err(error) => error,
@@ -33453,17 +33764,17 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Input(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline5382281D4E9E0AA4,
+                            DescriptionBlockInline20A779B79A4C0922,
                         >(value.clone()) {
                             return Ok(Self::Output(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInlineAE4F8A0DB26C279F,
+                            DescriptionBlockInline0ACD4295CA4AF260,
                         >(value.clone()) {
                             return Ok(Self::Literal(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline2440BE94047D3434,
+                            DescriptionBlockInline07ACA48DEAF3E134,
                         >(value.clone()) {
                             return Ok(Self::Btql(payload));
                         }
@@ -33473,7 +33784,7 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Gate(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline591523B40A593D3D,
+                            DescriptionBlockInlineD6CA662FC334ECD7,
                         >(value.clone()) {
                             return Ok(Self::PromptTemplate(payload));
                         }
@@ -33481,7 +33792,7 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                     }
                     "prompt_template" => {
                         let primary_error = match serde_json::from_value::<
-                            DescriptionBlockInline591523B40A593D3D,
+                            DescriptionBlockInlineD6CA662FC334ECD7,
                         >(value.clone()) {
                             Ok(payload) => return Ok(Self::PromptTemplate(payload)),
                             Err(error) => error,
@@ -33497,17 +33808,17 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Input(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline5382281D4E9E0AA4,
+                            DescriptionBlockInline20A779B79A4C0922,
                         >(value.clone()) {
                             return Ok(Self::Output(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInlineAE4F8A0DB26C279F,
+                            DescriptionBlockInline0ACD4295CA4AF260,
                         >(value.clone()) {
                             return Ok(Self::Literal(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline2440BE94047D3434,
+                            DescriptionBlockInline07ACA48DEAF3E134,
                         >(value.clone()) {
                             return Ok(Self::Btql(payload));
                         }
@@ -33517,7 +33828,7 @@ impl<'de> serde::Deserialize<'de> for GraphNode {
                             return Ok(Self::Gate(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            DescriptionBlockInline7013A06FD3DC81AE,
+                            DescriptionBlockInline8A5ECEF8C399DFEC,
                         >(value.clone()) {
                             return Ok(Self::Aggregator(payload));
                         }
@@ -33783,10 +34094,7 @@ pub struct FunctionIdRef {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///The input to the graph
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -33821,93 +34129,62 @@ pub struct DescriptionBlockInlinePosition {
     pub y: f64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub enum DescriptionBlockInlineAE4F8A0DB26C279FType {
-    #[default]
-    #[serde(rename = "literal")]
-    Literal,
-}
-impl DescriptionBlockInlineAE4F8A0DB26C279FType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Literal => "literal",
-        }
-    }
-}
-impl ::std::fmt::Display for DescriptionBlockInlineAE4F8A0DB26C279FType {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-impl AsRef<str> for DescriptionBlockInlineAE4F8A0DB26C279FType {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-///The position of the node
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DescriptionBlockInlineAE4F8A0DB26C279FPosition {
-    ///The x position of the node
-    pub x: f64,
-    ///The y position of the node
-    pub y: f64,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub enum DescriptionBlockInline7013A06FD3DC81AEType {
-    #[default]
-    #[serde(rename = "aggregator")]
-    Aggregator,
-}
-impl DescriptionBlockInline7013A06FD3DC81AEType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Aggregator => "aggregator",
-        }
-    }
-}
-impl ::std::fmt::Display for DescriptionBlockInline7013A06FD3DC81AEType {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-impl AsRef<str> for DescriptionBlockInline7013A06FD3DC81AEType {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-///The position of the node
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DescriptionBlockInline7013A06FD3DC81AEPosition {
-    ///The x position of the node
-    pub x: f64,
-    ///The y position of the node
-    pub y: f64,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub enum DescriptionBlockInline591523B40A593D3DType {
+pub enum DescriptionBlockInlineD6CA662FC334ECD7Type {
     #[default]
     #[serde(rename = "prompt_template")]
     PromptTemplate,
 }
-impl DescriptionBlockInline591523B40A593D3DType {
+impl DescriptionBlockInlineD6CA662FC334ECD7Type {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::PromptTemplate => "prompt_template",
         }
     }
 }
-impl ::std::fmt::Display for DescriptionBlockInline591523B40A593D3DType {
+impl ::std::fmt::Display for DescriptionBlockInlineD6CA662FC334ECD7Type {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
-impl AsRef<str> for DescriptionBlockInline591523B40A593D3DType {
+impl AsRef<str> for DescriptionBlockInlineD6CA662FC334ECD7Type {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 ///The position of the node
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DescriptionBlockInline591523B40A593D3DPosition {
+pub struct DescriptionBlockInlineD6CA662FC334ECD7Position {
+    ///The x position of the node
+    pub x: f64,
+    ///The y position of the node
+    pub y: f64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum DescriptionBlockInline8A5ECEF8C399DFECType {
+    #[default]
+    #[serde(rename = "aggregator")]
+    Aggregator,
+}
+impl DescriptionBlockInline8A5ECEF8C399DFECType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Aggregator => "aggregator",
+        }
+    }
+}
+impl ::std::fmt::Display for DescriptionBlockInline8A5ECEF8C399DFECType {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl AsRef<str> for DescriptionBlockInline8A5ECEF8C399DFECType {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+///The position of the node
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DescriptionBlockInline8A5ECEF8C399DFECPosition {
     ///The x position of the node
     pub x: f64,
     ///The y position of the node
@@ -33915,62 +34192,93 @@ pub struct DescriptionBlockInline591523B40A593D3DPosition {
 }
 ///The output of the graph
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub enum DescriptionBlockInline5382281D4E9E0AA4Type {
+pub enum DescriptionBlockInline20A779B79A4C0922Type {
     #[default]
     #[serde(rename = "output")]
     Output,
 }
-impl DescriptionBlockInline5382281D4E9E0AA4Type {
+impl DescriptionBlockInline20A779B79A4C0922Type {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Output => "output",
         }
     }
 }
-impl ::std::fmt::Display for DescriptionBlockInline5382281D4E9E0AA4Type {
+impl ::std::fmt::Display for DescriptionBlockInline20A779B79A4C0922Type {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
-impl AsRef<str> for DescriptionBlockInline5382281D4E9E0AA4Type {
+impl AsRef<str> for DescriptionBlockInline20A779B79A4C0922Type {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 ///The position of the node
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DescriptionBlockInline5382281D4E9E0AA4Position {
+pub struct DescriptionBlockInline20A779B79A4C0922Position {
     ///The x position of the node
     pub x: f64,
     ///The y position of the node
     pub y: f64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub enum DescriptionBlockInline2440BE94047D3434Type {
+pub enum DescriptionBlockInline0ACD4295CA4AF260Type {
     #[default]
-    #[serde(rename = "btql")]
-    Btql,
+    #[serde(rename = "literal")]
+    Literal,
 }
-impl DescriptionBlockInline2440BE94047D3434Type {
+impl DescriptionBlockInline0ACD4295CA4AF260Type {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Btql => "btql",
+            Self::Literal => "literal",
         }
     }
 }
-impl ::std::fmt::Display for DescriptionBlockInline2440BE94047D3434Type {
+impl ::std::fmt::Display for DescriptionBlockInline0ACD4295CA4AF260Type {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
-impl AsRef<str> for DescriptionBlockInline2440BE94047D3434Type {
+impl AsRef<str> for DescriptionBlockInline0ACD4295CA4AF260Type {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 ///The position of the node
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DescriptionBlockInline2440BE94047D3434Position {
+pub struct DescriptionBlockInline0ACD4295CA4AF260Position {
+    ///The x position of the node
+    pub x: f64,
+    ///The y position of the node
+    pub y: f64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum DescriptionBlockInline07ACA48DEAF3E134Type {
+    #[default]
+    #[serde(rename = "btql")]
+    Btql,
+}
+impl DescriptionBlockInline07ACA48DEAF3E134Type {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Btql => "btql",
+        }
+    }
+}
+impl ::std::fmt::Display for DescriptionBlockInline07ACA48DEAF3E134Type {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl AsRef<str> for DescriptionBlockInline07ACA48DEAF3E134Type {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+///The position of the node
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DescriptionBlockInline07ACA48DEAF3E134Position {
     ///The x position of the node
     pub x: f64,
     ///The y position of the node
@@ -34825,10 +35133,7 @@ pub struct CreateExperimentMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Braintrust-controlled metadata about the experiment.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -34843,10 +35148,7 @@ pub struct CreateExperimentInternalMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///BTQL filter payload used to evaluate a subset of a linked dataset.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -34854,10 +35156,7 @@ pub struct CreateExperimentInternalMetadataDatasetFilter {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateDataset {
@@ -34994,10 +35293,7 @@ pub struct CreateDatasetMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///An agent is a project-scoped durable object that identifies an AI agent or service emitting spans
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -35104,10 +35400,7 @@ pub struct CreateAgentMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateAISecret {
@@ -35267,25 +35560,38 @@ pub struct CreateAISecretMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ContentBlockInlineEEB1A7AB6D248331 {
+pub struct ContentBlockInlineC8623CC80E060C16 {
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub content: Option<Option<ContentBlockInlineEEB1A7AB6D248331Content>>,
+    pub content: Option<Option<String>>,
+    pub role: ContentBlockInlineC8623CC80E060C16Role,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContentBlockInlineC68D88B1B8618760 {
+    pub content: Option<String>,
+    pub name: String,
+    pub role: ContentBlockInlineC68D88B1B8618760Role,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContentBlockInlineC44AA64BB22F5C95 {
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
-    pub function_call: Option<Option<ContentBlockInlineEEB1A7AB6D248331FunctionCall>>,
+    pub content: Option<Option<ContentBlockInlineC44AA64BB22F5C95Content>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "tri_state_serde::deserialize"
+    )]
+    pub function_call: Option<Option<ContentBlockInlineC44AA64BB22F5C95FunctionCall>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -35304,7 +35610,7 @@ pub struct ContentBlockInlineEEB1A7AB6D248331 {
         deserialize_with = "tri_state_serde::deserialize"
     )]
     pub reasoning_signature: Option<Option<String>>,
-    pub role: ContentBlockInlineEEB1A7AB6D248331Role,
+    pub role: ContentBlockInlineC44AA64BB22F5C95Role,
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -35347,22 +35653,6 @@ impl AsRef<str> for ContentBlockInlineA7803B9F8FD640C8Type {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
-}
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ContentBlockInline96AC3C2BE6901BC2 {
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub content: Option<Option<String>>,
-    pub role: ContentBlockInline96AC3C2BE6901BC2Role,
-}
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ContentBlockInline515451E5C6744E42 {
-    pub content: Option<String>,
-    pub name: String,
-    pub role: ContentBlockInline515451E5C6744E42Role,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ContentBlockInline3B772F44C6FFD774 {
@@ -35459,10 +35749,7 @@ pub struct ConfigBlockInlineConfig {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConfigBlock {
@@ -35507,10 +35794,7 @@ pub struct ConfigBlockConfig {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConditionBlock {
@@ -36285,12 +36569,8 @@ pub struct EntrypointsBlock {
     pub entrypoints: Option<Vec<String>>,
     pub eval_name: String,
     ///Definition of current evaluator with parameters
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "tri_state_serde::deserialize"
-    )]
-    pub evaluator_definition: Option<Option<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluator_definition: Option<serde_json::Value>,
     ///Parameter values for sandbox eval execution
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<EntrypointsBlockParameters>,
@@ -36649,10 +36929,7 @@ pub struct EntrypointsBlockParameters {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CodeBlockInlineFDF5F7CEAF2BAD4F {
@@ -36873,10 +37150,7 @@ pub struct ChatTemplateKwargsBlock {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone)]
 pub enum ResponseFormatNullish {
@@ -37205,10 +37479,7 @@ pub struct ResponseFormatJsonSchemaVariant {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum JsonSchemaBlockType {
@@ -37355,20 +37626,17 @@ pub struct ChatTemplateKwargsBlockChatTemplateKwargs {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone)]
 pub enum ChatCompletionMessageParam {
     System(ContentBlock),
     User(ContentBlockInline),
-    Assistant(ContentBlockInlineEEB1A7AB6D248331),
+    Assistant(ContentBlockInlineC44AA64BB22F5C95),
     Tool(ContentBlockInline3B772F44C6FFD774),
-    Function(ContentBlockInline515451E5C6744E42),
+    Function(ContentBlockInlineC68D88B1B8618760),
     Developer(ContentBlockInlineABDCA560C0B03421),
-    Model(ContentBlockInline96AC3C2BE6901BC2),
+    Model(ContentBlockInlineC8623CC80E060C16),
 }
 impl serde::Serialize for ChatCompletionMessageParam {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -37743,7 +38011,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::User(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInlineEEB1A7AB6D248331,
+                            ContentBlockInlineC44AA64BB22F5C95,
                         >(value.clone()) {
                             return Ok(Self::Assistant(payload));
                         }
@@ -37753,7 +38021,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::Tool(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline515451E5C6744E42,
+                            ContentBlockInlineC68D88B1B8618760,
                         >(value.clone()) {
                             return Ok(Self::Function(payload));
                         }
@@ -37763,7 +38031,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::Developer(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline96AC3C2BE6901BC2,
+                            ContentBlockInlineC8623CC80E060C16,
                         >(value.clone()) {
                             return Ok(Self::Model(payload));
                         }
@@ -37782,7 +38050,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::System(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInlineEEB1A7AB6D248331,
+                            ContentBlockInlineC44AA64BB22F5C95,
                         >(value.clone()) {
                             return Ok(Self::Assistant(payload));
                         }
@@ -37792,7 +38060,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::Tool(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline515451E5C6744E42,
+                            ContentBlockInlineC68D88B1B8618760,
                         >(value.clone()) {
                             return Ok(Self::Function(payload));
                         }
@@ -37802,7 +38070,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::Developer(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline96AC3C2BE6901BC2,
+                            ContentBlockInlineC8623CC80E060C16,
                         >(value.clone()) {
                             return Ok(Self::Model(payload));
                         }
@@ -37810,7 +38078,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                     }
                     "assistant" => {
                         let primary_error = match serde_json::from_value::<
-                            ContentBlockInlineEEB1A7AB6D248331,
+                            ContentBlockInlineC44AA64BB22F5C95,
                         >(value.clone()) {
                             Ok(payload) => return Ok(Self::Assistant(payload)),
                             Err(error) => error,
@@ -37831,7 +38099,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::Tool(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline515451E5C6744E42,
+                            ContentBlockInlineC68D88B1B8618760,
                         >(value.clone()) {
                             return Ok(Self::Function(payload));
                         }
@@ -37841,7 +38109,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::Developer(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline96AC3C2BE6901BC2,
+                            ContentBlockInlineC8623CC80E060C16,
                         >(value.clone()) {
                             return Ok(Self::Model(payload));
                         }
@@ -37865,12 +38133,12 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::User(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInlineEEB1A7AB6D248331,
+                            ContentBlockInlineC44AA64BB22F5C95,
                         >(value.clone()) {
                             return Ok(Self::Assistant(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline515451E5C6744E42,
+                            ContentBlockInlineC68D88B1B8618760,
                         >(value.clone()) {
                             return Ok(Self::Function(payload));
                         }
@@ -37880,7 +38148,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::Developer(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline96AC3C2BE6901BC2,
+                            ContentBlockInlineC8623CC80E060C16,
                         >(value.clone()) {
                             return Ok(Self::Model(payload));
                         }
@@ -37888,7 +38156,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                     }
                     "function" => {
                         let primary_error = match serde_json::from_value::<
-                            ContentBlockInline515451E5C6744E42,
+                            ContentBlockInlineC68D88B1B8618760,
                         >(value.clone()) {
                             Ok(payload) => return Ok(Self::Function(payload)),
                             Err(error) => error,
@@ -37904,7 +38172,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::User(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInlineEEB1A7AB6D248331,
+                            ContentBlockInlineC44AA64BB22F5C95,
                         >(value.clone()) {
                             return Ok(Self::Assistant(payload));
                         }
@@ -37919,7 +38187,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::Developer(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline96AC3C2BE6901BC2,
+                            ContentBlockInlineC8623CC80E060C16,
                         >(value.clone()) {
                             return Ok(Self::Model(payload));
                         }
@@ -37943,7 +38211,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::User(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInlineEEB1A7AB6D248331,
+                            ContentBlockInlineC44AA64BB22F5C95,
                         >(value.clone()) {
                             return Ok(Self::Assistant(payload));
                         }
@@ -37953,12 +38221,12 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::Tool(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline515451E5C6744E42,
+                            ContentBlockInlineC68D88B1B8618760,
                         >(value.clone()) {
                             return Ok(Self::Function(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline96AC3C2BE6901BC2,
+                            ContentBlockInlineC8623CC80E060C16,
                         >(value.clone()) {
                             return Ok(Self::Model(payload));
                         }
@@ -37966,7 +38234,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                     }
                     "model" => {
                         let primary_error = match serde_json::from_value::<
-                            ContentBlockInline96AC3C2BE6901BC2,
+                            ContentBlockInlineC8623CC80E060C16,
                         >(value.clone()) {
                             Ok(payload) => return Ok(Self::Model(payload)),
                             Err(error) => error,
@@ -37982,7 +38250,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::User(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInlineEEB1A7AB6D248331,
+                            ContentBlockInlineC44AA64BB22F5C95,
                         >(value.clone()) {
                             return Ok(Self::Assistant(payload));
                         }
@@ -37992,7 +38260,7 @@ impl<'de> serde::Deserialize<'de> for ChatCompletionMessageParam {
                             return Ok(Self::Tool(payload));
                         }
                         if let Ok(payload) = serde_json::from_value::<
-                            ContentBlockInline515451E5C6744E42,
+                            ContentBlockInlineC68D88B1B8618760,
                         >(value.clone()) {
                             return Ok(Self::Function(payload));
                         }
@@ -38070,45 +38338,91 @@ impl AsRef<str> for ContentBlockInlineRole {
         self.as_str()
     }
 }
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ContentBlockInlineContent {
+    String(String),
+    ChatCompletionContentPartArray(ChatCompletionContentPartArray),
+}
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub enum ContentBlockInlineEEB1A7AB6D248331Role {
+pub enum ContentBlockInlineC8623CC80E060C16Role {
+    #[default]
+    #[serde(rename = "model")]
+    Model,
+}
+impl ContentBlockInlineC8623CC80E060C16Role {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Model => "model",
+        }
+    }
+}
+impl ::std::fmt::Display for ContentBlockInlineC8623CC80E060C16Role {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl AsRef<str> for ContentBlockInlineC8623CC80E060C16Role {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum ContentBlockInlineC68D88B1B8618760Role {
+    #[default]
+    #[serde(rename = "function")]
+    Function,
+}
+impl ContentBlockInlineC68D88B1B8618760Role {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Function => "function",
+        }
+    }
+}
+impl ::std::fmt::Display for ContentBlockInlineC68D88B1B8618760Role {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl AsRef<str> for ContentBlockInlineC68D88B1B8618760Role {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum ContentBlockInlineC44AA64BB22F5C95Role {
     #[default]
     #[serde(rename = "assistant")]
     Assistant,
 }
-impl ContentBlockInlineEEB1A7AB6D248331Role {
+impl ContentBlockInlineC44AA64BB22F5C95Role {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Assistant => "assistant",
         }
     }
 }
-impl ::std::fmt::Display for ContentBlockInlineEEB1A7AB6D248331Role {
+impl ::std::fmt::Display for ContentBlockInlineC44AA64BB22F5C95Role {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
-impl AsRef<str> for ContentBlockInlineEEB1A7AB6D248331Role {
+impl AsRef<str> for ContentBlockInlineC44AA64BB22F5C95Role {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ContentBlockInlineEEB1A7AB6D248331FunctionCall {
+pub struct ContentBlockInlineC44AA64BB22F5C95FunctionCall {
     pub arguments: String,
     pub name: String,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum ContentBlockInlineEEB1A7AB6D248331Content {
+pub enum ContentBlockInlineC44AA64BB22F5C95Content {
     String(String),
     ChatCompletionContentPartTextArrayInline(ChatCompletionContentPartTextArrayInline),
-}
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum ContentBlockInlineContent {
-    String(String),
-    ChatCompletionContentPartArray(ChatCompletionContentPartArray),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum ContentBlockInlineABDCA560C0B03421Role {
@@ -38140,52 +38454,6 @@ pub enum ContentBlockInlineABDCA560C0B03421Content {
     ChatCompletionContentPartTextArrayInline651DBD07A258D3D3(
         ChatCompletionContentPartTextArrayInline651DBD07A258D3D3,
     ),
-}
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub enum ContentBlockInline96AC3C2BE6901BC2Role {
-    #[default]
-    #[serde(rename = "model")]
-    Model,
-}
-impl ContentBlockInline96AC3C2BE6901BC2Role {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Model => "model",
-        }
-    }
-}
-impl ::std::fmt::Display for ContentBlockInline96AC3C2BE6901BC2Role {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-impl AsRef<str> for ContentBlockInline96AC3C2BE6901BC2Role {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub enum ContentBlockInline515451E5C6744E42Role {
-    #[default]
-    #[serde(rename = "function")]
-    Function,
-}
-impl ContentBlockInline515451E5C6744E42Role {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Function => "function",
-        }
-    }
-}
-impl ::std::fmt::Display for ContentBlockInline515451E5C6744E42Role {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-impl AsRef<str> for ContentBlockInline515451E5C6744E42Role {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum ContentBlockInline3B772F44C6FFD774Role {
@@ -39707,21 +39975,21 @@ pub struct TopicMapDataTopicNames {
 pub struct TopicMapGenerationSettings {
     pub algorithm: TopicMapGenerationSettingsAlgorithm,
     pub dimension_reduction: TopicMapGenerationSettingsDimensionReduction,
-    ///Constraint: minimum=0
+    ///Constraint: exclusiveMinimum=0
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hierarchy_threshold: Option<i64>,
-    ///Constraint: minimum=0
+    ///Constraint: exclusiveMinimum=0
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_cluster_size: Option<i64>,
-    ///Constraint: minimum=0
+    ///Constraint: exclusiveMinimum=0
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_samples: Option<i64>,
-    ///Constraint: minimum=0
+    ///Constraint: exclusiveMinimum=0
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n_clusters: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub naming_model: Option<String>,
-    ///Constraint: minimum=0
+    ///Constraint: exclusiveMinimum=0
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample_size: Option<i64>,
 }
@@ -40356,8 +40624,6 @@ pub enum FunctionTypeEnum {
     Parameters,
     #[serde(rename = "sandbox")]
     Sandbox,
-    #[serde(rename = "null")]
-    NullValue,
 }
 impl FunctionTypeEnum {
     pub fn as_str(&self) -> &'static str {
@@ -40373,7 +40639,6 @@ impl FunctionTypeEnum {
             Self::Tag => "tag",
             Self::Parameters => "parameters",
             Self::Sandbox => "sandbox",
-            Self::NullValue => "null",
         }
     }
 }
@@ -42597,10 +42862,7 @@ pub struct AgentMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 pub type AclListOrgResponse = Vec<Acl>;
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -42640,12 +42902,14 @@ pub struct AclItem {
     ///The id of the object the ACL applies to
     pub object_id: uuid::Uuid,
     pub object_type: AclObjectType,
+    ///Permission the ACL grants. Exactly one of `permission` and `role_id` will be provided
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
     pub permission: Option<Option<Permission>>,
+    ///When setting a permission directly, optionally restricts the permission grant to just the specified object type. Cannot be set alongside a `role_id`.
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -42846,12 +43110,14 @@ pub struct Acl {
     ///The id of the object the ACL applies to
     pub object_id: uuid::Uuid,
     pub object_type: AclObjectType,
+    ///Permission the ACL grants. Exactly one of `permission` and `role_id` will be provided
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
         deserialize_with = "tri_state_serde::deserialize"
     )]
     pub permission: Option<Option<Permission>>,
+    ///When setting a permission directly, optionally restricts the permission grant to just the specified object type. Cannot be set alongside a `role_id`.
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -43060,10 +43326,7 @@ pub struct AISecretMetadata {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 pub type AclBatchUpdateResponse400 = serde_json::Value;
 pub type AclBatchUpdateResponse401 = serde_json::Value;
@@ -44814,10 +45077,7 @@ pub struct MaxOutputTokensBlock {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MaxTokensBlock {
@@ -44841,10 +45101,7 @@ pub struct MaxTokensBlock {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///McpServer id
 pub type McpServerIdParam = uuid::Uuid;
@@ -45031,7 +45288,6 @@ pub type PatchOrganizationMembersResponse401 = serde_json::Value;
 pub type PatchOrganizationMembersResponse403 = serde_json::Value;
 pub type PatchOrganizationMembersResponse429 = serde_json::Value;
 pub type PatchOrganizationMembersResponse500 = serde_json::Value;
-pub type PatchProjectAutomationConfigVariant9 = serde_json::Value;
 pub type PatchProjectAutomationIdResponse400 = serde_json::Value;
 pub type PatchProjectAutomationIdResponse401 = serde_json::Value;
 pub type PatchProjectAutomationIdResponse403 = serde_json::Value;
@@ -45325,7 +45581,7 @@ pub type PostRoleResponse500 = serde_json::Value;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PostServiceTokenRequest {
     ///Number of seconds from now after which the service token should expire. If omitted, the token never expires.
-    ///Constraint: minimum=0
+    ///Constraint: exclusiveMinimum=0
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -45588,7 +45844,7 @@ pub type PutRoleResponse500 = serde_json::Value;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PutServiceTokenRequest {
     ///Number of seconds from now after which the service token should expire. If omitted, the token never expires.
-    ///Constraint: minimum=0
+    ///Constraint: exclusiveMinimum=0
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
@@ -45721,10 +45977,7 @@ pub struct ReasoningBudgetBlock {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ReasoningBudgetBlockInline {
@@ -45737,10 +45990,7 @@ pub struct ReasoningBudgetBlockInline {
     /// Additional properties matching the spec's
     /// `additionalProperties` value schema.
     #[serde(flatten)]
-    pub additional_properties: std::collections::BTreeMap<
-        String,
-        Option<serde_json::Value>,
-    >,
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 ///Role id
 pub type RoleIdParam = uuid::Uuid;
@@ -45815,8 +46065,6 @@ pub enum ViewType {
     ForReviewExperiments,
     #[serde(rename = "for_review_datasets")]
     ForReviewDatasets,
-    #[serde(rename = "null")]
-    NullValue,
 }
 impl ViewType {
     pub fn as_str(&self) -> &'static str {
@@ -45839,7 +46087,6 @@ impl ViewType {
             Self::ForReviewProjectLog => "for_review_project_log",
             Self::ForReviewExperiments => "for_review_experiments",
             Self::ForReviewDatasets => "for_review_datasets",
-            Self::NullValue => "null",
         }
     }
 }
