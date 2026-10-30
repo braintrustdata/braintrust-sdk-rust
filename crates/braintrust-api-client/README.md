@@ -1,15 +1,18 @@
 # Braintrust API client
 
-Typed async REST client generated with Progenitor 0.15.1. The main
-`braintrust-sdk-rust` crate re-exports it as `braintrust_sdk_rust::api`.
+Async Rust client for managing Braintrust resources, querying data, and writing
+logs. Use it directly or through `braintrust_sdk_rust::api`.
 Requires Rust 1.88 or newer.
+
+## Create a dataset
+
+Set `BRAINTRUST_API_KEY` and provide your project ID:
 
 ```rust,no_run
 use braintrust_api_client::{Client, types};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let client = Client::builder().build()?; // Reads BRAINTRUST_API_KEY.
-
+let client = Client::builder().build()?;
 let body: types::CreateDataset = types::CreateDataset::builder()
     .name("example")
     .project_id("00000000-0000-0000-0000-000000000001")
@@ -20,46 +23,11 @@ println!("{}", dataset.id);
 # }
 ```
 
-To supply the key programmatically:
+To provide a key in code, use `Client::builder().api_key("your-api-key").build()?`.
 
-```rust,no_run
-# use braintrust_api_client::Client;
-# fn example() -> Result<(), braintrust_api_client::ClientInitError> {
-let client = Client::builder()
-    .api_key("your-api-key")
-    .build()?;
-# Ok(())
-# }
-```
+## Connect to an organization
 
-Use `.api_url(url)` to override the endpoint. Otherwise the builder reads
-`BRAINTRUST_API_URL`, defaulting to `https://api.braintrust.dev`.
-Explicit values override environment variables.
-
-The builder sets a sensitive bearer authorization header so Debug output does
-not expose the key. Missing, empty, or invalid keys produce a `ClientInitError`.
-
-For custom certificates, proxies, timeouts, or other transport settings, supply
-a reqwest builder. Its settings are preserved, with bearer authentication added:
-
-```rust,no_run
-# use braintrust_api_client::Client;
-# fn example() -> Result<(), braintrust_api_client::ClientInitError> {
-let client = Client::builder()
-    .http_client_builder(reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30)))
-    .build()?;
-# Ok(())
-# }
-```
-
-The configured API key overrides any default authorization header on the reqwest
-builder. This REST client is independent of the logging SDK's login state and
-batching/retry behavior.
-
-## Login and organization discovery
-
-`build()` makes no network requests. To discover an organization's API endpoint:
+Use login to find your organization's API endpoint automatically:
 
 ```rust,no_run
 # use braintrust_api_client::Client;
@@ -68,20 +36,14 @@ let client = Client::builder()
     .org_name("my-org")
     .build_with_login()
     .await?;
-println!("{}", client.organization().unwrap().id);
 # Ok(())
 # }
 ```
 
-Login uses `.app_url(url)`, or `BRAINTRUST_APP_URL`, defaulting to
-`https://www.braintrust.dev`. It selects the first organization when no name is
-provided. Its discovered API URL replaces the configured fallback; if absent,
-the fallback remains. `client.login()` lists organizations without changing the
-client's endpoint. Organization selection also sets the `x-bt-org-name` header.
+Omit `.org_name(...)` to select the first available organization. To list your
+organizations, call `client.login().await?`.
 
-## Queries and logging
-
-The same client supports endpoints outside the public REST specification:
+## Query data and write logs
 
 ```rust,no_run
 # use braintrust_api_client::Client;
@@ -100,19 +62,29 @@ client.logs3(&serde_json::json!({
 # }
 ```
 
-`btql()` returns the raw response for JSONL or Parquet queries. `logs3_raw()`
-accepts already-serialized JSON. `version()` reports server capabilities.
-These methods make individual requests; batching and retry policy belong to
-the caller. `control_plane(object, action, &body)` supports legacy app operations;
-`experiment_comparison()` and `dataset_summary()` use the API endpoint.
+Use `btql()` for JSONL or Parquet results, and `logs3_raw()` when your log payload
+is already serialized. For buffered background logging, use the main SDK's
+logging APIs.
 
-For oversized logs, request a destination with `logs3_overflow()`, upload with
-`upload_logs3_overflow()`, then submit its key as a `logs3_overflow` reference
-through `logs3()`. Signed POST and PUT uploads use a separate transport without
-Braintrust credentials. Configure its certificates, proxies, or timeouts using
-`.upload_http_client_builder(...)` when needed; API transport settings are not
-copied to storage requests.
+## Customize your connection
 
-Handwritten operations use the same `Error` and `ResponseValue` types as the
-REST methods. Unsuccessful HTTP responses are preserved in
-`Error::UnexpectedResponse` for inspecting their status and body.
+Use `.api_url(url)` for a custom API endpoint and `.app_url(url)` for a custom
+login endpoint. These also read `BRAINTRUST_API_URL` and `BRAINTRUST_APP_URL`,
+respectively. Explicit settings take precedence over environment variables.
+Defaults are `https://api.braintrust.dev` and `https://www.braintrust.dev`.
+
+Configure timeouts, proxies, or trusted certificates with a reqwest builder:
+
+```rust,no_run
+# use braintrust_api_client::Client;
+# fn example() -> Result<(), braintrust_api_client::ClientInitError> {
+let client = Client::builder()
+    .http_client_builder(reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30)))
+    .build()?;
+# Ok(())
+# }
+```
+
+For custom settings when uploading large log batches to storage, use
+`.upload_http_client_builder(...)`.
