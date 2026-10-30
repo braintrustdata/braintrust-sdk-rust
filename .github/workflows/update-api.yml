@@ -5,16 +5,6 @@ on:
     types: [braintrust-openapi-updated]
   workflow_dispatch:
     inputs:
-      contract_version:
-        description: Update contract version
-        type: string
-        default: "1"
-        required: true
-      spec_repository:
-        description: Published spec repository
-        type: string
-        default: braintrustdata/braintrust-openapi
-        required: true
       spec_sha:
         description: Full commit SHA published on braintrust-openapi main
         type: string
@@ -41,13 +31,9 @@ jobs:
         id: update
         env:
           GH_TOKEN: ${{ github.token }}
-          CONTRACT_VERSION: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.contract_version || inputs.contract_version }}
-          SPEC_REPOSITORY: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.spec_repository || inputs.spec_repository }}
           SPEC_SHA: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.spec_sha || inputs.spec_sha }}
         run: |
           python3 scripts/update-openapi.py \
-            --contract-version "$CONTRACT_VERSION" \
-            --spec-repository "$SPEC_REPOSITORY" \
             --spec-sha "$SPEC_SHA"
 
       - name: Create SDK bot token

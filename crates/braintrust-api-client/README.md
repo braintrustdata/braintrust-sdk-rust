@@ -50,16 +50,15 @@ independently of the upstream spec.
 
 After a commit lands on `braintrust-openapi` main, its dispatcher sends a
 `repository_dispatch` event with type `braintrust-openapi-updated`. The
-`.github/workflows/update-api.yml` receiver accepts this versioned payload:
+`.github/workflows/update-api.yml` receiver accepts this payload:
 
 ```json
 {
-  "contract_version": "1",
-  "spec_repository": "braintrustdata/braintrust-openapi",
   "spec_sha": "<full published commit SHA>"
 }
 ```
 
+The source repository is hard-coded to `braintrustdata/braintrust-openapi`.
 The receiver verifies the notified commit is on upstream main, coalesces delayed
 notifications to the latest published main revision, and downloads that exact
 revision. If the spec bytes changed, it updates `openapi.json` and

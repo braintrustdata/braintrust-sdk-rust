@@ -74,14 +74,28 @@ class UpdateTests(unittest.TestCase):
     def test_invalid_inputs_are_rejected_before_fetching(self):
         def unexpected(_):
             self.fail("invalid inputs must not fetch")
-        for sha, repository, version in [
-            ("main", updater.REPOSITORY, "1"),
-            (NEW, "someone/else", "1"),
-            (NEW, updater.REPOSITORY, "2"),
-        ]:
-            with self.subTest(sha=sha, repository=repository, version=version):
+        for sha in ["main", "../other/repo", NEW + "?repository=other/repo"]:
+            with self.subTest(sha=sha):
                 with self.assertRaises(ValueError):
-                    updater.update(self.root, sha, repository, version, unexpected)
+                    updater.update(self.root, sha, fetch=unexpected)
+
+    def test_foreign_provenance_cannot_redirect_source_requests(self):
+        self.write_previous()
+        source_path = self.directory / "openapi-source.json"
+        source = json.loads(source_path.read_text())
+        source["repository"] = "someone/else"
+        source_path.write_text(json.dumps(source))
+        requested = []
+
+        def fetch(url):
+            requested.append(url)
+            return self.fetch(url)
+
+        with self.assertRaisesRegex(ValueError, "unexpected source repository"):
+            updater.update(self.root, NEW, fetch=fetch)
+        self.assertTrue(requested)
+        self.assertTrue(all(url.startswith(API + "/") for url in requested))
+        self.assertEqual((self.directory / "openapi.json").read_bytes(), b"previous")
 
     def test_invalid_spec_does_not_replace_snapshot(self):
         self.write_previous()

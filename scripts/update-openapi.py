@@ -25,9 +25,7 @@ def fetch_bytes(url):
     return data
 
 
-def update(root, spec_sha, repository=REPOSITORY, contract_version="1", fetch=fetch_bytes):
-    if contract_version != "1" or repository != REPOSITORY:
-        raise ValueError("unsupported spec update contract or source repository")
+def update(root, spec_sha, fetch=fetch_bytes):
     if not re.fullmatch(r"[0-9a-f]{40}", spec_sha):
         raise ValueError("spec_sha must be a full lowercase commit SHA")
     api = f"https://api.github.com/repos/{REPOSITORY}"
@@ -80,11 +78,9 @@ def update(root, spec_sha, repository=REPOSITORY, contract_version="1", fetch=fe
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec-sha", required=True)
-    parser.add_argument("--spec-repository", default=REPOSITORY)
-    parser.add_argument("--contract-version", default="1")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
-    changed = update(root, args.spec_sha, args.spec_repository, args.contract_version)
+    changed = update(root, args.spec_sha)
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             output.write(f"changed={str(changed).lower()}\n")
