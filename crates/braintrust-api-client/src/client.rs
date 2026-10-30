@@ -15,6 +15,7 @@ pub const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
 pub struct ClientBuilder {
     api_key: Option<String>,
     api_url: Option<String>,
+    http_client_builder: Option<reqwest::ClientBuilder>,
 }
 
 /// Errors encountered while configuring an authenticated API client.
@@ -50,6 +51,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Use custom transport settings, preserving their timeouts, headers, and user agent.
+    ///
+    /// The API key overrides any default authorization header on this builder.
+    pub fn http_client_builder(mut self, builder: reqwest::ClientBuilder) -> Self {
+        self.http_client_builder = Some(builder);
+        self
+    }
+
     /// Build the generated client with a sensitive bearer authorization header.
     pub fn build(self) -> Result<Client, ClientInitError> {
         let api_key = match self.api_key {
@@ -81,19 +90,20 @@ impl ClientBuilder {
         authorization.set_sensitive(true);
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, authorization);
-        let builder = reqwest::Client::builder()
-            .default_headers(headers)
-            .user_agent(concat!(
+        let builder = self.http_client_builder.unwrap_or_else(|| {
+            let builder = reqwest::Client::builder().user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
                 "/",
                 env!("CARGO_PKG_VERSION")
             ));
-        // Preserve the generated constructor's native timeout defaults.
-        #[cfg(not(target_arch = "wasm32"))]
-        let builder = builder
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .timeout(std::time::Duration::from_secs(15));
-        let http = builder.build()?;
+            // Preserve the generated constructor's native timeout defaults.
+            #[cfg(not(target_arch = "wasm32"))]
+            let builder = builder
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .timeout(std::time::Duration::from_secs(15));
+            builder
+        });
+        let http = builder.default_headers(headers).build()?;
         Ok(Client::new_with_client(api_url.trim_end_matches('/'), http))
     }
 }

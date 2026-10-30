@@ -42,7 +42,7 @@ fn empty_or_invalid_keys_are_rejected_without_exposing_values() {
 }
 
 #[tokio::test]
-async fn reexported_client_sends_typed_requests_with_custom_auth_and_pagination() {
+async fn custom_transport_preserves_headers_and_uses_the_configured_api_key() {
     let server = MockServer::start().await;
     let dataset =
         json!({"id": DATASET, "project_id": PROJECT, "name": "example", "url_slug": "example"});
@@ -50,6 +50,7 @@ async fn reexported_client_sends_typed_requests_with_custom_auth_and_pagination(
         .and(path("/v1/dataset"))
         .and(header("authorization", "Bearer test-key"))
         .and(header("user-agent", "generated-client-test"))
+        .and(header("x-custom-header", "preserved"))
         .and(body_json(json!({"name": "example", "project_id": PROJECT})))
         .respond_with(ResponseTemplate::new(200).set_body_json(dataset.clone()))
         .expect(1)
@@ -67,14 +68,19 @@ async fn reexported_client_sends_typed_requests_with_custom_auth_and_pagination(
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::AUTHORIZATION,
-        "Bearer test-key".parse().unwrap(),
+        "Bearer replaced-key".parse().unwrap(),
     );
+    headers.insert("x-custom-header", "preserved".parse().unwrap());
     let http = reqwest::Client::builder()
         .default_headers(headers)
-        .user_agent("generated-client-test")
+        .user_agent("generated-client-test");
+    let client = api::Client::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .http_client_builder(http)
         .build()
         .unwrap();
-    let client = api::Client::new_with_client(&server.uri(), http);
+    assert!(!format!("{client:?}").contains("test-key"));
     let body: types::CreateDataset = types::CreateDataset::builder()
         .name("example")
         .project_id(PROJECT)
@@ -98,6 +104,30 @@ async fn reexported_client_sends_typed_requests_with_custom_auth_and_pagination(
         .into_inner();
     assert_eq!(listed.objects.len(), 1);
     assert_eq!(listed.objects[0].id, created.id);
+}
+
+#[tokio::test]
+async fn custom_transport_timeout_is_preserved() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/dataset"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"objects": []}))
+                .set_delay(std::time::Duration::from_secs(1)),
+        )
+        .mount(&server)
+        .await;
+    let client = api::Client::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .http_client_builder(
+            reqwest::Client::builder().timeout(std::time::Duration::from_millis(50)),
+        )
+        .build()
+        .unwrap();
+    let error = client.get_dataset().send().await.unwrap_err();
+    assert!(matches!(error, api::Error::CommunicationError(error) if error.is_timeout()));
 }
 
 #[tokio::test]

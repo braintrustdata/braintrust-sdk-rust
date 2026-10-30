@@ -39,7 +39,20 @@ Explicit values override environment variables.
 The builder sets a sensitive bearer authorization header so Debug output does
 not expose the key. Missing, empty, or invalid keys produce a `ClientInitError`.
 
-For custom certificates, timeouts, or other transport settings, use the
-generated `Client::new_with_client(url, http)` and supply your own
-authenticated reqwest client. This REST client is independent of the logging
-SDK's login state and batching/retry behavior.
+For custom certificates, proxies, timeouts, or other transport settings, supply
+a reqwest builder. Its settings are preserved, with bearer authentication added:
+
+```rust,no_run
+# use braintrust_api_client::Client;
+# fn example() -> Result<(), braintrust_api_client::ClientInitError> {
+let client = Client::builder()
+    .http_client_builder(reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30)))
+    .build()?;
+# Ok(())
+# }
+```
+
+The configured API key overrides any default authorization header on the reqwest
+builder. This REST client is independent of the logging SDK's login state and
+batching/retry behavior.
