@@ -139,10 +139,10 @@ impl Client {
         request: &T,
     ) -> TransportResult<ResponseValue<BtqlResponse>> {
         let mut request = serde_json::to_value(request)
-            .map_err(|error| Error::InvalidRequest(error.to_string()))?;
+            .map_err(|error| Error::invalid_request(error.to_string()))?;
         let object = request
             .as_object_mut()
-            .ok_or_else(|| Error::InvalidRequest("BTQL request must be an object".into()))?;
+            .ok_or_else(|| Error::invalid_request("BTQL request must be an object".into()))?;
         object.insert("fmt".into(), Value::String("json".into()));
         ResponseValue::from_response(self.btql(&request).await?).await
     }
@@ -204,21 +204,21 @@ impl Client {
     ) -> TransportResult<ResponseValue<()>> {
         let payload = payload.into();
         let url = reqwest::Url::parse(&upload.signed_url)
-            .map_err(|error| Error::InvalidRequest(error.to_string()))?;
+            .map_err(|error| Error::invalid_request(error.to_string()))?;
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(values) = &upload.headers {
             for (key, value) in values {
                 let key = reqwest::header::HeaderName::from_bytes(key.as_bytes())
-                    .map_err(|error| Error::InvalidRequest(error.to_string()))?;
+                    .map_err(|error| Error::invalid_request(error.to_string()))?;
                 let value = reqwest::header::HeaderValue::from_str(value)
-                    .map_err(|error| Error::InvalidRequest(error.to_string()))?;
+                    .map_err(|error| Error::invalid_request(error.to_string()))?;
                 headers.insert(key, value);
             }
         }
         let request = if upload.method.eq_ignore_ascii_case("POST") {
             headers.remove(reqwest::header::CONTENT_TYPE);
             let fields = upload.fields.as_ref().ok_or_else(|| {
-                Error::InvalidRequest("overflow POST upload requires form fields".into())
+                Error::invalid_request("overflow POST upload requires form fields".into())
             })?;
             let mut form = reqwest::multipart::Form::new();
             for (key, value) in fields {
@@ -248,13 +248,13 @@ impl Client {
             }
             self.inner.upload_client.put(url).body(payload)
         } else {
-            return Err(Error::InvalidRequest(
+            return Err(Error::invalid_request(
                 "overflow upload method must be POST or PUT".into(),
             ));
         };
         let response = request.headers(headers).send().await?;
         if !response.status().is_success() {
-            return Err(Error::UnexpectedResponse(response));
+            return Err(crate::response::response_error(response).await?);
         }
         Ok(ResponseValue::empty(response))
     }
@@ -275,7 +275,7 @@ impl Client {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         }) {
-            return Err(Error::InvalidRequest(
+            return Err(Error::invalid_request(
                 "control-plane object and action must be path segments".into(),
             ));
         }
@@ -329,7 +329,7 @@ impl Client {
         crate::client::authorize_request(&self.inner, &mut request);
         let response = self.client.execute(request).await?;
         if !response.status().is_success() {
-            return Err(Error::UnexpectedResponse(response));
+            return Err(crate::response::response_error(response).await?);
         }
         Ok(response)
     }

@@ -86,7 +86,7 @@ fn default_builder_reports_missing_key() {
 async fn environment_key_child() {
     let client = api::Client::builder().build().unwrap();
     assert!(!format!("{client:?}").contains("environment-key"));
-    client.get_dataset().send().await.unwrap();
+    client.get_dataset_builder().send().await.unwrap();
 }
 
 #[tokio::test]
@@ -98,7 +98,7 @@ async fn explicit_key_child() {
         .build()
         .unwrap();
     assert!(!format!("{client:?}").contains("explicit-key"));
-    client.get_dataset().send().await.unwrap();
+    client.get_dataset_builder().send().await.unwrap();
 }
 
 #[test]

@@ -1,19 +1,38 @@
 use std::env;
 
+use crate::transport::LoginOrganization;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 
-use crate::Client;
-use crate::transport::LoginOrganization;
+/// Client with Braintrust authentication, discovery and upload support.
+#[derive(Clone)]
+pub struct Client {
+    pub(crate) baseurl: String,
+    pub(crate) client: reqwest::Client,
+    pub(crate) inner: ClientContext,
+    generated: crate::GeneratedClient,
+}
+
+impl std::ops::Deref for Client {
+    type Target = crate::GeneratedClient;
+    fn deref(&self) -> &Self::Target {
+        &self.generated
+    }
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("api_url", &self.baseurl)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Default endpoint for the Braintrust REST API.
 pub const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
 /// Default endpoint for authentication and control-plane operations.
 pub const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
 
-/// Additional state carried by the generated client.
-///
-/// Normally constructed by [`Client::builder`]. A default context supports the
-/// generated constructors when callers configure their own authentication.
+/// Authentication, organization and upload settings held by [`Client`].
 #[derive(Clone, Debug)]
 pub struct ClientContext {
     pub(crate) app_url: String,
@@ -81,6 +100,10 @@ pub enum ClientInitError {
 }
 
 impl Client {
+    /// The API endpoint used by generated methods, queries and logging.
+    pub fn baseurl(&self) -> &str {
+        &self.baseurl
+    }
     /// Configure authentication, endpoints, and transport settings.
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
@@ -172,17 +195,23 @@ impl ClientBuilder {
             .upload_http_client_builder
             .unwrap_or_else(default_http_builder)
             .build()?;
-        Ok(Client::new_with_client(
-            &api_url,
-            http,
-            ClientContext {
+        let generated = crate::GeneratedClient::with_client(http.clone())
+            .with_base_url(&api_url)
+            .with_api_key(api_key)
+            // Logging and query responses may exceed the generator's 8 MiB default.
+            .with_max_response_body_bytes(usize::MAX);
+        Ok(Client {
+            baseurl: api_url,
+            client: http,
+            generated,
+            inner: ClientContext {
                 app_url,
                 authorization: Some(authorization),
                 org_name,
                 organization: None,
                 upload_client,
             },
-        ))
+        })
     }
 
     /// Log in and use the selected organization's API endpoint.
@@ -209,6 +238,7 @@ impl ClientBuilder {
         };
         if let Some(url) = &organization.api_url {
             client.baseurl = validate_url(url, "login API URL")?;
+            client.generated = client.generated.with_base_url(&client.baseurl);
         }
         client.inner.org_name = Some(
             HeaderValue::from_str(&organization.name)

@@ -21,10 +21,10 @@ async fn explicit_api_key_sets_bearer_auth_without_exposing_the_key() {
         .api_url(format!("{}/", server.uri()))
         .build()
         .unwrap();
-    // The builder returns the generated type, including its trait implementations.
-    assert_eq!(api::ClientInfo::baseurl(&client), server.uri());
+    // Generated operations remain callable directly through the wrapper.
+    assert_eq!(client.baseurl(), server.uri());
     assert!(!format!("{client:?}").contains("programmatic-key"));
-    client.get_dataset().send().await.unwrap();
+    client.get_dataset_builder().send().await.unwrap();
 }
 
 #[test]
@@ -81,27 +81,16 @@ async fn custom_transport_preserves_headers_and_uses_the_configured_api_key() {
         .build()
         .unwrap();
     assert!(!format!("{client:?}").contains("test-key"));
-    let body: types::CreateDataset = types::CreateDataset::builder()
-        .name("example")
-        .project_id(PROJECT)
-        .try_into()
-        .unwrap();
-    let created = client
-        .post_dataset()
-        .body(body)
-        .send()
-        .await
-        .unwrap()
-        .into_inner();
+    let body = types::CreateDataset::new("example".into(), PROJECT.parse().unwrap());
+    let created = client.post_dataset(body).await.unwrap();
     assert_eq!(created.id.to_string(), DATASET);
     let listed = client
-        .get_dataset()
-        .limit(Some(10_u64))
+        .get_dataset_builder()
+        .limit("10")
         .starting_after(DATASET)
         .send()
         .await
-        .unwrap()
-        .into_inner();
+        .unwrap();
     assert_eq!(listed.objects.len(), 1);
     assert_eq!(listed.objects[0].id, created.id);
 }
@@ -126,8 +115,13 @@ async fn custom_transport_timeout_is_preserved() {
         )
         .build()
         .unwrap();
-    let error = client.get_dataset().send().await.unwrap_err();
-    assert!(matches!(error, api::Error::CommunicationError(error) if error.is_timeout()));
+    let error = client.get_dataset_builder().send().await.unwrap_err();
+    match error {
+        api::Error::Transport(api::HttpError::Middleware(reqwest_middleware::Error::Reqwest(
+            error,
+        ))) => assert!(error.is_timeout()),
+        other => panic!("expected timeout, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -143,14 +137,17 @@ async fn generated_client_preserves_api_error_status_and_body() {
         .api_url(server.uri())
         .build()
         .unwrap()
-        .get_dataset()
+        .get_dataset_builder()
         .send()
         .await
         .unwrap_err();
     match error {
-        api::Error::ErrorResponse(response) => {
-            assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-            assert_eq!(response.into_inner(), json!({"error": "rate limited"}));
+        api::Error::Api(response) => {
+            assert_eq!(response.status, 429);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&response.raw_body).unwrap(),
+                json!({"error": "rate limited"})
+            );
         }
         other => panic!("expected API error response, got {other:?}"),
     }
@@ -159,11 +156,12 @@ async fn generated_client_preserves_api_error_status_and_body() {
 #[test]
 fn nullable_enums_round_trip_null_and_non_null_values() {
     for value in [json!(null), json!("scorer")] {
-        let parsed: types::FunctionTypeEnum = serde_json::from_value(value.clone()).unwrap();
+        let parsed: Option<types::FunctionTypeEnum> =
+            serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), value);
     }
     for value in [json!(null), json!("datasets")] {
-        let parsed: types::ViewType = serde_json::from_value(value.clone()).unwrap();
+        let parsed: Option<types::ViewType> = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), value);
     }
     assert!(serde_json::from_value::<types::FunctionTypeEnum>(json!("unknown")).is_err());

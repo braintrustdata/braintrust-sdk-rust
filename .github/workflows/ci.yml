@@ -55,7 +55,7 @@ jobs:
 
       - name: Package workspace crates
         if: matrix.toolchain == 'stable'
-        run: cargo package --workspace --locked --no-verify
+        run: cargo package --workspace --exclude generate-api --locked --no-verify
 
   # Check documentation builds
   docs:

@@ -9,15 +9,17 @@ Requires Rust 1.88 or newer.
 Set `BRAINTRUST_API_KEY` and provide your project ID:
 
 ```rust,no_run
-use braintrust_api_client::{Client, types};
+use braintrust_api_client::Client;
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let client = Client::builder().build()?;
-let body: types::CreateDataset = types::CreateDataset::builder()
-    .name("example")
-    .project_id("00000000-0000-0000-0000-000000000001")
-    .try_into()?;
-let dataset = client.post_dataset().body(body).send().await?.into_inner();
+let dataset = client
+    .post_dataset_builder(
+        "example".into(),
+        "00000000-0000-0000-0000-000000000001".parse()?,
+    )
+    .send()
+    .await?;
 println!("{}", dataset.id);
 # Ok(())
 # }

@@ -1,7 +1,7 @@
 use braintrust_api_client::transport::{
     Logs3OverflowInputRow, Logs3OverflowInputRowMeta, Logs3OverflowRequest, Logs3OverflowUpload,
 };
-use braintrust_api_client::{Client, ClientInfo, ClientInitError, Error};
+use braintrust_api_client::{Client, ClientInitError, Error, HttpError};
 use serde_json::json;
 use wiremock::matchers::{
     body_bytes, body_json, body_string_contains, header, method, path, query_param,
@@ -49,10 +49,10 @@ async fn discovery_selects_an_org_and_routes_generated_and_manual_operations() {
         client.organization().unwrap().extra["git_metadata"],
         json!({"collect":false})
     );
-    assert_eq!(ClientInfo::baseurl(&client), format!("{}/data", api.uri()));
+    assert_eq!(client.baseurl(), format!("{}/data", api.uri()));
     assert_eq!(client.app_url(), format!("{}/app", app.uri()));
     assert!(!format!("{client:?}").contains("discovery-key"));
-    client.get_dataset().send().await.unwrap();
+    client.get_dataset_builder().send().await.unwrap();
     assert_eq!(
         client.version().await.unwrap().logs3_payload_max_bytes,
         Some(12345)
@@ -76,7 +76,7 @@ async fn plain_build_and_login_do_not_retarget_the_client() {
     assert!(app.received_requests().await.unwrap().is_empty());
     assert!(api.received_requests().await.unwrap().is_empty());
     assert_eq!(client.login().await.unwrap().org_info.len(), 1);
-    assert_eq!(ClientInfo::baseurl(&client), api.uri());
+    assert_eq!(client.baseurl(), api.uri());
     assert!(client.organization().is_none());
 }
 
@@ -99,7 +99,7 @@ async fn discovery_defaults_to_first_org_and_retains_fallback_url_if_absent() {
         .await
         .unwrap();
     assert_eq!(client.organization().unwrap().id, "first");
-    assert_eq!(ClientInfo::baseurl(&client), api.uri());
+    assert_eq!(client.baseurl(), api.uri());
 }
 
 #[tokio::test]
@@ -184,11 +184,11 @@ async fn logging_and_btql_preserve_payloads_and_transport_errors() {
     assert_eq!(response.data[0]["id"], "row");
     assert_eq!(response.cursor.as_deref(), Some("next"));
     assert_eq!(response.extra["statistics"], json!({"rows":1}));
-    let Error::UnexpectedResponse(response) = client.version().await.unwrap_err() else {
+    let Error::Api(response) = client.version().await.unwrap_err() else {
         panic!("expected original HTTP response")
     };
-    assert_eq!(response.status(), 429);
-    assert_eq!(response.text().await.unwrap(), "slow down");
+    assert_eq!(response.status, 429);
+    assert_eq!(response.body, "slow down");
 }
 
 #[tokio::test]
@@ -262,7 +262,7 @@ async fn control_plane_uses_app_url_and_summaries_use_api_url() {
     client.dataset_summary("dataset").await.unwrap();
     assert!(matches!(
         client.control_plane("../bad", "register", &json!({})).await,
-        Err(Error::InvalidRequest(_))
+        Err(Error::Transport(HttpError::Config(_)))
     ));
 }
 
@@ -392,7 +392,7 @@ async fn signed_multipart_upload_preserves_fields_and_boundary() {
     };
     assert!(matches!(
         client.upload_logs3_overflow(&missing_fields, "data").await,
-        Err(Error::InvalidRequest(_))
+        Err(Error::Transport(HttpError::Config(_)))
     ));
     let bad_method = Logs3OverflowUpload {
         method: "DELETE".into(),
@@ -400,7 +400,7 @@ async fn signed_multipart_upload_preserves_fields_and_boundary() {
     };
     assert!(matches!(
         client.upload_logs3_overflow(&bad_method, "data").await,
-        Err(Error::InvalidRequest(_))
+        Err(Error::Transport(HttpError::Config(_)))
     ));
 }
 
@@ -422,11 +422,11 @@ async fn login_failures_preserve_status_and_body() {
     let ClientInitError::Login(error) = error else {
         panic!("expected login error")
     };
-    let Error::UnexpectedResponse(response) = *error else {
+    let Error::Api(response) = *error else {
         panic!("expected original HTTP response")
     };
-    assert_eq!(response.status(), 401);
-    assert_eq!(response.text().await.unwrap(), "invalid credentials");
+    assert_eq!(response.status, 401);
+    assert_eq!(response.body, "invalid credentials");
 }
 
 #[test]
@@ -528,4 +528,61 @@ async fn org_header_is_scoped_to_logging_operations() {
         .logs3_overflow_with_org_name(&request, Some("explicit-org"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn generated_methods_preserve_errors_and_custom_transport_without_retries() {
+    let server = MockServer::start().await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("authorization", "Bearer wrong-default".parse().unwrap());
+    headers.insert("x-custom", "retained".parse().unwrap());
+    let client = Client::builder()
+        .api_key("key")
+        .api_url(server.uri())
+        .org_name("org")
+        .http_client_builder(reqwest::Client::builder().default_headers(headers))
+        .build()
+        .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/v1/dataset"))
+        .and(header("authorization", "Bearer key"))
+        .and(header("x-custom", "retained"))
+        .and(|request: &Request| !request.headers.contains_key("x-bt-org-name"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "10")
+                .set_body_string("slow down"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client.get_dataset_builder().send().await.unwrap_err();
+    let error = error.api().unwrap();
+    assert_eq!(error.status, 429);
+    assert_eq!(error.headers["retry-after"], "10");
+    assert_eq!(error.raw_body, b"slow down");
+    assert!(!format!("{client:?}").contains("Bearer key"));
+}
+
+#[test]
+fn generated_request_models_distinguish_omitted_null_and_value() {
+    let project = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+    let absent = braintrust_api_client::types::CreateDataset::new("example".into(), project);
+    assert!(
+        serde_json::to_value(absent)
+            .unwrap()
+            .get("description")
+            .is_none()
+    );
+    let null = braintrust_api_client::types::CreateDataset::builder("example".into(), project)
+        .description_null()
+        .build();
+    assert_eq!(
+        serde_json::to_value(null).unwrap()["description"],
+        serde_json::Value::Null
+    );
+    let value = braintrust_api_client::types::CreateDataset::builder("example".into(), project)
+        .description("text".into())
+        .build();
+    assert_eq!(serde_json::to_value(value).unwrap()["description"], "text");
 }
