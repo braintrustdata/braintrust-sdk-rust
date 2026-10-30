@@ -9,7 +9,5 @@ mod generated {
 
 mod client;
 
-pub use client::{Client, ClientInitError, DEFAULT_API_URL};
-/// Unwrapped generated client for configuring a custom HTTP transport.
-pub use generated::Client as GeneratedClient;
+pub use client::{ClientBuilder, ClientInitError, DEFAULT_API_URL};
 pub use generated::*;

@@ -1,19 +1,20 @@
-use std::{env, ops::Deref};
+use std::env;
 
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
-use crate::GeneratedClient;
+use crate::Client;
 
 /// Default endpoint for the Braintrust REST API.
 pub const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
 
-/// An authenticated Braintrust REST API client.
+/// Configuration for an authenticated Braintrust REST API client.
 ///
-/// All generated operations are available directly on this client. Its
-/// authorization header is marked sensitive to keep the key out of Debug output.
-#[derive(Clone, Debug)]
-pub struct Client {
-    inner: GeneratedClient,
+/// Unset values are read from `BRAINTRUST_API_KEY` and `BRAINTRUST_API_URL`
+/// when [`build`](Self::build) is called.
+#[derive(Default)]
+pub struct ClientBuilder {
+    api_key: Option<String>,
+    api_url: Option<String>,
 }
 
 /// Errors encountered while configuring an authenticated API client.
@@ -30,40 +31,48 @@ pub enum ClientInitError {
 }
 
 impl Client {
-    /// Read `BRAINTRUST_API_KEY` and construct an authenticated client.
-    ///
-    /// `BRAINTRUST_API_URL` optionally overrides [`DEFAULT_API_URL`].
-    pub fn new() -> Result<Self, ClientInitError> {
-        let key = match env::var("BRAINTRUST_API_KEY") {
-            Ok(key) => key,
-            Err(env::VarError::NotPresent) => return Err(ClientInitError::MissingApiKey),
-            Err(env::VarError::NotUnicode(_)) => {
-                return Err(ClientInitError::InvalidEnvironment("BRAINTRUST_API_KEY"));
-            }
-        };
-        Self::with_api_key(key)
+    /// Configure bearer authentication using explicit values or environment variables.
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::default()
+    }
+}
+
+impl ClientBuilder {
+    /// Override `BRAINTRUST_API_KEY`.
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
     }
 
-    /// Use an explicit API key instead of reading `BRAINTRUST_API_KEY`.
-    ///
-    /// `BRAINTRUST_API_URL` optionally overrides [`DEFAULT_API_URL`].
-    pub fn with_api_key(api_key: impl AsRef<str>) -> Result<Self, ClientInitError> {
-        let url = match env::var("BRAINTRUST_API_URL") {
-            Ok(url) => url,
-            Err(env::VarError::NotPresent) => DEFAULT_API_URL.to_owned(),
-            Err(env::VarError::NotUnicode(_)) => {
-                return Err(ClientInitError::InvalidEnvironment("BRAINTRUST_API_URL"));
-            }
-        };
-        Self::with_api_key_and_url(api_key, url)
+    /// Override `BRAINTRUST_API_URL` and the default API endpoint.
+    pub fn api_url(mut self, api_url: impl Into<String>) -> Self {
+        self.api_url = Some(api_url.into());
+        self
     }
 
-    /// Use an explicit API key and endpoint without reading environment variables.
-    pub fn with_api_key_and_url(
-        api_key: impl AsRef<str>,
-        api_url: impl AsRef<str>,
-    ) -> Result<Self, ClientInitError> {
-        let api_key = api_key.as_ref();
+    /// Build the generated client with a sensitive bearer authorization header.
+    pub fn build(self) -> Result<Client, ClientInitError> {
+        let api_key = match self.api_key {
+            Some(key) => key,
+            None => match env::var("BRAINTRUST_API_KEY") {
+                Ok(key) => key,
+                Err(env::VarError::NotPresent) => return Err(ClientInitError::MissingApiKey),
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err(ClientInitError::InvalidEnvironment("BRAINTRUST_API_KEY"));
+                }
+            },
+        };
+        let api_url = match self.api_url {
+            Some(url) => url,
+            None => match env::var("BRAINTRUST_API_URL") {
+                Ok(url) => url,
+                Err(env::VarError::NotPresent) => DEFAULT_API_URL.to_owned(),
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err(ClientInitError::InvalidEnvironment("BRAINTRUST_API_URL"));
+                }
+            },
+        };
+
         if api_key.trim().is_empty() {
             return Err(ClientInitError::InvalidApiKey);
         }
@@ -85,16 +94,6 @@ impl Client {
             .connect_timeout(std::time::Duration::from_secs(15))
             .timeout(std::time::Duration::from_secs(15));
         let http = builder.build()?;
-        Ok(Self {
-            inner: GeneratedClient::new_with_client(api_url.as_ref().trim_end_matches('/'), http),
-        })
-    }
-}
-
-impl Deref for Client {
-    type Target = GeneratedClient;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
+        Ok(Client::new_with_client(api_url.trim_end_matches('/'), http))
     }
 }

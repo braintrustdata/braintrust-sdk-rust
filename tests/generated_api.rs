@@ -16,9 +16,13 @@ async fn explicit_api_key_sets_bearer_auth_without_exposing_the_key() {
         .expect(1)
         .mount(&server)
         .await;
-    let client =
-        api::Client::with_api_key_and_url("programmatic-key", format!("{}/", server.uri()))
-            .unwrap();
+    let client = api::Client::builder()
+        .api_key("programmatic-key")
+        .api_url(format!("{}/", server.uri()))
+        .build()
+        .unwrap();
+    // The builder returns the generated type, including its trait implementations.
+    assert_eq!(api::ClientInfo::baseurl(&client), server.uri());
     assert!(!format!("{client:?}").contains("programmatic-key"));
     client.get_dataset().send().await.unwrap();
 }
@@ -26,7 +30,11 @@ async fn explicit_api_key_sets_bearer_auth_without_exposing_the_key() {
 #[test]
 fn empty_or_invalid_keys_are_rejected_without_exposing_values() {
     for key in ["", " \t", "private-key\ninvalid-header"] {
-        let error = api::Client::with_api_key_and_url(key, api::DEFAULT_API_URL).unwrap_err();
+        let error = api::Client::builder()
+            .api_key(key)
+            .api_url(api::DEFAULT_API_URL)
+            .build()
+            .unwrap_err();
         assert!(matches!(error, api::ClientInitError::InvalidApiKey));
         assert!(!format!("{error:?}").contains("private-key"));
         assert!(!error.to_string().contains("private-key"));
@@ -66,7 +74,7 @@ async fn reexported_client_sends_typed_requests_with_custom_auth_and_pagination(
         .user_agent("generated-client-test")
         .build()
         .unwrap();
-    let client = api::GeneratedClient::new_with_client(&server.uri(), http);
+    let client = api::Client::new_with_client(&server.uri(), http);
     let body: types::CreateDataset = types::CreateDataset::builder()
         .name("example")
         .project_id(PROJECT)
@@ -100,7 +108,10 @@ async fn generated_client_preserves_api_error_status_and_body() {
         .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error": "rate limited"})))
         .mount(&server)
         .await;
-    let error = api::Client::with_api_key_and_url("test-key", server.uri())
+    let error = api::Client::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .build()
         .unwrap()
         .get_dataset()
         .send()

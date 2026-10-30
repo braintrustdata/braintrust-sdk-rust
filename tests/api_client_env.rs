@@ -1,4 +1,4 @@
-//! Environment constructors run in child processes so tests never mutate the
+//! Environment builders run in child processes so tests never mutate the
 //! environment of a multithreaded test runner.
 
 use std::process::{Command, Output};
@@ -24,7 +24,7 @@ fn assert_success(output: Output) {
 }
 
 #[tokio::test]
-async fn default_constructor_uses_environment_key_and_endpoint() {
+async fn default_builder_uses_environment_key_and_endpoint() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/dataset"))
@@ -47,7 +47,7 @@ async fn default_constructor_uses_environment_key_and_endpoint() {
 }
 
 #[tokio::test]
-async fn programmatic_key_overrides_the_environment_key() {
+async fn explicit_configuration_overrides_the_environment() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/dataset"))
@@ -60,7 +60,8 @@ async fn programmatic_key_overrides_the_environment_key() {
     let output = tokio::task::spawn_blocking(move || {
         child_command("explicit_key_child")
             .env("BRAINTRUST_API_KEY", "unused-environment-key")
-            .env("BRAINTRUST_API_URL", url)
+            .env("BRAINTRUST_API_URL", "https://unused.example.invalid")
+            .env("TEST_API_URL", url)
             .output()
             .unwrap()
     })
@@ -70,7 +71,7 @@ async fn programmatic_key_overrides_the_environment_key() {
 }
 
 #[test]
-fn default_constructor_reports_missing_key() {
+fn default_builder_reports_missing_key() {
     assert_success(
         child_command("missing_key_child")
             .env_remove("BRAINTRUST_API_KEY")
@@ -83,7 +84,7 @@ fn default_constructor_reports_missing_key() {
 #[tokio::test]
 #[ignore = "run by the parent test with an isolated process environment"]
 async fn environment_key_child() {
-    let client = api::Client::new().unwrap();
+    let client = api::Client::builder().build().unwrap();
     assert!(!format!("{client:?}").contains("environment-key"));
     client.get_dataset().send().await.unwrap();
 }
@@ -91,7 +92,11 @@ async fn environment_key_child() {
 #[tokio::test]
 #[ignore = "run by the parent test with an isolated process environment"]
 async fn explicit_key_child() {
-    let client = api::Client::with_api_key("explicit-key").unwrap();
+    let client = api::Client::builder()
+        .api_key("explicit-key")
+        .api_url(std::env::var("TEST_API_URL").unwrap())
+        .build()
+        .unwrap();
     assert!(!format!("{client:?}").contains("explicit-key"));
     client.get_dataset().send().await.unwrap();
 }
@@ -100,7 +105,7 @@ async fn explicit_key_child() {
 #[ignore = "run by the parent test with an isolated process environment"]
 fn missing_key_child() {
     assert!(matches!(
-        api::Client::new(),
+        api::Client::builder().build(),
         Err(api::ClientInitError::MissingApiKey)
     ));
 }
