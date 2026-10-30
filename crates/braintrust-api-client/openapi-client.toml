@@ -1,0 +1,20 @@
+[generator]
+spec_path = "https://raw.githubusercontent.com/braintrustdata/braintrust-openapi/main/openapi/spec.json"
+output_dir = "src/generated"
+module_name = "api_types"
+overlays = ["openapi-client.overlay.yaml"]
+
+[generator.builders]
+enabled = true
+threshold = 0
+
+[features]
+enable_async_client = true
+enable_sse_client = true
+
+[http_client.auth]
+type = "Bearer"
+header_name = "Authorization"
+
+[http_client.tracing]
+enabled = false

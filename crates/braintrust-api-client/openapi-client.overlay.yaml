@@ -1,0 +1,27 @@
+overlay: 1.1.0
+info:
+  title: Braintrust Rust client adaptations
+  version: '1'
+actions:
+  # Browser preflights are not SDK operations.
+  - target: $.paths.*.options
+    remove: true
+  # The generator encodes this multi-segment catch-all as a single segment.
+  # Concrete proxy operations remain available.
+  - target: $.paths['/v1/proxy/{path+}']
+    remove: true
+  # Each intersection repeats SavedFunctionId's non-null branches. Removing
+  # the nullable reference preserves the intersection's non-null union.
+  # Match only a bare reference so additional constraints are never discarded.
+  - target: $.components.schemas.PromptDataNullish.properties.tool_functions.items.allOf[?(@['$ref'] == '#/components/schemas/SavedFunctionId' && length(@) == 1)]
+    remove: true
+  - target: $.components.schemas.TopicMapFunctionAutomation.properties.function.allOf[?(@['$ref'] == '#/components/schemas/SavedFunctionId' && length(@) == 1)]
+    remove: true
+  - target: $.components.schemas.TopicAutomationConfig.properties.facet_functions.items.allOf[?(@['$ref'] == '#/components/schemas/SavedFunctionId' && length(@) == 1)]
+    remove: true
+  - target: $.components.schemas.OnlineScoreConfig.properties.scorers.items.allOf[?(@['$ref'] == '#/components/schemas/SavedFunctionId' && length(@) == 1)]
+    remove: true
+  - target: $.components.schemas.TopicMapData.properties.source_facet_function.allOf[?(@['$ref'] == '#/components/schemas/SavedFunctionId' && length(@) == 1)]
+    remove: true
+  - target: $.components.schemas.PromptData.properties.tool_functions.items.allOf[?(@['$ref'] == '#/components/schemas/SavedFunctionId' && length(@) == 1)]
+    remove: true

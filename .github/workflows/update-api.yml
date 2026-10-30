@@ -1,0 +1,53 @@
+name: Update API client
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays at 06:00 UTC.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-openapi-snapshot
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout SDK main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          path: sdk
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: stable
+
+      - name: Install API client generator
+        run: cargo install openapi-to-rust --version 0.23.0 --locked
+
+      - name: Generate API client
+        working-directory: sdk
+        run: openapi-to-rust generate --config crates/braintrust-api-client/openapi-client.toml
+
+      # Run even with no diff so an obsolete pending update PR can be closed.
+      - name: Open or update SDK PR
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7.0.11
+        with:
+          path: sdk
+          token: ${{ github.token }}
+          base: main
+          branch: chore/update-openapi-snapshot
+          title: Update Braintrust API client
+          commit-message: Update Braintrust API client
+          body: |
+            Updates the REST API client to the latest published Braintrust specification.
+            Source: https://github.com/braintrustdata/braintrust-openapi/blob/main/openapi/spec.json
+          add-paths: |
+            crates/braintrust-api-client/src/generated/*.rs

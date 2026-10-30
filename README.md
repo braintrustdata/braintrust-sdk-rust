@@ -58,6 +58,11 @@ async fn main() -> anyhow::Result<()> {
 - **Async-first**: Built on Tokio for high-performance async operations
 - **Background submission**: Logs are submitted in the background to minimize latency
 
+## Generated REST API client
+
+The SDK includes a typed REST API client at `braintrust_sdk_rust::api`.
+See the [API client README](crates/braintrust-api-client/README.md) for usage.
+
 ## Preserving existing span provenance
 
 For updates that must not replace an existing span's origin, build the update
