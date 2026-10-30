@@ -1,8 +1,8 @@
 name: Update OpenAPI snapshot
 
 on:
-  repository_dispatch:
-    types: [braintrust-openapi-updated]
+  schedule:
+    - cron: '23 6 * * 1' # Mondays at 06:23 UTC.
   workflow_dispatch:
 
 permissions:
