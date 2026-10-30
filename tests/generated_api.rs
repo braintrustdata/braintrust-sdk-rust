@@ -126,6 +126,4 @@ fn nullable_enums_round_trip_null_and_non_null_values() {
         assert_eq!(serde_json::to_value(parsed).unwrap(), value);
     }
     assert!(serde_json::from_value::<types::FunctionTypeEnum>(json!("unknown")).is_err());
-    assert_eq!(api::OPENAPI_SPEC_SHA256.len(), 64);
-    assert!(!api::OPENAPI_SPEC_SOURCE.is_empty());
 }

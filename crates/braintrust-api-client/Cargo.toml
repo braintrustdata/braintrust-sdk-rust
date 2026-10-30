@@ -6,7 +6,7 @@ rust-version = "1.88.0"
 description = "Generated Rust client for the Braintrust REST API"
 repository = "https://github.com/braintrustdata/braintrust-sdk-rust"
 license = "Apache-2.0"
-include = ["src/**", "tests/**", "build.rs", "build_support/**", "openapi.json", "openapi-source.json", "README.md", "LICENSE"]
+include = ["src/**", "tests/**", "build.rs", "build_support/**", "openapi.json", "README.md", "LICENSE"]
 
 [dependencies]
 bytes = "1"
@@ -26,7 +26,6 @@ prettyplease = "0.3"
 progenitor = { version = "=0.15.1", default-features = false }
 # Progenitor's type-name allocation depends on the spec's component order.
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
 syn = { version = "3", features = ["full", "parsing"] }
 
 [package.metadata.docs.rs]
