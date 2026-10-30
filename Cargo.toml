@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/braintrust-api-client", "tools/generate-api"]
+members = ["crates/braintrust-api-client"]
 resolver = "3"
 
 [package]

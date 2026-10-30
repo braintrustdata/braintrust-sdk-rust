@@ -16,3 +16,6 @@ Thumbs.db
 # Test artifacts
 *.profraw
 *.profdata
+
+# Dependency reference emitted by the OpenAPI generator CLI
+/crates/braintrust-api-client/src/generated/REQUIRED_DEPS.toml

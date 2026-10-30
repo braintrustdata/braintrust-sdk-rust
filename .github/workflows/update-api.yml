@@ -29,18 +29,12 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Download published spec
-        run: >-
-          curl --fail --show-error --silent --location
-          https://raw.githubusercontent.com/braintrustdata/braintrust-openapi/main/openapi/spec.json
-          --output "$RUNNER_TEMP/braintrust-openapi.json"
+      - name: Install API client generator
+        run: cargo install openapi-to-rust --version 0.23.0 --locked
 
       - name: Generate API client
         working-directory: sdk
-        run: >-
-          cargo run --package generate-api --
-          "$RUNNER_TEMP/braintrust-openapi.json"
-          crates/braintrust-api-client/src/generated
+        run: openapi-to-rust generate --config .github/openapi-client.toml
 
       # Run even with no diff so an obsolete pending update PR can be closed.
       - name: Open or update SDK PR
@@ -56,4 +50,4 @@ jobs:
             Updates the REST API client to the latest published Braintrust specification.
             Source: https://github.com/braintrustdata/braintrust-openapi/blob/main/openapi/spec.json
           add-paths: |
-            crates/braintrust-api-client/src/generated/
+            crates/braintrust-api-client/src/generated/*.rs

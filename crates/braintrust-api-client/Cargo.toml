@@ -6,7 +6,7 @@ rust-version = "1.88.0"
 description = "Rust client for the Braintrust REST API"
 repository = "https://github.com/braintrustdata/braintrust-sdk-rust"
 license = "Apache-2.0"
-include = ["src/**", "tests/**", "README.md", "LICENSE"]
+include = ["src/**/*.rs", "tests/**", "README.md", "LICENSE"]
 
 [dependencies]
 bytes = "1"
