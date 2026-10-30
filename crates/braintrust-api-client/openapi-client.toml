@@ -12,5 +12,9 @@ threshold = 0
 enable_async_client = true
 enable_sse_client = true
 
+[http_client.auth]
+type = "Bearer"
+header_name = "Authorization"
+
 [http_client.tracing]
 enabled = false
