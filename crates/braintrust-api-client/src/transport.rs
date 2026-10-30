@@ -102,6 +102,8 @@ impl Logs3OverflowUpload {
     }
 }
 
+// Match the generated methods' upstream error type without adding a boxed error API.
+#[allow(clippy::result_large_err)]
 impl Client {
     /// List organizations for the configured API key using the app endpoint.
     ///
