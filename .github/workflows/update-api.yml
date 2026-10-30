@@ -34,7 +34,7 @@ jobs:
 
       - name: Generate API client
         working-directory: sdk
-        run: openapi-to-rust generate --config .github/openapi-client.toml
+        run: openapi-to-rust generate --config crates/braintrust-api-client/codegen/openapi-client.toml
 
       # Run even with no diff so an obsolete pending update PR can be closed.
       - name: Open or update SDK PR
