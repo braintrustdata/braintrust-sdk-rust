@@ -255,7 +255,7 @@ impl Logs3BatchUploader {
             .collect();
         let mut requests_sent = 0usize;
         let (upload_result, upload_attempts) =
-            run_with_backoff(|| self.request_overflow_upload(&overflow_rows)).await;
+            run_with_backoff(|| self.request_overflow_upload(&overflow_rows, payload_bytes)).await;
         requests_sent += upload_attempts;
         let upload = upload_result?;
 
@@ -287,6 +287,7 @@ impl Logs3BatchUploader {
     async fn request_overflow_upload(
         &self,
         rows: &[Logs3OverflowInputRow],
+        payload_bytes: usize,
     ) -> Result<Logs3OverflowUpload> {
         Ok(api_result(
             self.client
@@ -294,6 +295,7 @@ impl Logs3BatchUploader {
                     &Logs3OverflowRequest {
                         rows: rows.to_vec(),
                         content_type: Some("application/json".to_owned()),
+                        size_bytes: Some(payload_bytes),
                     },
                     self.org_name.as_deref(),
                 )

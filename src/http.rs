@@ -125,14 +125,14 @@ pub(crate) async fn api_result<T>(
     match result {
         Ok(value) => Ok(value),
         Err(crate::api::Error::Api(response)) => {
-            if let Some(error) = response.parse_error {
-                Err(BraintrustError::Background(error))
-            } else {
-                Err(BraintrustError::Api {
-                    status: response.status,
-                    message: response.body,
-                })
-            }
+            let message = match response.parse_error {
+                Some(error) => format!("{error}; response body: {}", response.body),
+                None => response.body,
+            };
+            Err(BraintrustError::Api {
+                status: response.status,
+                message,
+            })
         }
         Err(crate::api::Error::Transport(crate::api::HttpError::Network(error)))
         | Err(crate::api::Error::Transport(crate::api::HttpError::Middleware(
@@ -390,5 +390,28 @@ cb0bfZ7fHHs=
 
         assert!(response.status().is_success());
         server.await.expect("TLS test server task");
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn decode_errors_keep_http_status_for_retry_classification() {
+        for status in [200, 400, 503] {
+            let error = crate::api::Error::Api(crate::api::ApiError {
+                status,
+                headers: Default::default(),
+                body: "payload".into(),
+                raw_body: b"payload".to_vec(),
+                typed: None,
+                parse_error: Some("failed to decode response".into()),
+            });
+            let error = api_result::<()>(Err(error)).await.unwrap_err();
+            assert!(
+                matches!(error, BraintrustError::Api { status: actual, .. } if actual == status)
+            );
+        }
     }
 }
