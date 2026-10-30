@@ -71,6 +71,9 @@ pub struct Logs3OverflowRequest {
     pub rows: Vec<Logs3OverflowInputRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    /// Total byte size of the serialized logs3 payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<usize>,
 }
 
 /// A signed upload instruction returned by `/logs3/overflow`.
@@ -254,7 +257,7 @@ impl Client {
         };
         let response = request.headers(headers).send().await?;
         if !response.status().is_success() {
-            return Err(crate::response::response_error(response).await?);
+            return Err(crate::response::response_error(response).await);
         }
         Ok(ResponseValue::empty(response))
     }
@@ -339,7 +342,7 @@ impl Client {
         crate::client::authorize_request(&self.inner, &mut request);
         let response = self.client.execute(request).await?;
         if !response.status().is_success() {
-            return Err(crate::response::response_error(response).await?);
+            return Err(crate::response::response_error(response).await);
         }
         Ok(response)
     }

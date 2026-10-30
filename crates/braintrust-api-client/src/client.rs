@@ -292,11 +292,13 @@ fn resolve_url(
 }
 
 fn validate_url(value: &str, field: &'static str) -> Result<String, ClientInitError> {
-    let url = reqwest::Url::parse(value).map_err(|_| ClientInitError::InvalidUrl(field))?;
+    let mut url = reqwest::Url::parse(value).map_err(|_| ClientInitError::InvalidUrl(field))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(ClientInitError::InvalidUrl(field));
     }
-    Ok(value.trim_end_matches('/').to_owned())
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
 fn default_http_builder() -> reqwest::ClientBuilder {

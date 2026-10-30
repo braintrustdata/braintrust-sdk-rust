@@ -39,7 +39,16 @@ impl<T: DeserializeOwned> ResponseValue<T> {
     pub(crate) async fn from_response(response: Response) -> Result<Self, Error<Value>> {
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
+        let bytes = response.bytes().await.map_err(|error| {
+            Error::Api(ApiError {
+                status: status.as_u16(),
+                headers: headers.clone(),
+                body: String::new(),
+                raw_body: Vec::new(),
+                typed: None,
+                parse_error: Some(error.to_string()),
+            })
+        })?;
         let inner = serde_json::from_slice(&bytes).map_err(|error| {
             Error::Api(ApiError {
                 status: status.as_u16(),
@@ -74,16 +83,19 @@ impl<E: std::fmt::Debug> crate::ApiOpError<E> {
     }
 }
 
-pub(crate) async fn response_error(response: Response) -> Result<Error<Value>, reqwest::Error> {
+pub(crate) async fn response_error(response: Response) -> Error<Value> {
     let status = response.status().as_u16();
     let headers = response.headers().clone();
-    let raw_body = response.bytes().await?.to_vec();
-    Ok(Error::Api(ApiError {
+    let (raw_body, parse_error) = match response.bytes().await {
+        Ok(bytes) => (bytes.to_vec(), None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    Error::Api(ApiError {
         status,
         headers,
         body: String::from_utf8_lossy(&raw_body).into_owned(),
         typed: serde_json::from_slice(&raw_body).ok(),
         raw_body,
-        parse_error: None,
-    }))
+        parse_error,
+    })
 }

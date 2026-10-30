@@ -274,7 +274,7 @@ async fn overflow_upload_uses_separate_transport_without_api_credentials() {
     let payload = b"{\"rows\":[{\"id\":\"row\"}],\"api_version\":2}";
     Mock::given(method("POST")).and(path("/logs3/overflow"))
         .and(header("authorization", "Bearer test-key"))
-        .and(body_json(json!({"rows":[{"object_ids":{"project_id":"project"},"input_row":{"byte_size":payload.len()}}],"content_type":"application/json"})))
+        .and(body_json(json!({"rows":[{"object_ids":{"project_id":"project"},"input_row":{"byte_size":payload.len()}}],"content_type":"application/json", "size_bytes":payload.len()})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"method":"PUT", "signedUrl": upload_url, "key":"stored-key", "headers":{"x-storage-header":"required", "Content-Type":"application/octet-stream"}})))
         .expect(1).mount(&api).await;
     Mock::given(method("PUT"))
@@ -317,6 +317,7 @@ async fn overflow_upload_uses_separate_transport_without_api_credentials() {
                 },
             }],
             content_type: Some("application/json".into()),
+            size_bytes: Some(payload.len()),
         })
         .await
         .unwrap();
@@ -504,6 +505,7 @@ async fn org_header_is_scoped_to_logging_operations() {
     let request = Logs3OverflowRequest {
         rows: vec![],
         content_type: None,
+        size_bytes: None,
     };
     client.logs3_overflow(&request).await.unwrap();
     client.version().await.unwrap();
@@ -585,4 +587,83 @@ fn generated_request_models_distinguish_omitted_null_and_value() {
         .description("text".into())
         .build();
     assert_eq!(serde_json::to_value(value).unwrap()["description"], "text");
+}
+
+#[test]
+fn parity_overflow_requests_preserve_total_payload_size() {
+    let body = json!({"rows":[], "content_type":"application/json", "size_bytes":1234});
+    let request: Logs3OverflowRequest = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(serde_json::to_value(request).unwrap(), body);
+}
+
+#[tokio::test]
+async fn parity_incomplete_response_bodies_preserve_status_and_headers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for status in [400, 200] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            socket.write_all(format!(
+                "HTTP/1.1 {status} Response\r\nContent-Length: 100\r\nContent-Type: application/json\r\nX-Request-Id: trace\r\nConnection: close\r\n\r\n{{"
+            ).as_bytes()).await.unwrap();
+        });
+        let client = Client::builder()
+            .api_key("key")
+            .api_url(format!("http://{address}"))
+            .build()
+            .unwrap();
+        let error = client.version().await.unwrap_err();
+        let response = error
+            .api()
+            .expect("received HTTP status must survive a body read failure");
+        assert_eq!(response.status, status);
+        assert_eq!(response.headers["x-request-id"], "trace");
+        assert!(response.parse_error.is_some());
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn parity_base_url_query_and_fragment_do_not_replace_operation_paths() {
+    let server = MockServer::start().await;
+    for (verb, route, response) in [
+        ("GET", "/version", json!({})),
+        ("GET", "/v1/dataset", json!({"objects":[]})),
+        ("POST", "/api/apikey/login", json!({"org_info":[]})),
+    ] {
+        Mock::given(method(verb))
+            .and(path(route))
+            .and(|request: &Request| request.url.query().is_none())
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let base = format!("{}?ignored=1#fragment", server.uri());
+    // The SDK previously used Url::join, which drops a base query and fragment.
+    assert_eq!(
+        reqwest::Url::parse(&base)
+            .unwrap()
+            .join("version")
+            .unwrap()
+            .path(),
+        "/version"
+    );
+    let client = Client::builder()
+        .api_key("key")
+        .api_url(&base)
+        .app_url(base)
+        .build()
+        .unwrap();
+    client.version().await.unwrap();
+    client.get_dataset_builder().send().await.unwrap();
+    client.login().await.unwrap();
 }
