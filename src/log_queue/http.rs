@@ -200,6 +200,87 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[tokio::test]
+    async fn publishing_saves_original_debug_payloads_for_normal_and_overflow_requests() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let payload = b"{\"rows\":[{\"id\":\"row\"}],\"api_version\":2}";
+        for overflow in [false, true] {
+            for status in [200, 400] {
+                let server = MockServer::start().await;
+                let directory =
+                    std::env::temp_dir().join(format!("braintrust-debug-{}", uuid::Uuid::new_v4()));
+                let all = directory.join("all");
+                let failed = directory.join("failed");
+                let config = LogQueueConfig::builder()
+                    .num_retries(0)
+                    .all_publish_payloads_dir(all.clone())
+                    .failed_publish_payloads_dir(failed.clone())
+                    .build();
+                if overflow {
+                    Mock::given(method("POST")).and(path("/logs3/overflow"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "method":"PUT", "signedUrl":format!("{}/signed", server.uri()), "key":"overflow"
+                        }))).expect(1).mount(&server).await;
+                    Mock::given(method("PUT"))
+                        .and(path("/signed"))
+                        .respond_with(ResponseTemplate::new(200))
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                }
+                Mock::given(method("POST"))
+                    .and(path("/logs3"))
+                    .respond_with(ResponseTemplate::new(status))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let result = send_batch_with_retry(
+                    &reqwest::Client::new(),
+                    &Url::parse(&server.uri()).unwrap(),
+                    "key",
+                    None,
+                    make_batch(payload),
+                    &config,
+                    if overflow { 1 } else { payload.len() + 1 },
+                    overflow,
+                )
+                .await;
+                assert_eq!(result.is_ok(), status == 200);
+                let files: Vec<_> = std::fs::read_dir(&all)
+                    .unwrap()
+                    .map(|file| file.unwrap().path())
+                    .collect();
+                assert_eq!(files.len(), 1);
+                assert!(files[0]
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("all-"));
+                assert_eq!(std::fs::read(&files[0]).unwrap(), payload);
+                if status == 400 {
+                    let files: Vec<_> = std::fs::read_dir(&failed)
+                        .unwrap()
+                        .map(|file| file.unwrap().path())
+                        .collect();
+                    assert_eq!(files.len(), 1);
+                    assert!(files[0]
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("failed-"));
+                    assert_eq!(std::fs::read(&files[0]).unwrap(), payload);
+                } else {
+                    assert!(!failed.exists());
+                }
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn test_save_payload_debug() {
         use std::fs;
