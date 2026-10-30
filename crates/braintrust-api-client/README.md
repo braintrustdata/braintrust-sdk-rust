@@ -52,22 +52,17 @@ used by a compiled client. The digest covers the unmodified input.
 | --- | --- |
 | `BRAINTRUST_OPENAPI_REF` | Git ref to fetch; defaults to `main`. Set a commit SHA to reproduce a build. |
 | `BRAINTRUST_OPENAPI_SPEC` | Use a local JSON spec instead of fetching. Prefer an absolute path; relative paths are resolved from this crate's directory. Cargo tracks changes to the file. |
-| `BRAINTRUST_OPENAPI_OFFLINE=1` | Generate from the bundled snapshot without fetching. |
-| `CARGO_NET_OFFLINE=true` | Also selects the bundled snapshot. Cargo's `--offline` flag alone does not communicate this setting to build scripts; set this environment variable or the one above. |
-| `BRAINTRUST_OPENAPI_REQUIRE_REMOTE=1` | Fail if fetching fails. Conflicts with local/offline selection. CI enables this. |
 | `BRAINTRUST_OPENAPI_REFRESH` | Change this value to invalidate Cargo's cached generation. |
 | `BRAINTRUST_CUSTOM_CA_BUNDLE` | Additional PEM CA certificates for the build-time download. Standard proxy environment variables also apply. |
 
-`1` and `true` enable boolean options. Without strict remote mode, download
-failures produce a Cargo warning and generation uses the bundled snapshot.
-Invalid downloaded JSON, unsupported specs, and generation failures always fail
-the build; they do not silently fall back. docs.rs builds use the bundled
-snapshot because their build environment blocks network access.
+Download failures, invalid JSON, unsupported specs, and generation failures fail
+the build. There is no bundled spec or fallback. Offline builds must explicitly
+provide a local spec using `BRAINTRUST_OPENAPI_SPEC`; Cargo's `--offline` flag
+does not itself prevent build scripts from accessing the network.
 
-The bundled `openapi.json` is the unmodified public spec from
-`braintrust-openapi@90ef74e4573fccd223a3c365bba329bff19aa362`, SHA-256
-`6409b3f2bde596c05fd73c229bb1e13e42c5e1b77f434eeb2b792fbaef96b720`.
-Refresh it from a known public commit when updating the fallback.
+Automatic docs.rs builds cannot fetch the remote spec because their sandbox
+blocks network access. Documentation can be built in a network-enabled
+environment, or offline with an explicitly supplied local spec.
 
 Fetching `main` means the generated API can change without changing this
 crate's version or Cargo.lock. Use a fixed ref or local spec when repeatability
@@ -76,7 +71,7 @@ declared dependencies before the crate can build against them.
 
 ## Spec adaptations and coverage
 
-`build_support/adapt.rs` applies the same rules to remote, local, and bundled
+`build_support/adapt.rs` applies the same rules to remote and local
 specs before generation:
 
 - Represent `type: null` schemas as null-only enums.
@@ -89,11 +84,11 @@ specs before generation:
 - Exclude `/v1/proxy/{path+}`, whose array-valued catch-all path parameter is
   unsupported by Progenitor's path renderer. Concrete proxy routes remain.
 
-The bundled spec yields 168 operations after these exclusions. Existing logging,
-login, and other SDK endpoints absent from the public spec remain handwritten.
+Existing logging, login, and other SDK endpoints absent from the public spec
+remain handwritten.
 
 ## Publishing
 
 Publish `braintrust-api-client` before the main SDK, which depends on its exact
-version. The published API crate includes its build script, adaptations, and
-snapshot, so downstream generation does not depend on repository-only files.
+version. The published API crate includes its build script and adaptations,
+so downstream generation fetches the spec without repository-only files.

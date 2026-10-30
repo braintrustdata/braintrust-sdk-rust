@@ -16,7 +16,6 @@ jobs:
       matrix:
         toolchain: [stable, "1.88.0"]
     env:
-      BRAINTRUST_OPENAPI_REQUIRE_REMOTE: "1"
       BRAINTRUST_OPENAPI_REFRESH: ${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
@@ -60,7 +59,7 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: cargo package --workspace --locked --no-verify
 
-      - name: Build an offline downstream consumer from the packages
+      - name: Build a downstream consumer from the packages
         if: matrix.toolchain == 'stable'
         run: python3 scripts/check-packaged-client.py target/package
 
@@ -77,5 +76,5 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
-          DOCS_RS: "1"
+          BRAINTRUST_OPENAPI_REFRESH: ${{ github.run_id }}-${{ github.run_attempt }}
 

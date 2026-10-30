@@ -125,15 +125,3 @@ fn rejects_unsupported_spec_versions() {
             .contains("expected OpenAPI 3.0.x")
     );
 }
-
-#[test]
-fn bundled_spec_adapts_without_changing_api_coverage_unexpectedly() {
-    let mut input: Value = serde_json::from_str(include_str!("../openapi.json")).unwrap();
-    let changes = adapt_spec(&mut input).unwrap();
-    assert_eq!(changes.null_schemas, 22);
-    assert_eq!(changes.nullable_enums, 7);
-    assert_eq!(changes.preflights, 74);
-    assert_eq!(changes.catch_all_routes, 1);
-    assert!(input["paths"].get("/v1/dataset").is_some());
-    assert!(input["paths"].get("/v1/experiment").is_some());
-}

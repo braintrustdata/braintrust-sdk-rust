@@ -68,9 +68,8 @@ Use `api::Client::new_with_client()` to configure authentication and transport.
 The API crate fetches the latest public OpenAPI spec and generates its client
 during builds, including builds in downstream projects. Cargo caches successful
 generation. To explicitly refresh it, change `BRAINTRUST_OPENAPI_REFRESH`.
-For offline builds, set `BRAINTRUST_OPENAPI_OFFLINE=1` to use the bundled spec.
-Download failures also fall back with a warning unless
-`BRAINTRUST_OPENAPI_REQUIRE_REMOTE=1` is set.
+Builds require access to the remote spec unless `BRAINTRUST_OPENAPI_SPEC` points
+to a local JSON spec. Download or generation failures fail the build.
 
 See the [API client README](crates/braintrust-api-client/README.md) for usage,
 pinning the spec, build options, and generation coverage.

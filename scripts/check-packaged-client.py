@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a downstream consumer using only the two packaged crates, offline."""
+"""Build a downstream consumer using only the two packaged crates and a remotely fetched spec."""
 
 import argparse
 import json
@@ -46,24 +46,18 @@ fn main() {
         .try_into().unwrap();
     let client = api::Client::new("https://api.braintrust.dev");
     let _request = client.post_dataset().body(body);
-    assert!(api::OPENAPI_SPEC_SOURCE.starts_with("bundled "));
+    assert!(api::OPENAPI_SPEC_SOURCE.starts_with("https://raw.githubusercontent.com/braintrustdata/braintrust-openapi/"));
     assert_eq!(api::OPENAPI_SPEC_SHA256.len(), 64);
     println!("Packaged downstream client generated from {}", api::OPENAPI_SPEC_SOURCE);
 }
 ''')
         environment = os.environ.copy()
-        # No source-tree spec, network access, or previously generated code is
-        # needed. Patch only the unpublished API dependency to its unpacked crate.
-        for name in ("BRAINTRUST_OPENAPI_SPEC", "DOCS_RS"):
-            environment.pop(name, None)
-        environment.update({
-            "BRAINTRUST_OPENAPI_OFFLINE": "1",
-            "BRAINTRUST_OPENAPI_REQUIRE_REMOTE": "0",
-            "CARGO_NET_OFFLINE": "true",
-            "CARGO_TARGET_DIR": str(repository / "target"),
-        })
+        # Patch only the unpublished API dependency to its unpacked crate.
+        # Generation must fetch the spec without relying on source-tree files.
+        environment.pop("BRAINTRUST_OPENAPI_SPEC", None)
+        environment["CARGO_TARGET_DIR"] = str(repository / "target")
         subprocess.run(
-            ["cargo", "run", "--offline", "--manifest-path", str(consumer / "Cargo.toml")],
+            ["cargo", "run", "--manifest-path", str(consumer / "Cargo.toml")],
             env=environment, check=True,
         )
 

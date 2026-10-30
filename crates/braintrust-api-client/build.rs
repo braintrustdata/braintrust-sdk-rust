@@ -5,8 +5,6 @@ use std::{env, error::Error, fs, io::Read, path::PathBuf, time::Duration};
 
 use sha2::{Digest, Sha256};
 
-const SNAPSHOT: &[u8] = include_bytes!("openapi.json");
-const SNAPSHOT_SOURCE: &str = "bundled braintrust-openapi@90ef74e4573fccd223a3c365bba329bff19aa362";
 const MAX_SPEC_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() {
@@ -16,15 +14,10 @@ fn main() {
 }
 
 fn generate() -> Result<(), Box<dyn Error>> {
-    println!("cargo:rerun-if-changed=openapi.json");
     println!("cargo:rerun-if-changed=build_support");
     for name in [
         "BRAINTRUST_OPENAPI_SPEC",
         "BRAINTRUST_OPENAPI_REF",
-        "BRAINTRUST_OPENAPI_OFFLINE",
-        "BRAINTRUST_OPENAPI_REQUIRE_REMOTE",
-        "DOCS_RS",
-        "CARGO_NET_OFFLINE",
         "BRAINTRUST_OPENAPI_REFRESH",
         "BRAINTRUST_CUSTOM_CA_BUNDLE",
     ] {
@@ -57,34 +50,13 @@ fn generate() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn enabled(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-}
-
 fn load_spec() -> Result<(Vec<u8>, String), Box<dyn Error>> {
-    let required = enabled("BRAINTRUST_OPENAPI_REQUIRE_REMOTE");
     if let Some(path) = env::var_os("BRAINTRUST_OPENAPI_SPEC") {
-        if required {
-            return Err(
-                "BRAINTRUST_OPENAPI_SPEC conflicts with BRAINTRUST_OPENAPI_REQUIRE_REMOTE".into(),
-            );
-        }
         // Relative paths are relative to the API crate, even downstream. Use
         // absolute paths in CI or a consuming application's configuration.
         let path = PathBuf::from(path).canonicalize()?;
         println!("cargo:rerun-if-changed={}", path.display());
         return Ok((fs::read(&path)?, path.display().to_string()));
-    }
-    if enabled("BRAINTRUST_OPENAPI_OFFLINE")
-        || enabled("CARGO_NET_OFFLINE")
-        || env::var_os("DOCS_RS").is_some()
-    {
-        if required {
-            return Err(
-                "offline generation conflicts with BRAINTRUST_OPENAPI_REQUIRE_REMOTE".into(),
-            );
-        }
-        return Ok((SNAPSHOT.to_vec(), SNAPSHOT_SOURCE.into()));
     }
     let reference = env::var("BRAINTRUST_OPENAPI_REF").unwrap_or_else(|_| "main".into());
     if reference.is_empty() || reference.contains(['?', '#', '\n', '\r']) {
@@ -95,16 +67,8 @@ fn load_spec() -> Result<(Vec<u8>, String), Box<dyn Error>> {
     let url = format!(
         "https://raw.githubusercontent.com/braintrustdata/braintrust-openapi/{reference}/openapi/spec.json"
     );
-    match fetch_spec(&url) {
-        Ok(bytes) => Ok((bytes, url)),
-        Err(error) if !required => {
-            println!(
-                "cargo:warning=Could not fetch Braintrust OpenAPI spec ({error}); using {SNAPSHOT_SOURCE}. Set BRAINTRUST_OPENAPI_REQUIRE_REMOTE=1 to fail instead."
-            );
-            Ok((SNAPSHOT.to_vec(), SNAPSHOT_SOURCE.into()))
-        }
-        Err(error) => Err(format!("could not fetch {url}: {error}").into()),
-    }
+    let bytes = fetch_spec(&url).map_err(|error| format!("could not fetch {url}: {error}"))?;
+    Ok((bytes, url))
 }
 
 fn fetch_spec(url: &str) -> Result<Vec<u8>, Box<dyn Error>> {
