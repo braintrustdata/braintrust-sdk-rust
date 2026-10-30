@@ -287,6 +287,16 @@ impl Client {
         .await
     }
 
+    /// Call an app action and decode its response into the requested type.
+    pub async fn control_plane_json<T: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        object_type: &str,
+        action: &str,
+        request: &T,
+    ) -> TransportResult<ResponseValue<R>> {
+        ResponseValue::from_response(self.control_plane(object_type, action, request).await?).await
+    }
+
     /// Fetch experiment comparison data from the data plane.
     pub async fn experiment_comparison(
         &self,

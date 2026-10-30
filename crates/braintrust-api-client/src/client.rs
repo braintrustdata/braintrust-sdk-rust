@@ -74,6 +74,8 @@ pub struct ClientBuilder {
     org_name: Option<String>,
     http_client_builder: Option<reqwest::ClientBuilder>,
     upload_http_client_builder: Option<reqwest::ClientBuilder>,
+    http_client: Option<reqwest::Client>,
+    upload_http_client: Option<reqwest::Client>,
 }
 
 /// Errors encountered while configuring or logging in an API client.
@@ -151,6 +153,7 @@ impl ClientBuilder {
     ///
     /// The API key overrides any default authorization header on this builder.
     pub fn http_client_builder(mut self, builder: reqwest::ClientBuilder) -> Self {
+        self.http_client = None;
         self.http_client_builder = Some(builder);
         self
     }
@@ -160,7 +163,22 @@ impl ClientBuilder {
     /// Use this for custom storage certificates, proxies, or timeouts. Do not add
     /// Braintrust authorization headers to this transport.
     pub fn upload_http_client_builder(mut self, builder: reqwest::ClientBuilder) -> Self {
+        self.upload_http_client = None;
         self.upload_http_client_builder = Some(builder);
+        self
+    }
+
+    /// Reuse an existing API transport and its connection pool.
+    pub fn http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        self.http_client_builder = None;
+        self
+    }
+
+    /// Reuse an existing storage transport without adding Braintrust credentials.
+    pub fn upload_http_client(mut self, client: reqwest::Client) -> Self {
+        self.upload_http_client = Some(client);
+        self.upload_http_client_builder = None;
         self
     }
 
@@ -187,14 +205,20 @@ impl ClientBuilder {
             .org_name
             .map(|name| HeaderValue::from_str(&name).map_err(|_| ClientInitError::InvalidOrgName))
             .transpose()?;
-        let http = self
-            .http_client_builder
-            .unwrap_or_else(default_http_builder)
-            .build()?;
-        let upload_client = self
-            .upload_http_client_builder
-            .unwrap_or_else(default_http_builder)
-            .build()?;
+        let http = match self.http_client {
+            Some(client) => client,
+            None => self
+                .http_client_builder
+                .unwrap_or_else(default_http_builder)
+                .build()?,
+        };
+        let upload_client = match self.upload_http_client {
+            Some(client) => client,
+            None => self
+                .upload_http_client_builder
+                .unwrap_or_else(default_http_builder)
+                .build()?,
+        };
         let generated = crate::GeneratedClient::with_client(http.clone())
             .with_base_url(&api_url)
             .with_api_key(api_key)
