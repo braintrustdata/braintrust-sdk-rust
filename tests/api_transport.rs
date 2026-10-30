@@ -125,13 +125,25 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
     let api = MockServer::start().await;
     let storage = MockServer::start().await;
     Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .and(|request: &Request| !request.headers.contains_key("x-bt-org-name"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"org_info":[{"id":"org", "name":"my-org"}]})),
+        )
+        .expect(1)
+        .mount(&app)
+        .await;
+    Mock::given(method("POST"))
         .and(path("/api/project/register"))
+        .and(|request: &Request| !request.headers.contains_key("x-bt-org-name"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"project"}})))
         .expect(1)
         .mount(&app)
         .await;
     Mock::given(method("GET"))
         .and(path("/version"))
+        .and(header("x-bt-org-name", "my-org"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"logs3_payload_max_bytes":512})),
         )
@@ -140,6 +152,7 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
         .await;
     Mock::given(method("POST"))
         .and(path("/logs3/overflow"))
+        .and(|request: &Request| !request.headers.contains_key("x-bt-org-name"))
         .and(header("authorization", "Bearer upload-key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "method":"PUT", "signedUrl":format!("{}/signed", storage.uri()), "key":"overflow-key"
@@ -161,6 +174,7 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
         json!({"rows":{"type":"logs3_overflow", "key":"overflow-key"}, "api_version":2});
     Mock::given(method("POST"))
         .and(path("/logs3"))
+        .and(header("x-bt-org-name", "my-org"))
         .and(body_json(reference.clone()))
         .respond_with(ResponseTemplate::new(503))
         .with_priority(1)
@@ -170,6 +184,7 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
         .await;
     Mock::given(method("POST"))
         .and(path("/logs3"))
+        .and(header("x-bt-org-name", "my-org"))
         .and(body_json(reference))
         .and(header("authorization", "Bearer upload-key"))
         .respond_with(ResponseTemplate::new(200))
@@ -178,8 +193,9 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
         .mount(&api)
         .await;
     let client = BraintrustClient::builder()
-        .api_key("unused-key")
-        .skip_login(true)
+        .api_key("upload-key")
+        .org_name("my-org")
+        .blocking_login(true)
         .app_url(app.uri())
         .api_url(api.uri())
         .checked_delivery(true)
@@ -187,7 +203,9 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
         .await
         .unwrap();
     let span = client
-        .span_builder_with_credentials("upload-key", "org")
+        .span_builder()
+        .await
+        .unwrap()
         .project_name("project")
         .build();
     span.log(
