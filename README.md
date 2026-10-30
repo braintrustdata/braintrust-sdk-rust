@@ -58,6 +58,23 @@ async fn main() -> anyhow::Result<()> {
 - **Async-first**: Built on Tokio for high-performance async operations
 - **Background submission**: Logs are submitted in the background to minimize latency
 
+## Generated REST API client
+
+Requires Rust 1.88 or newer. The SDK re-exports the `braintrust-api-client`
+workspace crate as `braintrust_sdk_rust::api`. It provides typed REST methods
+such as `api::Client::post_dataset()` alongside the logging and tracing SDK.
+Use `api::Client::new_with_client()` to configure authentication and transport.
+
+The API crate fetches the latest public OpenAPI spec and generates its client
+during builds, including builds in downstream projects. Cargo caches successful
+generation. To explicitly refresh it, change `BRAINTRUST_OPENAPI_REFRESH`.
+For offline builds, set `BRAINTRUST_OPENAPI_OFFLINE=1` to use the bundled spec.
+Download failures also fall back with a warning unless
+`BRAINTRUST_OPENAPI_REQUIRE_REMOTE=1` is set.
+
+See the [API client README](crates/braintrust-api-client/README.md) for usage,
+pinning the spec, build options, and generation coverage.
+
 ## Preserving existing span provenance
 
 For updates that must not replace an existing span's origin, build the update

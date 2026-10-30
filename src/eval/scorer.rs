@@ -276,10 +276,11 @@ mod tests {
     async fn test_exact_match() {
         let scorer = ExactMatch::new();
 
+        let expected = "HELLO".to_string();
         let args = ScorerArgs {
             input: &"hello".to_string(),
             output: &"HELLO".to_string(),
-            expected: Some(&"HELLO".to_string()),
+            expected: Some(&expected),
             metadata: None,
         };
 
@@ -287,10 +288,11 @@ mod tests {
         assert_eq!(scores.len(), 1);
         assert_eq!(scores[0].score, 1.0);
 
+        let expected = "hello".to_string();
         let args = ScorerArgs {
             input: &"hello".to_string(),
             output: &"HELLO".to_string(),
-            expected: Some(&"hello".to_string()),
+            expected: Some(&expected),
             metadata: None,
         };
 
@@ -302,10 +304,11 @@ mod tests {
     async fn test_levenshtein() {
         let scorer = LevenshteinScorer::new();
 
+        let expected = "hallo".to_string();
         let args = ScorerArgs {
             input: &"test".to_string(),
             output: &"hello".to_string(),
-            expected: Some(&"hallo".to_string()),
+            expected: Some(&expected),
             metadata: None,
         };
 

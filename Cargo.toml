@@ -1,8 +1,12 @@
+[workspace]
+members = ["crates/braintrust-api-client"]
+resolver = "3"
+
 [package]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
 edition = "2021"
-rust-version = "1.86.0"
+rust-version = "1.88.0"
 authors = ["Braintrust Team <team@braintrust.dev>"]
 description = "Rust SDK for Braintrust logging and tracing"
 repository = "https://github.com/braintrustdata/braintrust-sdk-rust"
@@ -11,6 +15,7 @@ keywords = ["braintrust", "logging", "tracing", "observability"]
 categories = ["api-bindings", "asynchronous", "development-tools"]
 
 [dependencies]
+braintrust-api-client = { version = "=0.1.0-alpha.2", path = "crates/braintrust-api-client" }
 anyhow = "1"
 base64 = "0.23"
 bon = "3"

@@ -1,0 +1,33 @@
+[package]
+name = "braintrust-api-client"
+version = "0.1.0-alpha.2"
+edition = "2024"
+rust-version = "1.88.0"
+description = "Generated Rust client for the Braintrust REST API"
+repository = "https://github.com/braintrustdata/braintrust-sdk-rust"
+license = "Apache-2.0"
+include = ["src/**", "tests/**", "build.rs", "build_support/**", "openapi.json", "README.md", "LICENSE"]
+
+[dependencies]
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
+futures-core = "0.3"
+progenitor-client = "=0.15.1"
+regress = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[build-dependencies]
+prettyplease = "0.3"
+progenitor = { version = "=0.15.1", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# Progenitor's type-name allocation depends on the spec's component order.
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+syn = { version = "3", features = ["full", "parsing"] }
+
+[package.metadata.docs.rs]
+all-features = true
