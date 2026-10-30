@@ -15,6 +15,7 @@ async fn discovery_selects_an_org_and_routes_generated_and_manual_operations() {
     let api = MockServer::start().await;
     Mock::given(method("POST")).and(path("/app/api/apikey/login"))
         .and(header("authorization", "Bearer discovery-key"))
+        .and(|request: &Request| !request.headers.contains_key("x-bt-org-name"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"org_info": [
             {"id":"other", "name":"other-org", "api_url":fallback.uri()},
             {"id":"selected", "name":"selected-org", "api_url":format!("{}/data/", api.uri()), "proxy_url":"https://proxy.example", "git_metadata":{"collect":false}}
@@ -22,7 +23,7 @@ async fn discovery_selects_an_org_and_routes_generated_and_manual_operations() {
     Mock::given(method("GET"))
         .and(path("/data/v1/dataset"))
         .and(header("authorization", "Bearer discovery-key"))
-        .and(header("x-bt-org-name", "selected-org"))
+        .and(|request: &Request| !request.headers.contains_key("x-bt-org-name"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"objects":[]})))
         .expect(1)
         .mount(&api)
@@ -447,4 +448,84 @@ fn invalid_endpoint_and_org_configuration_is_rejected_before_requests() {
             .build(),
         Err(ClientInitError::InvalidOrgName)
     ));
+}
+
+#[tokio::test]
+async fn org_header_is_scoped_to_logging_operations() {
+    let server = MockServer::start().await;
+    let client = Client::builder()
+        .api_key("key")
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .org_name("org")
+        .build()
+        .unwrap();
+    for (verb, route, response) in [
+        ("POST", "/api/apikey/login", json!({"org_info":[]})),
+        ("POST", "/btql", json!({"data":[]})),
+        (
+            "POST",
+            "/api/project/register",
+            json!({"project":{"id":"id"}}),
+        ),
+        ("GET", "/dataset-summary", json!({})),
+        ("GET", "/experiment-comparison2", json!({})),
+        (
+            "POST",
+            "/logs3/overflow",
+            json!({"method":"PUT", "signedUrl":"https://storage.example/upload", "key":"key"}),
+        ),
+    ] {
+        Mock::given(method(verb))
+            .and(path(route))
+            .and(|request: &Request| !request.headers.contains_key("x-bt-org-name"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    for (verb, route) in [("GET", "/version"), ("POST", "/logs3")] {
+        Mock::given(method(verb))
+            .and(path(route))
+            .and(header("x-bt-org-name", "org"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(if verb == "POST" { 2 } else { 1 })
+            .mount(&server)
+            .await;
+    }
+    client.login().await.unwrap();
+    client.btql(&json!({"query":"select 1"})).await.unwrap();
+    client
+        .control_plane("project", "register", &json!({}))
+        .await
+        .unwrap();
+    client.dataset_summary("id").await.unwrap();
+    client.experiment_comparison("id", None).await.unwrap();
+    let request = Logs3OverflowRequest {
+        rows: vec![],
+        content_type: None,
+    };
+    client.logs3_overflow(&request).await.unwrap();
+    client.version().await.unwrap();
+    client
+        .logs3(&json!({"rows":[],"api_version":2}))
+        .await
+        .unwrap();
+    client
+        .logs3_raw("{\"rows\":[],\"api_version\":2}")
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/logs3/overflow"))
+        .and(header("x-bt-org-name", "explicit-org"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"method":"PUT", "signedUrl":"https://storage.example/upload", "key":"key"}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    client
+        .logs3_overflow_with_org_name(&request, Some("explicit-org"))
+        .await
+        .unwrap();
 }

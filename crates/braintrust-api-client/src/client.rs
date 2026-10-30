@@ -18,7 +18,7 @@ pub const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
 pub struct ClientContext {
     pub(crate) app_url: String,
     authorization: Option<HeaderValue>,
-    org_name: Option<HeaderValue>,
+    pub(crate) org_name: Option<HeaderValue>,
     pub(crate) organization: Option<LoginOrganization>,
     pub(crate) upload_client: reqwest::Client,
 }
@@ -40,11 +40,6 @@ pub(crate) fn authorize_request(context: &ClientContext, request: &mut reqwest::
         request
             .headers_mut()
             .insert(AUTHORIZATION, authorization.clone());
-    }
-    if let Some(org_name) = &context.org_name {
-        request
-            .headers_mut()
-            .insert("x-bt-org-name", org_name.clone());
     }
 }
 
@@ -123,7 +118,7 @@ impl ClientBuilder {
         self
     }
 
-    /// Select an organization during login and send `x-bt-org-name` on API requests.
+    /// Select an organization for login, version checks, and log submissions.
     pub fn org_name(mut self, org_name: impl Into<String>) -> Self {
         self.org_name = Some(org_name.into());
         self

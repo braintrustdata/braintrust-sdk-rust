@@ -117,7 +117,7 @@ impl Client {
 
     /// Fetch data-plane version and logging capabilities.
     pub async fn version(&self) -> TransportResult<ResponseValue<VersionInfo>> {
-        self.send_json(self.request(Method::GET, &self.baseurl, "version"))
+        self.send_json(self.logging_request(Method::GET, "version"))
             .await
     }
 
@@ -153,10 +153,7 @@ impl Client {
         payload: &T,
     ) -> TransportResult<ResponseValue<()>> {
         let response = self
-            .send(
-                self.request(Method::POST, &self.baseurl, "logs3")
-                    .json(payload),
-            )
+            .send(self.logging_request(Method::POST, "logs3").json(payload))
             .await?;
         Ok(ResponseValue::empty(response))
     }
@@ -165,7 +162,7 @@ impl Client {
     pub async fn logs3_raw(&self, payload: impl Into<Bytes>) -> TransportResult<ResponseValue<()>> {
         let response = self
             .send(
-                self.request(Method::POST, &self.baseurl, "logs3")
+                self.logging_request(Method::POST, "logs3")
                     .header("content-type", "application/json")
                     .body(payload.into()),
             )
@@ -178,11 +175,22 @@ impl Client {
         &self,
         request: &Logs3OverflowRequest,
     ) -> TransportResult<ResponseValue<Logs3OverflowUpload>> {
-        self.send_json(
-            self.request(Method::POST, &self.baseurl, "logs3/overflow")
-                .json(request),
-        )
-        .await
+        self.logs3_overflow_with_org_name(request, None).await
+    }
+
+    /// Request an overflow destination with an explicit organization header.
+    pub async fn logs3_overflow_with_org_name(
+        &self,
+        request: &Logs3OverflowRequest,
+        org_name: Option<&str>,
+    ) -> TransportResult<ResponseValue<Logs3OverflowUpload>> {
+        let mut request = self
+            .request(Method::POST, &self.baseurl, "logs3/overflow")
+            .json(request);
+        if let Some(name) = org_name {
+            request = request.header("x-bt-org-name", name);
+        }
+        self.send_json(request).await
     }
 
     /// Upload a logs3 payload using the supplied signed POST or PUT instruction.
@@ -306,6 +314,14 @@ impl Client {
     fn request(&self, method: Method, base: &str, path: &str) -> RequestBuilder {
         let url = format!("{}/{path}", base.trim_end_matches('/'));
         self.client.request(method, url)
+    }
+
+    fn logging_request(&self, method: Method, path: &str) -> RequestBuilder {
+        let mut request = self.request(method, &self.baseurl, path);
+        if let Some(name) = &self.inner.org_name {
+            request = request.header("x-bt-org-name", name.clone());
+        }
+        request
     }
 
     async fn send(&self, request: RequestBuilder) -> TransportResult<Response> {
