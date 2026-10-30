@@ -798,7 +798,7 @@ impl BraintrustClient {
             api_key.to_owned(),
             org.id.clone(),
             org.name.clone(),
-            crate::api::ClientInfo::baseurl(&client).to_owned(),
+            client.baseurl().to_owned(),
             client.app_url().to_owned(),
         );
         if !did_set {
