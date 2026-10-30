@@ -63,7 +63,10 @@ async fn main() -> anyhow::Result<()> {
 Requires Rust 1.88 or newer. The SDK re-exports the `braintrust-api-client`
 workspace crate as `braintrust_sdk_rust::api`. It provides typed REST methods
 such as `api::Client::post_dataset()` alongside the logging and tracing SDK.
-Use `api::Client::new_with_client()` to configure authentication and transport.
+Use `api::Client::new()` to read `BRAINTRUST_API_KEY`, or
+`api::Client::with_api_key(key)` to provide the key programmatically. Both set
+the bearer authorization header automatically. Custom transports remain
+available through `api::GeneratedClient::new_with_client()`.
 
 The API crate generates its client from a checked-in OpenAPI snapshot during
 builds, including builds in downstream projects. Builds do not fetch the spec.

@@ -25,16 +25,50 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: main
+          path: sdk
+          persist-credentials: false
+
+      - name: Checkout published specs
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: braintrustdata/braintrust-openapi
+          ref: main
+          path: openapi
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Update snapshot from published spec
         id: update
+        working-directory: sdk
         env:
-          GH_TOKEN: ${{ github.token }}
           SPEC_SHA: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.spec_sha || inputs.spec_sha }}
         run: |
-          python3 scripts/update-openapi.py \
-            --spec-sha "$SPEC_SHA"
+          set -euo pipefail
+          [[ "$SPEC_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid spec commit SHA" >&2; exit 1; }
+          git -C ../openapi merge-base --is-ancestor "$SPEC_SHA" HEAD || {
+            echo "Requested commit has not landed on upstream main" >&2; exit 1;
+          }
+
+          # Always use the latest published main so delayed events cannot roll back an update.
+          latest=$(git -C ../openapi rev-parse HEAD)
+          snapshot=crates/braintrust-api-client/openapi.json
+          source=crates/braintrust-api-client/openapi-source.json
+          jq -e '.repository == "braintrustdata/braintrust-openapi"' "$source" >/dev/null
+          previous=$(jq -er '.commit | select(test("^[0-9a-f]{40}$"))' "$source")
+          git -C ../openapi merge-base --is-ancestor "$previous" "$latest" || {
+            echo "Published spec would not advance the current snapshot" >&2; exit 1;
+          }
+
+          incoming=../openapi/openapi/spec.json
+          jq -e '(.openapi | type == "string" and startswith("3.0.")) and
+            (.paths | type == "object" and length > 0)' "$incoming" >/dev/null
+          digest=$(sha256sum "$incoming" | cut -d ' ' -f1)
+          if ! cmp -s "$snapshot" "$incoming" || [[ $(jq -r '.sha256' "$source") != "$digest" ]]; then
+            cp "$incoming" "$snapshot"
+            jq -n --arg commit "$latest" --arg sha256 "$digest" \
+              '{repository: "braintrustdata/braintrust-openapi", commit: $commit, sha256: $sha256}' > "$source"
+          fi
+          echo "spec_sha=$(jq -r '.commit' "$source")" >> "$GITHUB_OUTPUT"
 
       - name: Create SDK bot token
         id: bot
@@ -51,6 +85,7 @@ jobs:
       - name: Open or update SDK PR
         uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7.0.11
         with:
+          path: sdk
           token: ${{ steps.bot.outputs.token }}
           base: main
           branch: chore/update-openapi-snapshot

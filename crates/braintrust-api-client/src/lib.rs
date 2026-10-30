@@ -7,6 +7,11 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/api.rs"));
 }
 
+mod client;
+
+pub use client::{Client, ClientInitError, DEFAULT_API_URL};
+/// Unwrapped generated client for configuring a custom HTTP transport.
+pub use generated::Client as GeneratedClient;
 pub use generated::*;
 
 /// Location of the unmodified spec used to generate this build.

@@ -7,6 +7,33 @@ const PROJECT: &str = "00000000-0000-0000-0000-000000000001";
 const DATASET: &str = "00000000-0000-0000-0000-000000000002";
 
 #[tokio::test]
+async fn explicit_api_key_sets_bearer_auth_without_exposing_the_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/dataset"))
+        .and(header("authorization", "Bearer programmatic-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"objects": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client =
+        api::Client::with_api_key_and_url("programmatic-key", format!("{}/", server.uri()))
+            .unwrap();
+    assert!(!format!("{client:?}").contains("programmatic-key"));
+    client.get_dataset().send().await.unwrap();
+}
+
+#[test]
+fn empty_or_invalid_keys_are_rejected_without_exposing_values() {
+    for key in ["", " \t", "private-key\ninvalid-header"] {
+        let error = api::Client::with_api_key_and_url(key, api::DEFAULT_API_URL).unwrap_err();
+        assert!(matches!(error, api::ClientInitError::InvalidApiKey));
+        assert!(!format!("{error:?}").contains("private-key"));
+        assert!(!error.to_string().contains("private-key"));
+    }
+}
+
+#[tokio::test]
 async fn reexported_client_sends_typed_requests_with_custom_auth_and_pagination() {
     let server = MockServer::start().await;
     let dataset =
@@ -39,7 +66,7 @@ async fn reexported_client_sends_typed_requests_with_custom_auth_and_pagination(
         .user_agent("generated-client-test")
         .build()
         .unwrap();
-    let client = api::Client::new_with_client(&server.uri(), http);
+    let client = api::GeneratedClient::new_with_client(&server.uri(), http);
     let body: types::CreateDataset = types::CreateDataset::builder()
         .name("example")
         .project_id(PROJECT)
@@ -73,7 +100,8 @@ async fn generated_client_preserves_api_error_status_and_body() {
         .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error": "rate limited"})))
         .mount(&server)
         .await;
-    let error = api::Client::new(&server.uri())
+    let error = api::Client::with_api_key_and_url("test-key", server.uri())
+        .unwrap()
         .get_dataset()
         .send()
         .await

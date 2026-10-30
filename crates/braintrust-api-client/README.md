@@ -8,13 +8,7 @@ Requires Rust 1.88 or newer.
 use braintrust_api_client::{Client, types};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let mut headers = reqwest::header::HeaderMap::new();
-let mut authorization: reqwest::header::HeaderValue =
-    format!("Bearer {}", std::env::var("BRAINTRUST_API_KEY")?).parse()?;
-authorization.set_sensitive(true);
-headers.insert(reqwest::header::AUTHORIZATION, authorization);
-let http = reqwest::Client::builder().default_headers(headers).build()?;
-let client = Client::new_with_client("https://api.braintrust.dev", http);
+let client = Client::new()?; // Reads BRAINTRUST_API_KEY.
 
 let body: types::CreateDataset = types::CreateDataset::builder()
     .name("example")
@@ -26,9 +20,19 @@ println!("{}", dataset.id);
 # }
 ```
 
-Supply your own reqwest client for authentication, custom certificates,
-timeouts, or other transport settings. This REST client is independent of the
-logging SDK's login state and batching/retry behavior.
+To supply the key programmatically, use `Client::with_api_key("your-api-key")`.
+Both constructors use `BRAINTRUST_API_URL` when set, otherwise
+`https://api.braintrust.dev`. For an explicit endpoint without environment
+configuration, use `Client::with_api_key_and_url(key, url)`.
+
+These constructors set the bearer authorization header and mark it sensitive
+so Debug output does not expose the key. Missing, empty, or invalid keys produce
+a `ClientInitError`.
+
+For custom certificates, timeouts, or other transport settings, use the
+unwrapped `GeneratedClient::new_with_client(url, http)` and supply your own
+authenticated reqwest client. This REST client is independent of the logging
+SDK's login state and batching/retry behavior.
 
 ## Generation during builds
 
