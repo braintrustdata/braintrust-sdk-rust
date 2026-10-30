@@ -32,47 +32,55 @@ logging SDK's login state and batching/retry behavior.
 
 ## Generation during builds
 
-The crate's `build.rs` downloads
-<https://raw.githubusercontent.com/braintrustdata/braintrust-openapi/main/openapi/spec.json>,
-adapts it, and generates Rust in Cargo's `OUT_DIR`. This also happens when the
-crate is built as a dependency of another project. Java, Node, and a separate
-generator executable are not required. Progenitor and its runtime are pinned.
+The crate's `build.rs` generates Rust from the checked-in `openapi.json` into
+Cargo's `OUT_DIR`, including when another project builds it as a dependency.
+Builds never download a spec. Java, Node, and a separate generator executable
+are not required. Progenitor and its runtime are pinned.
 
-Cargo caches successful build-script output. A normal incremental build may
-reuse the previous client. Changing `BRAINTRUST_OPENAPI_REFRESH` to any new
-value requests another fetch and generation; CI sets it to the workflow run.
+Cargo tracks changes to the snapshot, its provenance, and the adaptation code.
+`OPENAPI_SPEC_SOURCE` and `OPENAPI_SPEC_SHA256` identify the unmodified input
+used by a compiled client. The build verifies the digest in
+`openapi-source.json` before generating code.
 
-The raw and adapted specs are saved alongside `api.rs` in `OUT_DIR` for
-inspection. `OPENAPI_SPEC_SOURCE` and `OPENAPI_SPEC_SHA256` identify the input
-used by a compiled client. The digest covers the unmodified input.
+The crate includes both snapshot files, so generation works offline and on
+docs.rs once Cargo dependencies are available. The API crate is versioned
+independently of the upstream spec.
 
-## Selecting the spec
+## Automated snapshot updates
 
-| Environment variable | Behavior |
-| --- | --- |
-| `BRAINTRUST_OPENAPI_REF` | Git ref to fetch; defaults to `main`. Set a commit SHA to reproduce a build. |
-| `BRAINTRUST_OPENAPI_SPEC` | Use a local JSON spec instead of fetching. Prefer an absolute path; relative paths are resolved from this crate's directory. Cargo tracks changes to the file. |
-| `BRAINTRUST_OPENAPI_REFRESH` | Change this value to invalidate Cargo's cached generation. |
-| `BRAINTRUST_CUSTOM_CA_BUNDLE` | Additional PEM CA certificates for the build-time download. Standard proxy environment variables also apply. |
+After a commit lands on `braintrust-openapi` main, its dispatcher sends a
+`repository_dispatch` event with type `braintrust-openapi-updated`. The
+`.github/workflows/update-api.yml` receiver accepts this versioned payload:
 
-Download failures, invalid JSON, unsupported specs, and generation failures fail
-the build. There is no bundled spec or fallback. Offline builds must explicitly
-provide a local spec using `BRAINTRUST_OPENAPI_SPEC`; Cargo's `--offline` flag
-does not itself prevent build scripts from accessing the network.
+```json
+{
+  "contract_version": "1",
+  "spec_repository": "braintrustdata/braintrust-openapi",
+  "spec_sha": "<full published commit SHA>"
+}
+```
 
-Automatic docs.rs builds cannot fetch the remote spec because their sandbox
-blocks network access. Documentation can be built in a network-enabled
-environment, or offline with an explicitly supplied local spec.
+The receiver verifies the notified commit is on upstream main, coalesces delayed
+notifications to the latest published main revision, and downloads that exact
+revision. If the spec bytes changed, it updates `openapi.json` and
+`openapi-source.json` on a persistent `chore/update-openapi-snapshot` PR. API
+crate versions are not changed automatically. SDK CI builds from the proposed
+snapshot and validates the generated API before merge.
 
-Fetching `main` means the generated API can change without changing this
-crate's version or Cargo.lock. Use a fixed ref or local spec when repeatability
-matters. New backend schema shapes can require changes to the adaptations or
-declared dependencies before the crate can build against them.
+Notifications that do not change the spec content create no new PR. If an
+upstream change reverts to the SDK snapshot, an obsolete pending update PR is
+closed. Serialized runs
+and commit ancestry checks prevent older notifications from downgrading an
+update. A manual `workflow_dispatch` with the same inputs can retry an update.
+
+The receiver needs `GH_BOT_APP_PRIVATE_KEY` for the Braintrust bot installed on
+this SDK repository, with Contents and Pull requests write access. Its public
+App ID defaults to `1394756`; set the repository variable `GH_BOT_APP_ID` to
+use another app. The bot token ensures update PRs trigger ordinary SDK CI.
 
 ## Spec adaptations and coverage
 
-`build_support/adapt.rs` applies the same rules to remote and local
-specs before generation:
+`build_support/adapt.rs` adapts the snapshot before generation:
 
 - Represent `type: null` schemas as null-only enums.
 - Remove inline schema titles so type names derive from their context, while
@@ -90,5 +98,6 @@ remain handwritten.
 ## Publishing
 
 Publish `braintrust-api-client` before the main SDK, which depends on its exact
-version. The published API crate includes its build script and adaptations,
-so downstream generation fetches the spec without repository-only files.
+version. The published API crate includes its build script, adaptations, and synced
+snapshot, so downstream generation needs neither repository-only files nor a
+network request.

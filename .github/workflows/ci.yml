@@ -15,8 +15,6 @@ jobs:
     strategy:
       matrix:
         toolchain: [stable, "1.88.0"]
-    env:
-      BRAINTRUST_OPENAPI_REFRESH: ${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Checkout
@@ -45,6 +43,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Test the spec update receiver
+        if: matrix.toolchain == 'stable'
+        run: python3 -m unittest discover -s scripts -p 'test_update_openapi.py' -v
+
       - name: Run clippy
         if: matrix.toolchain == 'stable'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -59,7 +61,7 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: cargo package --workspace --locked --no-verify
 
-      - name: Build a downstream consumer from the packages
+      - name: Build an offline downstream consumer from the packages
         if: matrix.toolchain == 'stable'
         run: python3 scripts/check-packaged-client.py target/package
 
@@ -76,5 +78,4 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
-          BRAINTRUST_OPENAPI_REFRESH: ${{ github.run_id }}-${{ github.run_attempt }}
 

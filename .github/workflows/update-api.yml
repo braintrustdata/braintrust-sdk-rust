@@ -1,0 +1,80 @@
+name: Update OpenAPI snapshot
+
+on:
+  repository_dispatch:
+    types: [braintrust-openapi-updated]
+  workflow_dispatch:
+    inputs:
+      contract_version:
+        description: Update contract version
+        type: string
+        default: "1"
+        required: true
+      spec_repository:
+        description: Published spec repository
+        type: string
+        default: braintrustdata/braintrust-openapi
+        required: true
+      spec_sha:
+        description: Full commit SHA published on braintrust-openapi main
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-openapi-snapshot
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout SDK main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Update snapshot from published spec
+        id: update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTRACT_VERSION: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.contract_version || inputs.contract_version }}
+          SPEC_REPOSITORY: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.spec_repository || inputs.spec_repository }}
+          SPEC_SHA: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.spec_sha || inputs.spec_sha }}
+        run: |
+          python3 scripts/update-openapi.py \
+            --contract-version "$CONTRACT_VERSION" \
+            --spec-repository "$SPEC_REPOSITORY" \
+            --spec-sha "$SPEC_SHA"
+
+      - name: Create SDK bot token
+        id: bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.GH_BOT_APP_ID || '1394756' }}
+          private-key: ${{ secrets.GH_BOT_APP_PRIVATE_KEY }}
+          owner: braintrustdata
+          repositories: braintrust-sdk-rust
+          permission-contents: write
+          permission-pull-requests: write
+
+      # Run even with no diff so an obsolete pending update PR can be closed.
+      - name: Open or update SDK PR
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7.0.11
+        with:
+          token: ${{ steps.bot.outputs.token }}
+          base: main
+          branch: chore/update-openapi-snapshot
+          title: Update Braintrust API specification
+          commit-message: Update Braintrust API specification
+          body: |
+            Updates the REST API client to the latest published Braintrust specification.
+            Source: https://github.com/braintrustdata/braintrust-openapi/commit/${{ steps.update.outputs.spec_sha }}
+            The source commit and content digest are recorded in openapi-source.json.
+            SDK CI validates generation and the resulting API behavior.
+          add-paths: |
+            crates/braintrust-api-client/openapi.json
+            crates/braintrust-api-client/openapi-source.json

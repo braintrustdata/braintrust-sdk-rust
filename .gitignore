@@ -17,3 +17,6 @@ Thumbs.db
 *.profraw
 *.profdata
 
+
+# Python workflow test artifacts
+__pycache__/

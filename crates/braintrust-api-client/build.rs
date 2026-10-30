@@ -1,11 +1,9 @@
 #[path = "build_support/adapt.rs"]
 mod adapt;
 
-use std::{env, error::Error, fs, io::Read, path::PathBuf, time::Duration};
+use std::{env, error::Error, fs, path::PathBuf};
 
 use sha2::{Digest, Sha256};
-
-const MAX_SPEC_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() {
     if let Err(error) = generate() {
@@ -15,25 +13,27 @@ fn main() {
 
 fn generate() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build_support");
-    for name in [
-        "BRAINTRUST_OPENAPI_SPEC",
-        "BRAINTRUST_OPENAPI_REF",
-        "BRAINTRUST_OPENAPI_REFRESH",
-        "BRAINTRUST_CUSTOM_CA_BUNDLE",
-    ] {
-        println!("cargo:rerun-if-env-changed={name}");
+    println!("cargo:rerun-if-changed=openapi.json");
+    println!("cargo:rerun-if-changed=openapi-source.json");
+    let bytes: &[u8] = include_bytes!("openapi.json");
+    let metadata: serde_json::Value = serde_json::from_str(include_str!("openapi-source.json"))?;
+    let commit = metadata["commit"]
+        .as_str()
+        .ok_or("snapshot source commit is missing")?;
+    let source = format!("bundled braintrust-openapi@{commit}");
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    if metadata["repository"] != "braintrustdata/braintrust-openapi" || metadata["sha256"] != digest
+    {
+        return Err("bundled OpenAPI spec does not match openapi-source.json".into());
     }
-
-    let (bytes, source) = load_spec()?;
-    let digest = format!("{:x}", Sha256::digest(&bytes));
-    let mut spec: serde_json::Value = serde_json::from_slice(&bytes)
+    let mut spec: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid JSON in {source}: {error}"))?;
     let changes =
         adapt::adapt_spec(&mut spec).map_err(|error| format!("cannot adapt {source}: {error}"))?;
     println!("Braintrust OpenAPI: {source} (sha256 {digest}); {changes:?}");
 
     let out = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?);
-    fs::write(out.join("openapi.original.json"), &bytes)?;
+    fs::write(out.join("openapi.original.json"), bytes)?;
     fs::write(
         out.join("openapi.adapted.json"),
         serde_json::to_vec_pretty(&spec)?,
@@ -48,51 +48,4 @@ fn generate() -> Result<(), Box<dyn Error>> {
     println!("cargo:rustc-env=BRAINTRUST_GENERATED_SPEC_SOURCE={source}");
     println!("cargo:rustc-env=BRAINTRUST_GENERATED_SPEC_SHA256={digest}");
     Ok(())
-}
-
-fn load_spec() -> Result<(Vec<u8>, String), Box<dyn Error>> {
-    if let Some(path) = env::var_os("BRAINTRUST_OPENAPI_SPEC") {
-        // Relative paths are relative to the API crate, even downstream. Use
-        // absolute paths in CI or a consuming application's configuration.
-        let path = PathBuf::from(path).canonicalize()?;
-        println!("cargo:rerun-if-changed={}", path.display());
-        return Ok((fs::read(&path)?, path.display().to_string()));
-    }
-    let reference = env::var("BRAINTRUST_OPENAPI_REF").unwrap_or_else(|_| "main".into());
-    if reference.is_empty() || reference.contains(['?', '#', '\n', '\r']) {
-        return Err(
-            "BRAINTRUST_OPENAPI_REF must be a Git ref without query or fragment characters".into(),
-        );
-    }
-    let url = format!(
-        "https://raw.githubusercontent.com/braintrustdata/braintrust-openapi/{reference}/openapi/spec.json"
-    );
-    let bytes = fetch_spec(&url).map_err(|error| format!("could not fetch {url}: {error}"))?;
-    Ok((bytes, url))
-}
-
-fn fetch_spec(url: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent(concat!(
-            "braintrust-api-client-build/",
-            env!("CARGO_PKG_VERSION")
-        ));
-    if let Ok(pem) = env::var("BRAINTRUST_CUSTOM_CA_BUNDLE") {
-        let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes())?;
-        if certs.is_empty() {
-            return Err("BRAINTRUST_CUSTOM_CA_BUNDLE did not contain any PEM certificates".into());
-        }
-        for certificate in certs {
-            builder = builder.add_root_certificate(certificate);
-        }
-    }
-    let client = builder.build()?;
-    let response = client.get(url).send()?.error_for_status()?;
-    let mut bytes = Vec::new();
-    response.take(MAX_SPEC_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_SPEC_BYTES {
-        return Err("OpenAPI spec exceeded the 8 MiB limit".into());
-    }
-    Ok(bytes)
 }

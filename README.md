@@ -65,14 +65,13 @@ workspace crate as `braintrust_sdk_rust::api`. It provides typed REST methods
 such as `api::Client::post_dataset()` alongside the logging and tracing SDK.
 Use `api::Client::new_with_client()` to configure authentication and transport.
 
-The API crate fetches the latest public OpenAPI spec and generates its client
-during builds, including builds in downstream projects. Cargo caches successful
-generation. To explicitly refresh it, change `BRAINTRUST_OPENAPI_REFRESH`.
-Builds require access to the remote spec unless `BRAINTRUST_OPENAPI_SPEC` points
-to a local JSON spec. Download or generation failures fail the build.
+The API crate generates its client from a checked-in OpenAPI snapshot during
+builds, including builds in downstream projects. Builds do not fetch the spec.
+Published changes in `braintrust-openapi` trigger a workflow that opens or
+updates a snapshot PR here; merging that PR updates the generated API.
 
 See the [API client README](crates/braintrust-api-client/README.md) for usage,
-pinning the spec, build options, and generation coverage.
+the update workflow, offline generation, and API coverage.
 
 ## Preserving existing span provenance
 
