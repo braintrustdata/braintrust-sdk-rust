@@ -1,6 +1,6 @@
 [generator]
 spec_path = "https://raw.githubusercontent.com/braintrustdata/braintrust-openapi/main/openapi/spec.json"
-output_dir = "../src/generated"
+output_dir = "src/generated"
 module_name = "api_types"
 overlays = ["openapi-client.overlay.yaml"]
 
