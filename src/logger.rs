@@ -18,7 +18,7 @@ use crate::experiments::api::{
     ExperimentRegisterResponse, ExperimentRegistrar,
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
-use crate::http::{build_http_client, CaBundleConfig};
+use crate::http::{api_client, api_client_builder, api_result, build_http_client, CaBundleConfig};
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
@@ -56,12 +56,6 @@ impl OrgInfo {
     pub fn api_url(&self) -> Option<&str> {
         self.api_url.as_deref()
     }
-}
-
-/// Response from the login endpoint.
-#[derive(Debug, Deserialize)]
-struct LoginResponse {
-    org_info: Vec<OrgInfo>,
 }
 
 /// Logged-in state containing API key and org info.
@@ -765,70 +759,53 @@ impl BraintrustClient {
         Ok(())
     }
 
-    /// Perform login synchronously.
+    fn request_client(&self, token: &str) -> Result<crate::api::Client> {
+        let api_url = self
+            .inner
+            .login_state
+            .api_url()
+            .unwrap_or_else(|| self.inner.api_url.to_string());
+        let app_url = self
+            .inner
+            .login_state
+            .app_url()
+            .unwrap_or_else(|| self.inner.app_url.to_string());
+        api_client(&self.inner.http_client, &api_url, &app_url, token, None)
+    }
+
+    /// Log in and discover the selected organization's API endpoint.
     async fn perform_login(&self, api_key: &str, org_name: Option<&str>) -> Result<()> {
-        let login_url = self
-            .inner
-            .app_url
-            .join("api/apikey/login")
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
-
-        let response = self
-            .inner
-            .http_client
-            .post(login_url)
-            .bearer_auth(api_key)
-            .header("Content-Type", "application/json")
-            .send()
-            .await
-            .map_err(|e| BraintrustError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        let login_response: LoginResponse =
-            response.json().await.map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("Failed to parse login response: {}", e),
-            })?;
-
-        // Find matching org or use first
-        let org = if let Some(name) = org_name {
-            login_response
-                .org_info
-                .into_iter()
-                .find(|o| o.name == name)
-                .ok_or_else(|| {
-                    BraintrustError::InvalidConfig(format!("Organization '{}' not found", name))
-                })?
-        } else {
-            login_response.org_info.into_iter().next().ok_or_else(|| {
-                BraintrustError::InvalidConfig(
-                    "No organizations found for this API key".to_string(),
-                )
-            })?
+        let result = api_client_builder(
+            &self.inner.http_client,
+            self.inner.api_url.as_str(),
+            self.inner.app_url.as_str(),
+            api_key,
+            org_name,
+        )
+        .build_with_login()
+        .await;
+        let client = match result {
+            Ok(client) => client,
+            Err(crate::api::ClientInitError::Login(error)) => {
+                return api_result::<()>(Err(*error)).await
+            }
+            Err(error) => return Err(BraintrustError::InvalidConfig(error.to_string())),
         };
-
+        let org = client.organization().ok_or_else(|| {
+            BraintrustError::InvalidConfig("login did not select an organization".into())
+        })?;
         let did_set = self.inner.login_state.set(
-            api_key.to_string(),
-            org.id,
-            org.name,
-            org.api_url
-                .unwrap_or_else(|| self.inner.api_url.to_string()),
-            self.inner.app_url.to_string(),
+            api_key.to_owned(),
+            org.id.clone(),
+            org.name.clone(),
+            client.baseurl().to_owned(),
+            client.app_url().to_owned(),
         );
         if !did_set {
             return Err(BraintrustError::InvalidConfig(
                 "Login state already set".to_string(),
             ));
         }
-
         self.inner.login_notify.notify_waiters();
         Ok(())
     }
@@ -1023,7 +1000,6 @@ impl SpanSubmitter for BraintrustClient {
     }
 }
 
-// Experiment trait implementations for BraintrustClient
 #[async_trait::async_trait]
 impl ExperimentRegistrar for BraintrustClient {
     async fn register_experiment(
@@ -1031,39 +1007,18 @@ impl ExperimentRegistrar for BraintrustClient {
         token: &str,
         request: ExperimentRegisterRequest,
     ) -> Result<ExperimentRegisterResponse> {
-        let url = self
-            .inner
-            .app_url
-            .join("api/experiment/register")
-            .map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid experiment register url: {e}"))
-            })?;
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: format!("register experiment failed: {text}"),
-            });
-        }
-
-        let register_response: ExperimentRegisterResponse = response.json().await.map_err(|e| {
-            BraintrustError::Background(format!(
-                "failed to parse experiment registration response: {e}"
-            ))
-        })?;
-
-        Ok(register_response)
+        let client = self.request_client(token)?;
+        Ok(api_result(
+            client
+                .control_plane_json::<_, ExperimentRegisterResponse>(
+                    "experiment",
+                    "register",
+                    &request,
+                )
+                .await,
+        )
+        .await?
+        .into_inner())
     }
 }
 
@@ -1074,50 +1029,31 @@ impl BaseExperimentFetcher for BraintrustClient {
         token: &str,
         experiment_id: &str,
     ) -> Result<Option<BaseExperimentInfo>> {
-        let url = self
-            .inner
-            .app_url
-            .join("api/base_experiment/get_id")
-            .map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid base experiment url: {e}"))
-            })?;
-
+        let client = self.request_client(token)?;
         let request = BaseExperimentRequest {
-            id: experiment_id.to_string(),
+            id: experiment_id.to_owned(),
         };
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-
-        let status = response.status();
-
-        // 400 means no base experiment - return None
-        if status.as_u16() == 400 {
-            return Ok(None);
-        }
-
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: format!("fetch base experiment failed: {text}"),
-            });
-        }
-
-        let base_response: BaseExperimentResponse = response.json().await.map_err(|e| {
-            BraintrustError::Background(format!("failed to parse base experiment response: {e}"))
-        })?;
-
-        match (base_response.base_exp_id, base_response.base_exp_name) {
-            (Some(id), Some(name)) => Ok(Some(BaseExperimentInfo { id, name })),
-            _ => Ok(None),
-        }
+        let response = api_result(
+            client
+                .control_plane_json::<_, BaseExperimentResponse>(
+                    "base_experiment",
+                    "get_id",
+                    &request,
+                )
+                .await,
+        )
+        .await;
+        let base_response: BaseExperimentResponse = match response {
+            Ok(response) => response.into_inner(),
+            Err(BraintrustError::Api { status: 400, .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(
+            match (base_response.base_exp_id, base_response.base_exp_name) {
+                (Some(id), Some(name)) => Some(BaseExperimentInfo { id, name }),
+                _ => None,
+            },
+        )
     }
 }
 
@@ -1129,50 +1065,18 @@ impl ExperimentComparisonFetcher for BraintrustClient {
         experiment_id: &str,
         base_experiment_id: Option<&str>,
     ) -> Result<ExperimentComparisonResponse> {
-        let mut url = self
-            .inner
-            .app_url
-            .join("experiment-comparison2")
-            .map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid experiment comparison url: {e}"))
-            })?;
-
-        url.query_pairs_mut()
-            .append_pair("experiment_id", experiment_id);
-
-        if let Some(base_id) = base_experiment_id {
-            url.query_pairs_mut()
-                .append_pair("base_experiment_id", base_id);
-        }
-
-        let response = self
-            .inner
-            .http_client
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: format!("fetch experiment comparison failed: {text}"),
-            });
-        }
-
-        let comparison: ExperimentComparisonResponse = response.json().await.map_err(|e| {
-            BraintrustError::Background(format!(
-                "failed to parse experiment comparison response: {e}"
-            ))
-        })?;
-
-        Ok(comparison)
+        let client = self.request_client(token)?;
+        let response = api_result(
+            client
+                .experiment_comparison(experiment_id, base_experiment_id)
+                .await,
+        )
+        .await?;
+        serde_json::from_value(response.into_inner())
+            .map_err(|error| BraintrustError::Background(error.to_string()))
     }
 }
 
-// Dataset trait implementations for BraintrustClient
 #[async_trait::async_trait]
 impl DatasetRegistrar for BraintrustClient {
     async fn register_dataset(
@@ -1180,76 +1084,33 @@ impl DatasetRegistrar for BraintrustClient {
         token: &str,
         request: DatasetRegisterRequest,
     ) -> Result<DatasetRegisterResponse> {
-        let url = self
-            .inner
-            .app_url
-            .join("api/dataset/register")
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| BraintrustError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        response
-            .json::<DatasetRegisterResponse>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("Failed to parse dataset register response: {}", e),
-            })
+        let client = self.request_client(token)?;
+        Ok(api_result(
+            client
+                .control_plane_json::<_, DatasetRegisterResponse>("dataset", "register", &request)
+                .await,
+        )
+        .await?
+        .into_inner())
     }
 }
 
 #[async_trait::async_trait]
 impl DatasetFetcher for BraintrustClient {
     async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse> {
-        let url = self
-            .inner
-            .api_url
-            .join("btql")
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
-
-        let response = self
-            .inner
-            .http_client
-            .post(url)
-            .bearer_auth(token)
-            .json(&query)
-            .send()
-            .await
-            .map_err(|e| BraintrustError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        response
-            .json::<BTQLResponse>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("Failed to parse BTQL response: {}", e),
-            })
+        let client = self.request_client(token)?;
+        let response = api_result(client.btql_json(&query).await)
+            .await?
+            .into_inner();
+        Ok(BTQLResponse {
+            data: response
+                .data
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|error| BraintrustError::Background(error.to_string()))?,
+            cursor: response.cursor,
+        })
     }
 }
 
@@ -1260,38 +1121,10 @@ impl DatasetSummarizer for BraintrustClient {
         token: &str,
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse> {
-        let mut url = self
-            .inner
-            .api_url
-            .join("dataset-summary")
-            .map_err(|e| BraintrustError::InvalidConfig(e.to_string()))?;
-        url.query_pairs_mut().append_pair("dataset_id", dataset_id);
-
-        let response = self
-            .inner
-            .http_client
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| BraintrustError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        response
-            .json::<DatasetSummaryResponse>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("Failed to parse dataset summary response: {}", e),
-            })
+        let client = self.request_client(token)?;
+        let response = api_result(client.dataset_summary(dataset_id).await).await?;
+        serde_json::from_value(response.into_inner())
+            .map_err(|error| BraintrustError::Background(error.to_string()))
     }
 }
 
