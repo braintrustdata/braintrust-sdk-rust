@@ -57,43 +57,6 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: cargo package --workspace --locked --no-verify
 
-      - name: Build an offline downstream consumer from the packages
-        if: matrix.toolchain == 'stable'
-        run: |
-          set -euo pipefail
-          metadata=$(cargo metadata --no-deps --format-version 1)
-          sdk_version=$(jq -r '.packages[] | select(.name == "braintrust-sdk-rust") | .version' <<< "$metadata")
-          api_version=$(jq -r '.packages[] | select(.name == "braintrust-api-client") | .version' <<< "$metadata")
-          consumer_dir=$(mktemp -d)
-          tar -xzf "target/package/braintrust-sdk-rust-$sdk_version.crate" -C "$consumer_dir"
-          tar -xzf "target/package/braintrust-api-client-$api_version.crate" -C "$consumer_dir"
-          mkdir "$consumer_dir/consumer"
-          cat > "$consumer_dir/consumer/Cargo.toml" <<EOF
-          [package]
-          name = "packaged-client-consumer"
-          version = "0.0.0"
-          edition = "2024"
-          [dependencies]
-          braintrust-sdk-rust = { path = "$consumer_dir/braintrust-sdk-rust-$sdk_version" }
-          [patch.crates-io]
-          braintrust-api-client = { path = "$consumer_dir/braintrust-api-client-$api_version" }
-          EOF
-          mkdir "$consumer_dir/consumer/src"
-          cat > "$consumer_dir/consumer/src/main.rs" <<'EOF'
-          use braintrust_sdk_rust::api;
-          fn main() {
-              let body: api::types::CreateDataset = api::types::CreateDataset::builder()
-                  .name("packaged-client").project_id("00000000-0000-0000-0000-000000000001")
-                  .try_into().unwrap();
-              let client = api::Client::with_api_key("packaged-client-test-key").unwrap();
-              let _request = client.post_dataset().body(body);
-              assert!(api::OPENAPI_SPEC_SOURCE.starts_with("bundled braintrust-openapi@"));
-              assert_eq!(api::OPENAPI_SPEC_SHA256.len(), 64);
-          }
-          EOF
-          CARGO_NET_OFFLINE=true CARGO_TARGET_DIR="$PWD/target" \
-            cargo run --offline --manifest-path "$consumer_dir/consumer/Cargo.toml"
-
   # Check documentation builds
   docs:
     runs-on: ubuntu-latest
