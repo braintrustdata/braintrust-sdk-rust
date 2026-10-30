@@ -215,4 +215,12 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
             .unwrap(),
     );
     span.flush().await.unwrap();
+    let requests = api.received_requests().await.unwrap();
+    let overflow = requests
+        .iter()
+        .find(|request| request.url.path() == "/logs3/overflow")
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&overflow.body).unwrap();
+    let uploads = storage.received_requests().await.unwrap();
+    assert_eq!(metadata["size_bytes"], uploads[0].body.len());
 }
