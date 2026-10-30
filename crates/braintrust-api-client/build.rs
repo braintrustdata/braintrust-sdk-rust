@@ -29,6 +29,8 @@ fn generate() -> Result<(), Box<dyn Error>> {
         .map_err(|error| format!("adapted spec is not supported by Progenitor: {error}"))?;
     let mut settings = progenitor::GenerationSettings::default();
     settings.with_interface(progenitor::InterfaceStyle::Builder);
+    settings.with_inner_type("crate::ClientContext".parse()?);
+    settings.with_pre_hook("crate::client::authorize_request".parse()?);
     let tokens = progenitor::Generator::new(&settings).generate_tokens(&api)?;
     let syntax = syn::parse2(tokens)?;
     fs::write(out.join("api.rs"), prettyplease::unparse(&syntax))?;

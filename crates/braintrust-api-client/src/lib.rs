@@ -8,6 +8,7 @@ mod generated {
 }
 
 mod client;
+pub mod transport;
 
-pub use client::{ClientBuilder, ClientInitError, DEFAULT_API_URL};
+pub use client::{ClientBuilder, ClientContext, ClientInitError, DEFAULT_API_URL, DEFAULT_APP_URL};
 pub use generated::*;
