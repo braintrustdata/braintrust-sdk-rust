@@ -2,7 +2,7 @@ name: Update OpenAPI snapshot
 
 on:
   schedule:
-    - cron: '23 6 * * 1' # Mondays at 06:23 UTC.
+    - cron: '0 6 * * 1' # Mondays at 06:00 UTC.
   workflow_dispatch:
 
 permissions:
