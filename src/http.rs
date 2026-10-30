@@ -124,22 +124,23 @@ pub(crate) async fn api_result<T>(
 ) -> Result<T> {
     match result {
         Ok(value) => Ok(value),
-        Err(crate::api::Error::UnexpectedResponse(response)) => {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            Err(BraintrustError::Api { status, message })
+        Err(crate::api::Error::Api(response)) => {
+            if let Some(error) = response.parse_error {
+                Err(BraintrustError::Background(error))
+            } else {
+                Err(BraintrustError::Api {
+                    status: response.status,
+                    message: response.body,
+                })
+            }
         }
-        Err(crate::api::Error::ErrorResponse(response)) => Err(BraintrustError::Api {
-            status: response.status().as_u16(),
-            message: response.into_inner().to_string(),
-        }),
-        Err(
-            crate::api::Error::CommunicationError(error)
-            | crate::api::Error::ResponseBodyError(error),
-        ) => Err(BraintrustError::Http(error)),
-        Err(crate::api::Error::InvalidRequest(message)) => {
-            Err(BraintrustError::InvalidConfig(message))
-        }
+        Err(crate::api::Error::Transport(crate::api::HttpError::Network(error)))
+        | Err(crate::api::Error::Transport(crate::api::HttpError::Middleware(
+            reqwest_middleware::Error::Reqwest(error),
+        ))) => Err(BraintrustError::Http(error)),
+        Err(crate::api::Error::Transport(
+            crate::api::HttpError::Config(message) | crate::api::HttpError::Serialization(message),
+        )) => Err(BraintrustError::InvalidConfig(message)),
         Err(error) => Err(BraintrustError::Background(error.to_string())),
     }
 }
