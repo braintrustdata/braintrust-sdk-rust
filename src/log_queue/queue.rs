@@ -1,4 +1,3 @@
-use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -708,37 +707,26 @@ impl LogQueueCore {
             }
             None => self.app_url.clone(),
         };
-        let url = app_url
-            .join("api/project/register")
-            .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
-
         let request = ProjectRegisterRequest {
             project_name,
             org_id: (!org_id.is_empty()).then_some(org_id),
             org_name,
         };
 
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: text,
-            }
-            .into());
-        }
-
-        let register_response: ProjectRegisterResponse = response
-            .json()
-            .await
-            .context("failed to parse project registration response")?;
+        let client = crate::http::api_client(
+            &self.client,
+            self.api_url.as_str(),
+            app_url.as_str(),
+            token,
+            org_name,
+        )?;
+        let register_response: ProjectRegisterResponse = crate::http::api_result(
+            client
+                .control_plane_json::<_, ProjectRegisterResponse>("project", "register", &request)
+                .await,
+        )
+        .await?
+        .into_inner();
 
         {
             let mut cache = self.project_cache.lock().await;

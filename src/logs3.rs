@@ -1,16 +1,17 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoffBuilder;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest::{multipart, Client, Url};
-use serde::{Deserialize, Serialize};
+use reqwest::Url;
 use serde_json::{json, Map, Value};
 use tokio::time::sleep;
 
+use crate::api::transport::{
+    Logs3OverflowInputRow, Logs3OverflowInputRowMeta as OverflowInputRowInfo, Logs3OverflowRequest,
+    Logs3OverflowUpload,
+};
 use crate::error::{BraintrustError, Result};
-use crate::http::{build_http_client, CaBundleConfig};
+use crate::http::{api_client, api_result, build_http_client, CaBundleConfig};
 use crate::log_queue::batch_items;
 
 const DEFAULT_MAX_REQUEST_SIZE: usize = 6 * 1024 * 1024;
@@ -37,10 +38,7 @@ pub struct Logs3UploadResult {
 
 #[derive(Debug, Clone)]
 pub struct Logs3BatchUploader {
-    client: Client,
-    api_url: Url,
-    api_key: String,
-    org_name: Option<String>,
+    client: crate::api::Client,
     max_request_size_override: Option<usize>,
     payload_limits: Option<PayloadLimits>,
 }
@@ -56,42 +54,6 @@ struct RowPayload {
     row_json: String,
     row_bytes: usize,
     overflow_meta: Logs3OverflowInputRow,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct Logs3OverflowInputRow {
-    object_ids: Map<String, Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    is_delete: Option<bool>,
-    input_row: OverflowInputRowInfo,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OverflowInputRowInfo {
-    byte_size: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct VersionInfo {
-    #[serde(default)]
-    logs3_payload_max_bytes: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-enum OverflowMethod {
-    Put,
-    Post,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Logs3OverflowUpload {
-    method: OverflowMethod,
-    signed_url: String,
-    headers: Option<HashMap<String, String>>,
-    fields: Option<HashMap<String, String>>,
-    key: String,
 }
 
 impl Logs3BatchUploader {
@@ -133,12 +95,17 @@ impl Logs3BatchUploader {
     ) -> Result<Self> {
         let api_url = Url::parse(api_url.as_ref())
             .map_err(|e| BraintrustError::InvalidConfig(format!("invalid api_url: {e}")))?;
-        let client = build_http_client(Duration::from_secs(30), ca_bundle.as_ref(), None)?;
+        let http = build_http_client(Duration::from_secs(30), ca_bundle.as_ref(), None)?;
+        let org_name = org_name.filter(|s| !s.trim().is_empty());
+        let client = api_client(
+            &http,
+            api_url.as_str(),
+            crate::api::DEFAULT_APP_URL,
+            &api_key.into(),
+            org_name.as_deref(),
+        )?;
         Ok(Self {
             client,
-            api_url,
-            api_key: api_key.into(),
-            org_name: org_name.filter(|s| !s.trim().is_empty()),
             max_request_size_override: None,
             payload_limits: None,
         })
@@ -190,20 +157,10 @@ impl Logs3BatchUploader {
     }
 
     async fn fetch_payload_limits(&self) -> PayloadLimits {
-        let mut server_limit: Option<usize> = None;
-        if let Ok(url) = self.api_url.join("version") {
-            let mut request = self.client.get(url).bearer_auth(&self.api_key);
-            if let Some(org_name) = &self.org_name {
-                request = request.header("x-bt-org-name", org_name);
-            }
-            if let Ok(response) = request.send().await {
-                if response.status().is_success() {
-                    if let Ok(version) = response.json::<VersionInfo>().await {
-                        server_limit = version.logs3_payload_max_bytes.filter(|v| *v > 0);
-                    }
-                }
-            }
-        }
+        let server_limit = api_result(self.client.version().await)
+            .await
+            .ok()
+            .and_then(|version| version.logs3_payload_max_bytes.filter(|limit| *limit > 0));
 
         let can_use_overflow = server_limit.is_some();
         let mut max_request_size = DEFAULT_MAX_REQUEST_SIZE;
@@ -296,7 +253,7 @@ impl Logs3BatchUploader {
             .collect();
         let mut requests_sent = 0usize;
         let (upload_result, upload_attempts) =
-            run_with_backoff(|| self.request_overflow_upload(&overflow_rows, payload_bytes)).await;
+            run_with_backoff(|| self.request_overflow_upload(&overflow_rows)).await;
         requests_sent += upload_attempts;
         let upload = upload_result?;
 
@@ -328,40 +285,17 @@ impl Logs3BatchUploader {
     async fn request_overflow_upload(
         &self,
         rows: &[Logs3OverflowInputRow],
-        payload_bytes: usize,
     ) -> Result<Logs3OverflowUpload> {
-        let url = self
-            .api_url
-            .join("logs3/overflow")
-            .map_err(|e| BraintrustError::InvalidConfig(format!("invalid overflow URL: {e}")))?;
-
-        let request_body = json!({
-            "content_type": "application/json",
-            "size_bytes": payload_bytes,
-            "rows": rows,
-        });
-        let mut request = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&request_body);
-        if let Some(org_name) = &self.org_name {
-            request = request.header("x-bt-org-name", org_name);
-        }
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api { status, message });
-        }
-        response
-            .json::<Logs3OverflowUpload>()
-            .await
-            .map_err(|e| BraintrustError::Api {
-                status: 200,
-                message: format!("failed to parse logs3 overflow response: {e}"),
-            })
+        Ok(api_result(
+            self.client
+                .logs3_overflow(&Logs3OverflowRequest {
+                    rows: rows.to_vec(),
+                    content_type: Some("application/json".to_owned()),
+                })
+                .await,
+        )
+        .await?
+        .into_inner())
     }
 
     async fn upload_overflow_payload(
@@ -369,89 +303,17 @@ impl Logs3BatchUploader {
         upload: &Logs3OverflowUpload,
         payload: &str,
     ) -> Result<()> {
-        let signed_url = Url::parse(&upload.signed_url).map_err(|e| {
-            BraintrustError::InvalidConfig(format!("invalid logs3 overflow signed URL: {e}"))
-        })?;
-        match upload.method {
-            OverflowMethod::Post => {
-                let fields = upload.fields.clone().ok_or_else(|| {
-                    BraintrustError::InvalidConfig(
-                        "logs3 overflow POST upload missing form fields".to_string(),
-                    )
-                })?;
-                let content_type = fields
-                    .get("Content-Type")
-                    .cloned()
-                    .unwrap_or_else(|| "application/json".to_string());
-                let mut form = multipart::Form::new();
-                for (key, value) in &fields {
-                    form = form.text(key.clone(), value.clone());
-                }
-                let file_part = multipart::Part::text(payload.to_string())
-                    .mime_str(&content_type)
-                    .map_err(|e| {
-                        BraintrustError::InvalidConfig(format!(
-                            "invalid overflow content-type '{content_type}': {e}"
-                        ))
-                    })?;
-                form = form.part("file", file_part);
-
-                let mut request = self.client.post(signed_url).multipart(form);
-                let mut headers = header_map_from_pairs(upload.headers.as_ref())?;
-                headers.remove("content-type");
-                if !headers.is_empty() {
-                    request = request.headers(headers);
-                }
-                let response = request.send().await?;
-                if !response.status().is_success() {
-                    let status = response.status().as_u16();
-                    let message = response.text().await.unwrap_or_default();
-                    return Err(BraintrustError::Api { status, message });
-                }
-            }
-            OverflowMethod::Put => {
-                let mut headers = header_map_from_pairs(upload.headers.as_ref())?;
-                if upload.signed_url.contains("blob.core.windows.net")
-                    && !headers.contains_key("x-ms-blob-type")
-                {
-                    headers.insert("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
-                }
-
-                let mut request = self.client.put(signed_url).body(payload.to_string());
-                if !headers.is_empty() {
-                    request = request.headers(headers);
-                }
-                let response = request.send().await?;
-                if !response.status().is_success() {
-                    let status = response.status().as_u16();
-                    let message = response.text().await.unwrap_or_default();
-                    return Err(BraintrustError::Api { status, message });
-                }
-            }
-        }
+        api_result(
+            self.client
+                .upload_logs3_overflow(upload, payload.to_owned())
+                .await,
+        )
+        .await?;
         Ok(())
     }
 
     async fn post_logs3_raw(&self, payload: &str) -> Result<()> {
-        let url = self
-            .api_url
-            .join("logs3")
-            .map_err(|e| BraintrustError::InvalidConfig(format!("invalid logs3 URL: {e}")))?;
-        let mut request = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .body(payload.to_string());
-        if let Some(org_name) = &self.org_name {
-            request = request.header("x-bt-org-name", org_name);
-        }
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api { status, message });
-        }
+        api_result(self.client.logs3_raw(payload.to_owned()).await).await?;
         Ok(())
     }
 }
@@ -490,24 +352,6 @@ fn construct_logs3_payload(items: &[RowPayload]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{{\"rows\":[{rows}],\"api_version\":{LOGS_API_VERSION}}}")
-}
-
-fn header_map_from_pairs(headers: Option<&HashMap<String, String>>) -> Result<HeaderMap> {
-    let mut out = HeaderMap::new();
-    if let Some(headers) = headers {
-        for (key, value) in headers {
-            let name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
-                BraintrustError::InvalidConfig(format!("invalid HTTP header name '{key}': {e}"))
-            })?;
-            let header_value = HeaderValue::from_str(value).map_err(|e| {
-                BraintrustError::InvalidConfig(format!(
-                    "invalid HTTP header value for '{key}': {e}"
-                ))
-            })?;
-            out.insert(name, header_value);
-        }
-    }
-    Ok(out)
 }
 
 fn should_retry(err: &BraintrustError) -> bool {
