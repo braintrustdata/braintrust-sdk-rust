@@ -78,7 +78,10 @@ pub(crate) async fn send_batch_with_retry(
         crate::api::DEFAULT_APP_URL,
         token,
         org_name,
-    )?;
+    )
+    .inspect_err(|_| {
+        save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed").ok();
+    })?;
     let use_overflow = can_use_overflow && json_bytes.len() > max_request_size;
     let mut overflow_upload: Option<Logs3OverflowUpload> = None;
     for attempt in 0..=config.num_retries() {
@@ -92,6 +95,7 @@ pub(crate) async fn send_batch_with_retry(
                     api.logs3_overflow(&Logs3OverflowRequest {
                         rows: batch.overflow_rows.clone(),
                         content_type: Some("application/json".to_owned()),
+                        size_bytes: Some(json_bytes.len()),
                     })
                     .await,
                 )
@@ -162,6 +166,38 @@ mod tests {
             data: data.to_vec(),
             overflow_rows: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_credentials_still_save_failed_payload_debug() {
+        let directory =
+            std::env::temp_dir().join(format!("braintrust-failed-{}", uuid::Uuid::new_v4()));
+        let config = LogQueueConfig::builder()
+            .num_retries(0)
+            .failed_publish_payloads_dir(directory.clone())
+            .build();
+        let payload = b"{\"rows\":[],\"api_version\":2}";
+        assert!(send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse("http://127.0.0.1:1/").unwrap(),
+            "\n",
+            None,
+            make_batch(payload),
+            &config,
+            1024,
+            false
+        )
+        .await
+        .is_err());
+        let files: Vec<_> = std::fs::read_dir(&directory)
+            .expect("failed payload must be saved")
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            std::fs::read(files[0].as_ref().unwrap().path()).unwrap(),
+            payload
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
