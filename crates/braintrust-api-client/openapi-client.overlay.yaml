@@ -25,3 +25,8 @@ actions:
     remove: true
   - target: $.components.schemas.PromptData.properties.tool_functions.items.allOf[?(@['$ref'] == '#/components/schemas/SavedFunctionId' && length(@) == 1)]
     remove: true
+  # OpenAPI permits unspecified properties by default. Preserve forward-compatible
+  # topic settings rather than rejecting them in the generated union decoder.
+  - target: $.components.schemas.TopicAutomationConfig
+    update:
+      additionalProperties: true

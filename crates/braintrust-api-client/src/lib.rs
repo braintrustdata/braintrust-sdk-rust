@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod backend;
 mod client;
 #[allow(dead_code, clippy::all, rustdoc::bare_urls)]
 #[rustfmt::skip]
@@ -13,7 +14,7 @@ pub use client::{
 };
 pub use generated::client::{HttpClient as GeneratedClient, *};
 pub use generated::{sse, types};
-pub use request::{PreparedRequest, Request, Transport};
+pub(crate) use request::{Request, Transport};
 pub use response::ResponseValue;
 /// Errors from login, queries, logging and other SDK operations.
 pub type Error<E = serde_json::Value> = ApiOpError<E>;

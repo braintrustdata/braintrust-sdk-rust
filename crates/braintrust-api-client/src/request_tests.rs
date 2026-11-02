@@ -1,4 +1,4 @@
-use braintrust_api_client::{Client, Transport};
+use crate::{Client, Transport};
 use reqwest::Method;
 use serde_json::json;
 use wiremock::matchers::{body_json, body_string_contains, header, method, path, query_param};

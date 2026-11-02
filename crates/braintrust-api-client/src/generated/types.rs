@@ -23883,6 +23883,9 @@ pub struct TopicAutomationConfig {
     pub status: Option<AutomationStatus>,
     ///Topic map functions with optional per-topic-map filters
     pub topic_map_functions: Vec<TopicMapFunctionAutomation>,
+    /// Additional properties not explicitly defined in the schema
+    #[serde(flatten)]
+    pub additional_properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TopicMapFunctionAutomation {

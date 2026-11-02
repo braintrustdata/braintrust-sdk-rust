@@ -10,7 +10,7 @@ use crate::{Client, transport::TransportResult};
 /// Use this for OAuth, browser setup and signed URLs. Authenticated Braintrust
 /// requests should use [`Client::api_request`] or [`Client::app_request`].
 #[derive(Clone)]
-pub struct Transport {
+pub(crate) struct Transport {
     client: reqwest::Client,
 }
 
@@ -69,7 +69,7 @@ impl Transport {
 /// A configurable request for API operations that need a raw response.
 ///
 /// No retries are performed. The body can be cloned for caller-owned retries.
-pub struct Request {
+pub(crate) struct Request {
     inner: reqwest::RequestBuilder,
 }
 
@@ -116,6 +116,7 @@ impl Request {
         self
     }
 
+    #[cfg(test)]
     pub fn try_clone(&self) -> Option<Self> {
         self.inner.try_clone().map(|inner| Self { inner })
     }
@@ -137,13 +138,14 @@ impl Request {
     /// Send once, leaving status interpretation to a protocol-specific caller.
     ///
     /// Useful for OAuth error responses and polling.
+    #[cfg(test)]
     pub async fn send_unchecked(self) -> reqwest::Result<Response> {
         self.build()?.send_unchecked().await
     }
 }
 
 /// A validated request that can be replayed without serializing its body again.
-pub struct PreparedRequest {
+pub(crate) struct PreparedRequest {
     client: reqwest::Client,
     request: reqwest::Request,
 }
@@ -175,12 +177,12 @@ impl Client {
     ///
     /// The path is appended to the base URL; absolute URLs cannot redirect the
     /// request to another host. Organization headers must be set explicitly.
-    pub fn api_request(&self, method: Method, path: &str) -> Request {
+    pub(crate) fn api_request(&self, method: Method, path: &str) -> Request {
         self.scoped_request(method, &self.baseurl, path)
     }
 
     /// Make an authenticated request under the configured app URL.
-    pub fn app_request(&self, method: Method, path: &str) -> Request {
+    pub(crate) fn app_request(&self, method: Method, path: &str) -> Request {
         self.scoped_request(method, &self.inner.app_url, path)
     }
 
@@ -207,3 +209,7 @@ impl From<reqwest::Client> for Transport {
         Self::new(client)
     }
 }
+
+#[cfg(test)]
+#[path = "request_tests.rs"]
+mod tests;
