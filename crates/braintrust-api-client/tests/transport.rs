@@ -627,6 +627,9 @@ async fn parity_incomplete_response_bodies_preserve_status_and_headers() {
         assert_eq!(response.status, status);
         assert_eq!(response.headers["x-request-id"], "trace");
         assert!(response.parse_error.is_some());
+        if status == 400 {
+            assert_eq!(response.raw_body, b"{");
+        }
         server.await.unwrap();
     }
 }

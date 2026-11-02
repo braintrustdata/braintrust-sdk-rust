@@ -9,13 +9,14 @@ license = "Apache-2.0"
 include = ["src/**/*.rs", "tests/**", "README.md", "LICENSE"]
 
 [dependencies]
+http = "1"
 bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 futures-util = "0.3"
 futures-timer = "3"
 reqwest-middleware = { version = "0.5", features = ["query"] }
 url = { version = "2", features = ["serde"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "query", "stream", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "form", "query", "stream", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"

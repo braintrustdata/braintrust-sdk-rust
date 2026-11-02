@@ -42,6 +42,12 @@ pub struct ClientContext {
     pub(crate) upload_client: reqwest::Client,
 }
 
+impl ClientContext {
+    pub(crate) fn authorization(&self) -> Option<&HeaderValue> {
+        self.authorization.as_ref()
+    }
+}
+
 impl Default for ClientContext {
     fn default() -> Self {
         Self {

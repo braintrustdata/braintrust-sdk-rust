@@ -83,12 +83,16 @@ impl<E: std::fmt::Debug> crate::ApiOpError<E> {
     }
 }
 
-pub(crate) async fn response_error(response: Response) -> Error<Value> {
+pub(crate) async fn response_error(mut response: Response) -> Error<Value> {
     let status = response.status().as_u16();
     let headers = response.headers().clone();
-    let (raw_body, parse_error) = match response.bytes().await {
-        Ok(bytes) => (bytes.to_vec(), None),
-        Err(error) => (Vec::new(), Some(error.to_string())),
+    let mut raw_body = Vec::new();
+    let parse_error = loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => raw_body.extend_from_slice(&chunk),
+            Ok(None) => break None,
+            Err(error) => break Some(error.to_string()),
+        }
     };
     Error::Api(ApiError {
         status,
