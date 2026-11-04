@@ -502,7 +502,11 @@ fn retry_reason(error: &anyhow::Error) -> Option<RetryReason> {
     }
     error.downcast_ref::<reqwest::Error>().and_then(|error| {
         (!error.is_builder()
-            && (error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()))
+            && (error.is_connect()
+                || error.is_timeout()
+                || error.is_request()
+                || error.is_body()
+                || error.is_decode()))
         .then_some(RetryReason::Network)
     })
 }
