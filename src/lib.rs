@@ -15,6 +15,9 @@ mod stream;
 pub(crate) mod test_utils;
 mod types;
 
+/// Generated client for the public Braintrust REST API.
+pub use braintrust_api_client as api;
+
 pub use dataset::{
     DatasetBuilder, DatasetBuilderError, DatasetInsert, DatasetInsertBuilder,
     DatasetInsertBuilderError, DatasetIterator, DatasetRecord, DatasetSummary,
