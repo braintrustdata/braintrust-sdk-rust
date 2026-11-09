@@ -92,10 +92,11 @@ pub(crate) async fn send_batch_with_retry(
         if use_overflow && overflow_upload.is_none() {
             let upload = async {
                 let upload = api_result(
-                    api.logs3_overflow(&Logs3OverflowRequest {
-                        rows: batch.overflow_rows.clone(),
-                        content_type: Some("application/json".to_owned()),
-                        size_bytes: Some(json_bytes.len()),
+                    api.logs3_overflow(&{
+                        let mut value = Logs3OverflowRequest::new(batch.overflow_rows.clone());
+                        value.content_type = Some("application/json".to_owned());
+                        value.size_bytes = Some(json_bytes.len());
+                        value
                     })
                     .await,
                 )
