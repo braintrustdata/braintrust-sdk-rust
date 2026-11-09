@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
@@ -781,7 +781,7 @@ struct SpanData {
     scores: HashMap<String, f64>,
     metadata: Map<String, Value>,
     metrics: HashMap<String, f64>,
-    tags: Vec<String>,
+    tags: BTreeSet<String>,
     context: Option<Value>,
     environment: Option<SpanOriginEnvironment>,
     span_origin: Option<SpanOrigin>,
@@ -815,7 +815,7 @@ impl From<SpanData> for SpanPayload {
             scores: (!data.scores.is_empty()).then_some(data.scores),
             metadata: (!data.metadata.is_empty()).then_some(data.metadata),
             metrics: (!data.metrics.is_empty()).then_some(data.metrics),
-            tags: (!data.tags.is_empty()).then_some(data.tags),
+            tags: (!data.tags.is_empty()).then(|| data.tags.into_iter().collect()),
             context: merge_span_origin_context(
                 data.context,
                 data.environment.as_ref(),
@@ -1132,6 +1132,29 @@ mod tests {
             captured.parent,
             Some(ParentSpanInfo::ProjectLogs { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn span_tags_remain_unique_across_log_updates() {
+        let (span, collector) = build_test_span();
+        span.log(
+            SpanLog::builder()
+                .tags(vec!["b".into(), "a".into(), "a".into()])
+                .build()
+                .unwrap(),
+        );
+        span.log(
+            SpanLog::builder()
+                .tags(vec!["a".into(), "c".into()])
+                .build()
+                .unwrap(),
+        );
+        span.end();
+        let captured = collector.spans();
+        assert_eq!(
+            captured.last().unwrap().payload.tags.as_deref(),
+            Some(["a".into(), "b".into(), "c".into()].as_slice())
+        );
     }
 
     #[tokio::test]
