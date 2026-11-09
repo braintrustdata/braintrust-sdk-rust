@@ -292,10 +292,11 @@ impl Logs3BatchUploader {
         Ok(api_result(
             self.client
                 .logs3_overflow_with_org_name(
-                    &Logs3OverflowRequest {
-                        rows: rows.to_vec(),
-                        content_type: Some("application/json".to_owned()),
-                        size_bytes: Some(payload_bytes),
+                    &{
+                        let mut value = Logs3OverflowRequest::new(rows.to_vec());
+                        value.content_type = Some("application/json".to_owned());
+                        value.size_bytes = Some(payload_bytes);
+                        value
                     },
                     self.org_name.as_deref(),
                 )
@@ -341,12 +342,13 @@ impl RowPayload {
         Ok(Self {
             row_json,
             row_bytes,
-            overflow_meta: Logs3OverflowInputRow {
-                object_ids,
-                is_delete,
-                input_row: OverflowInputRowInfo {
-                    byte_size: row_bytes,
-                },
+            overflow_meta: {
+                let mut value = Logs3OverflowInputRow::new(
+                    object_ids,
+                    OverflowInputRowInfo::new(row_bytes),
+                );
+                value.is_delete = is_delete;
+                value
             },
         })
     }
