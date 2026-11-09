@@ -273,66 +273,6 @@ fn resource_definitions_reject_fields_that_would_be_silently_lost() {
 }
 
 #[tokio::test]
-async fn interrupted_error_body_preserves_status_headers_and_is_not_retried() {
-    use braintrust_api_client::backend::{HttpError, OperationOptions};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let requests = Arc::new(AtomicUsize::new(0));
-    let observed = requests.clone();
-    let server = tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            observed.fetch_add(1, Ordering::SeqCst);
-            let mut buffer = [0; 4096];
-            let _ = stream.read(&mut buffer).await;
-            stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 100\r\nX-Test: kept\r\nConnection: close\r\n\r\npartial error").await.unwrap();
-            stream.shutdown().await.unwrap();
-        }
-    });
-    let client = BackendClient::new(&url, &url, "test-key", "org", "test-org", "test").unwrap();
-    let error = client
-        .generated()
-        .get_project_builder()
-        .send()
-        .await
-        .unwrap_err();
-    let api = error.api().expect("response must retain its HTTP status");
-    assert_eq!(api.status, 400);
-    assert_eq!(api.headers["x-test"], "kept");
-    assert_eq!(api.raw_body, b"partial error");
-    assert!(
-        api.parse_error
-            .as_deref()
-            .unwrap()
-            .contains("failed to read")
-    );
-
-    let client = client.with_options(OperationOptions {
-        retry: Some(true),
-        ..Default::default()
-    });
-    let error = client
-        .run(|| client.generated().get_project_builder().send())
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error.downcast_ref::<HttpError>().unwrap().status.as_u16(),
-        400
-    );
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        2,
-        "400 responses must not be retried"
-    );
-    server.abort();
-}
-
-#[tokio::test]
 async fn interrupted_success_body_remains_a_retryable_network_error() {
     use braintrust_api_client::backend::{OperationOptions, RetryReason};
     use std::sync::{

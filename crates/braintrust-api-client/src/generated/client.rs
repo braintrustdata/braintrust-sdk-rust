@@ -213,33 +213,20 @@ pub struct HttpClient {
     custom_headers: BTreeMap<String, String>,
     max_response_body_bytes: usize,
 }
-async fn __read_bounded_response_body<E: std::fmt::Debug>(
+async fn __read_bounded_response_body(
     response: reqwest::Response,
     limit: usize,
-) -> Result<Vec<u8>, ApiOpError<E>> {
+) -> Result<Vec<u8>, HttpError> {
     use futures_util::StreamExt;
-    let status = response.status();
-    let headers = response.headers().clone();
     let mut body = Vec::new();
     let mut stream = std::pin::pin!(response.bytes_stream());
     while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) if !status.is_success() => {
-                return Err(ApiOpError::Api(ApiError {
-                    status: status.as_u16(),
-                    headers,
-                    body: String::from_utf8_lossy(&body).into_owned(),
-                    raw_body: body,
-                    typed: None,
-                    parse_error: Some(format!("failed to read response body: {error}")),
-                }));
-            }
-            Err(error) => return Err(HttpError::Network(error).into()),
-        };
+        let chunk = chunk.map_err(HttpError::Network)?;
         let next_len = body.len().checked_add(chunk.len());
         if next_len.is_none_or(|next_len| next_len > limit) {
-            return Err(HttpError::ResponseTooLarge { limit }.into());
+            return Err(HttpError::ResponseTooLarge {
+                limit,
+            });
         }
         body.extend_from_slice(&chunk);
     }
