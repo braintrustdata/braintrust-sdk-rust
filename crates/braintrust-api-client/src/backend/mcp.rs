@@ -2,14 +2,26 @@ use super::build_api_client;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-pub const PROTOCOL_VERSION: &str = "2025-03-26";
+const PROTOCOL_VERSION: &str = "2025-03-26";
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct Tool {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: Value,
+}
+
+impl Tool {
+    /// Describe a tool and its JSON input schema.
+    pub fn new(name: impl Into<String>, input_schema: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            input_schema,
+        }
+    }
 }
 #[derive(Debug, Deserialize)]
 struct ToolsResult {
@@ -37,6 +49,7 @@ struct RpcRequest<'a> {
     params: Value,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolResult {
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
@@ -209,7 +222,7 @@ impl McpSession {
     }
 }
 
-pub fn parse_rpc_body(body: &str) -> Result<Value> {
+fn parse_rpc_body(body: &str) -> Result<Value> {
     if let Ok(value) = serde_json::from_str(body) {
         return Ok(value);
     }

@@ -18,6 +18,7 @@ struct QueryBody<'a, Q: ?Sized> {
 
 /// Optional BTQL execution settings. Omitted fields preserve server defaults.
 #[derive(Default, Serialize)]
+#[non_exhaustive]
 pub struct BtqlOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none", rename = "query_source")]
     pub source: Option<&'a str>,
@@ -73,7 +74,7 @@ impl BackendClient {
     }
 }
 
-pub fn deserialize_cursor<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn deserialize_cursor<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error> {
     use serde::Deserialize;
@@ -187,6 +188,7 @@ impl Pagination {
 
 /// One fetched page and whether a requested row bound cut the result short.
 /// `response.data` is a Vec, so use `.get(index)` for checked positional access.
+#[non_exhaustive]
 pub struct Page<T> {
     pub response: BtqlResponse<T>,
     pub truncated: bool,

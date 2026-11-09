@@ -17,6 +17,7 @@ pub type TransportResult<T> = Result<T, Error<Value>>;
 
 /// Organization information returned by API-key login.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct LoginOrganization {
     pub id: String,
     pub name: String,
@@ -29,12 +30,14 @@ pub struct LoginOrganization {
 
 /// Available organizations and their data-plane endpoints.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct LoginResponse {
     pub org_info: Vec<LoginOrganization>,
 }
 
 /// Server capabilities used to choose logging transport limits.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct VersionInfo {
     pub logs3_payload_max_bytes: Option<usize>,
     #[serde(flatten)]
@@ -43,6 +46,7 @@ pub struct VersionInfo {
 
 /// JSON BTQL result. Query-specific record fields remain JSON values.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct BtqlResponse {
     #[serde(default)]
     pub data: Vec<Value>,
@@ -53,6 +57,7 @@ pub struct BtqlResponse {
 
 /// Destination and size metadata for a row in an overflow payload.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct Logs3OverflowInputRow {
     pub object_ids: Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,13 +65,33 @@ pub struct Logs3OverflowInputRow {
     pub input_row: Logs3OverflowInputRowMeta,
 }
 
+impl Logs3OverflowInputRow {
+    /// Create a Logs3OverflowInputRow with the required fields.
+    pub fn new(object_ids: Map<String, Value>, input_row: Logs3OverflowInputRowMeta) -> Self {
+        Self {
+            object_ids,
+            is_delete: None,
+            input_row,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct Logs3OverflowInputRowMeta {
     pub byte_size: usize,
 }
 
+impl Logs3OverflowInputRowMeta {
+    /// Create a Logs3OverflowInputRowMeta with the required fields.
+    pub fn new(byte_size: usize) -> Self {
+        Self { byte_size }
+    }
+}
+
 /// Request a signed storage destination for a serialized logs3 payload.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct Logs3OverflowRequest {
     pub rows: Vec<Logs3OverflowInputRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,9 +101,21 @@ pub struct Logs3OverflowRequest {
     pub size_bytes: Option<usize>,
 }
 
+impl Logs3OverflowRequest {
+    /// Create a Logs3OverflowRequest with the required fields.
+    pub fn new(rows: Vec<Logs3OverflowInputRow>) -> Self {
+        Self {
+            rows,
+            content_type: None,
+            size_bytes: None,
+        }
+    }
+}
+
 /// A signed upload instruction returned by `/logs3/overflow`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Logs3OverflowUpload {
     pub method: String,
     pub signed_url: String,
@@ -89,6 +126,7 @@ pub struct Logs3OverflowUpload {
 
 /// The logs3 reference submitted after a successful signed upload.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct Logs3OverflowReference {
     #[serde(rename = "type")]
     pub reference_type: String,
@@ -96,6 +134,21 @@ pub struct Logs3OverflowReference {
 }
 
 impl Logs3OverflowUpload {
+    /// Create an upload instruction without additional headers or form fields.
+    pub fn new(
+        method: impl Into<String>,
+        signed_url: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Self {
+        Self {
+            method: method.into(),
+            signed_url: signed_url.into(),
+            headers: None,
+            fields: None,
+            key: key.into(),
+        }
+    }
+
     /// Reference to submit to logs3 after this upload succeeds.
     pub fn reference(&self) -> Logs3OverflowReference {
         Logs3OverflowReference {

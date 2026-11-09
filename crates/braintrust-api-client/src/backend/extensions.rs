@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FunctionListQuery {
     pub project_id: Option<String>,
     pub project_name: Option<String>,
@@ -19,6 +20,7 @@ pub struct FunctionListQuery {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct CodeUploadSlot {
     pub url: String,
     #[serde(rename = "bundleId")]
@@ -26,25 +28,60 @@ pub struct CodeUploadSlot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AutomationProjectRequest {
     pub automation_id: String,
     pub project_id: String,
 }
 
+impl AutomationProjectRequest {
+    /// Create a AutomationProjectRequest with the required fields.
+    pub fn new(automation_id: String, project_id: String) -> Self {
+        Self {
+            automation_id,
+            project_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct UpsertObjectCursorRequest {
     pub automation_id: String,
     pub object_id: String,
 }
 
+impl UpsertObjectCursorRequest {
+    /// Create a UpsertObjectCursorRequest with the required fields.
+    pub fn new(automation_id: String, object_id: String) -> Self {
+        Self {
+            automation_id,
+            object_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ResetObjectCursorRequest {
     pub automation_id: String,
     pub object_id: String,
     pub start_xact_id: String,
 }
 
+impl ResetObjectCursorRequest {
+    /// Create a ResetObjectCursorRequest with the required fields.
+    pub fn new(automation_id: String, object_id: String, start_xact_id: String) -> Self {
+        Self {
+            automation_id,
+            object_id,
+            start_xact_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RegisterTopicAutomationRequest {
     pub project_automation_name: String,
     pub description: String,
@@ -53,7 +90,27 @@ pub struct RegisterTopicAutomationRequest {
     pub update: bool,
 }
 
+impl RegisterTopicAutomationRequest {
+    /// Create a RegisterTopicAutomationRequest with the required fields.
+    pub fn new(
+        project_automation_name: String,
+        description: String,
+        project_id: String,
+        config: RegisterTopicAutomationConfig,
+        update: bool,
+    ) -> Self {
+        Self {
+            project_automation_name,
+            description,
+            project_id,
+            config,
+            update,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RegisterTopicAutomationConfig {
     pub event_type: String,
     pub sampling_rate: f64,
@@ -66,7 +123,32 @@ pub struct RegisterTopicAutomationConfig {
     pub btql_filter: Option<String>,
 }
 
+impl RegisterTopicAutomationConfig {
+    /// Create a RegisterTopicAutomationConfig with the required fields.
+    pub fn new(
+        event_type: String,
+        sampling_rate: f64,
+        facet_functions: Vec<GlobalFacetFunctionRef>,
+        topic_map_functions: Vec<TopicMapFunctionRef>,
+        scope: TraceScopeConfig,
+        rerun_seconds: i64,
+        backfill_time_range: String,
+    ) -> Self {
+        Self {
+            event_type,
+            sampling_rate,
+            facet_functions,
+            topic_map_functions,
+            scope,
+            rerun_seconds,
+            backfill_time_range,
+            btql_filter: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct GlobalFacetFunctionRef {
     #[serde(rename = "type")]
     pub ref_type: String,
@@ -74,33 +156,83 @@ pub struct GlobalFacetFunctionRef {
     pub function_type: String,
 }
 
+impl GlobalFacetFunctionRef {
+    /// Create a GlobalFacetFunctionRef with the required fields.
+    pub fn new(ref_type: String, name: String, function_type: String) -> Self {
+        Self {
+            ref_type,
+            name,
+            function_type,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TopicMapFunctionRef {
     pub function: FunctionIdRef,
 }
 
+impl TopicMapFunctionRef {
+    /// Create a TopicMapFunctionRef with the required fields.
+    pub fn new(function: FunctionIdRef) -> Self {
+        Self { function }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FunctionIdRef {
     #[serde(rename = "type")]
     pub ref_type: String,
     pub id: String,
 }
 
+impl FunctionIdRef {
+    /// Create a FunctionIdRef with the required fields.
+    pub fn new(ref_type: String, id: String) -> Self {
+        Self { ref_type, id }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TraceScopeConfig {
     #[serde(rename = "type")]
     pub scope_type: String,
     pub idle_seconds: i64,
 }
 
+impl TraceScopeConfig {
+    /// Create a TraceScopeConfig with the required fields.
+    pub fn new(scope_type: String, idle_seconds: i64) -> Self {
+        Self {
+            scope_type,
+            idle_seconds,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TopicMapReportUrlRequest<'a> {
     pub function_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<&'a str>,
 }
 
+impl<'a> TopicMapReportUrlRequest<'a> {
+    /// Create a TopicMapReportUrlRequest with the required fields.
+    pub fn new(function_id: &'a str) -> Self {
+        Self {
+            function_id,
+            version: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct AiProviderSecret {
     #[serde(default)]
     pub id: Option<String>,
@@ -117,8 +249,24 @@ pub struct AiProviderSecret {
     pub created: Option<String>,
 }
 
+impl AiProviderSecret {
+    /// Create a secret descriptor with no optional metadata.
+    pub fn new(name: String) -> Self {
+        Self {
+            id: None,
+            name,
+            r#type: None,
+            preview_secret: None,
+            secret_updated_at: None,
+            updated_at: None,
+            created: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AttachmentUploadMetadata {
     pub signed_url: String,
     #[serde(default)]
@@ -126,22 +274,36 @@ pub struct AttachmentUploadMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FunctionPage {
     pub objects: Vec<types::Function>,
     pub next_cursor: Option<String>,
     pub snapshot: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SignedUrl {
     pub url: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TopicMapAssetRequest {
     pub function_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
+
+impl TopicMapAssetRequest {
+    /// Create a TopicMapAssetRequest with the required fields.
+    pub fn new(function_id: String) -> Self {
+        Self {
+            function_id,
+            version: None,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EnvironmentObject {
     pub id: String,
     pub object_type: String,
@@ -152,29 +314,73 @@ pub struct EnvironmentObject {
     pub created: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EnvironmentAssignment {
     pub object_version: String,
     pub org_name: String,
 }
+
+impl EnvironmentAssignment {
+    /// Create a EnvironmentAssignment with the required fields.
+    pub fn new(object_version: String, org_name: String) -> Self {
+        Self {
+            object_version,
+            org_name,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FunctionInsert {
     #[serde(flatten)]
     pub definition: types::CreateFunction,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub if_exists: Option<String>,
 }
+
+impl FunctionInsert {
+    /// Create a FunctionInsert with the required fields.
+    pub fn new(definition: types::CreateFunction) -> Self {
+        Self {
+            definition,
+            if_exists: None,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InsertFunctionsRequest {
     pub functions: Vec<FunctionInsert>,
 }
+
+impl InsertFunctionsRequest {
+    /// Create a InsertFunctionsRequest with the required fields.
+    pub fn new(functions: Vec<FunctionInsert>) -> Self {
+        Self { functions }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InsertedFunction {
     pub id: String,
     pub project_id: String,
     pub slug: String,
     pub found_existing: bool,
 }
+
+impl InsertedFunction {
+    /// Describe a function returned by an insert operation.
+    pub fn new(id: String, project_id: String, slug: String, found_existing: bool) -> Self {
+        Self {
+            id,
+            project_id,
+            slug,
+            found_existing,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InsertFunctionsResponse {
     #[serde(default)]
     pub functions: Vec<InsertedFunction>,
@@ -182,35 +388,81 @@ pub struct InsertFunctionsResponse {
     pub ignored_count: Option<usize>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RuntimeContext {
     pub runtime: String,
     pub version: String,
 }
+
+impl RuntimeContext {
+    /// Create a RuntimeContext with the required fields.
+    pub fn new(runtime: String, version: String) -> Self {
+        Self { runtime, version }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CodeUploadRequest {
     pub org_id: String,
     pub runtime_context: RuntimeContext,
 }
+
+impl CodeUploadRequest {
+    /// Create a CodeUploadRequest with the required fields.
+    pub fn new(org_id: String, runtime_context: RuntimeContext) -> Self {
+        Self {
+            org_id,
+            runtime_context,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AttachmentRequest {
     pub key: String,
     pub filename: String,
     pub content_type: String,
     pub org_id: String,
 }
+
+impl AttachmentRequest {
+    /// Create a AttachmentRequest with the required fields.
+    pub fn new(key: String, filename: String, content_type: String, org_id: String) -> Self {
+        Self {
+            key,
+            filename,
+            content_type,
+            org_id,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AttachmentStatusRequest {
     pub key: String,
     pub org_id: String,
     pub status: AttachmentStatus,
 }
+
+impl AttachmentStatusRequest {
+    /// Create a AttachmentStatusRequest with the required fields.
+    pub fn new(key: String, org_id: String, status: AttachmentStatus) -> Self {
+        Self {
+            key,
+            org_id,
+            status,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "upload_status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AttachmentStatus {
     Done,
     Error { error_message: String },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AsyncQuerySubmission {
     pub query: String,
     pub format: String,
@@ -218,6 +470,7 @@ pub struct AsyncQuerySubmission {
     pub batch_size: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AsyncQuery {
     pub id: String,
     pub project_id: Option<String>,
@@ -226,6 +479,7 @@ pub struct AsyncQuery {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AsyncQueryState {
     Queued,
     Running,
@@ -234,11 +488,13 @@ pub enum AsyncQueryState {
     Failed,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AsyncQueryStatus {
     pub status: AsyncQueryState,
     pub error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AsyncQueryPage {
     pub status: AsyncQueryState,
     #[serde(default)]
@@ -248,13 +504,22 @@ pub struct AsyncQueryPage {
     pub error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AutomationPatch {
     pub id: String,
     #[serde(flatten)]
     pub patch: types::PatchProjectAutomation,
 }
+
+impl AutomationPatch {
+    /// Create a AutomationPatch with the required fields.
+    pub fn new(id: String, patch: types::PatchProjectAutomation) -> Self {
+        Self { id, patch }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum AutomationRegistration {
     Wrapped {
         project_automation: types::ProjectAutomation,
@@ -262,6 +527,7 @@ pub enum AutomationRegistration {
     Direct(types::ProjectAutomation),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AutomationCursors {
     pub total_segments: Option<u64>,
     pub pending_segments: Option<u64>,
@@ -271,6 +537,7 @@ pub struct AutomationCursors {
     pub pending_min_executed_xact_id: Option<Value>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AutomationObjectCursors {
     pub total_objects: Option<u64>,
     pub due_objects: Option<u64>,
@@ -284,9 +551,20 @@ pub struct AutomationObjectCursors {
     pub topic_runtime: Option<Value>,
 }
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Invocation {
     pub function: types::FunctionId,
     pub arguments: types::InvokeApi,
+}
+
+impl Invocation {
+    /// Create a Invocation with the required fields.
+    pub fn new(function: types::FunctionId, arguments: types::InvokeApi) -> Self {
+        Self {
+            function,
+            arguments,
+        }
+    }
 }
 impl<'de> Deserialize<'de> for Invocation {
     fn deserialize<D: serde::Deserializer<'de>>(
@@ -553,6 +831,7 @@ impl BackendClient {
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SnapshotCreation {
     pub dataset_snapshot: types::DatasetSnapshot,
     pub found_existing: bool,
@@ -562,15 +841,25 @@ fn encode(value: &str) -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CreateApiKey {
     pub name: String,
     pub org_id: String,
 }
+
+impl CreateApiKey {
+    /// Create a CreateApiKey with the required fields.
+    pub fn new(name: String, org_id: String) -> Self {
+        Self { name, org_id }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CreatedApiKey {
     pub key: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DatasetLookup {
     pub project_id: String,
     pub name: String,
@@ -614,6 +903,7 @@ impl crate::Client {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct FunctionValidationSuggestion {
     pub action: String,
     #[serde(default)]
@@ -621,6 +911,7 @@ pub struct FunctionValidationSuggestion {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct FunctionValidationIssue {
     pub code: String,
     pub path: Vec<Value>,
@@ -658,19 +949,29 @@ impl std::fmt::Display for FunctionValidationIssue {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct FunctionValidationResult {
     pub issues: Vec<FunctionValidationIssue>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct FunctionValidationReport {
     pub valid: bool,
     pub results: Vec<FunctionValidationResult>,
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct FunctionValidationError {
     pub report: FunctionValidationReport,
+}
+
+impl FunctionValidationError {
+    /// Create an error from a backend validation report.
+    pub fn new(report: FunctionValidationReport) -> Self {
+        Self { report }
+    }
 }
 
 impl std::fmt::Display for FunctionValidationError {

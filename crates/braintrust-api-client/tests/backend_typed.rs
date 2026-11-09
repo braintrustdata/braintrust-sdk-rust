@@ -37,11 +37,12 @@ async fn typed_function_pagination_preserves_cursor_snapshot_and_query_encoding(
         .mount(&server)
         .await;
     let result = client(&server)
-        .function_page(&FunctionListQuery {
-            project_name: Some("test project & name".into()),
-            cursor: Some("cursor/with space".into()),
-            snapshot: Some("test-snapshot".into()),
-            ..Default::default()
+        .function_page(&{
+            let mut options = FunctionListQuery::default();
+            options.project_name = Some("test project & name".into());
+            options.cursor = Some("cursor/with space".into());
+            options.snapshot = Some("test-snapshot".into());
+            options
         })
         .await
         .unwrap();
@@ -216,12 +217,13 @@ async fn generated_operations_retry_transient_errors_through_the_api_policy() {
         .await;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let observed = reasons.clone();
-    let client = client(&server).with_options(OperationOptions {
-        retry: Some(true),
-        on_retry: Some(Arc::new(move |reason| {
+    let client = client(&server).with_options({
+        let mut options = OperationOptions::default();
+        options.retry = Some(true);
+        options.on_retry = Some(Arc::new(move |reason| {
             observed.lock().unwrap().push(reason)
-        })),
-        ..Default::default()
+        }));
+        options
     });
     client
         .run(|| client.generated().get_project_builder().send())
@@ -246,9 +248,10 @@ async fn generated_operation_timeouts_are_classified_by_the_api_client() {
         )
         .mount(&server)
         .await;
-    let client = client(&server).with_options(OperationOptions {
-        timeout: Some(Duration::from_millis(20)),
-        ..Default::default()
+    let client = client(&server).with_options({
+        let mut options = OperationOptions::default();
+        options.timeout = Some(Duration::from_millis(20));
+        options
     });
     let error = client
         .run(|| client.generated().get_project_builder().send())
@@ -303,12 +306,13 @@ async fn interrupted_success_body_remains_a_retryable_network_error() {
     let captured = reasons.clone();
     let client = BackendClient::new(&url, &url, "test-key", "org", "test-org", "test")
         .unwrap()
-        .with_options(OperationOptions {
-            retry: Some(true),
-            on_retry: Some(Arc::new(move |reason| {
+        .with_options({
+            let mut options = OperationOptions::default();
+            options.retry = Some(true);
+            options.on_retry = Some(Arc::new(move |reason| {
                 captured.lock().unwrap().push(reason)
-            })),
-            ..Default::default()
+            }));
+            options
         });
     let result = client
         .run(|| client.generated().get_project_builder().send())

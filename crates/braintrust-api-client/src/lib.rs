@@ -9,9 +9,7 @@ mod request;
 mod response;
 pub mod transport;
 
-pub use client::{
-    Client, ClientBuilder, ClientContext, ClientInitError, DEFAULT_API_URL, DEFAULT_APP_URL,
-};
+pub use client::{Client, ClientBuilder, ClientInitError, DEFAULT_API_URL, DEFAULT_APP_URL};
 pub use generated::client::{HttpClient as GeneratedClient, *};
 pub use generated::{sse, types};
 pub(crate) use request::{Request, Transport};

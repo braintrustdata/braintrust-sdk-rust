@@ -17,14 +17,14 @@ use reqwest::{ClientBuilder, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-pub const DEFAULT_USER_AGENT: &str = concat!("braintrust-api-client/", env!("CARGO_PKG_VERSION"));
+pub(crate) const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_USER_AGENT: &str = concat!("braintrust-api-client/", env!("CARGO_PKG_VERSION"));
 
-pub fn build_http_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
+fn build_http_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
     build_http_client_from_builder(reqwest::Client::builder().timeout(timeout))
 }
 
-pub fn build_http_client_from_builder(builder: ClientBuilder) -> Result<reqwest::Client> {
+fn build_http_client_from_builder(builder: ClientBuilder) -> Result<reqwest::Client> {
     configured_http_builder(builder)?
         .build()
         .context("failed to build HTTP client")
@@ -98,9 +98,17 @@ pub struct BackendClient {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct HttpError {
     pub status: reqwest::StatusCode,
     pub body: String,
+}
+
+impl HttpError {
+    /// Create an HTTP error from a status and response body.
+    pub fn new(status: StatusCode, body: String) -> Self {
+        Self { status, body }
+    }
 }
 
 impl std::fmt::Display for HttpError {
@@ -207,12 +215,24 @@ fn parse_response_error<T>(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BtqlResponse<T = serde_json::Map<String, serde_json::Value>> {
     pub data: Vec<T>,
     #[serde(default, deserialize_with = "btql::deserialize_cursor")]
     pub cursor: Option<String>,
     #[serde(default)]
     pub schema: Option<serde_json::Value>,
+}
+
+impl<T> BtqlResponse<T> {
+    /// Create a result with no continuation cursor or schema.
+    pub fn new(data: Vec<T>) -> Self {
+        Self {
+            data,
+            cursor: None,
+            schema: None,
+        }
+    }
 }
 
 impl BackendClient {
@@ -413,7 +433,19 @@ impl BackendClient {
 }
 
 /// Options applied to one configured copy of a backend client.
+///
+/// ```
+/// use braintrust_api_client::backend::OperationOptions;
+/// let mut options = OperationOptions::default();
+/// options.retry = Some(true);
+/// ```
+///
+/// ```compile_fail
+/// use braintrust_api_client::backend::OperationOptions;
+/// let _ = OperationOptions { retry: Some(true), ..Default::default() };
+/// ```
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct OperationOptions {
     pub timeout: Option<Duration>,
     pub retry: Option<bool>,
@@ -471,6 +503,7 @@ pub(crate) struct HttpOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RetryReason {
     Status(u16),
     Network,
@@ -481,7 +514,14 @@ const MAX_DELAY: Duration = Duration::from_secs(8);
 
 #[derive(Debug, thiserror::Error)]
 #[error("backend operation timed out after {0:?}")]
-pub struct OperationTimeout(pub Duration);
+pub struct OperationTimeout(Duration);
+
+impl OperationTimeout {
+    /// The timeout applied to the operation.
+    pub fn duration(&self) -> Duration {
+        self.0
+    }
+}
 
 fn retry_reason(error: &anyhow::Error) -> Option<RetryReason> {
     if error.is::<OperationTimeout>() {
@@ -629,6 +669,7 @@ impl FromResponse for Text {
 }
 
 /// Retain response headers alongside a decoded JSON or text body.
+#[non_exhaustive]
 pub struct WithHeaders<T> {
     pub headers: reqwest::header::HeaderMap,
     pub body: T,
@@ -853,6 +894,7 @@ impl BackendConnection {
 
 /// Semantic failure categories for callers choosing an action or exit status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FailureKind {
     Authentication,
     InvalidInput,

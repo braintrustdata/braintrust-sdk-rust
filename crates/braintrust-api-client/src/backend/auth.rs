@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct OAuthTokenResponse {
     pub access_token: String,
     #[serde(default)]
@@ -21,6 +22,7 @@ struct OAuthErrorResponse {
     pub error_description: Option<String>,
 }
 #[derive(Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct SetupWizardSession {
     pub session_token: String,
     pub poll_token: String,
@@ -31,6 +33,7 @@ pub struct SetupWizardSession {
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SetupWizardPollResult {
     Pending {
         #[serde(rename = "expires_at")]
@@ -47,6 +50,7 @@ pub enum SetupWizardPollResult {
     },
 }
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OAuthFailure {
     #[error("oauth token request rejected: {error} ({description:?})")]
     Rejected {
@@ -170,6 +174,7 @@ impl BrowserSetupClient {
     }
 }
 
+#[non_exhaustive]
 pub struct OAuthEndpoints {
     pub authorize_url: url::Url,
     pub token_url: url::Url,

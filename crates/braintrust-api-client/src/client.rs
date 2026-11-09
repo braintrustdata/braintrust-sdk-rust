@@ -34,7 +34,7 @@ pub const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
 
 /// Authentication, organization and upload settings held by [`Client`].
 #[derive(Clone, Debug)]
-pub struct ClientContext {
+pub(crate) struct ClientContext {
     pub(crate) app_url: String,
     authorization: Option<HeaderValue>,
     pub(crate) org_name: Option<HeaderValue>,
@@ -86,6 +86,7 @@ pub struct ClientBuilder {
 
 /// Errors encountered while configuring or logging in an API client.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientInitError {
     #[error("BRAINTRUST_API_KEY is not set")]
     MissingApiKey,

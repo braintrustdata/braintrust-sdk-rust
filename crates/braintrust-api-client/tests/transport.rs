@@ -308,16 +308,18 @@ async fn overflow_upload_uses_separate_transport_without_api_credentials() {
         .build()
         .unwrap();
     let upload = client
-        .logs3_overflow(&Logs3OverflowRequest {
-            rows: vec![Logs3OverflowInputRow {
-                object_ids: serde_json::from_value(json!({"project_id":"project"})).unwrap(),
-                is_delete: None,
-                input_row: Logs3OverflowInputRowMeta {
-                    byte_size: payload.len(),
-                },
-            }],
-            content_type: Some("application/json".into()),
-            size_bytes: Some(payload.len()),
+        .logs3_overflow(&{
+            let mut value = Logs3OverflowRequest::new(vec![{
+                let mut value = Logs3OverflowInputRow::new(
+                    serde_json::from_value(json!({"project_id":"project"})).unwrap(),
+                    Logs3OverflowInputRowMeta::new(payload.len()),
+                );
+                value.is_delete = None;
+                value
+            }]);
+            value.content_type = Some("application/json".into());
+            value.size_bytes = Some(payload.len());
+            value
         })
         .await
         .unwrap();
@@ -364,40 +366,42 @@ async fn signed_multipart_upload_preserves_fields_and_boundary() {
         .mount(&storage)
         .await;
     let client = Client::builder().api_key("test-key").build().unwrap();
-    let upload = Logs3OverflowUpload {
-        method: "POST".into(),
-        signed_url: format!("{}/upload", storage.uri()),
-        key: "object-key".into(),
-        fields: Some(
+    let upload = {
+        let mut value =
+            Logs3OverflowUpload::new("POST", format!("{}/upload", storage.uri()), "object-key");
+        value.fields = Some(
             [
                 ("key".into(), "object-key".into()),
                 ("Content-Type".into(), "application/json".into()),
             ]
             .into(),
-        ),
-        headers: Some(
+        );
+        value.headers = Some(
             [
                 ("Content-Type".into(), "application/json".into()),
                 ("x-storage".into(), "required".into()),
             ]
             .into(),
-        ),
+        );
+        value
     };
     client
         .upload_logs3_overflow(&upload, "payload-data")
         .await
         .unwrap();
-    let missing_fields = Logs3OverflowUpload {
-        fields: None,
-        ..upload.clone()
+    let missing_fields = {
+        let mut value = upload.clone();
+        value.fields = None;
+        value
     };
     assert!(matches!(
         client.upload_logs3_overflow(&missing_fields, "data").await,
         Err(Error::Transport(HttpError::Config(_)))
     ));
-    let bad_method = Logs3OverflowUpload {
-        method: "DELETE".into(),
-        ..upload
+    let bad_method = {
+        let mut value = upload;
+        value.method = "DELETE".into();
+        value
     };
     assert!(matches!(
         client.upload_logs3_overflow(&bad_method, "data").await,
@@ -502,10 +506,11 @@ async fn org_header_is_scoped_to_logging_operations() {
         .unwrap();
     client.dataset_summary("id").await.unwrap();
     client.experiment_comparison("id", None).await.unwrap();
-    let request = Logs3OverflowRequest {
-        rows: vec![],
-        content_type: None,
-        size_bytes: None,
+    let request = {
+        let mut value = Logs3OverflowRequest::new(vec![]);
+        value.content_type = None;
+        value.size_bytes = None;
+        value
     };
     client.logs3_overflow(&request).await.unwrap();
     client.version().await.unwrap();

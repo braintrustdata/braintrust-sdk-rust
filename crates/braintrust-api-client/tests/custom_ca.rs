@@ -167,12 +167,15 @@ fn backend_tls_child() {
         default_client.login().await.unwrap();
         client
             .upload_logs3_overflow(
-                &braintrust_api_client::transport::Logs3OverflowUpload {
-                    method: "PUT".into(),
-                    signed_url: format!("{url}/overflow"),
-                    headers: None,
-                    fields: None,
-                    key: "test-key".into(),
+                &{
+                    let mut value = braintrust_api_client::transport::Logs3OverflowUpload::new(
+                        "PUT",
+                        format!("{url}/overflow"),
+                        "test-key",
+                    );
+                    value.headers = None;
+                    value.fields = None;
+                    value
                 },
                 b"test".to_vec(),
             )
