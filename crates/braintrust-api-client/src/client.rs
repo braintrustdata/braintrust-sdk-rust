@@ -105,6 +105,8 @@ pub enum ClientInitError {
     Login(#[from] Box<crate::Error<serde_json::Value>>),
     #[error("failed to create HTTP client: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("invalid BRAINTRUST_CUSTOM_CA_BUNDLE: {0}")]
+    InvalidCaBundle(String),
 }
 
 impl Client {
@@ -213,17 +215,19 @@ impl ClientBuilder {
             .transpose()?;
         let http = match self.http_client {
             Some(client) => client,
-            None => self
-                .http_client_builder
-                .unwrap_or_else(default_http_builder)
-                .build()?,
+            None => match self.http_client_builder {
+                Some(builder) => builder,
+                None => default_http_builder()?,
+            }
+            .build()?,
         };
         let upload_client = match self.upload_http_client {
             Some(client) => client,
-            None => self
-                .upload_http_client_builder
-                .unwrap_or_else(default_http_builder)
-                .build()?,
+            None => match self.upload_http_client_builder {
+                Some(builder) => builder,
+                None => default_http_builder()?,
+            }
+            .build()?,
         };
         let generated = crate::GeneratedClient::with_client(http.clone())
             .with_base_url(&api_url)
@@ -307,15 +311,52 @@ fn validate_url(value: &str, field: &'static str) -> Result<String, ClientInitEr
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
-fn default_http_builder() -> reqwest::ClientBuilder {
+fn default_http_builder() -> Result<reqwest::ClientBuilder, ClientInitError> {
     let builder = reqwest::Client::builder().user_agent(concat!(
         env!("CARGO_PKG_NAME"),
         "/",
         env!("CARGO_PKG_VERSION")
     ));
     #[cfg(not(target_arch = "wasm32"))]
-    let builder = builder
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(15));
-    builder
+    let builder = {
+        configure_tls(builder)?
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(15))
+    };
+    Ok(builder)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn configure_tls(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::ClientBuilder, ClientInitError> {
+    // Load native roots explicitly so SSL_CERT_FILE also applies to uploads.
+    let roots = rustls_native_certs::load_native_certs()
+        .certs
+        .into_iter()
+        .filter_map(|cert| reqwest::Certificate::from_der(cert.as_ref()).ok());
+    let mut builder = builder.tls_certs_only(roots);
+    if let Some(pem) = env::var_os("BRAINTRUST_CUSTOM_CA_BUNDLE") {
+        let pem = pem
+            .into_string()
+            .map_err(|_| ClientInitError::InvalidEnvironment("BRAINTRUST_CUSTOM_CA_BUNDLE"))?;
+        let certificates = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
+            .map_err(|error| ClientInitError::InvalidCaBundle(error.to_string()))?;
+        if certificates.is_empty() {
+            return Err(ClientInitError::InvalidCaBundle(
+                "no PEM certificates found".into(),
+            ));
+        }
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+    Ok(builder)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn configure_tls(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::ClientBuilder, ClientInitError> {
+    Ok(builder)
 }

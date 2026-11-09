@@ -25,19 +25,13 @@ pub fn build_http_client(timeout: std::time::Duration) -> Result<reqwest::Client
 }
 
 pub fn build_http_client_from_builder(builder: ClientBuilder) -> Result<reqwest::Client> {
-    configured_http_builder(builder)
+    configured_http_builder(builder)?
         .build()
         .context("failed to build HTTP client")
 }
 
-fn configured_http_builder(builder: ClientBuilder) -> ClientBuilder {
-    // Prefer the platform/native root store so standard envs like SSL_CERT_FILE
-    // are honored consistently for backend requests.
-    let roots = rustls_native_certs::load_native_certs()
-        .certs
-        .into_iter()
-        .filter_map(|cert| reqwest::Certificate::from_der(cert.as_ref()).ok());
-    builder.user_agent(DEFAULT_USER_AGENT).tls_certs_only(roots)
+fn configured_http_builder(builder: ClientBuilder) -> Result<ClientBuilder> {
+    Ok(crate::client::configure_tls(builder)?.user_agent(DEFAULT_USER_AGENT))
 }
 
 pub(crate) fn build_auth_transport(timeout: Duration) -> Result<Transport> {
@@ -60,7 +54,7 @@ pub fn build_api_client(
         .app_url(app_url)
         .http_client_builder(configured_http_builder(
             reqwest::Client::builder().timeout(timeout),
-        ))
+        )?)
         .build()
         .context("failed to build Braintrust API client")
 }
@@ -235,7 +229,7 @@ impl BackendClient {
             .app_url(app_url)
             .api_key(api_key)
             .http_client_builder(
-                configured_http_builder(reqwest::Client::builder().timeout(DEFAULT_HTTP_TIMEOUT))
+                configured_http_builder(reqwest::Client::builder().timeout(DEFAULT_HTTP_TIMEOUT))?
                     .user_agent(user_agent),
             )
             .build()?;
@@ -842,7 +836,7 @@ pub struct BackendConnection {
 impl BackendConnection {
     pub fn new(timeout: Duration, user_agent: &str) -> Result<Self> {
         Ok(Self {
-            client: configured_http_builder(reqwest::Client::builder().timeout(timeout))
+            client: configured_http_builder(reqwest::Client::builder().timeout(timeout))?
                 .user_agent(user_agent)
                 .build()?,
         })

@@ -36,6 +36,9 @@ futures-timer = { version = "3", features = ["wasm-bindgen"] }
 all-features = true
 
 [dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"
+tokio-rustls = "0.26"
 actix-web = "4"
 actix-rt = { version = "2", features = ["net", "signal"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
