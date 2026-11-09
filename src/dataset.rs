@@ -146,31 +146,7 @@ impl DatasetInsertBuilder {
 // Dataset Record
 // ============================================================================
 
-/// A record within a dataset.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct DatasetRecord {
-    /// Unique record ID.
-    pub id: String,
-    /// Input data for the operation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<Value>,
-    /// Expected output for evaluation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected: Option<Value>,
-    /// Key-value metadata.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Map<String, Value>>,
-    /// String tags for filtering.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,
-    /// Transaction ID (for versioning).
-    #[serde(rename = "_xact_id", skip_serializing_if = "Option::is_none")]
-    pub xact_id: Option<String>,
-    /// ISO 8601 timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created: Option<String>,
-}
+pub use crate::api::btql::DatasetRecord;
 
 // ============================================================================
 // Dataset Summary
@@ -252,95 +228,10 @@ pub(crate) struct DatasetMetadata {
     pub project_id: String,
 }
 
-/// Request body for dataset registration.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DatasetRegisterRequest {
-    pub project_name: String,
-    pub org_name: String,
-    pub dataset_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Map<String, Value>>,
-}
-
-/// Response from dataset registration.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DatasetRegisterResponse {
-    pub project: DatasetProjectInfo,
-    pub dataset: DatasetInfo,
-}
-
-/// Project info from registration response.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DatasetProjectInfo {
-    pub id: String,
-    #[allow(dead_code)]
-    pub name: String,
-}
-
-/// Dataset info from registration response.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DatasetInfo {
-    pub id: String,
-    #[allow(dead_code)]
-    pub name: String,
-}
-
-// ============================================================================
-// BTQL Query Types (Internal)
-// ============================================================================
-
-/// BTQL query for fetching dataset records.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct BTQLQuery {
-    pub query: BTQLQueryInner,
-}
-
-/// Inner BTQL query structure.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct BTQLQueryInner {
-    /// Dataset reference: dataset('id')
-    pub from: String,
-    /// Maximum records per page.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-    /// Pagination cursor token.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
-}
-
-/// Response from BTQL query.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct BTQLResponse {
-    /// Records in JSONL format.
-    #[serde(default)]
-    pub data: Vec<DatasetRecord>,
-    /// Cursor for next page (None if last page).
-    pub cursor: Option<String>,
-}
-
-// ============================================================================
-// Dataset Summary API Types (Internal)
-// ============================================================================
-
-/// Response from dataset summary API.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DatasetSummaryResponse {
-    pub project_name: String,
-    pub dataset_name: String,
-    pub project_id: String,
-    pub dataset_id: String,
-    pub project_url: Option<String>,
-    pub dataset_url: Option<String>,
-    pub data_summary: Option<DataSummaryStats>,
-}
-
-/// Data summary statistics.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DataSummaryStats {
-    pub total_records: Option<u64>,
-}
+pub(crate) use crate::api::btql::{BTQLQuery, BTQLQueryInner, BTQLResponse};
+pub(crate) use crate::api::datasets::{
+    DatasetRegisterRequest, DatasetRegisterResponse, DatasetSummaryResponse,
+};
 
 // ============================================================================
 // Traits for API Operations

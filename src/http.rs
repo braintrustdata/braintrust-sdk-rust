@@ -58,6 +58,16 @@ pub(crate) fn build_http_client(
     ca_bundle: Option<&CaBundleConfig>,
     user_agent: Option<&str>,
 ) -> Result<Client> {
+    build_http_client_builder(timeout, ca_bundle, user_agent)?
+        .build()
+        .map_err(|err| BraintrustError::InvalidConfig(err.to_string()))
+}
+
+pub(crate) fn build_http_client_builder(
+    timeout: std::time::Duration,
+    ca_bundle: Option<&CaBundleConfig>,
+    user_agent: Option<&str>,
+) -> Result<reqwest::ClientBuilder> {
     let mut builder = Client::builder()
         .timeout(timeout)
         .user_agent(user_agent.unwrap_or(USER_AGENT));
@@ -81,9 +91,7 @@ pub(crate) fn build_http_client(
         }
     }
 
-    builder
-        .build()
-        .map_err(|err| BraintrustError::InvalidConfig(err.to_string()))
+    Ok(builder)
 }
 
 #[cfg(test)]
@@ -287,6 +295,20 @@ cb0bfZ7fHHs=
             .expect("custom CA request");
         assert!(response.status().is_success());
 
+        server.await.expect("TLS test server task");
+    }
+
+    #[tokio::test]
+    async fn direct_api_client_uses_shared_custom_tls_configuration() {
+        let (url, certificate_pem, server) = start_tls_server(1).await;
+        let mut config = crate::api::Config::new("token");
+        config.api_url = url;
+        config.custom_ca_bundle_pem = Some(certificate_pem.into_bytes());
+        let api = crate::api::Client::new(config).expect("direct API client");
+        api.logs3()
+            .post_raw(b"{}".to_vec())
+            .await
+            .expect("private TLS request");
         server.await.expect("TLS test server task");
     }
 

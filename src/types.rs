@@ -340,45 +340,10 @@ impl LogDestination {
     }
 }
 
-/// Response from POST logs3/overflow — provides a signed URL to upload the payload.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Logs3OverflowUpload {
-    pub method: String,
-    pub signed_url: String,
-    pub headers: Option<HashMap<String, String>>,
-    pub fields: Option<HashMap<String, String>>,
-    pub key: String,
-}
-
-/// A single row's overflow metadata, sent when requesting the overflow upload URL.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Logs3OverflowInputRow {
-    /// Key identifying fields extracted from the row (experiment_id, dataset_id, etc.)
-    pub object_ids: serde_json::Map<String, Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_delete: Option<bool>,
-    pub input_row: Logs3OverflowInputRowMeta,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Logs3OverflowInputRowMeta {
-    pub byte_size: usize,
-}
-
-/// Reference sent to POST logs3 after a successful overflow upload.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Logs3OverflowRequest {
-    pub rows: Logs3OverflowReference,
-    pub api_version: u8,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Logs3OverflowReference {
-    #[serde(rename = "type")]
-    pub reference_type: &'static str,
-    pub key: String,
-}
+pub(crate) use crate::api::logs3::{
+    Logs3OverflowInputRow, Logs3OverflowInputRowMeta, Logs3OverflowReference, Logs3OverflowRequest,
+    Logs3OverflowUpload,
+};
 
 /// The object ID keys that identify a row's destination, used for overflow metadata.
 /// Matches the TypeScript SDK's OBJECT_ID_KEYS.

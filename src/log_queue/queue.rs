@@ -1,6 +1,5 @@
 use anyhow::Context;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
 use super::batching::batch_and_serialize_rows;
 use super::config::LogQueueConfig;
@@ -24,27 +23,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use url::Url;
 
-/// Request body for project registration.
-#[derive(Serialize)]
-struct ProjectRegisterRequest<'a> {
-    project_name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_name: Option<&'a str>,
-}
-
-/// Response from project registration.
-#[derive(Deserialize)]
-struct ProjectRegisterResponse {
-    project: ProjectInfo,
-}
-
-/// Project info in registration response.
-#[derive(Deserialize)]
-struct ProjectInfo {
-    id: String,
-}
+use crate::api::projects::{ProjectRegisterRequest, ProjectRegisterResponse};
 
 /// A raw span payload queued for deferred preparation and flushing.
 ///
@@ -713,9 +692,9 @@ impl LogQueueCore {
             .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
 
         let request = ProjectRegisterRequest {
-            project_name,
-            org_id: (!org_id.is_empty()).then_some(org_id),
-            org_name,
+            project_name: project_name.to_owned(),
+            org_id: (!org_id.is_empty()).then(|| org_id.to_owned()),
+            org_name: org_name.map(str::to_owned),
         };
 
         let response = self

@@ -73,31 +73,4 @@ pub enum GitMetadataField {
     CommitTime,
 }
 
-/// Repository information for experiment tracking.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct RepoInfo {
-    /// Git commit SHA.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit: Option<String>,
-    /// Current branch name.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Current tag (if any).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
-    /// Whether the working directory has uncommitted changes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dirty: Option<bool>,
-    /// Git author name.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub author_name: Option<String>,
-    /// Git author email.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub author_email: Option<String>,
-    /// Git commit message.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit_message: Option<String>,
-    /// Git commit timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit_time: Option<String>,
-}
+pub use crate::api::experiments::RepoInfo;
