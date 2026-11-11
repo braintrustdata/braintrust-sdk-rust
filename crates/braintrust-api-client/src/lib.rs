@@ -7,6 +7,7 @@ mod client;
 mod generated;
 mod request;
 mod response;
+mod sdk_types;
 pub mod transport;
 
 pub use client::{Client, ClientBuilder, ClientInitError, DEFAULT_API_URL, DEFAULT_APP_URL};
@@ -14,5 +15,9 @@ pub use generated::client::{HttpClient as GeneratedClient, *};
 pub use generated::{sse, types};
 pub(crate) use request::{Request, Transport};
 pub use response::ResponseValue;
+pub use sdk_types::{
+    ComparisonMetricData, ComparisonScoreData, DataSummaryStats, DatasetSummaryResponse,
+    ExperimentComparisonResponse,
+};
 /// Errors from login, queries, logging and other SDK operations.
 pub type Error<E = serde_json::Value> = ApiOpError<E>;
