@@ -1060,10 +1060,7 @@ impl ExperimentComparisonFetcher for BraintrustClient {
         let client = self.request_client(token)?;
         let response = api_result(
             client
-                .experiment_comparison_as::<ExperimentComparisonResponse>(
-                    experiment_id,
-                    base_experiment_id,
-                )
+                .experiment_comparison(experiment_id, base_experiment_id)
                 .await,
         )
         .await?;
@@ -1108,12 +1105,7 @@ impl DatasetSummarizer for BraintrustClient {
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse> {
         let client = self.request_client(token)?;
-        let response = api_result(
-            client
-                .dataset_summary(dataset_id)
-                .await,
-        )
-        .await?;
+        let response = api_result(client.dataset_summary(dataset_id).await).await?;
         Ok(response.into_inner())
     }
 }
