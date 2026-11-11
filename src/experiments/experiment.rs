@@ -1,8 +1,8 @@
 //! Main Experiment type and implementation.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
@@ -83,12 +83,12 @@ impl<S: SpanSubmitter> Clone for Experiment<S> {
 
 #[allow(private_bounds)]
 impl<
-    S: SpanSubmitter
-        + ExperimentRegistrar
-        + BaseExperimentFetcher
-        + ExperimentComparisonFetcher
-        + 'static,
-> Experiment<S>
+        S: SpanSubmitter
+            + ExperimentRegistrar
+            + BaseExperimentFetcher
+            + ExperimentComparisonFetcher
+            + 'static,
+    > Experiment<S>
 {
     /// Log an event to the experiment, creating and ending a span internally.
     ///

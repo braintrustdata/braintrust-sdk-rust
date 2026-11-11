@@ -18,9 +18,9 @@ use crate::experiments::api::{
     ExperimentRegistrar,
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
-use crate::http::{CaBundleConfig, api_client, api_client_builder, api_result, build_http_client};
+use crate::http::{api_client, api_client_builder, api_result, build_http_client, CaBundleConfig};
 use crate::log_queue::{LogQueue, LogQueueConfig};
-use crate::span::{SpanOrigin, SpanOriginEnvironment, SpanSubmitter, merge_span_origin_context};
+use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
 
@@ -1356,11 +1356,9 @@ mod tests {
         }
 
         let error = result.expect_err("malformed environment CA bundle should fail");
-        assert!(
-            error
-                .to_string()
-                .contains(crate::http::CUSTOM_CA_BUNDLE_ENV)
-        );
+        assert!(error
+            .to_string()
+            .contains(crate::http::CUSTOM_CA_BUNDLE_ENV));
     }
 
     #[tokio::test]

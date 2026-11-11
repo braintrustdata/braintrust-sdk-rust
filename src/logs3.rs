@@ -343,10 +343,8 @@ impl RowPayload {
             row_json,
             row_bytes,
             overflow_meta: {
-                let mut value = Logs3OverflowInputRow::new(
-                    object_ids,
-                    OverflowInputRowInfo::new(row_bytes),
-                );
+                let mut value =
+                    Logs3OverflowInputRow::new(object_ids, OverflowInputRowInfo::new(row_bytes));
                 value.is_delete = is_delete;
                 value
             },
