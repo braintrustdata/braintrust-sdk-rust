@@ -1010,11 +1010,7 @@ impl ExperimentRegistrar for BraintrustClient {
         let client = self.request_client(token)?;
         Ok(api_result(
             client
-                .control_plane_json::<_, ExperimentRegisterResponse>(
-                    "experiment",
-                    "register",
-                    &request,
-                )
+                .register_experiment::<_, ExperimentRegisterResponse>(&request)
                 .await,
         )
         .await?
@@ -1035,11 +1031,7 @@ impl BaseExperimentFetcher for BraintrustClient {
         };
         let response = api_result(
             client
-                .control_plane_json::<_, BaseExperimentResponse>(
-                    "base_experiment",
-                    "get_id",
-                    &request,
-                )
+                .base_experiment::<_, BaseExperimentResponse>(&request)
                 .await,
         )
         .await;
@@ -1068,12 +1060,14 @@ impl ExperimentComparisonFetcher for BraintrustClient {
         let client = self.request_client(token)?;
         let response = api_result(
             client
-                .experiment_comparison(experiment_id, base_experiment_id)
+                .experiment_comparison_as::<ExperimentComparisonResponse>(
+                    experiment_id,
+                    base_experiment_id,
+                )
                 .await,
         )
         .await?;
-        serde_json::from_value(response.into_inner())
-            .map_err(|error| BraintrustError::Background(error.to_string()))
+        Ok(response.into_inner())
     }
 }
 
@@ -1087,7 +1081,7 @@ impl DatasetRegistrar for BraintrustClient {
         let client = self.request_client(token)?;
         Ok(api_result(
             client
-                .control_plane_json::<_, DatasetRegisterResponse>("dataset", "register", &request)
+                .register_dataset::<_, DatasetRegisterResponse>(&request)
                 .await,
         )
         .await?
@@ -1099,18 +1093,10 @@ impl DatasetRegistrar for BraintrustClient {
 impl DatasetFetcher for BraintrustClient {
     async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse> {
         let client = self.request_client(token)?;
-        let response = api_result(client.btql_json(&query).await)
+        let response = api_result(client.btql_json_as::<_, BTQLResponse>(&query).await)
             .await?
             .into_inner();
-        Ok(BTQLResponse {
-            data: response
-                .data
-                .into_iter()
-                .map(serde_json::from_value)
-                .collect::<std::result::Result<_, _>>()
-                .map_err(|error| BraintrustError::Background(error.to_string()))?,
-            cursor: response.cursor,
-        })
+        Ok(response)
     }
 }
 
@@ -1122,9 +1108,13 @@ impl DatasetSummarizer for BraintrustClient {
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse> {
         let client = self.request_client(token)?;
-        let response = api_result(client.dataset_summary(dataset_id).await).await?;
-        serde_json::from_value(response.into_inner())
-            .map_err(|error| BraintrustError::Background(error.to_string()))
+        let response = api_result(
+            client
+                .dataset_summary_as::<DatasetSummaryResponse>(dataset_id)
+                .await,
+        )
+        .await?;
+        Ok(response.into_inner())
     }
 }
 
