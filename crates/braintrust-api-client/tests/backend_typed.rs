@@ -273,6 +273,15 @@ fn resource_definitions_reject_fields_that_would_be_silently_lost() {
             .to_string()
             .contains("/test_unrepresented_setting")
     );
+    let error =
+        resource_definition::<_, types::PatchProject>(json!({"test_unrepresented_setting": null}))
+            .unwrap_err();
+    assert!(error.to_string().contains("/test_unrepresented_setting"));
+    let patch: types::PatchProject = resource_definition(json!({"description": null})).unwrap();
+    assert_eq!(
+        serde_json::to_value(patch).unwrap(),
+        json!({"description": null})
+    );
 }
 
 #[tokio::test]

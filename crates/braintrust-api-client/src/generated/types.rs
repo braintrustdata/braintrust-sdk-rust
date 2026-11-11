@@ -18666,6 +18666,12 @@ pub struct Dataset {
         deserialize_with = "tri_state_serde::deserialize"
     )]
     pub created: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "tri_state_serde::deserialize"
+    )]
+    pub created_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
     ///Date of dataset deletion, or null if the dataset is still active
     #[serde(
         skip_serializing_if = "Option::is_none",
