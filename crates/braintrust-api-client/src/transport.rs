@@ -361,6 +361,15 @@ impl Client {
         ResponseValue::from_response(self.control_plane(object_type, action, request).await?).await
     }
 
+    /// Select a project, creating it when needed.
+    pub async fn register_project(
+        &self,
+        request: &crate::ProjectRegisterRequest,
+    ) -> TransportResult<ResponseValue<crate::ProjectRegisterResponse>> {
+        self.control_plane_json("project", "register", request)
+            .await
+    }
+
     /// Register an experiment in a project.
     pub async fn register_experiment(
         &self,

@@ -19,7 +19,8 @@ pub use sdk_types::{
     BaseExperimentResponse, ComparisonMetricData, ComparisonScoreData, DataSummaryStats,
     DatasetRegisterRequest, DatasetRegisterResponse, DatasetSummaryResponse,
     ExperimentComparisonResponse, ExperimentRegisterRequest, ExperimentRegisterResponse,
-    ExperimentRepoInfo, RegisteredResource,
+    ExperimentRepoInfo, ProjectRegisterRequest, ProjectRegisterResponse, RegisteredProject,
+    RegisteredResource,
 };
 /// Errors from login, queries, logging and other SDK operations.
 pub type Error<E = serde_json::Value> = ApiOpError<E>;
