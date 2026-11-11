@@ -13,14 +13,14 @@ use crate::dataset::{
 };
 use crate::error::{BraintrustError, Result};
 use crate::experiments::api::{
-    BaseExperimentFetcher, BaseExperimentRequest, BaseExperimentResponse,
-    ExperimentComparisonFetcher, ExperimentComparisonResponse, ExperimentRegisterRequest,
-    ExperimentRegisterResponse, ExperimentRegistrar,
+    BaseExperimentFetcher, BaseExperimentResponse, ExperimentComparisonFetcher,
+    ExperimentComparisonResponse, ExperimentRegisterRequest, ExperimentRegisterResponse,
+    ExperimentRegistrar,
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
-use crate::http::{api_client, api_client_builder, api_result, build_http_client, CaBundleConfig};
+use crate::http::{CaBundleConfig, api_client, api_client_builder, api_result, build_http_client};
 use crate::log_queue::{LogQueue, LogQueueConfig};
-use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
+use crate::span::{SpanOrigin, SpanOriginEnvironment, SpanSubmitter, merge_span_origin_context};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
 
@@ -787,7 +787,7 @@ impl BraintrustClient {
         let client = match result {
             Ok(client) => client,
             Err(crate::api::ClientInitError::Login(error)) => {
-                return api_result::<()>(Err(*error)).await
+                return api_result::<()>(Err(*error)).await;
             }
             Err(error) => return Err(BraintrustError::InvalidConfig(error.to_string())),
         };
@@ -1008,13 +1008,9 @@ impl ExperimentRegistrar for BraintrustClient {
         request: ExperimentRegisterRequest,
     ) -> Result<ExperimentRegisterResponse> {
         let client = self.request_client(token)?;
-        Ok(api_result(
-            client
-                .register_experiment::<_, ExperimentRegisterResponse>(&request)
-                .await,
-        )
-        .await?
-        .into_inner())
+        Ok(api_result(client.register_experiment(&request).await)
+            .await?
+            .into_inner())
     }
 }
 
@@ -1026,15 +1022,7 @@ impl BaseExperimentFetcher for BraintrustClient {
         experiment_id: &str,
     ) -> Result<Option<BaseExperimentInfo>> {
         let client = self.request_client(token)?;
-        let request = BaseExperimentRequest {
-            id: experiment_id.to_owned(),
-        };
-        let response = api_result(
-            client
-                .base_experiment::<_, BaseExperimentResponse>(&request)
-                .await,
-        )
-        .await;
+        let response = api_result(client.base_experiment(experiment_id).await).await;
         let base_response: BaseExperimentResponse = match response {
             Ok(response) => response.into_inner(),
             Err(BraintrustError::Api { status: 400, .. }) => return Ok(None),
@@ -1076,13 +1064,9 @@ impl DatasetRegistrar for BraintrustClient {
         request: DatasetRegisterRequest,
     ) -> Result<DatasetRegisterResponse> {
         let client = self.request_client(token)?;
-        Ok(api_result(
-            client
-                .register_dataset::<_, DatasetRegisterResponse>(&request)
-                .await,
-        )
-        .await?
-        .into_inner())
+        Ok(api_result(client.register_dataset(&request).await)
+            .await?
+            .into_inner())
     }
 }
 
@@ -1372,9 +1356,11 @@ mod tests {
         }
 
         let error = result.expect_err("malformed environment CA bundle should fail");
-        assert!(error
-            .to_string()
-            .contains(crate::http::CUSTOM_CA_BUNDLE_ENV));
+        assert!(
+            error
+                .to_string()
+                .contains(crate::http::CUSTOM_CA_BUNDLE_ENV)
+        );
     }
 
     #[tokio::test]
