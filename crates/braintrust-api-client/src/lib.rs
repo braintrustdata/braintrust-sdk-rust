@@ -16,8 +16,10 @@ pub use generated::{sse, types};
 pub(crate) use request::{Request, Transport};
 pub use response::ResponseValue;
 pub use sdk_types::{
-    ComparisonMetricData, ComparisonScoreData, DataSummaryStats, DatasetSummaryResponse,
-    ExperimentComparisonResponse,
+    BaseExperimentResponse, ComparisonMetricData, ComparisonScoreData, DataSummaryStats,
+    DatasetRegisterRequest, DatasetRegisterResponse, DatasetSummaryResponse,
+    ExperimentComparisonResponse, ExperimentRegisterRequest, ExperimentRegisterResponse,
+    ExperimentRepoInfo, RegisteredResource,
 };
 /// Errors from login, queries, logging and other SDK operations.
 pub type Error<E = serde_json::Value> = ApiOpError<E>;
