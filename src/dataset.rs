@@ -324,23 +324,7 @@ pub(crate) struct BTQLResponse {
 // Dataset Summary API Types (Internal)
 // ============================================================================
 
-/// Response from dataset summary API.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DatasetSummaryResponse {
-    pub project_name: String,
-    pub dataset_name: String,
-    pub project_id: String,
-    pub dataset_id: String,
-    pub project_url: Option<String>,
-    pub dataset_url: Option<String>,
-    pub data_summary: Option<DataSummaryStats>,
-}
-
-/// Data summary statistics.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DataSummaryStats {
-    pub total_records: Option<u64>,
-}
+pub(crate) use crate::api::DatasetSummaryResponse;
 
 // ============================================================================
 // Traits for API Operations
