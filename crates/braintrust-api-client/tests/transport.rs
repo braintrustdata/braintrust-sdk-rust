@@ -248,13 +248,12 @@ async fn control_plane_uses_app_url_and_summaries_use_api_url() {
         .build()
         .unwrap();
     let response = client
-        .control_plane("project", "register", &json!({"project_name":"example"}))
+        .register_project(&braintrust_api_client::ProjectRegisterRequest::new(
+            "example".into(),
+        ))
         .await
         .unwrap();
-    assert_eq!(
-        response.json::<serde_json::Value>().await.unwrap()["project"]["id"],
-        "project"
-    );
+    assert_eq!(response.project.id, "project");
     client
         .experiment_comparison("exp", Some("base"))
         .await

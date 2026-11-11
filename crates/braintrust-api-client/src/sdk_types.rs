@@ -150,3 +150,34 @@ pub struct BaseExperimentResponse {
     pub base_exp_id: Option<String>,
     pub base_exp_name: Option<String>,
 }
+
+/// Select a project, creating it when needed.
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct ProjectRegisterRequest {
+    pub project_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_name: Option<String>,
+}
+impl ProjectRegisterRequest {
+    pub fn new(project_name: String) -> Self {
+        Self {
+            project_name,
+            org_id: None,
+            org_name: None,
+        }
+    }
+}
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct RegisteredProject {
+    pub id: String,
+    pub name: Option<String>,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct ProjectRegisterResponse {
+    pub project: RegisteredProject,
+}
