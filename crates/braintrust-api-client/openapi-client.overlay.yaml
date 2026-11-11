@@ -3,6 +3,12 @@ info:
   title: Braintrust Rust client adaptations
   version: '1'
 actions:
+  # Older dataset responses may use created_at instead of created.
+  - target: $.components.schemas.Dataset.properties
+    update:
+      created_at:
+        type: [string, 'null']
+        format: date-time
   # Browser preflights are not SDK operations.
   - target: $.paths.*.options
     remove: true

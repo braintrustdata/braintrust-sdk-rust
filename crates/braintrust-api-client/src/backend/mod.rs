@@ -963,7 +963,7 @@ pub fn resource_definition<T: Serialize, R: DeserializeOwned + Serialize>(value:
                         if let Some(path) = missing_field(value, encoded, &path) {
                             return Some(path);
                         }
-                    } else if !value.is_null() {
+                    } else {
                         return Some(path);
                     }
                 }

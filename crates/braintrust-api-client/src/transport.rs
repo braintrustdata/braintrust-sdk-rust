@@ -194,6 +194,14 @@ impl Client {
         &self,
         request: &T,
     ) -> TransportResult<ResponseValue<BtqlResponse>> {
+        self.btql_json_as(request).await
+    }
+
+    /// Execute a JSON BTQL query and decode the response into the requested shape.
+    pub async fn btql_json_as<T: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        request: &T,
+    ) -> TransportResult<ResponseValue<R>> {
         let mut request = serde_json::to_value(request)
             .map_err(|error| Error::invalid_request(error.to_string()))?;
         let object = request
@@ -353,12 +361,49 @@ impl Client {
         ResponseValue::from_response(self.control_plane(object_type, action, request).await?).await
     }
 
+    /// Register an experiment in a project.
+    pub async fn register_experiment<T: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        request: &T,
+    ) -> TransportResult<ResponseValue<R>> {
+        self.control_plane_json("experiment", "register", request)
+            .await
+    }
+
+    /// Find the base experiment for an experiment.
+    pub async fn base_experiment<T: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        request: &T,
+    ) -> TransportResult<ResponseValue<R>> {
+        self.control_plane_json("base_experiment", "get_id", request)
+            .await
+    }
+
+    /// Register a dataset in a project.
+    pub async fn register_dataset<T: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        request: &T,
+    ) -> TransportResult<ResponseValue<R>> {
+        self.control_plane_json("dataset", "register", request)
+            .await
+    }
+
     /// Fetch experiment comparison data from the data plane.
     pub async fn experiment_comparison(
         &self,
         experiment_id: &str,
         base_experiment_id: Option<&str>,
     ) -> TransportResult<ResponseValue<Value>> {
+        self.experiment_comparison_as(experiment_id, base_experiment_id)
+            .await
+    }
+
+    /// Fetch experiment comparison data into a typed response.
+    pub async fn experiment_comparison_as<R: DeserializeOwned>(
+        &self,
+        experiment_id: &str,
+        base_experiment_id: Option<&str>,
+    ) -> TransportResult<ResponseValue<R>> {
         let mut request = self
             .request(Method::GET, &self.baseurl, "experiment-comparison2")
             .query(&[("experiment_id", experiment_id)]);
@@ -370,6 +415,14 @@ impl Client {
 
     /// Fetch a legacy dataset summary from the data plane.
     pub async fn dataset_summary(&self, dataset_id: &str) -> TransportResult<ResponseValue<Value>> {
+        self.dataset_summary_as(dataset_id).await
+    }
+
+    /// Fetch a dataset summary into a typed response.
+    pub async fn dataset_summary_as<R: DeserializeOwned>(
+        &self,
+        dataset_id: &str,
+    ) -> TransportResult<ResponseValue<R>> {
         self.send_json(
             self.request(Method::GET, &self.baseurl, "dataset-summary")
                 .query(&[("dataset_id", dataset_id)]),
