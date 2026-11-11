@@ -393,17 +393,7 @@ impl Client {
         &self,
         experiment_id: &str,
         base_experiment_id: Option<&str>,
-    ) -> TransportResult<ResponseValue<Value>> {
-        self.experiment_comparison_as(experiment_id, base_experiment_id)
-            .await
-    }
-
-    /// Fetch experiment comparison data into a typed response.
-    pub async fn experiment_comparison_as<R: DeserializeOwned>(
-        &self,
-        experiment_id: &str,
-        base_experiment_id: Option<&str>,
-    ) -> TransportResult<ResponseValue<R>> {
+    ) -> TransportResult<ResponseValue<crate::ExperimentComparisonResponse>> {
         let mut request = self
             .request(Method::GET, &self.baseurl, "experiment-comparison2")
             .query(&[("experiment_id", experiment_id)]);
@@ -414,15 +404,10 @@ impl Client {
     }
 
     /// Fetch a legacy dataset summary from the data plane.
-    pub async fn dataset_summary(&self, dataset_id: &str) -> TransportResult<ResponseValue<Value>> {
-        self.dataset_summary_as(dataset_id).await
-    }
-
-    /// Fetch a dataset summary into a typed response.
-    pub async fn dataset_summary_as<R: DeserializeOwned>(
+    pub async fn dataset_summary(
         &self,
         dataset_id: &str,
-    ) -> TransportResult<ResponseValue<R>> {
+    ) -> TransportResult<ResponseValue<crate::DatasetSummaryResponse>> {
         self.send_json(
             self.request(Method::GET, &self.baseurl, "dataset-summary")
                 .query(&[("dataset_id", dataset_id)]),

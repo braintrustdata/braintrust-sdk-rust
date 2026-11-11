@@ -237,7 +237,7 @@ async fn control_plane_uses_app_url_and_summaries_use_api_url() {
     Mock::given(method("GET"))
         .and(path("/dataset-summary"))
         .and(query_param("dataset_id", "dataset"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"dataset_id":"dataset"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"dataset_id":"dataset", "dataset_name":"test", "project_id":"project", "project_name":"test"})))
         .expect(1)
         .mount(&api)
         .await;
@@ -473,7 +473,11 @@ async fn org_header_is_scoped_to_logging_operations() {
             "/api/project/register",
             json!({"project":{"id":"id"}}),
         ),
-        ("GET", "/dataset-summary", json!({})),
+        (
+            "GET",
+            "/dataset-summary",
+            json!({"dataset_id":"id", "dataset_name":"test", "project_id":"project", "project_name":"test"}),
+        ),
         ("GET", "/experiment-comparison2", json!({})),
         (
             "POST",
