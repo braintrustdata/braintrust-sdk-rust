@@ -1110,7 +1110,7 @@ impl DatasetSummarizer for BraintrustClient {
         let client = self.request_client(token)?;
         let response = api_result(
             client
-                .dataset_summary_as::<DatasetSummaryResponse>(dataset_id)
+                .dataset_summary(dataset_id)
                 .await,
         )
         .await?;
