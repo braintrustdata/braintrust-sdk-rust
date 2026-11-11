@@ -362,28 +362,32 @@ impl Client {
     }
 
     /// Register an experiment in a project.
-    pub async fn register_experiment<T: Serialize + ?Sized, R: DeserializeOwned>(
+    pub async fn register_experiment(
         &self,
-        request: &T,
-    ) -> TransportResult<ResponseValue<R>> {
+        request: &crate::ExperimentRegisterRequest,
+    ) -> TransportResult<ResponseValue<crate::ExperimentRegisterResponse>> {
         self.control_plane_json("experiment", "register", request)
             .await
     }
 
     /// Find the base experiment for an experiment.
-    pub async fn base_experiment<T: Serialize + ?Sized, R: DeserializeOwned>(
+    pub async fn base_experiment(
         &self,
-        request: &T,
-    ) -> TransportResult<ResponseValue<R>> {
-        self.control_plane_json("base_experiment", "get_id", request)
-            .await
+        experiment_id: &str,
+    ) -> TransportResult<ResponseValue<crate::BaseExperimentResponse>> {
+        self.control_plane_json(
+            "base_experiment",
+            "get_id",
+            &serde_json::json!({"id": experiment_id}),
+        )
+        .await
     }
 
     /// Register a dataset in a project.
-    pub async fn register_dataset<T: Serialize + ?Sized, R: DeserializeOwned>(
+    pub async fn register_dataset(
         &self,
-        request: &T,
-    ) -> TransportResult<ResponseValue<R>> {
+        request: &crate::DatasetRegisterRequest,
+    ) -> TransportResult<ResponseValue<crate::DatasetRegisterResponse>> {
         self.control_plane_json("dataset", "register", request)
             .await
     }
