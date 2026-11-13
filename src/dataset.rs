@@ -252,40 +252,7 @@ pub(crate) struct DatasetMetadata {
     pub project_id: String,
 }
 
-/// Request body for dataset registration.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DatasetRegisterRequest {
-    pub project_name: String,
-    pub org_name: String,
-    pub dataset_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Map<String, Value>>,
-}
-
-/// Response from dataset registration.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DatasetRegisterResponse {
-    pub project: DatasetProjectInfo,
-    pub dataset: DatasetInfo,
-}
-
-/// Project info from registration response.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DatasetProjectInfo {
-    pub id: String,
-    #[allow(dead_code)]
-    pub name: String,
-}
-
-/// Dataset info from registration response.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DatasetInfo {
-    pub id: String,
-    #[allow(dead_code)]
-    pub name: String,
-}
+pub(crate) use crate::api::{DatasetRegisterRequest, DatasetRegisterResponse};
 
 // ============================================================================
 // BTQL Query Types (Internal)
@@ -324,23 +291,7 @@ pub(crate) struct BTQLResponse {
 // Dataset Summary API Types (Internal)
 // ============================================================================
 
-/// Response from dataset summary API.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DatasetSummaryResponse {
-    pub project_name: String,
-    pub dataset_name: String,
-    pub project_id: String,
-    pub dataset_id: String,
-    pub project_url: Option<String>,
-    pub dataset_url: Option<String>,
-    pub data_summary: Option<DataSummaryStats>,
-}
-
-/// Data summary statistics.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DataSummaryStats {
-    pub total_records: Option<u64>,
-}
+pub(crate) use crate::api::DatasetSummaryResponse;
 
 // ============================================================================
 // Traits for API Operations
@@ -564,13 +515,13 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     async fn ensure_registered(&self) -> Result<&DatasetMetadata> {
         self.lazy_metadata
             .get_or_init(|| async {
-                let request = DatasetRegisterRequest {
-                    project_name: self.project_name.clone(),
-                    org_name: self.org_name.clone(),
-                    dataset_name: self.dataset_name.clone(),
-                    description: self.description.clone(),
-                    metadata: self.metadata.clone(),
-                };
+                let mut request = DatasetRegisterRequest::new(
+                    self.project_name.clone(),
+                    self.org_name.clone(),
+                    self.dataset_name.clone(),
+                );
+                request.description = self.description.clone();
+                request.metadata = self.metadata.clone();
 
                 match self.submitter.register_dataset(&self.token, request).await {
                     Ok(response) => Ok(DatasetMetadata {

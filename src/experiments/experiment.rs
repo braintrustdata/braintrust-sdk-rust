@@ -422,17 +422,26 @@ impl<
     pub(crate) async fn ensure_registered(&self) -> ExperimentMetadata {
         self.lazy_metadata
             .get_or_init(|| async {
-                let request = ExperimentRegisterRequest {
-                    project_name: self.project_name.clone(),
-                    org_id: self.org_id.clone(),
-                    experiment_name: self.experiment_name.clone(),
-                    description: self.description.clone(),
-                    base_experiment: self.base_experiment.clone(),
-                    metadata: self.metadata.clone(),
-                    public: self.public,
-                    update: self.update,
-                    repo_info: self.repo_info.clone(),
-                };
+                let mut request =
+                    ExperimentRegisterRequest::new(self.project_name.clone(), self.org_id.clone());
+                request.experiment_name = self.experiment_name.clone();
+                request.description = self.description.clone();
+                request.base_experiment = self.base_experiment.clone();
+                request.metadata = self.metadata.clone();
+                request.public = self.public;
+                request.update = self.update;
+                request.repo_info = self.repo_info.clone().map(|repo| {
+                    let mut value = crate::api::ExperimentRepoInfo::default();
+                    value.commit = repo.commit;
+                    value.branch = repo.branch;
+                    value.tag = repo.tag;
+                    value.dirty = repo.dirty;
+                    value.author_name = repo.author_name;
+                    value.author_email = repo.author_email;
+                    value.commit_message = repo.commit_message;
+                    value.commit_time = repo.commit_time;
+                    value
+                });
 
                 match self
                     .submitter
