@@ -2,6 +2,7 @@
 spec_path = "https://raw.githubusercontent.com/braintrustdata/braintrust-openapi/main/openapi/spec.json"
 output_dir = "src/generated"
 module_name = "api_types"
+non_exhaustive_models = true
 overlays = ["openapi-client.overlay.yaml"]
 
 [generator.builders]
