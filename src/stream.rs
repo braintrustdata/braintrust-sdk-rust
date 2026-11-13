@@ -1076,7 +1076,7 @@ where
                     };
 
                     // Flush every N chunks OR every T seconds (whichever comes first)
-                    let should_flush = count % STREAMING_FLUSH_CHUNK_INTERVAL == 0
+                    let should_flush = count.is_multiple_of(STREAMING_FLUSH_CHUNK_INTERVAL)
                         || elapsed > STREAMING_FLUSH_TIME_INTERVAL;
 
                     if should_flush {
