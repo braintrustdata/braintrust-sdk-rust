@@ -30,7 +30,7 @@ jobs:
           toolchain: stable
 
       - name: Install API client generator
-        run: cargo install openapi-to-rust --version 0.23.0 --locked
+        run: cargo install openapi-to-rust --version 0.24.0 --locked
 
       - name: Generate API client
         working-directory: sdk
