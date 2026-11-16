@@ -337,39 +337,103 @@ async fn interrupted_success_body_remains_a_retryable_network_error() {
 async fn attachment_upload_keeps_api_credentials_out_of_object_storage() {
     let server = MockServer::start().await;
     let storage = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/attachment"))
+    Mock::given(method("POST"))
+        .and(path("/attachment"))
         .and(header("authorization", "Bearer test-key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"signedUrl":format!("{}/object",storage.uri()),"headers":{"x-upload":"signed"}})))
-        .expect(1).mount(&server).await;
-    Mock::given(method("PUT")).and(path("/object"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"signedUrl":format!("{}/object",storage.uri()),"headers":{"x-upload":"signed"}}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/object"))
         .and(header("x-upload", "signed"))
-        .and(|request: &Request| !request.headers.contains_key("authorization") && request.body == b"attachment-bytes")
-        .respond_with(ResponseTemplate::new(200)).expect(1).mount(&storage).await;
-    Mock::given(method("POST")).and(path("/attachment/status"))
-        .and(body_json(json!({"key":"key","org_id":"org","status":{"upload_status":"done"}})))
+        .and(|request: &Request| {
+            !request.headers.contains_key("authorization") && request.body == b"attachment-bytes"
+        })
         .respond_with(ResponseTemplate::new(200))
-        .expect(1).mount(&server).await;
-    client(&server).upload_attachment(&AttachmentRequest::new("key".into(), "file.bin".into(), "application/octet-stream".into(), "org".into()), b"attachment-bytes".to_vec()).await.unwrap();
+        .expect(1)
+        .mount(&storage)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/attachment/status"))
+        .and(body_json(
+            json!({"key":"key","org_id":"org","status":{"upload_status":"done"}}),
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    client(&server)
+        .upload_attachment(
+            &AttachmentRequest::new(
+                "key".into(),
+                "file.bin".into(),
+                "application/octet-stream".into(),
+                "org".into(),
+            ),
+            b"attachment-bytes".to_vec(),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn failed_attachment_upload_does_not_report_completion_and_can_retry() {
     let server = MockServer::start().await;
     let storage = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/attachment"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"signedUrl":format!("{}/object",storage.uri()),"headers":{}})))
-        .expect(2).mount(&server).await;
-    Mock::given(method("POST")).and(path("/attachment/status"))
+    Mock::given(method("POST"))
+        .and(path("/attachment"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"signedUrl":format!("{}/object",storage.uri()),"headers":{}}),
+            ),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/attachment/status"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(1).mount(&server).await;
-    Mock::given(method("PUT")).and(path("/object"))
-        .respond_with(ResponseTemplate::new(403)).mount(&storage).await;
-    let request = AttachmentRequest::new("key".into(), "file.bin".into(), "application/octet-stream".into(), "org".into());
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/object"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&storage)
+        .await;
+    let request = AttachmentRequest::new(
+        "key".into(),
+        "file.bin".into(),
+        "application/octet-stream".into(),
+        "org".into(),
+    );
     let backend = client(&server);
-    assert!(backend.upload_attachment(&request, b"data".to_vec()).await.is_err());
-    assert!(!server.received_requests().await.unwrap().iter().any(|request| request.url.path() == "/attachment/status"));
+    assert!(
+        backend
+            .upload_attachment(&request, b"data".to_vec())
+            .await
+            .is_err()
+    );
+    assert!(
+        !server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path() == "/attachment/status")
+    );
     storage.reset().await;
-    Mock::given(method("PUT")).and(path("/object"))
-        .respond_with(ResponseTemplate::new(200)).expect(1).mount(&storage).await;
-    backend.upload_attachment(&request, b"data".to_vec()).await.unwrap();
+    Mock::given(method("PUT"))
+        .and(path("/object"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&storage)
+        .await;
+    backend
+        .upload_attachment(&request, b"data".to_vec())
+        .await
+        .unwrap();
 }
