@@ -58,16 +58,26 @@ impl MockBraintrustClient {
 
 #[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
-    fn submit(&self, token: String, payload: SpanPayload, parent_info: Option<ParentSpanInfo>) {
+    fn submit(
+        &self,
+        token: String,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         self.collector.push(CapturedSpan {
             token,
             payload,
             parent: parent_info,
         });
+        let (sender, completion) = crate::Completion::pair();
+        let _ = sender.send(Ok(crate::DeliveryReceipt::new()));
+        completion
     }
 
-    async fn flush(&self) -> Result<()> {
-        Ok(())
+    fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+        let (sender, completion) = crate::Completion::pair();
+        let _ = sender.send(Ok(crate::FlushReport::default()));
+        completion
     }
 
     async fn trigger_flush(&self) -> Result<()> {
