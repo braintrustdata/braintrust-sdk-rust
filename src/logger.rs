@@ -1262,6 +1262,9 @@ mod tests {
 
     #[tokio::test]
     async fn builder_rejects_missing_api_key() {
+        if crate::http::tests::run_isolated("logger::tests::builder_rejects_missing_api_key") {
+            return;
+        }
         // Clear any env vars that might be set
         std::env::remove_var("BRAINTRUST_API_KEY");
 
@@ -1333,7 +1336,11 @@ mod tests {
 
     #[tokio::test]
     async fn builder_rejects_malformed_environment_ca_bundle() {
-        let _lock = crate::http::tests::ENV_LOCK.lock().await;
+        if crate::http::tests::run_isolated(
+            "logger::tests::builder_rejects_malformed_environment_ca_bundle",
+        ) {
+            return;
+        }
         let original = std::env::var_os(crate::http::CUSTOM_CA_BUNDLE_ENV);
         std::env::set_var(
             crate::http::CUSTOM_CA_BUNDLE_ENV,

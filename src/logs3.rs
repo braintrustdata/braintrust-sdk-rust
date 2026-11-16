@@ -136,7 +136,11 @@ mod tests {
 
     #[tokio::test]
     async fn uploader_rejects_malformed_environment_ca_bundle() {
-        let _lock = crate::http::tests::ENV_LOCK.lock().await;
+        if crate::http::tests::run_isolated(
+            "logs3::tests::uploader_rejects_malformed_environment_ca_bundle",
+        ) {
+            return;
+        }
         let original = std::env::var_os(crate::http::CUSTOM_CA_BUNDLE_ENV);
         std::env::set_var(
             crate::http::CUSTOM_CA_BUNDLE_ENV,
