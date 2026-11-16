@@ -2,15 +2,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::{Arc, Mutex};
 
+use super::{CaseError, DatasetVersionRef};
 use crate::SpanHandle;
 
 /// A single test case for evaluation
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Case<I, O>
-where
-    I: Clone,
-    O: Clone,
-{
+pub struct Case<I, O> {
     /// The input to the task
     pub input: I,
     /// The expected output (optional)
@@ -34,8 +31,7 @@ where
 
 impl<I, O> Default for Case<I, O>
 where
-    I: Default + Clone,
-    O: Clone,
+    I: Default,
 {
     fn default() -> Self {
         Self {
@@ -118,9 +114,16 @@ pub struct EvalResult<I, O> {
     /// Tags from the case and task
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
-    /// Error message if evaluation failed
+    /// Computation failures, with task/scorer identity and original causes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<CaseError>,
+    /// Source case identity and dataset transaction information.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub case_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
     /// Span ID for this evaluation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_id: Option<String>,
@@ -152,30 +155,29 @@ pub struct EvalSummary<I, O> {
     pub score_stats: Vec<ScoreStats>,
     /// Total number of cases evaluated
     pub total_cases: usize,
-    /// Number of successful evaluations
+    /// Cases without task/scorer errors, independently of recording status.
     pub successful_cases: usize,
-    /// Number of failed evaluations
+    /// Cases with task/scorer errors, independently of recording status.
     pub failed_cases: usize,
-    /// Dataset ID (if using Braintrust dataset)
+    /// Full dataset provenance captured before source consumption.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dataset_id: Option<String>,
+    pub dataset: Option<DatasetVersionRef>,
 }
 
 impl<I, O> EvalSummary<I, O> {
-    /// Compute score statistics from results
+    /// Compute statistics from scores that were actually produced, including
+    /// successful scorers in cases where another scorer failed.
     pub fn compute_stats(results: &[EvalResult<I, O>]) -> Vec<ScoreStats> {
         use std::collections::HashMap;
 
         let mut score_map: HashMap<String, Vec<f64>> = HashMap::new();
 
         for result in results {
-            if result.error.is_none() {
-                for score in &result.scores {
-                    score_map
-                        .entry(score.name.clone())
-                        .or_default()
-                        .push(score.score);
-                }
+            for score in &result.scores {
+                score_map
+                    .entry(score.name.clone())
+                    .or_default()
+                    .push(score.score);
             }
         }
 
@@ -202,8 +204,8 @@ impl<I, O> EvalSummary<I, O> {
 
 /// Hooks provided to tasks for instrumentation and metadata
 pub struct TaskHooks<'a, I, O> {
-    /// Span handle for logging
-    pub span: &'a SpanHandle,
+    /// Optional span handle supplied by the recording adapter.
+    pub span: Option<&'a SpanHandle>,
     /// Expected output (if available)
     pub expected: Option<&'a O>,
     /// Mutable metadata map for the task to add context
@@ -216,11 +218,39 @@ pub struct TaskHooks<'a, I, O> {
 
 impl<'a, I, O> TaskHooks<'a, I, O> {
     pub fn new(span: &'a SpanHandle, expected: Option<&'a O>) -> Self {
+        Self::for_case(Some(span), expected, None, None)
+    }
+
+    /// Hooks for computation without a client, runtime or recording span.
+    pub fn local(expected: Option<&'a O>) -> Self {
+        Self::for_case(None, expected, None, None)
+    }
+
+    pub(crate) fn for_case(
+        span: Option<&'a SpanHandle>,
+        expected: Option<&'a O>,
+        metadata: Option<Map<String, Value>>,
+        tags: Option<Vec<String>>,
+    ) -> Self {
         Self {
             span,
             expected,
-            metadata: Arc::new(Mutex::new(Map::new())),
-            tags: Arc::new(Mutex::new(Vec::new())),
+            metadata: Arc::new(Mutex::new(metadata.unwrap_or_default())),
+            tags: Arc::new(Mutex::new(tags.unwrap_or_default())),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn rebind<'b>(
+        &self,
+        span: Option<&'b SpanHandle>,
+        expected: Option<&'b O>,
+    ) -> TaskHooks<'b, I, O> {
+        TaskHooks {
+            span,
+            expected,
+            metadata: self.metadata.clone(),
+            tags: self.tags.clone(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -235,7 +265,10 @@ impl<'a, I, O> TaskHooks<'a, I, O> {
     /// Add a tag
     pub fn add_tag(&self, tag: impl Into<String>) {
         if let Ok(mut tags) = self.tags.lock() {
-            tags.push(tag.into());
+            let tag = tag.into();
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
         }
     }
 

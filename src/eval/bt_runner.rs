@@ -10,7 +10,7 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{BraintrustClient, BraintrustError, Result};
@@ -186,20 +186,24 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 /// ```no_run
 /// use braintrust_sdk_rust::eval::*;
 ///
-/// # async fn example() -> braintrust_sdk_rust::Result<()> {
+/// # async fn example() -> anyhow::Result<()> {
 /// let mut runner = BtEvalRunner::from_env().await?;
+///
+/// let definition = EvalDefinition::new(
+///     Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()))),
+///     vec![Box::new(ExactMatch::new())],
+/// )?;
 ///
 /// runner.eval(
 ///     "my-project",
 ///     EvalOpts::builder()
 ///         .name("my-eval".to_string())
-///         .dataset(vec![Case {
+///         .source(vec![Case {
 ///             input: "hello".to_string(),
 ///             expected: Some("HELLO".to_string()),
 ///             ..Default::default()
 ///         }].into())
-///         .task(Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()))))
-///         .scorers(vec![Box::new(ExactMatch::new())])
+///         .definition(definition.clone())
 ///         .build(),
 /// ).await?;
 ///
@@ -288,8 +292,8 @@ impl BtEvalRunner {
     /// If the eval name does not pass the configured filters, it is skipped silently.
     pub async fn eval<I, O>(&mut self, project: &str, mut opts: EvalOpts<I, O>) -> Result<()>
     where
-        I: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
-        O: Serialize + DeserializeOwned + Send + Sync + PartialEq + Clone + 'static,
+        I: Serialize + Send + Sync + 'static,
+        O: Serialize + Send + Sync + 'static,
     {
         let name = opts.name.clone();
 
@@ -349,7 +353,7 @@ impl BtEvalRunner {
                     eprintln!("Evaluator '{}' failed: {}", name, e);
                 }
                 if self.config.terminate_on_failure {
-                    return Err(e);
+                    return Err(BraintrustError::Background(e.to_string()));
                 }
             }
         }
