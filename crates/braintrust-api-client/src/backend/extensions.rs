@@ -801,7 +801,7 @@ impl BackendClient {
     }
 
     pub async fn attachment_status(&self, request: &AttachmentStatusRequest) -> Result<()> {
-        let _: Value = self.post("/attachment/status", request).await?;
+        let _: super::NoContent = self.post("/attachment/status", request).await?;
         Ok(())
     }
     pub async fn submit_query(&self, request: &AsyncQuerySubmission) -> Result<AsyncQuery> {
