@@ -1090,7 +1090,7 @@ where
                         drop(agg);
 
                         // Non-blocking flush for real-time updates
-                        let _ = span.trigger_flush().await;
+                        drop(span.flush());
                         *last_flush.lock().await = Instant::now();
                     }
                 }

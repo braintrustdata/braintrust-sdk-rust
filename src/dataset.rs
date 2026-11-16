@@ -13,13 +13,13 @@
 //!     .await?
 //!     .project_name("my-project")
 //!     .dataset_name("test-cases")
-//!     .build();
+//!     .build()?;
 //!
 //! let id = dataset.insert(
 //!     DatasetInsert::builder()
 //!         .input(json!({"question": "What is 2+2?"}))
 //!         .expected(json!({"answer": "4"}))
-//!         .build()
+//!         .build()?
 //! ).await?;
 //! ```
 
@@ -27,10 +27,21 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
+use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
+
+use crate::error::{BraintrustError, Result};
+use crate::http::api_result;
+use crate::internal::execution::ExecutionBinding;
+use crate::internal::session::CredentialScope;
+use crate::Completion;
+
+// ============================================================================
+// Dataset Insert Types
+// ============================================================================
 
 /// Fields stored in a dataset record. Absent fields are omitted from the wire.
 ///
@@ -129,11 +140,6 @@ impl DatasetWrite {
         }
     }
 }
-
-use crate::error::Result;
-use crate::http::api_result;
-use crate::internal::execution::ExecutionBinding;
-use crate::internal::session::CredentialScope;
 
 // ============================================================================
 // Dataset Insert Types
@@ -407,13 +413,9 @@ impl Dataset {
                 );
                 request.description = self.description.clone();
                 request.metadata = self.metadata.clone();
-                let api = self.scope.api(&self.api)?;
-                let response = self
-                    .execution
-                    .response::<_, crate::BraintrustError, _>(async move {
-                        Ok(api_result(api.register_dataset(&request).await)?.into_inner())
-                    })
-                    .await?;
+                let response =
+                    api_result(self.scope.api(&self.api)?.register_dataset(&request).await)?
+                        .into_inner();
                 Ok(DatasetMetadata {
                     dataset_id: response.dataset.id,
                     project_id: response.project.id,
@@ -423,7 +425,13 @@ impl Dataset {
     }
 
     /// Get the dataset ID (triggers registration if needed).
-    pub async fn dataset_id(&self) -> Result<String> {
+    pub fn dataset_id(&self) -> Completion<String, BraintrustError> {
+        let dataset = self.clone();
+        self.execution
+            .response(async move { dataset.dataset_id_inner().await })
+    }
+
+    async fn dataset_id_inner(&self) -> Result<String> {
         Ok(self.ensure_registered().await?.dataset_id.clone())
     }
 
@@ -438,7 +446,13 @@ impl Dataset {
     }
 
     /// Insert a record and return its generated ID after the API acknowledges it.
-    pub async fn insert(&self, record: DatasetInsert) -> Result<String> {
+    pub fn insert(&self, record: DatasetInsert) -> Completion<String, BraintrustError> {
+        let dataset = self.clone();
+        self.execution
+            .response(async move { dataset.insert_inner(record).await })
+    }
+
+    async fn insert_inner(&self, record: DatasetInsert) -> Result<String> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         let id = Uuid::new_v4().to_string();
         self.write_record(DatasetWrite::insert(dataset_id, id.clone(), record.into()))
@@ -447,23 +461,28 @@ impl Dataset {
     }
 
     /// Merge supplied fields into a record, returning after API acknowledgement.
-    /// Omitted fields remain unchanged; explicit JSON null values are sent as null.
-    ///
-    /// ```no_run
-    /// use braintrust_sdk_rust::{Dataset, DatasetFields};
-    /// # async fn update(dataset: &Dataset) -> braintrust_sdk_rust::Result<()> {
-    /// dataset.update("record-id", DatasetFields::builder().expected(4).build()).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn update(&self, id: &str, fields: DatasetFields) -> Result<()> {
+    pub fn update(&self, id: &str, fields: DatasetFields) -> Completion<(), BraintrustError> {
+        let dataset = self.clone();
+        let id = id.to_owned();
+        self.execution
+            .response(async move { dataset.update_inner(&id, fields).await })
+    }
+
+    async fn update_inner(&self, id: &str, fields: DatasetFields) -> Result<()> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         self.write_record(DatasetWrite::update(dataset_id, id, fields))
             .await
     }
 
     /// Delete a record, returning after API acknowledgement.
-    pub async fn delete(&self, id: &str) -> Result<()> {
+    pub fn delete(&self, id: &str) -> Completion<(), BraintrustError> {
+        let dataset = self.clone();
+        let id = id.to_owned();
+        self.execution
+            .response(async move { dataset.delete_inner(&id).await })
+    }
+
+    async fn delete_inner(&self, id: &str) -> Result<()> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         self.write_record(DatasetWrite::delete(dataset_id, id))
             .await
@@ -472,7 +491,13 @@ impl Dataset {
     /// Fetch records with pagination.
     ///
     /// Returns an iterator that fetches records in batches.
-    pub async fn fetch(&self, batch_size: Option<usize>) -> Result<DatasetIterator> {
+    pub fn fetch(&self, batch_size: Option<usize>) -> Completion<DatasetIterator, BraintrustError> {
+        let dataset = self.clone();
+        self.execution
+            .response(async move { dataset.fetch_inner(batch_size).await })
+    }
+
+    async fn fetch_inner(&self, batch_size: Option<usize>) -> Result<DatasetIterator> {
         let metadata = self.ensure_registered().await?;
         Ok(DatasetIterator::new(
             self.api.clone(),
@@ -484,18 +509,23 @@ impl Dataset {
     }
 
     /// Get dataset summary statistics.
-    pub async fn summarize(&self) -> Result<DatasetSummary> {
+    pub fn summarize(&self) -> Completion<DatasetSummary, BraintrustError> {
+        let dataset = self.clone();
+        self.execution
+            .response(async move { dataset.summarize_inner().await })
+    }
+
+    async fn summarize_inner(&self) -> Result<DatasetSummary> {
         let metadata = self.ensure_registered().await?;
 
         // Fetch summary from API
-        let api = self.scope.api(&self.api)?;
-        let id = metadata.dataset_id.clone();
-        let response = self
-            .execution
-            .response::<_, crate::BraintrustError, _>(async move {
-                Ok(api_result(api.dataset_summary(&id).await)?.into_inner())
-            })
-            .await?;
+        let response = api_result(
+            self.scope
+                .api(&self.api)?
+                .dataset_summary(&metadata.dataset_id)
+                .await,
+        )?
+        .into_inner();
 
         Ok(DatasetSummary {
             project_name: response.project_name,
@@ -509,22 +539,29 @@ impl Dataset {
     }
 
     async fn write_record(&self, row: DatasetWrite) -> Result<()> {
-        let api = self.scope.api(&self.api)?;
-        self.execution
-            .response::<_, crate::BraintrustError, _>(async move {
-                api_result(
-                    api.logs3(&serde_json::json!({"api_version": crate::types::LOGS_API_VERSION, "rows": [row]}))
-                        .await,
-                )?;
-                Ok(())
-            })
-            .await
+        api_result(
+            self.scope
+                .api(&self.api)?
+                .logs3(&serde_json::json!({"api_version": crate::types::LOGS_API_VERSION, "rows": [row]}))
+                .await,
+        )?;
+        Ok(())
     }
 }
 
 // ============================================================================
 // DatasetIterator
 // ============================================================================
+
+struct DatasetCursor {
+    fetcher: reqwest::Client,
+    scope: CredentialScope,
+    dataset_id: String,
+    batch_size: usize,
+    cursor: Option<String>,
+    buffer: VecDeque<DatasetRecord>,
+    done: bool,
+}
 
 /// Iterator for fetching dataset records with pagination.
 ///
@@ -539,14 +576,9 @@ impl Dataset {
 /// # }
 /// ```
 pub struct DatasetIterator {
-    fetcher: reqwest::Client,
     execution: ExecutionBinding,
-    scope: CredentialScope,
-    dataset_id: String,
-    batch_size: usize,
-    cursor: Option<String>,
-    buffer: VecDeque<DatasetRecord>,
-    done: bool,
+    cursor: Arc<tokio::sync::Mutex<DatasetCursor>>,
+    tail: futures::future::Shared<BoxFuture<'static, ()>>,
 }
 
 impl DatasetIterator {
@@ -558,19 +590,72 @@ impl DatasetIterator {
         batch_size: usize,
     ) -> Self {
         Self {
-            fetcher,
             execution,
-            scope,
-            dataset_id,
-            batch_size,
-            cursor: None,
-            buffer: VecDeque::new(),
-            done: false,
+            tail: futures::future::ready(()).boxed().shared(),
+            cursor: Arc::new(tokio::sync::Mutex::new(DatasetCursor {
+                fetcher,
+                scope,
+                dataset_id,
+                batch_size,
+                cursor: None,
+                buffer: VecDeque::new(),
+                done: false,
+            })),
         }
     }
 
+    /// Submit a request for the next record, fetching a page if needed.
+    /// Accepted cursor operations run in issuance order; dropping a token still consumes
+    /// its record. An API error preserves the cursor for a later retry.
+    #[allow(clippy::should_implement_trait)] // Observation is async, unlike Iterator::next.
+    pub fn next(&mut self) -> Completion<Option<DatasetRecord>, BraintrustError> {
+        self.submit(|mut cursor| async move { cursor.next().await })
+    }
+
+    /// Submit collection of all remaining records. Dropping the returned token
+    /// does not cancel collection; page failures remain operation errors.
+    pub fn collect(mut self) -> Completion<Vec<DatasetRecord>, BraintrustError> {
+        self.submit(|mut cursor| async move {
+            let mut records = Vec::new();
+            while let Some(record) = cursor.next().await? {
+                records.push(record);
+            }
+            Ok(records)
+        })
+    }
+
+    fn submit<T, F, Fut>(&mut self, work: F) -> Completion<T, BraintrustError>
+    where
+        T: Send + 'static,
+        F: FnOnce(tokio::sync::OwnedMutexGuard<DatasetCursor>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        let cursor = self.cursor.clone();
+        let previous = self.tail.clone();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let completion = self.execution.response(async move {
+            // Holding the sender across the whole operation preserves issuance
+            // order even if runtime task polling is reordered. Drop releases
+            // the next operation on success, error, panic or cancellation.
+            let _release = release;
+            previous.await;
+            work(cursor.lock_owned().await).await
+        });
+        if completion.is_ok() {
+            self.tail = async move {
+                let _ = released.await;
+            }
+            .boxed()
+            .shared();
+        }
+        // Rejected work leaves the existing chain and cursor untouched.
+        completion
+    }
+}
+
+impl DatasetCursor {
     /// Get the next record, fetching a new batch if needed.
-    pub async fn next(&mut self) -> Result<Option<DatasetRecord>> {
+    async fn next(&mut self) -> Result<Option<DatasetRecord>> {
         loop {
             if let Some(record) = self.buffer.pop_front() {
                 return Ok(Some(record));
@@ -587,13 +672,13 @@ impl DatasetIterator {
                 },
             };
             // A failed request leaves the cursor and EOF state untouched.
-            let api = self.scope.api(&self.fetcher)?;
-            let response = self
-                .execution
-                .response::<_, crate::BraintrustError, _>(async move {
-                    Ok(api_result(api.btql_json_as::<_, BTQLResponse>(&query).await)?.into_inner())
-                })
-                .await?;
+            let response = api_result(
+                self.scope
+                    .api(&self.fetcher)?
+                    .btql_json_as::<_, BTQLResponse>(&query)
+                    .await,
+            )?
+            .into_inner();
             if response.cursor.is_some() && response.cursor == previous_cursor {
                 return Err(crate::BraintrustError::Background(
                     "dataset pagination cursor did not advance".into(),
@@ -604,15 +689,6 @@ impl DatasetIterator {
             self.buffer.extend(response.data);
             // Empty pages with a continuation are not end-of-data.
         }
-    }
-
-    /// Collect all remaining records, preserving any page failure as an error.
-    pub async fn collect(mut self) -> Result<Vec<DatasetRecord>> {
-        let mut records = Vec::new();
-        while let Some(record) = self.next().await? {
-            records.push(record);
-        }
-        Ok(records)
     }
 }
 
