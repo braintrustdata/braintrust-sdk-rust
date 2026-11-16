@@ -7,7 +7,8 @@ use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use crate::error::Result;
 use crate::internal::delivery::WriteService;
-use crate::logger::LoginState;
+use crate::internal::ports::{DeliveryControl, SpanSubmitter};
+use crate::internal::session::CredentialScope;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use crate::{
@@ -21,9 +22,21 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex as TokioMutex, OnceCell};
-use tracing::warn;
 use url::Url;
+use tokio::sync::Mutex as TokioMutex;
+use tracing::warn;
+
+use crate::api::ProjectRegisterRequest;
+
+// Bound successful lookup caches too, so one shared client cannot retain an
+// unlimited number of per-tenant credentials. Eviction only repeats a lookup.
+const LOOKUP_CACHE_CAPACITY: usize = 1024;
+fn cache_insert<K: Eq + std::hash::Hash, V>(cache: &mut IndexMap<K, V>, key: K, value: V) {
+    if cache.len() >= LOOKUP_CACHE_CAPACITY && !cache.contains_key(&key) {
+        cache.shift_remove_index(0);
+    }
+    cache.insert(key, value);
+}
 
 /// Supplies the bearer token for queued uploads when they are sent.
 ///
@@ -41,16 +54,16 @@ pub trait TokenProvider: Send + Sync {
 /// How a queued item authenticates its upload.
 #[derive(Clone)]
 enum Credential {
-    Token(String),
+    Token,
     /// Fetched when the item is sent. Items share a credential only if they share
     /// the provider `Arc`.
     Provider(Arc<dyn TokenProvider>),
 }
 
 impl Credential {
-    async fn token(&self) -> std::result::Result<Cow<'_, str>, anyhow::Error> {
+    async fn token<'a>(&'a self, scope: &'a CredentialScope) -> std::result::Result<Cow<'a, str>, anyhow::Error> {
         match self {
-            Self::Token(token) => Ok(Cow::Borrowed(token)),
+            Self::Token => Ok(Cow::Borrowed(scope.token())),
             Self::Provider(provider) => provider
                 .token()
                 .await
@@ -63,7 +76,7 @@ impl Credential {
 impl PartialEq for Credential {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Token(a), Self::Token(b)) => a == b,
+            (Self::Token, Self::Token) => true,
             (Self::Provider(a), Self::Provider(b)) => {
                 std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
             }
@@ -77,7 +90,7 @@ impl Eq for Credential {}
 impl Hash for Credential {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            Self::Token(token) => token.hash(state),
+            Self::Token => 0u8.hash(state),
             Self::Provider(provider) => Arc::as_ptr(provider).cast::<()>().hash(state),
         }
     }
@@ -89,6 +102,7 @@ impl Hash for Credential {
 /// Fields are private — construction and destructuring happen only within this
 /// module. `worker.rs` never touches the fields directly.
 struct SubmitCommand {
+    scope: CredentialScope,
     credential: Credential,
     item: QueuedItem,
 }
@@ -103,8 +117,6 @@ enum QueuedItem {
     },
     /// A caller-built row, uploaded as given.
     Row {
-        org_id: String,
-        org_name: Option<String>,
         row: Map<String, Value>,
     },
 }
@@ -143,7 +155,6 @@ impl DropCounters {
 
 /// Rows bound for one upload credential (token or token provider, and org).
 struct CredentialGroup {
-    org_name: Option<String>,
     spans: Vec<Logs3Row>,
     rows: Vec<Map<String, Value>>,
 }
@@ -152,48 +163,35 @@ struct CredentialGroup {
 struct SpanBatchProcessor {
     drops: Arc<DropCounters>,
     config: LogQueueConfig,
-    login_state: LoginState,
     client: reqwest::Client,
-    api_url: Url,
-    app_url: Url,
-    project_cache: TokioMutex<IndexMap<String, String>>,
-    version_info: OnceCell<(usize, bool)>,
+    project_cache: TokioMutex<IndexMap<(CredentialScope, String), String>>,
+    version_info: TokioMutex<IndexMap<CredentialScope, (usize, bool)>>,
 }
 impl SpanBatchProcessor {
-    fn new(
-        config: LogQueueConfig,
-        drops: Arc<DropCounters>,
-        login_state: LoginState,
-        client: reqwest::Client,
-        api_url: Url,
-        app_url: Url,
-    ) -> Arc<Self> {
+    fn new(config: LogQueueConfig, drops: Arc<DropCounters>, client: reqwest::Client) -> Arc<Self> {
         Arc::new(Self {
             drops,
             config,
-            login_state,
             client,
-            api_url,
-            app_url,
             project_cache: TokioMutex::new(IndexMap::new()),
-            version_info: OnceCell::new(),
+            version_info: TokioMutex::new(IndexMap::new()),
         })
     }
 
-    /// Get the cached (max_request_size, can_use_overflow) from GET /version.
-    /// Fetches lazily on first call and caches the result.
-    async fn get_version_info(
-        &self,
-        api_url: &Url,
-        token: &str,
-        org_name: Option<&str>,
-    ) -> (usize, bool) {
-        *self
-            .version_info
-            .get_or_init(|| async {
-                fetch_version_info(&self.client, api_url, token, org_name).await
-            })
-            .await
+    /// Capabilities are cached within the exact authentication and routing scope.
+    async fn get_version_info(&self, scope: &CredentialScope) -> (usize, bool) {
+        if let Some(info) = self.version_info.lock().await.get(scope).copied() {
+            return info;
+        }
+        let info = fetch_version_info(
+            &self.client,
+            scope.api_url(),
+            scope.token(),
+            scope.org_name(),
+        )
+        .await;
+        cache_insert(&mut *self.version_info.lock().await, scope.clone(), info);
+        info
     }
 
     /// Prepare, merge, batch and upload one detached delivery generation.
@@ -211,42 +209,17 @@ impl SpanBatchProcessor {
         }
         let mut first_error = None;
 
-        // Resolve the data-plane URL. Prefer the shared login state (covers the
-        // logged-in path, including an org-specific api_url returned by login) and
-        // fall back to the client-configured URL so per-request-credential callers
-        // work without ever populating the shared login state.
-        let api_url_str = self
-            .login_state
-            .api_url()
-            .unwrap_or_else(|| self.api_url.to_string());
-        let api_url = match Url::parse(&api_url_str) {
-            Ok(url) => url,
-            Err(e) => {
-                warn!(error = %e, "Invalid API URL");
-                self.drops
-                    .upload_failed
-                    .fetch_add(cmds.len() as u64, Ordering::Relaxed);
-                return Err(e.into());
-            }
-        };
-
-        // Prepare rows and bucket them by their upload credentials. The batch
-        // "destination" is (credential, org_id): rows uploaded with different
-        // credentials or orgs must never be merged or batched into the same request
-        // under one token. `org_name` is carried alongside for the `x-bt-org-name`
-        // header.
-        let mut groups: IndexMap<(Credential, String), CredentialGroup> = IndexMap::new();
+        // Uploads and caches are isolated by the full immutable scope and token provider.
+        let mut groups: IndexMap<(CredentialScope, Credential), CredentialGroup> = IndexMap::new();
         for cmd in cmds {
-            let SubmitCommand { credential, item } = cmd;
+            let SubmitCommand { scope, credential, item } = cmd;
             match item {
                 QueuedItem::Span {
                     payload,
                     parent_info,
-                } => match self.prepare_span(&credential, payload, parent_info).await {
+                } => match self.prepare_row(&scope, payload, parent_info).await {
                     Ok(row) => {
-                        let org_id = row.org_id.clone();
-                        let org_name = row.org_name.clone();
-                        self.credential_group(&mut groups, credential, org_id, org_name)
+                        self.credential_group(&mut groups, scope, credential)
                             .spans
                             .push(row);
                     }
@@ -260,12 +233,8 @@ impl SpanBatchProcessor {
                         }
                     }
                 },
-                QueuedItem::Row {
-                    org_id,
-                    org_name,
-                    row,
-                } => self
-                    .credential_group(&mut groups, credential, org_id, org_name)
+                QueuedItem::Row { row } => self
+                    .credential_group(&mut groups, scope, credential)
                     .rows
                     .push(row),
             }
@@ -275,15 +244,14 @@ impl SpanBatchProcessor {
             return first_error.map_or(Ok(()), Err);
         }
 
-        for ((credential, _org_id), group) in groups {
+        for ((scope, credential), group) in groups {
             let CredentialGroup {
-                org_name,
                 spans,
                 rows,
             } = group;
             // Tokens from a provider are fetched now, so rows that waited in the
             // queue still go out with a current token.
-            let token = match credential.token().await {
+            let token = match credential.token(&scope).await {
                 Ok(token) => token,
                 Err(e) => {
                     warn!(error = %e, "failed to get upload token, dropping rows");
@@ -295,12 +263,8 @@ impl SpanBatchProcessor {
                 }
             };
 
-            // Version info reflects a server-wide limit, so it is fetched once
-            // (with the first group's credentials) and cached.
-            let (max_request_size, can_use_overflow) = self
-                .get_version_info(&api_url, &token, org_name.as_deref())
-                .await;
-
+            let resolved = scope.clone().with_token(token.into_owned());
+            let (max_request_size, can_use_overflow) = self.get_version_info(&resolved).await;
             // Effective batch byte limit: the smaller of the locally configured limit and half the
             // server-advertised max request size. This mirrors the TypeScript SDK which uses
             // `maxRequestSize / 2` as the batching limit, where maxRequestSize comes from /version.
@@ -331,9 +295,9 @@ impl SpanBatchProcessor {
                 let batches = self.serialized_batches(batches, count, &mut first_error);
                 if let Err(e) = self
                     .send_batches(
-                        &api_url,
-                        &token,
-                        org_name.as_deref(),
+                        resolved.api_url(),
+                        resolved.token(),
+                        resolved.org_name(),
                         batches,
                         max_request_size,
                         can_use_overflow,
@@ -355,9 +319,9 @@ impl SpanBatchProcessor {
                 let batches = self.serialized_batches(batches, count, &mut first_error);
                 if let Err(e) = self
                     .send_batches(
-                        &api_url,
-                        &token,
-                        org_name.as_deref(),
+                        resolved.api_url(),
+                        resolved.token(),
+                        resolved.org_name(),
                         batches,
                         max_request_size,
                         can_use_overflow,
@@ -371,22 +335,15 @@ impl SpanBatchProcessor {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// The upload group for a credential, created on first use. Rows without an
-    /// org name fall back to the shared login state's.
     fn credential_group<'a>(
         &self,
-        groups: &'a mut IndexMap<(Credential, String), CredentialGroup>,
+        groups: &'a mut IndexMap<(CredentialScope, Credential), CredentialGroup>,
+        scope: CredentialScope,
         credential: Credential,
-        org_id: String,
-        org_name: Option<String>,
     ) -> &'a mut CredentialGroup {
-        groups
-            .entry((credential, org_id))
-            .or_insert_with(|| CredentialGroup {
-                org_name: org_name.or_else(|| self.login_state.org_name()),
-                spans: Vec::new(),
-                rows: Vec::new(),
-            })
+        groups.entry((scope, credential)).or_insert_with(|| CredentialGroup {
+            spans: Vec::new(), rows: Vec::new(),
+        })
     }
 
     /// Unwrap a chunk's serialization result, counting its rows as dropped on failure.
@@ -464,24 +421,13 @@ impl SpanBatchProcessor {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// Prepare a span with its credential's token, which project registration uses.
-    async fn prepare_span(
-        &self,
-        credential: &Credential,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) -> std::result::Result<Logs3Row, anyhow::Error> {
-        let token = credential.token().await?;
-        self.prepare_row(&token, payload, parent_info).await
-    }
-
     /// Prepare a `Logs3Row` from a submit command's token, payload, and parent info.
     ///
     /// Resolves the destination (including calling the project registration API
     /// if needed) and builds the complete row for the flush pipeline.
     async fn prepare_row(
         &self,
-        token: &str,
+        scope: &CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> std::result::Result<Logs3Row, anyhow::Error> {
@@ -490,8 +436,8 @@ impl SpanBatchProcessor {
             span_id,
             is_merge,
             span_components,
-            org_id,
-            org_name,
+            org_id: _,
+            org_name: _,
             project_name,
             input,
             output,
@@ -506,14 +452,12 @@ impl SpanBatchProcessor {
             extra,
         } = payload;
 
+        let org_id = scope.org_id().to_owned();
+        let org_name = scope.org_name().map(str::to_owned);
+
         if let Some(span_components) = span_components {
             let destination = self
-                .destination_from_span_components(
-                    token,
-                    &org_id,
-                    org_name.as_deref(),
-                    &span_components,
-                )
+                .destination_from_span_components(scope, &span_components)
                 .await?;
             let root_span_id = span_components
                 .root_span_id
@@ -549,10 +493,7 @@ impl SpanBatchProcessor {
         }
 
         let project_id = if let Some(ref pn) = project_name {
-            Some(
-                self.ensure_project_id(token, &org_id, org_name.as_deref(), pn)
-                    .await?,
-            )
+            Some(self.ensure_project_id(scope, pn).await?)
         } else {
             None
         };
@@ -576,9 +517,7 @@ impl SpanBatchProcessor {
                 LogDestination::project_logs(object_id),
             ),
             Some(ParentSpanInfo::ProjectName { project_name }) => {
-                let proj_id = self
-                    .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name)
-                    .await?;
+                let proj_id = self.ensure_project_id(scope, &project_name).await?;
                 (span_id.clone(), None, LogDestination::project_logs(proj_id))
             }
             Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
@@ -614,14 +553,8 @@ impl SpanBatchProcessor {
                                 LogDestination::project_logs(object_id)
                             }
                             Some(ProjectLogsIdentifier::ProjectName(project_name)) => {
-                                let project_id = self
-                                    .ensure_project_id(
-                                        token,
-                                        &org_id,
-                                        org_name.as_deref(),
-                                        &project_name,
-                                    )
-                                    .await?;
+                                let project_id =
+                                    self.ensure_project_id(scope, &project_name).await?;
                                 LogDestination::project_logs(project_id)
                             }
                             None => {
@@ -671,9 +604,7 @@ impl SpanBatchProcessor {
 
     async fn destination_from_span_components(
         &self,
-        token: &str,
-        org_id: &str,
-        org_name: Option<&str>,
+        scope: &CredentialScope,
         span_components: &crate::span_components::SpanComponents,
     ) -> std::result::Result<LogDestination, anyhow::Error> {
         match span_components.object_type {
@@ -687,9 +618,7 @@ impl SpanBatchProcessor {
                     Ok(LogDestination::project_logs(object_id))
                 }
                 Some(ProjectLogsIdentifier::ProjectName(project_name)) => {
-                    let project_id = self
-                        .ensure_project_id(token, org_id, org_name, &project_name)
-                        .await?;
+                    let project_id = self.ensure_project_id(scope, &project_name).await?;
                     Ok(LogDestination::project_logs(project_id))
                 }
                 None => anyhow::bail!(
@@ -704,54 +633,29 @@ impl SpanBatchProcessor {
         }
     }
 
-    /// Ensure a project ID is available for the given project name, registering
-    /// it via the API if it is not yet cached.
-    ///
-    /// Uses `login_state.app_url()` for the registration endpoint so the URL
-    /// doesn't need to be passed separately.
+    /// Resolve project names only within the producer's immutable request scope.
     async fn ensure_project_id(
         &self,
-        token: &str,
-        org_id: &str,
-        org_name: Option<&str>,
+        scope: &CredentialScope,
         project_name: &str,
     ) -> std::result::Result<String, anyhow::Error> {
-        let cache_key = format!("{org_id}:{project_name}");
-        {
-            let cache = self.project_cache.lock().await;
-            if let Some(project_id) = cache.get(&cache_key) {
-                return Ok(project_id.clone());
-            }
+        let cache_key = (scope.clone(), project_name.to_owned());
+        if let Some(id) = self.project_cache.lock().await.get(&cache_key).cloned() {
+            return Ok(id);
         }
-
-        // Prefer the login-state control-plane URL (logged-in path), falling back
-        // to the client-configured URL for per-request-credential callers.
-        let app_url = match self.login_state.app_url() {
-            Some(app_url_str) => {
-                Url::parse(&app_url_str).map_err(|e| anyhow::anyhow!("invalid app URL: {e}"))?
-            }
-            None => self.app_url.clone(),
-        };
-        let mut request = crate::api::ProjectRegisterRequest::new(project_name.to_owned());
-        request.org_id = (!org_id.is_empty()).then(|| org_id.to_owned());
-        request.org_name = org_name.map(str::to_owned);
-
-        let client = crate::http::api_client(
-            &self.client,
-            self.api_url.as_str(),
-            app_url.as_str(),
-            token,
-            org_name,
-        )?;
-        let register_response = crate::http::api_result(client.register_project(&request).await)
-            .await?
-            .into_inner();
-
-        {
-            let mut cache = self.project_cache.lock().await;
-            cache.insert(cache_key, register_response.project.id.clone());
-        }
-        Ok(register_response.project.id)
+        let mut request = ProjectRegisterRequest::new(project_name.to_owned());
+        request.org_id = (!scope.org_id().is_empty()).then(|| scope.org_id().to_owned());
+        request.org_name = scope.org_name().map(str::to_owned);
+        let response =
+            crate::http::api_result(scope.api(&self.client)?.register_project(&request).await)
+                .await?
+                .into_inner();
+        cache_insert(
+            &mut *self.project_cache.lock().await,
+            cache_key,
+            response.project.id.clone(),
+        );
+        Ok(response.project.id)
     }
 }
 
@@ -809,6 +713,7 @@ impl RejectionReporter {
         };
         handle.spawn(async move {
             let SubmitCommand {
+                scope: _,
                 credential: _,
                 item,
             } = cmd;
@@ -951,14 +856,7 @@ pub struct LogQueue {
     writes: WriteService<SubmitCommand>,
 }
 impl LogQueue {
-    pub fn new(
-        config: LogQueueConfig,
-        login_state: LoginState,
-        client: reqwest::Client,
-        _worker_queue_size: usize,
-        api_url: Url,
-        app_url: Url,
-    ) -> Self {
+    pub fn new(config: LogQueueConfig, client: reqwest::Client, _worker_queue_size: usize) -> Self {
         let capacity = config.queue_max_size();
         let drops = Arc::new(DropCounters::default());
         let rejections = Arc::new(RejectionReporter {
@@ -968,7 +866,7 @@ impl LogQueue {
             config: config.clone(),
         });
         let processor =
-            SpanBatchProcessor::new(config, drops, login_state, client, api_url, app_url);
+            SpanBatchProcessor::new(config, drops, client);
         let writes = WriteService::new(
             capacity,
             tokio::runtime::Handle::current(),
@@ -982,12 +880,13 @@ impl LogQueue {
 
     pub fn submit(
         &self,
-        token: impl Into<String>,
+        scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> Completion<DeliveryReceipt, WriteError> {
         self.enqueue(SubmitCommand {
-            credential: Credential::Token(token.into()),
+            scope,
+            credential: Credential::Token,
             item: QueuedItem::Span {
                 payload,
                 parent_info,
@@ -1014,47 +913,16 @@ impl LogQueue {
             })
     }
 
-    /// Submit caller-built rows, uploaded as given with `token` and `org_id`.
-    ///
-    /// Each row takes one queue slot, so a full queue drops the rows that don't fit.
-    pub(crate) fn submit_rows(
-        &self,
-        token: &str,
-        org_id: &str,
-        org_name: Option<&str>,
-        rows: impl IntoIterator<Item = Map<String, Value>>,
-    ) {
-        self.submit_rows_with(Credential::Token(token.to_owned()), org_id, org_name, rows);
+    /// Submit each raw row into the same bounded delivery queue as spans.
+    pub(crate) fn submit_rows(&self, scope: CredentialScope, rows: impl IntoIterator<Item = Map<String, Value>>) {
+        self.submit_rows_with(scope, Credential::Token, rows);
     }
-
-    /// Submit caller-built rows whose token is fetched from `provider` when they
-    /// are sent.
-    pub(crate) fn submit_rows_with_provider(
-        &self,
-        provider: Arc<dyn TokenProvider>,
-        org_id: &str,
-        org_name: Option<&str>,
-        rows: impl IntoIterator<Item = Map<String, Value>>,
-    ) {
-        self.submit_rows_with(Credential::Provider(provider), org_id, org_name, rows);
+    pub(crate) fn submit_rows_with_provider(&self, provider: Arc<dyn TokenProvider>, scope: CredentialScope, rows: impl IntoIterator<Item = Map<String, Value>>) {
+        self.submit_rows_with(scope, Credential::Provider(provider), rows);
     }
-
-    fn submit_rows_with(
-        &self,
-        credential: Credential,
-        org_id: &str,
-        org_name: Option<&str>,
-        rows: impl IntoIterator<Item = Map<String, Value>>,
-    ) {
+    fn submit_rows_with(&self, scope: CredentialScope, credential: Credential, rows: impl IntoIterator<Item = Map<String, Value>>) {
         for row in rows {
-            self.enqueue(SubmitCommand {
-                credential: credential.clone(),
-                item: QueuedItem::Row {
-                    org_id: org_id.to_owned(),
-                    org_name: org_name.map(str::to_owned),
-                    row,
-                },
-            });
+            self.enqueue(SubmitCommand { scope: scope.clone(), credential: credential.clone(), item: QueuedItem::Row { row } });
         }
     }
 
@@ -1085,10 +953,32 @@ impl LogQueue {
     }
 }
 
+#[async_trait::async_trait]
+impl DeliveryControl for LogQueue {
+    fn flush(&self) -> Completion<FlushReport, FlushError> {
+        LogQueue::flush(self)
+    }
+    async fn trigger_flush(&self) -> Result<()> {
+        self.trigger_flush_command().await
+    }
+}
+#[async_trait::async_trait]
+impl SpanSubmitter for LogQueue {
+    fn submit(
+        &self,
+        scope: CredentialScope,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        LogQueue::submit(self, scope, payload, parent_info)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use url::Url;
     use wiremock::{
         matchers::{header, method, path},
         Mock, MockServer, ResponseTemplate,
@@ -1116,12 +1006,18 @@ mod tests {
             extra: std::collections::HashMap::new(),
         }
     }
-    fn queue(server: &MockServer) -> LogQueue {
+    fn queue(_server: &MockServer) -> LogQueue {
         LogQueue::new(
             LogQueueConfig::builder().num_retries(0).build(),
-            LoginState::new(),
             reqwest::Client::new(),
             32,
+        )
+    }
+    fn scope(server: &MockServer, token: &str) -> CredentialScope {
+        CredentialScope::new(
+            token.into(),
+            "org".into(),
+            Some("tenant".into()),
             Url::parse(&server.uri()).unwrap(),
             Url::parse(&server.uri()).unwrap(),
         )
@@ -1138,7 +1034,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/version"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -1156,9 +1052,9 @@ mod tests {
             .mount(&server)
             .await;
         let queue = queue(&server);
-        let first = queue.submit("good", payload("merged", false), parent());
-        let update = queue.submit("good", payload("merged", true), parent());
-        let last = queue.submit("bad", payload("other", false), parent());
+        let first = queue.submit(scope(&server, "good"), payload("merged", false), parent());
+        let update = queue.submit(scope(&server, "good"), payload("merged", true), parent());
+        let last = queue.submit(scope(&server, "bad"), payload("other", false), parent());
         let Err(FlushError::Delivery(failure)) = queue.flush().await else {
             panic!("expected failed flush");
         };
@@ -1183,7 +1079,7 @@ mod tests {
         let first_body: Value = serde_json::from_slice(&uploads[0].body).unwrap();
         assert_eq!(first_body["rows"].as_array().unwrap().len(), 1);
         assert_eq!(first_body["rows"][0]["input"]["value"], 2);
-        let fresh = queue.submit("good", payload("fresh", false), parent());
+        let fresh = queue.submit(scope(&server, "good"), payload("fresh", false), parent());
         assert_eq!(queue.flush().await.unwrap().delivered, 1);
         fresh.await.unwrap();
         queue
@@ -1217,8 +1113,16 @@ mod tests {
             .mount(&server)
             .await;
         let queue = queue(&server);
-        let first = queue.submit("token", payload("committed", false), parent());
-        let last = queue.submit("token", payload("late-failure", false), parent());
+        let first = queue.submit(
+            scope(&server, "token"),
+            payload("committed", false),
+            parent(),
+        );
+        let last = queue.submit(
+            scope(&server, "token"),
+            payload("late-failure", false),
+            parent(),
+        );
         let Err(FlushError::Delivery(failure)) = queue.flush().await else {
             panic!("expected failure");
         };
