@@ -16,6 +16,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BraintrustError {
+    #[error(transparent)]
+    Execution(#[from] crate::ExecutionError),
+    #[error(transparent)]
+    Admission(#[from] crate::EnqueueError),
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
     #[error("http error: {0}")]

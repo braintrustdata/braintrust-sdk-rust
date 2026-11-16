@@ -21,13 +21,13 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    runtime::Handle,
     sync::{oneshot, Semaphore},
     task::AbortHandle,
 };
 use tracing::warn;
 
-use crate::internal::write_outcome::{WriteOutcome, WriteResponder};
+use crate::internal::execution::ExecutionBinding;
+use crate::internal::shared_outcome::{WriteOutcome, WriteResponder};
 type WriteSender = WriteResponder;
 type FlushSender = oneshot::Sender<Result<FlushReport, FlushError>>;
 /// Generic delivery coordination for an injected batch processor. Producers own
@@ -48,7 +48,7 @@ impl<C> Clone for WriteService<C> {
 struct Producer<C> {
     inner: Arc<Inner<C>>,
     abort: AbortHandle,
-    runtime: Handle,
+    runtime: ExecutionBinding,
     exit: Shared<BoxFuture<'static, Result<(), ExecutionError>>>,
     control_limit: usize,
     shutdown_controls: Arc<Semaphore>,
@@ -59,7 +59,7 @@ impl<C> Drop for Producer<C> {
     }
 }
 impl<C: Send + 'static> WriteService<C> {
-    pub fn new<F>(capacity: usize, runtime: Handle, process: F) -> Self
+    pub fn new<F>(capacity: usize, runtime: ExecutionBinding, process: F) -> Self
     where
         F: Fn(Vec<C>) -> BoxFuture<'static, anyhow::Result<()>> + Send + 'static,
     {
@@ -213,6 +213,11 @@ impl<C: Send + 'static> WriteService<C> {
             let _ = sender.send(result);
         });
         completion
+    }
+
+    pub fn cancel(&self, error: ExecutionError) {
+        self.producer.inner.stop(error);
+        self.producer.abort.abort();
     }
 
     #[cfg(test)]
@@ -850,15 +855,19 @@ mod tests {
         let (entered, receiver) = mpsc::unbounded_channel();
         let gate = Arc::new(Semaphore::new(0));
         let process_gate = gate.clone();
-        let service = WriteService::new(capacity, Handle::current(), move |commands| {
-            let gate = process_gate.clone();
-            let entered = entered.clone();
-            Box::pin(async move {
-                entered.send(commands).unwrap();
-                gate.acquire().await.unwrap().forget();
-                Ok(())
-            })
-        });
+        let service = WriteService::new(
+            capacity,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
+            move |commands| {
+                let gate = process_gate.clone();
+                let entered = entered.clone();
+                Box::pin(async move {
+                    entered.send(commands).unwrap();
+                    gate.acquire().await.unwrap().forget();
+                    Ok(())
+                })
+            },
+        );
         (service, receiver, gate)
     }
 
@@ -894,18 +903,22 @@ mod tests {
         let (entered, mut receiver) = mpsc::unbounded_channel();
         let gate = Arc::new(Semaphore::new(0));
         let process_gate = gate.clone();
-        let service = WriteService::new(4, Handle::current(), move |commands: Vec<usize>| {
-            let entered = entered.clone();
-            let gate = process_gate.clone();
-            Box::pin(async move {
-                entered.send(commands.clone()).unwrap();
-                gate.acquire().await.unwrap().forget();
-                if commands == [1] {
-                    anyhow::bail!("first batch failed");
-                }
-                Ok(())
-            })
-        });
+        let service = WriteService::new(
+            4,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
+            move |commands: Vec<usize>| {
+                let entered = entered.clone();
+                let gate = process_gate.clone();
+                Box::pin(async move {
+                    entered.send(commands.clone()).unwrap();
+                    gate.acquire().await.unwrap().forget();
+                    if commands == [1] {
+                        anyhow::bail!("first batch failed");
+                    }
+                    Ok(())
+                })
+            },
+        );
         let first = service.enqueue(1);
         assert_eq!(receiver.recv().await.unwrap(), vec![1]);
         let second = service.enqueue(2);
@@ -926,11 +939,15 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_shutdown_reports_its_failed_batch_after_notifying_all_writes() {
-        let service = WriteService::new(4, Handle::current(), |_: Vec<usize>| {
-            Box::pin(async {
-                anyhow::bail!("terminal failure");
-            })
-        });
+        let service = WriteService::new(
+            4,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
+            |_: Vec<usize>| {
+                Box::pin(async {
+                    anyhow::bail!("terminal failure");
+                })
+            },
+        );
         let first = service.enqueue(1);
         let second = service.enqueue(2);
         let shutdown = service.shutdown(Duration::from_secs(1));
@@ -983,15 +1000,19 @@ mod tests {
     async fn every_failed_batch_notifies_all_members_releases_errors_and_allows_fresh_work() {
         let fail = Arc::new(AtomicBool::new(true));
         let process_fail = fail.clone();
-        let service = WriteService::new(4, Handle::current(), move |_: Vec<usize>| {
-            let fail = process_fail.load(Ordering::Relaxed);
-            Box::pin(async move {
-                if fail {
-                    anyhow::bail!("terminal failure");
-                }
-                Ok(())
-            })
-        });
+        let service = WriteService::new(
+            4,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
+            move |_: Vec<usize>| {
+                let fail = process_fail.load(Ordering::Relaxed);
+                Box::pin(async move {
+                    if fail {
+                        anyhow::bail!("terminal failure");
+                    }
+                    Ok(())
+                })
+            },
+        );
         for _ in 0..100 {
             let first = service.enqueue(1);
             let second = service.enqueue(2);
@@ -1143,15 +1164,19 @@ mod tests {
         let (entered, mut receiver) = mpsc::unbounded_channel();
         let gate = Arc::new(Semaphore::new(0));
         let process_gate = gate.clone();
-        let service = WriteService::new(4, Handle::current(), move |_: Vec<usize>| {
-            let entered = entered.clone();
-            let gate = process_gate.clone();
-            Box::pin(async move {
-                entered.send(()).unwrap();
-                gate.acquire().await.unwrap().forget();
-                panic!("test processor failed");
-            })
-        });
+        let service = WriteService::new(
+            4,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
+            move |_: Vec<usize>| {
+                let entered = entered.clone();
+                let gate = process_gate.clone();
+                Box::pin(async move {
+                    entered.send(()).unwrap();
+                    gate.acquire().await.unwrap().forget();
+                    panic!("test processor failed");
+                })
+            },
+        );
         let active = service.enqueue(1);
         receiver.recv().await.unwrap();
         let pending = service.enqueue(2);
@@ -1216,7 +1241,7 @@ mod tests {
         for (fail, cancel) in [(false, false), (true, false), (false, true)] {
             let service = WriteService::new(
                 1,
-                tokio::runtime::Handle::current(),
+                ExecutionBinding::external(tokio::runtime::Handle::current()),
                 move |_: Vec<usize>| {
                     Box::pin(async move {
                         if fail {
@@ -1259,11 +1284,15 @@ mod tests {
         let processed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let process_seen = seen.clone();
         let process_count = processed.clone();
-        let service = WriteService::new(1024, Handle::current(), move |commands: Vec<usize>| {
-            lock(&process_seen).extend(commands.iter().copied());
-            process_count.fetch_add(commands.len(), Ordering::Relaxed);
-            Box::pin(async { Ok(()) })
-        });
+        let service = WriteService::new(
+            1024,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
+            move |commands: Vec<usize>| {
+                lock(&process_seen).extend(commands.iter().copied());
+                process_count.fetch_add(commands.len(), Ordering::Relaxed);
+                Box::pin(async { Ok(()) })
+            },
+        );
         let (writes, flushes) = std::thread::scope(|scope| {
             let producers: Vec<_> = (0..4)
                 .map(|producer| {

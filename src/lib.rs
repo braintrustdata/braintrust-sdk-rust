@@ -15,6 +15,7 @@ mod json_merge;
 mod log_queue;
 mod logger;
 mod logs3;
+mod runtime;
 mod span;
 mod span_components;
 mod stream;
@@ -43,6 +44,7 @@ pub use logger::{
     DEFAULT_APP_URL,
 };
 pub use logs3::{Logs3BatchUploader, Logs3UploadResult};
+pub use runtime::current_runtime;
 pub use span::{
     SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanOrigin, SpanOriginEnvironment,
 };
