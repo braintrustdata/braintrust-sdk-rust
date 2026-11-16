@@ -76,11 +76,10 @@ pub(crate) fn batch_and_serialize_rows(
                     return Err(error);
                 }
             };
-            let overflow_row = Logs3OverflowInputRow {
-                input_row: Logs3OverflowInputRowMeta {
-                    byte_size: row_bytes.len(),
-                },
-                ..overflow_row
+            let overflow_row = {
+                let mut value = overflow_row;
+                value.input_row = Logs3OverflowInputRowMeta::new(row_bytes.len());
+                value
             };
             Ok((row_bytes, overflow_row))
         })
@@ -170,10 +169,11 @@ fn build_overflow_row_from_logs3row(row: &Logs3Row) -> Logs3OverflowInputRow {
         );
     }
 
-    Logs3OverflowInputRow {
-        object_ids,
-        is_delete: row.object_delete.filter(|&b| b),
-        input_row: Logs3OverflowInputRowMeta { byte_size: 0 }, // Will be updated after serialization
+    // The byte size is updated after serialization.
+    {
+        let mut value = Logs3OverflowInputRow::new(object_ids, Logs3OverflowInputRowMeta::new(0));
+        value.is_delete = row.object_delete.filter(|&b| b);
+        value
     }
 }
 

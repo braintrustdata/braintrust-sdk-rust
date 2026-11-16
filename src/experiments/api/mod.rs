@@ -9,7 +9,6 @@ pub(crate) mod traits;
 
 pub(crate) use comparison::ExperimentComparisonResponse;
 pub(crate) use registration::{
-    BaseExperimentRequest, BaseExperimentResponse, ExperimentRegisterRequest,
-    ExperimentRegisterResponse,
+    BaseExperimentResponse, ExperimentRegisterRequest, ExperimentRegisterResponse,
 };
 pub(crate) use traits::{BaseExperimentFetcher, ExperimentComparisonFetcher, ExperimentRegistrar};

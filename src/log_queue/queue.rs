@@ -1,6 +1,4 @@
-use anyhow::Context;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
 use super::batching::batch_and_serialize_rows;
 use super::config::LogQueueConfig;
@@ -23,28 +21,6 @@ use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, OnceCell};
 use tokio::task::JoinHandle;
 use tracing::warn;
 use url::Url;
-
-/// Request body for project registration.
-#[derive(Serialize)]
-struct ProjectRegisterRequest<'a> {
-    project_name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_name: Option<&'a str>,
-}
-
-/// Response from project registration.
-#[derive(Deserialize)]
-struct ProjectRegisterResponse {
-    project: ProjectInfo,
-}
-
-/// Project info in registration response.
-#[derive(Deserialize)]
-struct ProjectInfo {
-    id: String,
-}
 
 /// A raw span payload queued for deferred preparation and flushing.
 ///
@@ -708,37 +684,20 @@ impl LogQueueCore {
             }
             None => self.app_url.clone(),
         };
-        let url = app_url
-            .join("api/project/register")
-            .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
+        let mut request = crate::api::ProjectRegisterRequest::new(project_name.to_owned());
+        request.org_id = (!org_id.is_empty()).then(|| org_id.to_owned());
+        request.org_name = org_name.map(str::to_owned);
 
-        let request = ProjectRegisterRequest {
-            project_name,
-            org_id: (!org_id.is_empty()).then_some(org_id),
+        let client = crate::http::api_client(
+            &self.client,
+            self.api_url.as_str(),
+            app_url.as_str(),
+            token,
             org_name,
-        };
-
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(BraintrustError::Api {
-                status: status.as_u16(),
-                message: text,
-            }
-            .into());
-        }
-
-        let register_response: ProjectRegisterResponse = response
-            .json()
-            .await
-            .context("failed to parse project registration response")?;
+        )?;
+        let register_response = crate::http::api_result(client.register_project(&request).await)
+            .await?
+            .into_inner();
 
         {
             let mut cache = self.project_cache.lock().await;
