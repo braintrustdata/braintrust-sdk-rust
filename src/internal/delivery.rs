@@ -355,25 +355,28 @@ impl<C> State<C> {
             failure: None,
         });
     }
-    fn finish(&mut self, result: &Result<(), Arc<DeliveryError>>) -> usize {
+    fn finish(
+        &mut self,
+        result: &Result<(), Arc<DeliveryError>>,
+    ) -> (Vec<WriteSender>, Vec<Barrier<C>>) {
         let active = self.active.take().expect("active batch");
         let count = active.senders.len();
-        finish_writes(active.senders, result.clone().map_err(WriteError::Delivery));
+        let mut completed = Vec::new();
         // Every registered barrier covers this batch: completed cutoffs
         // are removed here, before admitting any subsequent flush.
         for barrier in &mut self.barriers {
             barrier.record(count as u64, result);
         }
-        // Cutoffs follow admission order, so completed observers leave from
-        // the front and their senders never need an intermediate empty state.
+        // Remove completed cutoffs before admitting another flush. Their
+        // notifications are published after capacity retirement.
         while self
             .barriers
             .front()
             .is_some_and(|barrier| Arc::ptr_eq(&barrier.through, &active.epoch))
         {
-            self.barriers.pop_front().expect("checked above").finish();
+            completed.push(self.barriers.pop_front().expect("checked above"));
         }
-        count
+        (active.senders, completed)
     }
 }
 struct Inner<C> {
@@ -444,8 +447,8 @@ impl<C> Inner<C> {
     fn fail_epoch(&self, epoch: &QueueEpoch<C>, error: ExecutionError) {
         while let Some(entry) = epoch.queue.pop() {
             let accepted = entry.take().expect("each queue entry is taken once");
-            let _ = accepted.sender.send(Err(error.into()));
             self.release(1);
+            let _ = accepted.sender.send(Err(error.into()));
         }
     }
 
@@ -475,18 +478,25 @@ impl<C> Inner<C> {
         // returning processor cannot report success after shutdown has failed it.
         self.terminal.store(code, Ordering::SeqCst);
         self.close(&mut state);
-        if let Some(active) = state.active.take() {
+        let active = state.active.take();
+        let ready: Vec<_> = state.ready.drain(..).collect();
+        let barriers: Vec<_> = state.barriers.drain(..).collect();
+        // Deferred commands can own the last producer. Destroying one can close
+        // the queue again, so notifications and command drops happen unlocked.
+        drop(state);
+        if let Some(active) = active {
             let count = active.senders.len();
-            finish_writes(active.senders, Err(error.into()));
             self.release(count);
+            finish_writes(active.senders, Err(error.into()));
             self.fail_epoch(&active.epoch, error);
         }
-        for epoch in state.ready.drain(..) {
+        for epoch in ready {
             self.fail_epoch(&epoch, error);
         }
-        for barrier in state.barriers.drain(..) {
+        for barrier in barriers {
             let _ = barrier.sender.send(Err(error.into()));
         }
+
         error
     }
     fn close(&self, state: &mut State<C>) {
@@ -561,8 +571,8 @@ where
                 drop(state);
                 // stop() drains the rest of the epoch; these entries were
                 // already taken and remain the worker's responsibility.
-                finish_writes(senders, Err(error.into()));
                 guard.inner.release(commands.len());
+                finish_writes(senders, Err(error.into()));
                 break;
             }
             state.active.as_mut().expect("active batch").senders = senders;
@@ -581,8 +591,13 @@ where
         if guard.inner.terminal_error().is_some() {
             break;
         }
-        let count = state.finish(&result);
-        guard.inner.release(count);
+        let (writes, barriers) = state.finish(&result);
+        guard.inner.release(writes.len());
+        drop(state);
+        finish_writes(writes, result.map_err(WriteError::Delivery));
+        for barrier in barriers {
+            barrier.finish();
+        }
     }
     if let Some(exit) = guard.exit.take() {
         let result = guard.inner.terminal_error().map_or(Ok(()), Err);
@@ -1147,6 +1162,68 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn write_completion_observes_retired_capacity_and_unlocked_control() {
+        use futures::task::{waker, ArcWake};
+        use std::{future::Future, task::Context};
+
+        struct ObserveCompletion {
+            inner: Arc<Inner<usize>>,
+            outstanding: AtomicUsize,
+            control_unlocked: AtomicBool,
+            wake: tokio::sync::Notify,
+        }
+        impl ArcWake for ObserveCompletion {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.outstanding.store(
+                    this.inner.outstanding.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                this.control_unlocked
+                    .store(this.inner.state.try_lock().is_ok(), Ordering::Release);
+                this.wake.notify_one();
+            }
+        }
+        for (fail, cancel) in [(false, false), (true, false), (false, true)] {
+            let service = WriteService::new(
+                1,
+                tokio::runtime::Handle::current(),
+                move |_: Vec<usize>| {
+                    Box::pin(async move {
+                        if fail {
+                            anyhow::bail!("processor failed");
+                        }
+                        Ok(())
+                    })
+                },
+            );
+            let observer = Arc::new(ObserveCompletion {
+                inner: service.producer.inner.clone(),
+                outstanding: AtomicUsize::new(usize::MAX),
+                control_unlocked: AtomicBool::new(false),
+                wake: tokio::sync::Notify::new(),
+            });
+            let mut completion = Box::pin(service.enqueue(1).into_future());
+            let waker = waker(observer.clone());
+            assert!(completion
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            if cancel {
+                service.producer.inner.stop(ExecutionError::WorkerLost);
+            }
+            tokio::time::timeout(Duration::from_secs(5), observer.wake.notified())
+                .await
+                .unwrap();
+            assert_eq!(observer.outstanding.load(Ordering::Acquire), 0);
+            assert!(observer.control_unlocked.load(Ordering::Acquire));
+            assert_eq!(completion.await.is_err(), fail || cancel);
+            if !cancel {
+                service.shutdown(Duration::from_secs(1)).await.unwrap();
+            }
         }
     }
 
