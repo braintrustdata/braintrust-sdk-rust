@@ -347,7 +347,7 @@ async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
         .filter(|request| request.url.path() == "/logs3")
         .collect();
     assert_eq!(logs_requests.len(), contexts.len() * 3);
-    for (requests, context) in logs_requests.chunks_exact(3).zip(&contexts) {
+    for (requests, context) in logs_requests.as_chunks::<3>().0.iter().zip(&contexts) {
         for (index, request) in requests.iter().enumerate() {
             let body: Value = serde_json::from_slice(&request.body).expect("json body");
             let rows = body["rows"].as_array().expect("rows");
