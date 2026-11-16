@@ -3,6 +3,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::internal::session::CredentialScope;
+use crate::internal::write_outcome::WriteOutcome;
 use crate::types::{ParentSpanInfo, SpanPayload};
 
 #[async_trait]
@@ -14,5 +15,6 @@ pub(crate) trait SpanSubmitter: Send + Sync {
         scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
+        outcome: Option<WriteOutcome>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
 }

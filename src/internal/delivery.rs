@@ -27,7 +27,8 @@ use tokio::{
 };
 use tracing::warn;
 
-type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
+use crate::internal::write_outcome::{WriteOutcome, WriteResponder};
+type WriteSender = WriteResponder;
 type FlushSender = oneshot::Sender<Result<FlushReport, FlushError>>;
 /// Generic delivery coordination for an injected batch processor. Producers own
 /// no completed-outcome registry: a batch owns its write senders until all its
@@ -107,19 +108,22 @@ impl<C: Send + 'static> WriteService<C> {
 
     #[cfg(test)]
     pub fn enqueue(&self, command: C) -> Completion<DeliveryReceipt, WriteError> {
-        self.enqueue_with_rejection(command, |_, _| {})
+        self.enqueue_with_rejection(command, None, |_, _| {})
     }
 
     pub fn enqueue_with_rejection(
         &self,
         command: C,
+        outcome: Option<WriteOutcome>,
         rejected: impl FnOnce(C, EnqueueError),
     ) -> Completion<DeliveryReceipt, WriteError> {
         let producer = &self.producer;
         let (sender, mut completion) = Completion::pair();
+        let sender = WriteResponder::new(sender, outcome);
         match producer.inner.admit() {
             Err(error) => {
                 completion.record_issuance(Err(error.into()));
+                let _ = sender.send(Err(error.into()));
                 rejected(command, error);
             }
             Ok((epoch, depth)) => {
@@ -647,10 +651,13 @@ mod tests {
                 .await
                 .is_err()
         );
-        service
-            .producer
-            .inner
-            .publish(&epoch, Accepted { command: 2, sender });
+        service.producer.inner.publish(
+            &epoch,
+            Accepted {
+                command: 2,
+                sender: WriteResponder::new(sender, None),
+            },
+        );
         gate.add_permits(1);
         assert!(first.await.is_ok());
         assert_eq!(entered.recv().await.unwrap(), vec![2]);
@@ -678,10 +685,13 @@ mod tests {
             &service.producer.inner.ingress.load_full()
         ));
         let after = service.enqueue(3);
-        service
-            .producer
-            .inner
-            .publish(&old_epoch, Accepted { command: 2, sender });
+        service.producer.inner.publish(
+            &old_epoch,
+            Accepted {
+                command: 2,
+                sender: WriteResponder::new(sender, None),
+            },
+        );
 
         gate.add_permits(1);
         first.await.unwrap();
@@ -732,10 +742,13 @@ mod tests {
             first.await,
             Err(WriteError::Execution(ExecutionError::WorkerLost))
         ));
-        service
-            .producer
-            .inner
-            .publish(&old_epoch, Accepted { command: 2, sender });
+        service.producer.inner.publish(
+            &old_epoch,
+            Accepted {
+                command: 2,
+                sender: WriteResponder::new(sender, None),
+            },
+        );
         assert!(matches!(
             late.await,
             Err(WriteError::Execution(ExecutionError::WorkerLost))
@@ -1098,11 +1111,13 @@ mod tests {
     #[tokio::test]
     async fn worker_cancellation_before_first_poll_completes_every_accepted_sender() {
         let (service, _, _) = gated(4);
-        let first = service.enqueue(1);
+        let outcome = WriteOutcome::default();
+        let first = service.enqueue_with_rejection(1, Some(outcome.clone()), |_, _| {});
+        let repeated_end = outcome.observe();
         let second = service.enqueue(2);
         let flush = service.flush();
         service.producer.abort.abort();
-        for completion in [first, second] {
+        for completion in [first, second, repeated_end] {
             assert!(matches!(
                 completion.await,
                 Err(WriteError::Execution(ExecutionError::WorkerLost))
@@ -1111,6 +1126,10 @@ mod tests {
         assert!(matches!(
             flush.await,
             Err(FlushError::Execution(ExecutionError::WorkerLost))
+        ));
+        assert!(matches!(
+            outcome.observe().await,
+            Err(WriteError::Execution(ExecutionError::WorkerLost))
         ));
         assert!(service.is_empty());
         assert!(matches!(

@@ -9,6 +9,7 @@ use crate::error::Result;
 use crate::internal::delivery::WriteService;
 use crate::internal::ports::SpanSubmitter;
 use crate::internal::session::CredentialScope;
+use crate::internal::write_outcome::WriteOutcome;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use crate::{
@@ -647,6 +648,7 @@ impl LogQueue {
         scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
+        outcome: Option<WriteOutcome>,
     ) -> Completion<DeliveryReceipt, WriteError> {
         let command = SubmitCommand {
             scope,
@@ -654,7 +656,7 @@ impl LogQueue {
             parent_info,
         };
         self.writes
-            .enqueue_with_rejection(command, |command, error| {
+            .enqueue_with_rejection(command, outcome, |command, error| {
                 self.rejections
                     .dropped_count
                     .fetch_add(1, Ordering::Relaxed);
@@ -702,8 +704,9 @@ impl SpanSubmitter for LogQueue {
         scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
+        outcome: Option<WriteOutcome>,
     ) -> Completion<DeliveryReceipt, WriteError> {
-        LogQueue::submit(self, scope, payload, parent_info)
+        LogQueue::submit(self, scope, payload, parent_info, outcome)
     }
 }
 
@@ -785,9 +788,24 @@ mod tests {
             .mount(&server)
             .await;
         let queue = queue(&server);
-        let first = queue.submit(scope(&server, "good"), payload("merged", false), parent());
-        let update = queue.submit(scope(&server, "good"), payload("merged", true), parent());
-        let last = queue.submit(scope(&server, "bad"), payload("other", false), parent());
+        let first = queue.submit(
+            scope(&server, "good"),
+            payload("merged", false),
+            parent(),
+            None,
+        );
+        let update = queue.submit(
+            scope(&server, "good"),
+            payload("merged", true),
+            parent(),
+            None,
+        );
+        let last = queue.submit(
+            scope(&server, "bad"),
+            payload("other", false),
+            parent(),
+            None,
+        );
         let Err(FlushError::Delivery(failure)) = queue.flush().await else {
             panic!("expected failed flush");
         };
@@ -812,7 +830,12 @@ mod tests {
         let first_body: Value = serde_json::from_slice(&uploads[0].body).unwrap();
         assert_eq!(first_body["rows"].as_array().unwrap().len(), 1);
         assert_eq!(first_body["rows"][0]["input"]["value"], 2);
-        let fresh = queue.submit(scope(&server, "good"), payload("fresh", false), parent());
+        let fresh = queue.submit(
+            scope(&server, "good"),
+            payload("fresh", false),
+            parent(),
+            None,
+        );
         assert_eq!(queue.flush().await.unwrap().delivered, 1);
         fresh.await.unwrap();
         queue
@@ -850,11 +873,13 @@ mod tests {
             scope(&server, "token"),
             payload("committed", false),
             parent(),
+            None,
         );
         let last = queue.submit(
             scope(&server, "token"),
             payload("late-failure", false),
             parent(),
+            None,
         );
         let Err(FlushError::Delivery(failure)) = queue.flush().await else {
             panic!("expected failure");
