@@ -1,10 +1,8 @@
 use super::batching::SerializedBatch;
 use super::config::LogQueueConfig;
-use crate::api::transport::{Logs3OverflowRequest, Logs3OverflowUpload};
-use crate::error::BraintrustError;
-use crate::http::{api_client, api_result};
+use crate::internal::upload::{Capabilities, UploadCoordinator, UploadPolicy};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use url::Url;
 
@@ -28,37 +26,32 @@ pub(crate) fn save_payload_debug(
     Ok(())
 }
 
-/// Fetch logging capabilities, falling back to conservative defaults when unavailable.
+/// Compatibility adapter for the queue; protocol behavior lives in one coordinator.
 pub(crate) async fn fetch_version_info(
     client: &reqwest::Client,
     api_url: &Url,
     token: &str,
     org_name: Option<&str>,
 ) -> (usize, bool) {
-    let result = async {
-        let api = api_client(
-            client,
-            api_url.as_str(),
-            crate::api::DEFAULT_APP_URL,
-            token,
-            org_name,
-        )?;
-        api_result(api.version().await).await
-    }
-    .await;
-    match result {
-        Ok(version) => match version.logs3_payload_max_bytes.filter(|limit| *limit > 0) {
-            Some(limit) => (limit, true),
-            None => (crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2, false),
-        },
+    let fallback = crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2;
+    match UploadCoordinator::new(
+        client.clone(),
+        api_url,
+        token,
+        org_name,
+        UploadPolicy::Queue { retries: 0 },
+    ) {
+        Ok(coordinator) => {
+            let capabilities = coordinator.capabilities(fallback, None).await;
+            (capabilities.max_request_size, capabilities.overflow)
+        }
         Err(error) => {
-            warn!(%error, "Failed to fetch version info");
-            (crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2, false)
+            warn!(%error, "invalid ingestion scope");
+            (fallback, false)
         }
     }
 }
 
-/// Deliver a serialized batch, preserving retry and staged overflow semantics.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_batch_with_retry(
     client: &reqwest::Client,
@@ -70,91 +63,30 @@ pub(crate) async fn send_batch_with_retry(
     max_request_size: usize,
     can_use_overflow: bool,
 ) -> Result<(), anyhow::Error> {
-    let json_bytes = batch.data;
-    save_payload_debug(&json_bytes, config.all_publish_payloads_dir(), "all").ok();
-    let api = api_client(
-        client,
-        api_url.as_str(),
-        crate::api::DEFAULT_APP_URL,
+    save_payload_debug(&batch.data, config.all_publish_payloads_dir(), "all").ok();
+    let data = batch.data.clone();
+    let coordinator = UploadCoordinator::new(
+        client.clone(),
+        api_url,
         token,
         org_name,
-    )
-    .inspect_err(|_| {
-        save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed").ok();
-    })?;
-    let use_overflow = can_use_overflow && json_bytes.len() > max_request_size;
-    let mut overflow_upload: Option<Logs3OverflowUpload> = None;
-    for attempt in 0..=config.num_retries() {
-        if attempt > 0 {
-            let delay_secs = 1u64.checked_shl((attempt - 1) as u32).unwrap_or(30).min(30);
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-        }
-        if use_overflow && overflow_upload.is_none() {
-            let upload = async {
-                let upload = api_result(
-                    api.logs3_overflow(&{
-                        let mut value = Logs3OverflowRequest::new(batch.overflow_rows.clone());
-                        value.content_type = Some("application/json".to_owned());
-                        value.size_bytes = Some(json_bytes.len());
-                        value
-                    })
-                    .await,
-                )
-                .await?
-                .into_inner();
-                api_result(api.upload_logs3_overflow(&upload, json_bytes.clone()).await).await?;
-                Ok::<_, BraintrustError>(upload)
-            }
-            .await;
-            match upload {
-                Ok(upload) => overflow_upload = Some(upload),
-                Err(error) => {
-                    if attempt < config.num_retries() {
-                        warn!(%error, attempt, "overflow upload failed, retrying");
-                        continue;
-                    }
-                    save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
-                        .ok();
-                    return Err(error.into());
-                }
-            }
-        }
-        let payload = match &overflow_upload {
-            Some(upload) => serde_json::to_vec(&serde_json::json!({
-                "rows": upload.reference(),
-                "api_version": crate::types::LOGS_API_VERSION,
-            }))?,
-            None => json_bytes.clone(),
-        };
-        let started = Instant::now();
-        match api_result(api.logs3_raw(payload).await).await {
-            Ok(_) => {
-                tracing::debug!(
-                    bytes = json_bytes.len(),
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "batch sent"
-                );
-                return Ok(());
-            }
-            Err(error) => {
-                let retryable = match &error {
-                    BraintrustError::Api { status, .. } => {
-                        *status == 429 || (500..=599).contains(status)
-                    }
-                    BraintrustError::Http(_) => true,
-                    _ => false,
-                };
-                if retryable && attempt < config.num_retries() {
-                    warn!(%error, attempt, "batch send failed, retrying");
-                    continue;
-                }
-                save_payload_debug(&json_bytes, config.failed_publish_payloads_dir(), "failed")
-                    .ok();
-                return Err(error.into());
-            }
-        }
+        UploadPolicy::Queue {
+            retries: config.num_retries(),
+        },
+    )?;
+    let result = coordinator
+        .upload(
+            batch,
+            Capabilities {
+                max_request_size,
+                overflow: can_use_overflow,
+            },
+        )
+        .await;
+    if result.is_err() {
+        save_payload_debug(&data, config.failed_publish_payloads_dir(), "failed").ok();
     }
-    unreachable!("retry loop always returns")
+    result.map(|_| ()).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -162,124 +94,14 @@ mod tests {
     use super::*;
     use crate::log_queue::config::LogQueueConfig;
 
-    fn make_batch(data: &[u8]) -> SerializedBatch {
-        SerializedBatch {
-            data: data.to_vec(),
-            overflow_rows: vec![],
-        }
-    }
-
-    #[tokio::test]
-    async fn invalid_credentials_still_save_failed_payload_debug() {
-        let directory =
-            std::env::temp_dir().join(format!("braintrust-failed-{}", uuid::Uuid::new_v4()));
-        let config = LogQueueConfig::builder()
-            .num_retries(0)
-            .failed_publish_payloads_dir(directory.clone())
-            .build();
-        let payload = b"{\"rows\":[],\"api_version\":2}";
-        assert!(send_batch_with_retry(
-            &reqwest::Client::new(),
-            &Url::parse("http://127.0.0.1:1/").unwrap(),
-            "\n",
-            None,
-            make_batch(payload),
-            &config,
-            1024,
-            false
+    fn make_batch() -> SerializedBatch {
+        SerializedBatch::partition(
+            vec![crate::internal::ingest::EncodedRow::from_map(&serde_json::Map::new()).unwrap()],
+            1,
+            usize::MAX,
         )
-        .await
-        .is_err());
-        let files: Vec<_> = std::fs::read_dir(&directory)
-            .expect("failed payload must be saved")
-            .collect();
-        assert_eq!(files.len(), 1);
-        assert_eq!(
-            std::fs::read(files[0].as_ref().unwrap().path()).unwrap(),
-            payload
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[tokio::test]
-    async fn publishing_saves_original_debug_payloads_for_normal_and_overflow_requests() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let payload = b"{\"rows\":[{\"id\":\"row\"}],\"api_version\":2}";
-        for overflow in [false, true] {
-            for status in [200, 400] {
-                let server = MockServer::start().await;
-                let directory =
-                    std::env::temp_dir().join(format!("braintrust-debug-{}", uuid::Uuid::new_v4()));
-                let all = directory.join("all");
-                let failed = directory.join("failed");
-                let config = LogQueueConfig::builder()
-                    .num_retries(0)
-                    .all_publish_payloads_dir(all.clone())
-                    .failed_publish_payloads_dir(failed.clone())
-                    .build();
-                if overflow {
-                    Mock::given(method("POST")).and(path("/logs3/overflow"))
-                        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                            "method":"PUT", "signedUrl":format!("{}/signed", server.uri()), "key":"overflow"
-                        }))).expect(1).mount(&server).await;
-                    Mock::given(method("PUT"))
-                        .and(path("/signed"))
-                        .respond_with(ResponseTemplate::new(200))
-                        .expect(1)
-                        .mount(&server)
-                        .await;
-                }
-                Mock::given(method("POST"))
-                    .and(path("/logs3"))
-                    .respond_with(ResponseTemplate::new(status))
-                    .expect(1)
-                    .mount(&server)
-                    .await;
-                let result = send_batch_with_retry(
-                    &reqwest::Client::new(),
-                    &Url::parse(&server.uri()).unwrap(),
-                    "key",
-                    None,
-                    make_batch(payload),
-                    &config,
-                    if overflow { 1 } else { payload.len() + 1 },
-                    overflow,
-                )
-                .await;
-                assert_eq!(result.is_ok(), status == 200);
-                let files: Vec<_> = std::fs::read_dir(&all)
-                    .unwrap()
-                    .map(|file| file.unwrap().path())
-                    .collect();
-                assert_eq!(files.len(), 1);
-                assert!(files[0]
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .starts_with("all-"));
-                assert_eq!(std::fs::read(&files[0]).unwrap(), payload);
-                if status == 400 {
-                    let files: Vec<_> = std::fs::read_dir(&failed)
-                        .unwrap()
-                        .map(|file| file.unwrap().path())
-                        .collect();
-                    assert_eq!(files.len(), 1);
-                    assert!(files[0]
-                        .file_name()
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .starts_with("failed-"));
-                    assert_eq!(std::fs::read(&files[0]).unwrap(), payload);
-                } else {
-                    assert!(!failed.exists());
-                }
-                std::fs::remove_dir_all(directory).unwrap();
-            }
-        }
+        .pop()
+        .unwrap()
     }
 
     #[test]
@@ -318,6 +140,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_direct_batch_splits_in_order_without_retrying_identical_bytes() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                ResponseTemplate::new(if body["rows"].as_array().unwrap().len() > 1 {
+                    413
+                } else {
+                    200
+                })
+            })
+            .expect(5)
+            .mount(&server)
+            .await;
+        let rows = ["first", "second", "third"]
+            .into_iter()
+            .map(|id| {
+                crate::internal::ingest::EncodedRow::from_map(
+                    serde_json::json!({"id":id}).as_object().unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let batch = SerializedBatch::partition(rows, 100, usize::MAX)
+            .pop()
+            .unwrap();
+        send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse(&server.uri()).unwrap(),
+            "token",
+            None,
+            batch,
+            &LogQueueConfig::builder().num_retries(2).build(),
+            usize::MAX,
+            false,
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let delivered: Vec<_> = requests
+            .iter()
+            .filter_map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let rows = body["rows"].as_array().unwrap();
+                (rows.len() == 1).then(|| rows[0]["id"].clone())
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![
+                serde_json::json!("first"),
+                serde_json::json!("second"),
+                serde_json::json!("third")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_singleton_uses_overflow_once_when_supported() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(413))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).and(path("/logs3/overflow"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"method":"PUT","signedUrl":format!("{}/object",server.uri()),"key":"key"})))
+            .expect(1).mount(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/object"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse(&server.uri()).unwrap(),
+            "token",
+            None,
+            make_batch(),
+            &LogQueueConfig::builder().num_retries(0).build(),
+            usize::MAX,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_queue_retries_send_exactly_the_configured_attempts() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let result = send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse(&server.uri()).unwrap(),
+            "token",
+            None,
+            make_batch(),
+            &LogQueueConfig::builder().num_retries(2).build(),
+            usize::MAX,
+            false,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn overflow_reference_retry_reuses_the_successful_grant_and_object_upload() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3/overflow"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "method":"PUT", "signedUrl":format!("{}/object", server.uri()), "key":"saved-grant"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/object"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(503))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse(&server.uri()).unwrap(),
+            "token",
+            None,
+            make_batch(),
+            &LogQueueConfig::builder().num_retries(1).build(),
+            1,
+            true,
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        let object = requests.iter().find(|r| r.url.path() == "/object").unwrap();
+        assert!(!object
+            .headers
+            .keys()
+            .any(|name| name.as_str().eq_ignore_ascii_case("authorization")));
+        for request in requests.iter().filter(|r| r.url.path() == "/logs3") {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["rows"]["key"], "saved-grant");
+        }
+    }
+
+    #[tokio::test]
     async fn test_send_batch_with_retry_success() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
@@ -336,7 +355,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
@@ -372,7 +391,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
@@ -407,7 +426,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
@@ -436,7 +455,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
@@ -466,7 +485,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,
@@ -501,7 +520,7 @@ mod tests {
             &api_url,
             "token",
             None,
-            make_batch(b"{}"),
+            make_batch(),
             &config,
             usize::MAX,
             false,

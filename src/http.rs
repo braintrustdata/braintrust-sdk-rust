@@ -59,6 +59,7 @@ pub(crate) fn build_http_client(
     user_agent: Option<&str>,
 ) -> Result<Client> {
     let mut builder = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .user_agent(user_agent.unwrap_or(USER_AGENT));
 

@@ -316,7 +316,11 @@ impl Client {
                 "overflow upload method must be POST or PUT".into(),
             ));
         };
-        let response = request.headers(headers).send().await?;
+        let response = request
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|error| error.without_url())?;
         if !response.status().is_success() {
             return Err(crate::response::response_error(response).await);
         }

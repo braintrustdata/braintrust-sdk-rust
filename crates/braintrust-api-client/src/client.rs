@@ -313,11 +313,13 @@ fn validate_url(value: &str, field: &'static str) -> Result<String, ClientInitEr
 }
 
 fn default_http_builder() -> Result<reqwest::ClientBuilder, ClientInitError> {
-    let builder = reqwest::Client::builder().user_agent(concat!(
-        env!("CARGO_PKG_NAME"),
-        "/",
-        env!("CARGO_PKG_VERSION")
-    ));
+    let builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        ));
     #[cfg(not(target_arch = "wasm32"))]
     let builder = {
         configure_tls(builder)?
