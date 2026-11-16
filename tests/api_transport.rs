@@ -61,17 +61,19 @@ async fn dataset_queries_and_summaries_use_the_discovered_api() {
         .unwrap()
         .project_name("project")
         .dataset_name("dataset")
-        .build()
+        .build();
+    let records = dataset
+        .fetch(Some(1))
+        .await
+        .unwrap()
+        .collect()
+        .await
         .unwrap();
-    let records = dataset.fetch(Some(1)).await.unwrap().collect().await;
     assert_eq!(
-        records
-            .iter()
-            .map(|row| row.id.as_str())
-            .collect::<Vec<_>>(),
+        records.iter().map(|row| row.id()).collect::<Vec<_>>(),
         ["first", "second"]
     );
-    assert_eq!(records[0].xact_id.as_deref(), Some("version"));
+    assert_eq!(records[0].xact_id(), Some("version"));
     assert_eq!(dataset.summarize().await.unwrap().total_records(), Some(2));
     assert!(fallback.received_requests().await.unwrap().is_empty());
 }
@@ -113,8 +115,7 @@ async fn experiment_summary_uses_api_host_and_accepts_a_missing_base() {
     let experiment = client
         .experiment_builder_with_credentials("per-request-key", "org")
         .project_name("project")
-        .build()
-        .unwrap();
+        .build();
     let summary = experiment.summarize().await.unwrap();
     assert_eq!(summary.scores()["accuracy"].score(), 0.9);
 }
@@ -136,7 +137,7 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
         .await;
     Mock::given(method("POST"))
         .and(path("/api/project/register"))
-        .and(|request: &Request| !request.headers.contains_key("x-bt-org-name"))
+        .and(header("x-bt-org-name", "my-org"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"project"}})))
         .expect(1)
         .mount(&app)
@@ -198,7 +199,6 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
         .blocking_login(true)
         .app_url(app.uri())
         .api_url(api.uri())
-        .checked_delivery(true)
         .build()
         .await
         .unwrap();

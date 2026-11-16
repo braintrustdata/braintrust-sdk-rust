@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::error::Result;
+use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle};
 use crate::types::{ParentSpanInfo, SpanPayload};
 
-use crate::span::SpanSubmitter;
+use crate::internal::ports::{DeliveryControl, SpanSubmitter};
 
 #[derive(Clone, Default)]
 pub(crate) struct TestSpanCollector {
@@ -60,12 +61,12 @@ impl MockBraintrustClient {
 impl SpanSubmitter for MockBraintrustClient {
     fn submit(
         &self,
-        token: String,
+        scope: CredentialScope,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         self.collector.push(CapturedSpan {
-            token,
+            token: scope.token().to_owned(),
             payload,
             parent: parent_info,
         });
@@ -73,7 +74,10 @@ impl SpanSubmitter for MockBraintrustClient {
         let _ = sender.send(Ok(crate::DeliveryReceipt::new()));
         completion
     }
+}
 
+#[async_trait]
+impl DeliveryControl for MockBraintrustClient {
     fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         let (sender, completion) = crate::Completion::pair();
         let _ = sender.send(Ok(crate::FlushReport::default()));
@@ -86,13 +90,13 @@ impl SpanSubmitter for MockBraintrustClient {
     }
 }
 
-pub(crate) fn mock_span_builder() -> (SpanBuilder<MockBraintrustClient>, TestSpanCollector) {
+pub(crate) fn mock_span_builder() -> (SpanBuilder, TestSpanCollector) {
     let (submitter, collector) = MockBraintrustClient::new();
-    let builder = SpanBuilder::new(submitter, "test-token", "org-id");
+    let builder = SpanBuilder::new(submitter, CredentialScope::test("test-token", "org-id"));
     (builder, collector)
 }
 
-pub(crate) fn build_test_span() -> (SpanHandle<MockBraintrustClient>, TestSpanCollector) {
+pub(crate) fn build_test_span() -> (SpanHandle, TestSpanCollector) {
     let (builder, collector) = mock_span_builder();
     (builder.build(), collector)
 }
