@@ -32,10 +32,15 @@ jobs:
       - name: Install API client generator
         run: cargo install openapi-to-rust --version 0.24.0 --locked
 
-      - name: Generate API client
+      - name: Update schema pin and generate API client
+        id: generate
         working-directory: sdk
         run: |
+          spec_sha=$(git ls-remote https://github.com/braintrustdata/braintrust-openapi.git refs/heads/main | cut -f1)
+          [[ "$spec_sha" =~ ^[0-9a-f]{40}$ ]]
+          sed -i -E "s#^spec_path = .*#spec_path = \"https://raw.githubusercontent.com/braintrustdata/braintrust-openapi/$spec_sha/openapi/spec.json\"#" crates/braintrust-api-client/openapi-client.toml
           openapi-to-rust generate --config crates/braintrust-api-client/openapi-client.toml
+          echo "spec_sha=$spec_sha" >> "$GITHUB_OUTPUT"
 
       # Run even with no diff so an obsolete pending update PR can be closed.
       - name: Open or update SDK PR
@@ -49,6 +54,7 @@ jobs:
           commit-message: Update Braintrust API client
           body: |
             Updates the REST API client to the latest published Braintrust specification.
-            Source: https://github.com/braintrustdata/braintrust-openapi/blob/main/openapi/spec.json
+            Source: https://github.com/braintrustdata/braintrust-openapi/blob/${{ steps.generate.outputs.spec_sha }}/openapi/spec.json
           add-paths: |
+            crates/braintrust-api-client/openapi-client.toml
             crates/braintrust-api-client/src/generated/*.rs
