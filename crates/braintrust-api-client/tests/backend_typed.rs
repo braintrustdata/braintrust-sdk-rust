@@ -437,3 +437,77 @@ async fn failed_attachment_upload_does_not_report_completion_and_can_retry() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn attachment_uploads_reuse_the_storage_connection_across_client_clones() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let server = MockServer::start().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let storage = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+        for _ in 0..2 {
+            let mut size = 0;
+            loop {
+                let mut line = String::new();
+                assert!(
+                    stream.read_line(&mut line).await.unwrap() > 0,
+                    "storage connection was not reused"
+                );
+                if line == "\r\n" {
+                    break;
+                }
+                let line = line.to_ascii_lowercase();
+                assert!(!line.starts_with("authorization:"));
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    size = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut data = vec![0; size];
+            stream.read_exact(&mut data).await.unwrap();
+            assert_eq!(data, b"data");
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    Mock::given(method("POST"))
+        .and(path("/attachment"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"signedUrl":format!("http://{address}/bytes"),"headers":{}})),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/attachment/status"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let backend = client(&server);
+    let clone = backend.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for (index, backend) in [&backend, &clone].into_iter().enumerate() {
+            backend
+                .upload_attachment(
+                    &AttachmentRequest::new(
+                        format!("key-{index}"),
+                        "file.bin".into(),
+                        "application/octet-stream".into(),
+                        "org".into(),
+                    ),
+                    b"data".to_vec(),
+                )
+                .await
+                .unwrap();
+        }
+        storage.await.unwrap();
+    })
+    .await
+    .expect("uploads should reuse one storage connection");
+}
