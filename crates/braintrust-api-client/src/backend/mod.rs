@@ -644,9 +644,7 @@ impl<T: DeserializeOwned> FromResponse for T {
 }
 
 /// A successful response whose body is irrelevant (including an empty 204).
-#[cfg(test)]
 pub(crate) struct NoContent;
-#[cfg(test)]
 impl FromResponse for NoContent {
     async fn decode(_: reqwest::Response, _: &str, _: &str) -> Result<Self> {
         Ok(Self)

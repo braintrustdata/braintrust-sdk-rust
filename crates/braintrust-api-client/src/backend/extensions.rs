@@ -778,8 +778,51 @@ impl BackendClient {
     ) -> Result<AttachmentUploadMetadata> {
         self.post("/attachment", request).await
     }
+    /// Upload bytes using an attachment slot, then mark the attachment ready.
+    /// Object storage receives only slot headers, never API credentials.
+    pub async fn upload_attachment(
+        &self,
+        request: &AttachmentRequest,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let slot = self.request_attachment(request).await?;
+        let http = super::build_http_client_from_builder(
+            reqwest::Client::builder()
+                .timeout(super::DEFAULT_HTTP_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none()),
+        )?;
+        let mut upload = http.put(&slot.signed_url);
+        for (name, value) in &slot.headers {
+            upload = upload.header(name, value);
+        }
+        let url = url::Url::parse(&slot.signed_url)?;
+        if url
+            .host_str()
+            .is_some_and(|host| host.ends_with(".blob.core.windows.net"))
+        {
+            upload = upload.header("x-ms-blob-type", "BlockBlob");
+        }
+        upload
+            .body(data)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("attachment object upload failed: {}", error.without_url())
+            })?
+            .error_for_status()
+            .map_err(|error| {
+                anyhow::anyhow!("attachment object upload failed: {}", error.without_url())
+            })?;
+        self.attachment_status(&AttachmentStatusRequest::new(
+            request.key.clone(),
+            request.org_id.clone(),
+            AttachmentStatus::Done,
+        ))
+        .await
+    }
+
     pub async fn attachment_status(&self, request: &AttachmentStatusRequest) -> Result<()> {
-        let _: Value = self.post("/attachment/status", request).await?;
+        let _: super::NoContent = self.post("/attachment/status", request).await?;
         Ok(())
     }
     pub async fn submit_query(&self, request: &AsyncQuerySubmission) -> Result<AsyncQuery> {
