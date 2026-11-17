@@ -86,7 +86,8 @@ async fn plain_thread_issuance_drains_unobserved_registration_and_delivery_after
     tokio::time::timeout(Duration::from_secs(5), arrived.notified())
         .await
         .unwrap();
-    assert_eq!(flush.await.unwrap().delivered(), 1);
+    // Automatic delivery may retire the event before this flush captures active work.
+    flush.await.unwrap();
     shutdown.await.unwrap();
     let requests = server.received_requests().await.unwrap();
     let rows: Vec<serde_json::Value> = requests
