@@ -116,7 +116,7 @@ impl Client {
         self.inner
             .org_name
             .as_ref()
-            .and_then(|value| value.to_str().ok())
+            .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
     }
 
     /// The API endpoint used by generated methods, queries and logging.
