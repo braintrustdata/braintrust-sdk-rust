@@ -19,11 +19,11 @@ use crate::experiments::api::{
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
 use crate::http::{api_client, api_client_builder, api_result, build_http_client, CaBundleConfig};
-use crate::internal::retry::{exponential, RetryExecutor};
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
+use backon::{ExponentialBuilder, Retryable};
 
 // 30s covers both quick API calls (login, project registration) and slower batch log uploads.
 // The TypeScript SDK applies no explicit timeout.
@@ -816,30 +816,19 @@ impl BraintrustClient {
         let client = self.clone();
         tokio::spawn(async move {
             const MAX_ATTEMPTS: usize = 10;
-            let outcome = RetryExecutor::new(
-                MAX_ATTEMPTS - 1,
-                exponential(Duration::from_millis(100), Duration::from_secs(5)),
-            )
-            .run(
-                |_| client.perform_login(&api_key, org_name.as_deref()),
-                |_| true, // Preserve the existing background-login policy.
-                |attempt, error, delay| {
-                    tracing::warn!(
-                        attempt = attempt.index + 1,
-                        max = MAX_ATTEMPTS,
-                        "Background login failed: {}, retrying in {:?}",
-                        error,
-                        delay
-                    );
-                },
-            )
-            .await;
-            match outcome.result {
+            let result = (|| client.perform_login(&api_key, org_name.as_deref()))
+                .retry(ExponentialBuilder::default()
+                    .with_min_delay(Duration::from_millis(100))
+                    .with_max_delay(Duration::from_secs(5))
+                    .with_max_times(MAX_ATTEMPTS - 1))
+                .notify(|error, delay| tracing::warn!(%error, ?delay, "Background login failed, retrying"))
+                .await;
+            match result {
                 Ok(()) => tracing::debug!("Background login completed successfully"),
                 Err(error) => tracing::error!(
                     "Background login failed after {} attempts: {}. \
                      Spans will not be uploaded until the client is re-created.",
-                    outcome.attempts,
+                    MAX_ATTEMPTS,
                     error
                 ),
             }

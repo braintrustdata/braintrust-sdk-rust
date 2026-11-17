@@ -111,6 +111,14 @@ pub enum ClientInitError {
 }
 
 impl Client {
+    /// Organization name configured for logging requests.
+    pub fn organization_name(&self) -> Option<&str> {
+        self.inner
+            .org_name
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+    }
+
     /// The API endpoint used by generated methods, queries and logging.
     pub fn baseurl(&self) -> &str {
         &self.baseurl

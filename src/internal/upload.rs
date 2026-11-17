@@ -1,13 +1,12 @@
 //! SDK ingestion orchestration, built on the one-attempt API.
-use super::ingest::{EncodedBatch, UploadPlan, UploadPlanner};
-use super::retry::{exponential, jittered_exponential, RetryExecutor};
+use super::ingest::EncodedBatch;
 use crate::api::{self, transport::Logs3OverflowRequest};
 use crate::error::{BraintrustError, Result};
-use crate::http::{api_client, api_result};
+use crate::http::api_result;
 use crate::types::LOGS_API_VERSION;
+use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, Retryable};
 use std::{future::Future, time::Duration};
 use tracing::warn;
-use url::Url;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Capabilities {
@@ -15,37 +14,35 @@ pub(crate) struct Capabilities {
     pub overflow: bool,
 }
 
-/// Existing schedules remain caller policy; orchestration and classification
-/// are shared. Retries are shared across all stages and splits of one batch.
-#[derive(Clone, Copy)]
+/// Queue and bulk uploads use bounded backoff policies. Retries are shared across all stages and splits of one batch.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum UploadPolicy {
     Queue { retries: usize },
     Standalone,
 }
 impl UploadPolicy {
     fn budget(self) -> RetryBudget {
-        let (retries, delays): (_, Box<dyn Iterator<Item = Duration> + Send>) = match self {
-            Self::Queue { retries } => (
-                retries,
-                Box::new(exponential(Duration::from_secs(1), Duration::from_secs(30))),
-            ),
-            Self::Standalone => (
-                4,
-                Box::new(jittered_exponential(
-                    Duration::from_millis(300),
-                    Duration::from_secs(8),
-                    0.2,
-                )),
-            ),
-        };
+        let delays = match self {
+            Self::Queue { retries } => ExponentialBuilder::default()
+                .with_min_delay(Duration::from_secs(1))
+                .with_max_delay(Duration::from_secs(30))
+                .with_max_times(retries),
+            Self::Standalone => ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(300))
+                .with_max_delay(Duration::from_secs(8))
+                .with_max_times(4)
+                .with_jitter(),
+        }
+        .build();
         RetryBudget {
-            executor: RetryExecutor::new(retries, delays),
+            delays,
             requests: 0,
         }
     }
 }
+// Borrowing the iterator lets backon share retries across overflow stages and splits.
 struct RetryBudget {
-    executor: RetryExecutor<Box<dyn Iterator<Item = Duration> + Send>>,
+    delays: ExponentialBackoff,
     requests: usize,
 }
 impl RetryBudget {
@@ -54,14 +51,17 @@ impl RetryBudget {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let outcome = self.executor.run_shared(
-            |_| operation(), retryable,
-            |attempt, error, _| warn!(%error, retry = attempt.index + 1, "ingestion request failed, retrying"),
-        ).await;
-        self.requests += outcome.attempts;
-        outcome.result
+        (|| {
+            self.requests += 1;
+            operation()
+        })
+        .retry(&mut self.delays)
+        .when(retryable)
+        .notify(|error, delay| warn!(%error, ?delay, "ingestion request failed, retrying"))
+        .await
     }
 }
+
 fn retryable(error: &BraintrustError) -> bool {
     match error {
         BraintrustError::Http(error) => !error.is_builder(),
@@ -76,25 +76,14 @@ pub(crate) struct UploadResult {
     pub requests_sent: usize,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct UploadCoordinator {
     logs: api::Client,
-    org_name: Option<String>,
     policy: UploadPolicy,
 }
 impl UploadCoordinator {
-    pub fn new(
-        http: reqwest::Client,
-        api_url: &Url,
-        token: &str,
-        org_name: Option<&str>,
-        policy: UploadPolicy,
-    ) -> Result<Self> {
-        let logs = api_client(&http, api_url.as_str(), api_url.as_str(), token, org_name)?;
-        Ok(Self {
-            logs,
-            policy,
-            org_name: org_name.map(str::to_owned),
-        })
+    pub fn new(logs: api::Client, policy: UploadPolicy) -> Self {
+        Self { logs, policy }
     }
 
     pub async fn capabilities(
@@ -130,43 +119,42 @@ impl UploadCoordinator {
         batch: EncodedBatch,
         capabilities: Capabilities,
     ) -> Result<UploadResult> {
-        let planner = UploadPlanner {
-            max_request_bytes: capabilities.max_request_size,
-            overflow: capabilities.overflow,
-        };
-        let mut pending = vec![planner.plan(batch)?];
+        let mut pending = vec![batch];
         let mut budget = self.policy.budget();
         let mut result = UploadResult::default();
-        while let Some(plan) = pending.pop() {
-            match plan {
-                UploadPlan::Split(left, right) => {
-                    pending.push(planner.plan(right)?);
-                    pending.push(planner.plan(left)?);
-                }
-                UploadPlan::Direct(batch) => {
-                    match budget
-                        .run(|| async {
-                            api_result(self.logs.logs3_raw(batch.data.clone()).await)
-                                .await
-                                .map(|_| ())
-                        })
-                        .await
-                    {
-                        Ok(()) => {
-                            result.rows_uploaded += batch.len();
-                            result.bytes_processed += batch.data.len();
-                        }
-                        Err(BraintrustError::Api { status: 413, .. }) => {
-                            pending.push(planner.rejected(batch)?)
-                        }
-                        Err(error) => return Err(error),
+        while let Some(batch) = pending.pop() {
+            if batch.data.len() <= capabilities.max_request_size {
+                match budget
+                    .run(|| async {
+                        api_result(self.logs.logs3_raw(batch.data.clone()).await)
+                            .await
+                            .map(|_| ())
+                    })
+                    .await
+                {
+                    Ok(()) => {
+                        result.rows_uploaded += batch.len();
+                        result.bytes_processed += batch.data.len();
+                        continue;
                     }
+                    Err(BraintrustError::Api { status: 413, .. }) => {}
+                    Err(error) => return Err(error),
                 }
-                UploadPlan::Overflow(batch) => {
-                    self.overflow(&batch, &mut budget).await?;
-                    result.rows_uploaded += batch.len();
-                    result.bytes_processed += batch.data.len();
-                }
+            }
+            if capabilities.overflow {
+                self.overflow(&batch, &mut budget).await?;
+                result.rows_uploaded += batch.len();
+                result.bytes_processed += batch.data.len();
+            } else if batch.len() > 1 {
+                let (left, right) = batch.split();
+                pending.push(right);
+                pending.push(left);
+            } else {
+                return Err(BraintrustError::Api {
+                    status: 413,
+                    message: "single row exceeds server payload limit and overflow is unavailable"
+                        .into(),
+                });
             }
         }
         result.requests_sent = budget.requests;
@@ -176,12 +164,12 @@ impl UploadCoordinator {
     async fn overflow(&self, batch: &EncodedBatch, budget: &mut RetryBudget) -> Result<()> {
         let grant = budget
             .run(|| async {
-                let mut request = Logs3OverflowRequest::new(batch.overflow_rows.clone());
+                let mut request = Logs3OverflowRequest::new(batch.overflow_rows());
                 request.content_type = Some("application/json".into());
                 request.size_bytes = Some(batch.data.len());
                 api_result(
                     self.logs
-                        .logs3_overflow_with_org_name(&request, self.org_name.as_deref())
+                        .logs3_overflow_with_org_name(&request, self.logs.organization_name())
                         .await,
                 )
                 .await
@@ -234,14 +222,18 @@ mod tests {
     }
     fn coordinator(server: &MockServer, policy: UploadPolicy) -> UploadCoordinator {
         UploadCoordinator::new(
-            crate::http::build_http_client(Duration::from_secs(3), None, None).unwrap(),
-            &Url::parse(&server.uri()).unwrap(),
-            "secret",
-            Some("tenant"),
+            crate::http::api_client(
+                &crate::http::build_http_client(Duration::from_secs(3), None, None).unwrap(),
+                &server.uri(),
+                &server.uri(),
+                "secret",
+                Some("tenant"),
+            )
+            .unwrap(),
             policy,
         )
-        .unwrap()
     }
+
     fn capabilities() -> Capabilities {
         Capabilities {
             max_request_size: 1,

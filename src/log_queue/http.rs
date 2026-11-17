@@ -34,15 +34,11 @@ pub(crate) async fn fetch_version_info(
     org_name: Option<&str>,
 ) -> (usize, bool) {
     let fallback = crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2;
-    match UploadCoordinator::new(
-        client.clone(),
-        api_url,
-        token,
-        org_name,
-        UploadPolicy::Queue { retries: 0 },
-    ) {
-        Ok(coordinator) => {
-            let capabilities = coordinator.capabilities(fallback, None).await;
+    match crate::http::api_client(client, api_url.as_str(), api_url.as_str(), token, org_name) {
+        Ok(api) => {
+            let capabilities = UploadCoordinator::new(api, UploadPolicy::Queue { retries: 0 })
+                .capabilities(fallback, None)
+                .await;
             (capabilities.max_request_size, capabilities.overflow)
         }
         Err(error) => {
@@ -65,16 +61,15 @@ pub(crate) async fn send_batch_with_retry(
 ) -> Result<(), anyhow::Error> {
     save_payload_debug(&batch.data, config.all_publish_payloads_dir(), "all").ok();
     let data = batch.data.clone();
-    let coordinator = UploadCoordinator::new(
-        client.clone(),
-        api_url,
-        token,
-        org_name,
-        UploadPolicy::Queue {
-            retries: config.num_retries(),
-        },
-    )?;
-    let result = coordinator
+    let result = async {
+        let api =
+            crate::http::api_client(client, api_url.as_str(), api_url.as_str(), token, org_name)?;
+        UploadCoordinator::new(
+            api,
+            UploadPolicy::Queue {
+                retries: config.num_retries(),
+            },
+        )
         .upload(
             batch,
             Capabilities {
@@ -82,7 +77,9 @@ pub(crate) async fn send_batch_with_retry(
                 overflow: can_use_overflow,
             },
         )
-        .await;
+        .await
+    }
+    .await;
     if result.is_err() {
         save_payload_debug(&data, config.failed_publish_payloads_dir(), "failed").ok();
     }
@@ -102,6 +99,39 @@ mod tests {
         )
         .pop()
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn invalid_credentials_still_save_failed_payload_debug() {
+        let directory =
+            std::env::temp_dir().join(format!("braintrust-failed-{}", uuid::Uuid::new_v4()));
+        let config = LogQueueConfig::builder()
+            .num_retries(0)
+            .failed_publish_payloads_dir(directory.clone())
+            .build();
+        let batch = make_batch();
+        let payload = batch.data.clone();
+        assert!(send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse("http://127.0.0.1:1/").unwrap(),
+            "\n",
+            None,
+            batch,
+            &config,
+            1024,
+            false
+        )
+        .await
+        .is_err());
+        let files: Vec<_> = std::fs::read_dir(&directory)
+            .expect("failed payload must be saved")
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            std::fs::read(files[0].as_ref().unwrap().path()).unwrap(),
+            payload
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

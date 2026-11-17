@@ -131,7 +131,7 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_slice(&batch.data).unwrap();
             assert!(parsed.get("rows").is_some());
             assert_eq!(parsed["api_version"], LOGS_API_VERSION);
-            assert!(!batch.overflow_rows.is_empty());
+            assert!(!batch.overflow_rows().is_empty());
         }
     }
 
@@ -156,10 +156,10 @@ mod tests {
         let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes()).unwrap();
 
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].overflow_rows.len(), 1);
+        assert_eq!(batches[0].overflow_rows().len(), 1);
 
         // Should have experiment_id in object_ids
-        let overflow_row = &batches[0].overflow_rows[0];
+        let overflow_row = &batches[0].overflow_rows()[0];
         assert!(overflow_row.object_ids.contains_key("experiment_id"));
         assert!(!overflow_row.object_ids.contains_key("project_id"));
     }
@@ -170,7 +170,7 @@ mod tests {
         let rows = vec![make_row("row-1", 10)];
         let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes()).unwrap();
 
-        let overflow_row = &batches[0].overflow_rows[0];
+        let overflow_row = &batches[0].overflow_rows()[0];
         assert!(overflow_row.input_row.byte_size > 0);
     }
 
@@ -183,7 +183,7 @@ mod tests {
             batch_and_serialize_rows(vec![row], &config, config.batch_max_bytes()).unwrap();
 
         assert_eq!(batches.len(), 1);
-        let overflow_row = &batches[0].overflow_rows[0];
+        let overflow_row = &batches[0].overflow_rows()[0];
         assert_eq!(
             overflow_row.is_delete,
             Some(true),
@@ -198,7 +198,7 @@ mod tests {
         let batches =
             batch_and_serialize_rows(vec![row], &config, config.batch_max_bytes()).unwrap();
 
-        let overflow_row = &batches[0].overflow_rows[0];
+        let overflow_row = &batches[0].overflow_rows()[0];
         assert!(
             overflow_row.is_delete.is_none(),
             "is_delete should be None when _object_delete is not set"

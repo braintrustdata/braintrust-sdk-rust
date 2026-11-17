@@ -1,8 +1,8 @@
 use crate::error::{BraintrustError, Result};
-use crate::http::{build_http_client, CaBundleConfig};
+use crate::http::{api_client, build_http_client, CaBundleConfig};
 use crate::internal::ingest::{EncodedBatch, EncodedRow};
 use crate::internal::upload::{Capabilities, UploadCoordinator, UploadPolicy};
-use reqwest::{Client, Url};
+use reqwest::Url;
 use serde_json::{Map, Value};
 use std::time::Duration;
 
@@ -17,10 +17,7 @@ pub struct Logs3UploadResult {
 
 #[derive(Debug, Clone)]
 pub struct Logs3BatchUploader {
-    client: Client,
-    api_url: Url,
-    api_key: String,
-    org_name: Option<String>,
+    coordinator: UploadCoordinator,
     max_request_size_override: Option<usize>,
     payload_limits: Option<Capabilities>,
 }
@@ -65,11 +62,15 @@ impl Logs3BatchUploader {
         let api_url = Url::parse(api_url.as_ref())
             .map_err(|e| BraintrustError::InvalidConfig(format!("invalid api_url: {e}")))?;
         let client = build_http_client(Duration::from_secs(30), ca_bundle.as_ref(), None)?;
+        let api = api_client(
+            &client,
+            api_url.as_str(),
+            api_url.as_str(),
+            &api_key.into(),
+            org_name.as_deref(),
+        )?;
         Ok(Self {
-            client,
-            api_url,
-            api_key: api_key.into(),
-            org_name: org_name.filter(|s| !s.trim().is_empty()),
+            coordinator: UploadCoordinator::new(api, UploadPolicy::Standalone),
             max_request_size_override: None,
             payload_limits: None,
         })
@@ -89,17 +90,11 @@ impl Logs3BatchUploader {
             return Ok(Logs3UploadResult::default());
         }
 
-        let coordinator = UploadCoordinator::new(
-            self.client.clone(),
-            &self.api_url,
-            &self.api_key,
-            self.org_name.as_deref(),
-            UploadPolicy::Standalone,
-        )?;
         let limits = match self.payload_limits {
             Some(limits) => limits,
             None => {
-                let limits = coordinator
+                let limits = self
+                    .coordinator
                     .capabilities(DEFAULT_MAX_REQUEST_SIZE, self.max_request_size_override)
                     .await;
                 self.payload_limits = Some(limits);
@@ -121,7 +116,7 @@ impl Logs3BatchUploader {
 
         let mut result = Logs3UploadResult::default();
         for batch in batches {
-            let batch_result = coordinator.upload(batch, limits).await?;
+            let batch_result = self.coordinator.upload(batch, limits).await?;
             result.bytes_processed += batch_result.bytes_processed;
             result.requests_sent += batch_result.requests_sent;
             result.rows_uploaded += batch_result.rows_uploaded;

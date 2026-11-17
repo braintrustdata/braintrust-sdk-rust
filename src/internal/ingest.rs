@@ -1,5 +1,4 @@
-//! Pure logs3 encoding and upload decisions. No transport or retry policy.
-use super::batching::{BatchLimits, Batcher, Partition};
+//! Logs3 encoding and size-limited batching.
 use crate::types::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, LOGS_API_VERSION};
 use bytes::Bytes;
 use serde::Serialize;
@@ -48,7 +47,6 @@ impl EncodedRow {
 #[derive(Debug, Clone)]
 pub(crate) struct EncodedBatch {
     pub data: Bytes,
-    pub overflow_rows: Vec<Logs3OverflowInputRow>,
     rows: Vec<EncodedRow>,
 }
 
@@ -65,88 +63,48 @@ impl EncodedBatch {
         data.extend_from_slice(format!("],\"api_version\":{LOGS_API_VERSION}}}").as_bytes());
         Self {
             data: data.into(),
-            overflow_rows: rows.iter().map(|row| row.overflow.clone()).collect(),
             rows,
         }
     }
 
     pub fn partition(rows: Vec<EncodedRow>, max_items: usize, max_bytes: usize) -> Vec<Self> {
         let container_bytes = Self::encode(Vec::new()).data.len();
-        Batcher::partition(
-            rows,
-            BatchLimits {
-                max_items,
-                max_bytes,
-                container_bytes,
-                separator_bytes: 1,
-            },
-            |row| row.data.len(),
-        )
-        .into_iter()
-        .map(|part| {
-            Self::encode(match part {
-                Partition::Batch(rows) => rows,
-                // Keep the oversized row as a singleton for the planner to handle.
-                Partition::Oversized(row) => vec![row],
-            })
-        })
-        .collect()
+        let mut batches = Vec::new();
+        let mut batch = Vec::new();
+        let mut bytes = container_bytes;
+        for row in rows {
+            let next = bytes
+                .checked_add(usize::from(!batch.is_empty()))
+                .and_then(|bytes| bytes.checked_add(row.data.len()));
+            if !batch.is_empty()
+                && (batch.len() >= max_items.max(1) || next.is_none_or(|size| size > max_bytes))
+            {
+                batches.push(Self::encode(std::mem::take(&mut batch)));
+                bytes = container_bytes;
+            }
+            // An oversized row remains a singleton for overflow or a clear error.
+            bytes = bytes
+                .saturating_add(usize::from(!batch.is_empty()))
+                .saturating_add(row.data.len());
+            batch.push(row);
+        }
+        if !batch.is_empty() {
+            batches.push(Self::encode(batch));
+        }
+        batches
+    }
+
+    pub fn overflow_rows(&self) -> Vec<Logs3OverflowInputRow> {
+        self.rows.iter().map(|row| row.overflow.clone()).collect()
     }
 
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
-    fn split(mut self) -> (Self, Self) {
+    pub fn split(mut self) -> (Self, Self) {
         let right = self.rows.split_off(self.rows.len() / 2);
         (Self::encode(self.rows), Self::encode(right))
-    }
-}
-
-pub(crate) enum UploadPlan {
-    Direct(EncodedBatch),
-    Overflow(EncodedBatch),
-    Split(EncodedBatch, EncodedBatch),
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct UploadPlanner {
-    pub max_request_bytes: usize,
-    pub overflow: bool,
-}
-
-impl UploadPlanner {
-    pub fn plan(&self, batch: EncodedBatch) -> Result<UploadPlan, crate::error::BraintrustError> {
-        self.decide(batch, false)
-    }
-
-    /// A rejected direct request must change shape, never retry identical bytes.
-    pub fn rejected(
-        &self,
-        batch: EncodedBatch,
-    ) -> Result<UploadPlan, crate::error::BraintrustError> {
-        self.decide(batch, true)
-    }
-
-    fn decide(
-        &self,
-        batch: EncodedBatch,
-        rejected: bool,
-    ) -> Result<UploadPlan, crate::error::BraintrustError> {
-        if !rejected && batch.data.len() <= self.max_request_bytes {
-            Ok(UploadPlan::Direct(batch))
-        } else if self.overflow {
-            Ok(UploadPlan::Overflow(batch))
-        } else if batch.len() > 1 {
-            let (left, right) = batch.split();
-            Ok(UploadPlan::Split(left, right))
-        } else {
-            Err(crate::error::BraintrustError::Api {
-                status: 413,
-                message: "single row exceeds server payload limit and overflow is unavailable"
-                    .into(),
-            })
-        }
     }
 }
 
@@ -184,7 +142,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .zip(batch.overflow_rows)
+                .zip(batch.overflow_rows())
             {
                 assert_eq!(
                     meta.input_row.byte_size,
@@ -197,49 +155,36 @@ mod tests {
     }
 
     #[test]
-    fn planner_handles_oversized_and_rejected_batches_without_reordering() {
-        let batch = EncodedBatch::encode(rows());
-        let planner = UploadPlanner {
-            max_request_bytes: batch.data.len(),
-            overflow: false,
-        };
-        assert!(matches!(
-            planner.plan(batch.clone()).unwrap(),
-            UploadPlan::Direct(_)
-        ));
-        let UploadPlan::Split(left, right) = planner.rejected(batch).unwrap() else {
-            panic!("expected split")
-        };
-        let ids: Vec<_> = [left.clone(), right]
+    fn oversized_rows_do_not_reorder_neighboring_batches() {
+        let input: Vec<_> = ["a".to_owned(), "x".repeat(200), "b".to_owned()]
             .iter()
-            .flat_map(|batch| {
-                serde_json::from_slice::<Value>(&batch.data).unwrap()["rows"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|row| row["id"].clone())
-                    .collect::<Vec<_>>()
-            })
+            .map(|id| EncodedRow::from_map(json!({"id": id}).as_object().unwrap()).unwrap())
             .collect();
-        assert_eq!(ids, vec![json!("é\\\""), json!("second"), json!("third")]);
-        assert!(planner.rejected(left.clone()).is_err());
-        assert!(matches!(
-            UploadPlanner {
-                overflow: true,
-                ..planner
-            }
-            .rejected(left)
-            .unwrap(),
-            UploadPlan::Overflow(_)
-        ));
-        assert!(matches!(
-            UploadPlanner {
-                max_request_bytes: 1,
-                overflow: true
-            }
-            .plan(EncodedBatch::encode(rows()))
-            .unwrap(),
-            UploadPlan::Overflow(_)
-        ));
+        let batches = EncodedBatch::partition(input.clone(), 100, 100);
+        assert_eq!(batches.len(), 3);
+        for (batch, row) in batches.into_iter().zip(input) {
+            assert_eq!(batch.len(), 1);
+            let value: Value = serde_json::from_slice(&batch.data).unwrap();
+            assert_eq!(
+                value["rows"][0],
+                serde_json::from_slice::<Value>(&row.data).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_rows_stay_in_order_and_empty_input_has_no_batches() {
+        assert!(EncodedBatch::partition(vec![], 0, 0).is_empty());
+        let input = rows();
+        let batches = EncodedBatch::partition(input.clone(), 0, 0);
+        assert_eq!(batches.len(), input.len());
+        for (batch, row) in batches.iter().zip(input) {
+            assert_eq!(batch.len(), 1);
+            let value: Value = serde_json::from_slice(&batch.data).unwrap();
+            assert_eq!(
+                value["rows"][0],
+                serde_json::from_slice::<Value>(&row.data).unwrap()
+            );
+        }
     }
 }
