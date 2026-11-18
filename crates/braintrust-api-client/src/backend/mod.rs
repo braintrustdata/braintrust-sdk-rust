@@ -7,7 +7,7 @@ pub use btql::{BtqlOptions, Pagination};
 use backoff::{ExponentialBackoffBuilder, backoff::Backoff};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{Client, Request, Transport};
@@ -90,6 +90,8 @@ pub fn api_error(error: crate::Error) -> anyhow::Error {
 #[derive(Clone)]
 pub struct BackendClient {
     http: Client,
+    // Shared by clones; storage requests never use the authenticated API transport.
+    attachment_http: Arc<Mutex<Option<reqwest::Client>>>,
     base_url: String,
     api_key: String,
     org_id: String,
@@ -255,12 +257,30 @@ impl BackendClient {
             .build()?;
         Ok(Self {
             http,
+            attachment_http: Arc::new(Mutex::new(None)),
             base_url: api_url.trim_end_matches('/').to_owned(),
             api_key: api_key.to_owned(),
             org_id: org_id.to_owned(),
             org_name: org_name.to_owned(),
             options: HttpOptions::default(),
         })
+    }
+
+    fn attachment_http_client(&self) -> Result<reqwest::Client> {
+        let mut cached = self
+            .attachment_http
+            .lock()
+            .map_err(|_| anyhow::anyhow!("attachment HTTP client lock poisoned"))?;
+        if let Some(client) = cached.as_ref() {
+            return Ok(client.clone());
+        }
+        let client = build_http_client_from_builder(
+            reqwest::Client::builder()
+                .timeout(DEFAULT_HTTP_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none()),
+        )?;
+        *cached = Some(client.clone());
+        Ok(client)
     }
 
     pub fn generated(&self) -> &crate::GeneratedClient {

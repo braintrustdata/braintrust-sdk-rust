@@ -310,6 +310,7 @@ mod tests {
         let handle = server.handle();
         tokio::spawn(server);
         let client = BackendClient {
+            attachment_http: Default::default(),
             http: super::super::build_api_client(
                 &base_url,
                 &base_url,
@@ -471,6 +472,7 @@ mod tests {
             }
         });
         let client = BackendClient {
+            attachment_http: Default::default(),
             http: super::super::build_api_client(
                 &base_url,
                 &base_url,

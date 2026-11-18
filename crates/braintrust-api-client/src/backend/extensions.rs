@@ -786,11 +786,7 @@ impl BackendClient {
         data: Vec<u8>,
     ) -> Result<()> {
         let slot = self.request_attachment(request).await?;
-        let http = super::build_http_client_from_builder(
-            reqwest::Client::builder()
-                .timeout(super::DEFAULT_HTTP_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none()),
-        )?;
+        let http = self.attachment_http_client()?;
         let mut upload = http.put(&slot.signed_url);
         for (name, value) in &slot.headers {
             upload = upload.header(name, value);
