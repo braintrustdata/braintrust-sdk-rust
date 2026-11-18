@@ -23,6 +23,7 @@ use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
+use backon::{ExponentialBuilder, Retryable};
 
 // 30s covers both quick API calls (login, project registration) and slower batch log uploads.
 // The TypeScript SDK applies no explicit timeout.
@@ -814,37 +815,22 @@ impl BraintrustClient {
     fn start_background_login(&self, api_key: String, org_name: Option<String>) {
         let client = self.clone();
         tokio::spawn(async move {
-            // Retry with exponential backoff up to a fixed maximum number of attempts.
-            const MAX_ATTEMPTS: u32 = 10;
-            let mut delay = Duration::from_millis(100);
-            let max_delay = Duration::from_secs(5);
-
-            for attempt in 1..=MAX_ATTEMPTS {
-                match client.perform_login(&api_key, org_name.as_deref()).await {
-                    Ok(()) => {
-                        tracing::debug!("Background login completed successfully");
-                        return;
-                    }
-                    Err(e) if attempt < MAX_ATTEMPTS => {
-                        tracing::warn!(
-                            attempt,
-                            max = MAX_ATTEMPTS,
-                            "Background login failed: {}, retrying in {:?}",
-                            e,
-                            delay
-                        );
-                        tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(max_delay);
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Background login failed after {} attempts: {}. \
-                             Spans will not be uploaded until the client is re-created.",
-                            MAX_ATTEMPTS,
-                            e
-                        );
-                    }
-                }
+            const MAX_ATTEMPTS: usize = 10;
+            let result = (|| client.perform_login(&api_key, org_name.as_deref()))
+                .retry(ExponentialBuilder::default()
+                    .with_min_delay(Duration::from_millis(100))
+                    .with_max_delay(Duration::from_secs(5))
+                    .with_max_times(MAX_ATTEMPTS - 1))
+                .notify(|error, delay| tracing::warn!(%error, ?delay, "Background login failed, retrying"))
+                .await;
+            match result {
+                Ok(()) => tracing::debug!("Background login completed successfully"),
+                Err(error) => tracing::error!(
+                    "Background login failed after {} attempts: {}. \
+                     Spans will not be uploaded until the client is re-created.",
+                    MAX_ATTEMPTS,
+                    error
+                ),
             }
         });
     }
@@ -1265,6 +1251,9 @@ mod tests {
 
     #[tokio::test]
     async fn builder_rejects_missing_api_key() {
+        if crate::http::tests::run_isolated("logger::tests::builder_rejects_missing_api_key") {
+            return;
+        }
         // Clear any env vars that might be set
         std::env::remove_var("BRAINTRUST_API_KEY");
 
@@ -1336,7 +1325,11 @@ mod tests {
 
     #[tokio::test]
     async fn builder_rejects_malformed_environment_ca_bundle() {
-        let _lock = crate::http::tests::ENV_LOCK.lock().await;
+        if crate::http::tests::run_isolated(
+            "logger::tests::builder_rejects_malformed_environment_ca_bundle",
+        ) {
+            return;
+        }
         let original = std::env::var_os(crate::http::CUSTOM_CA_BUNDLE_ENV);
         std::env::set_var(
             crate::http::CUSTOM_CA_BUNDLE_ENV,

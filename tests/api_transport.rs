@@ -152,7 +152,7 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
         .await;
     Mock::given(method("POST"))
         .and(path("/logs3/overflow"))
-        .and(|request: &Request| !request.headers.contains_key("x-bt-org-name"))
+        .and(header("x-bt-org-name", "my-org"))
         .and(header("authorization", "Bearer upload-key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "method":"PUT", "signedUrl":format!("{}/signed", storage.uri()), "key":"overflow-key"

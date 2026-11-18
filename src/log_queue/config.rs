@@ -297,6 +297,11 @@ mod tests {
 
     #[test]
     fn test_dir_getter_falls_back_to_env_var() {
+        if crate::http::tests::run_isolated(
+            "log_queue::config::tests::test_dir_getter_falls_back_to_env_var",
+        ) {
+            return;
+        }
         let failed_key = "BRAINTRUST_FAILED_PUBLISH_PAYLOADS_DIR";
         let all_key = "BRAINTRUST_ALL_PUBLISH_PAYLOADS_DIR";
 

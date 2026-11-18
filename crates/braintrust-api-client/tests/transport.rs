@@ -678,3 +678,53 @@ async fn parity_base_url_query_and_fragment_do_not_replace_operation_paths() {
     client.get_dataset_builder().send().await.unwrap();
     client.login().await.unwrap();
 }
+
+#[tokio::test]
+async fn default_transport_preserves_redirects_as_one_attempt_results() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(307).insert_header("location", "/redirected"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/redirected"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let client = Client::builder()
+        .api_key("secret")
+        .api_url(server.uri())
+        .build()
+        .unwrap();
+    assert_eq!(
+        client
+            .logs3_raw("{}")
+            .await
+            .unwrap_err()
+            .api()
+            .unwrap()
+            .status,
+        307
+    );
+}
+
+#[tokio::test]
+async fn signed_upload_network_errors_omit_the_signed_url() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let client = Client::builder().api_key("api-secret").build().unwrap();
+    let upload = Logs3OverflowUpload::new(
+        "PUT",
+        format!("http://{address}/object?signature=storage-secret"),
+        "key",
+    );
+    let error = client
+        .upload_logs3_overflow(&upload, "{}")
+        .await
+        .unwrap_err();
+    assert!(!format!("{error:?}").contains("storage-secret"));
+    assert!(!error.to_string().contains("storage-secret"));
+}

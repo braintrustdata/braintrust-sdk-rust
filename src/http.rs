@@ -59,6 +59,7 @@ pub(crate) fn build_http_client(
     user_agent: Option<&str>,
 ) -> Result<Client> {
     let mut builder = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .user_agent(user_agent.unwrap_or(USER_AGENT));
 
@@ -160,7 +161,25 @@ pub(crate) mod tests {
 
     use super::*;
 
-    pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Returns true in the parent once the isolated test has completed.
+    pub(crate) fn run_isolated(name: &str) -> bool {
+        const CHILD: &str = "BRAINTRUST_SDK_ISOLATED_TEST";
+        if std::env::var(CHILD).ok().as_deref() == Some(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated test {name} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
     static CRYPTO_PROVIDER: Once = Once::new();
 
     pub(crate) const VALID_TEST_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
@@ -369,7 +388,9 @@ cb0bfZ7fHHs=
 
     #[tokio::test]
     async fn environment_ca_bundle_enables_private_tls_server() {
-        let _lock = ENV_LOCK.lock().await;
+        if run_isolated("http::tests::environment_ca_bundle_enables_private_tls_server") {
+            return;
+        }
         let original = std::env::var_os(CUSTOM_CA_BUNDLE_ENV);
         let (url, certificate_pem, server) = start_tls_server(1).await;
         std::env::set_var(CUSTOM_CA_BUNDLE_ENV, certificate_pem);
