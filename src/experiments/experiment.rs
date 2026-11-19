@@ -182,7 +182,7 @@ impl Experiment {
     /// Use this for more control over span lifecycle. Pending and successful
     /// starts prevent `log()` on this experiment.
     /// Rejected or failed starts release their pending mode reservation.
-    pub fn start_span(&self) -> crate::Completion<crate::BraintrustError> {
+    pub fn start_span(&self) -> crate::Completion<SpanBuilder, crate::BraintrustError> {
         self.execution.response_try(|| {
             let pending = self.state.pending_start();
             let experiment = self.clone();
