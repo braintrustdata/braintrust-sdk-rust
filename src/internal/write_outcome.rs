@@ -26,7 +26,9 @@ impl WriteOutcome {
         let (sender, mut completion) = Completion::pair();
         let mut state = lock(&self.0);
         if let Some(result) = &state.result {
-            let _ = sender.send(result.clone());
+            let result = result.clone();
+            drop(state);
+            let _ = sender.send(result);
         } else {
             state.observers.retain(|observer| !observer.is_closed());
             if state.observers.len() >= MAX_PENDING_OBSERVERS {
@@ -43,10 +45,12 @@ impl WriteOutcome {
         if state.result.is_some() {
             return;
         }
-        for sender in state.observers.drain(..) {
+        let observers = std::mem::take(&mut state.observers);
+        state.result = Some(result.clone());
+        drop(state);
+        for sender in observers {
             let _ = sender.send(result.clone());
         }
-        state.result = Some(result);
     }
 }
 
@@ -84,6 +88,37 @@ impl Drop for WriteResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_wakes_observers_outside_the_outcome_lock() {
+        use std::future::{Future, IntoFuture};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Context;
+
+        struct Reenter {
+            outcome: WriteOutcome,
+            wakes: AtomicUsize,
+        }
+        impl futures::task::ArcWake for Reenter {
+            fn wake_by_ref(this: &Arc<Self>) {
+                assert!(this.outcome.0.try_lock().is_ok());
+                assert!(this.outcome.observe().is_ok());
+                this.wakes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let outcome = WriteOutcome::default();
+        let observer = Arc::new(Reenter {
+            outcome: outcome.clone(),
+            wakes: AtomicUsize::new(0),
+        });
+        let waker = futures::task::waker(observer.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut completion = Box::pin(outcome.observe().into_future());
+        assert!(completion.as_mut().poll(&mut context).is_pending());
+        outcome.finish(Ok(DeliveryReceipt::new()));
+        assert_eq!(observer.wakes.load(Ordering::SeqCst), 1);
+        assert!(completion.as_mut().poll(&mut context).is_ready());
+    }
 
     #[tokio::test]
     async fn pending_observers_are_bounded_and_dropped_tokens_release_slots() {
