@@ -163,7 +163,7 @@ where
         }
 
         // End root span
-        root_span.end();
+        root_span.end().await?;
 
         // Compute statistics
         let score_stats = EvalSummary::<I, O>::compute_stats(&results);
@@ -244,7 +244,7 @@ where
                         .error(json!(e.to_string()))
                         .build(),
                 );
-                case_span.end();
+                case_span.end().await?;
 
                 return Ok(EvalResult {
                     input: case.input.clone(),
@@ -313,7 +313,7 @@ where
         }
         case_span.log(final_log.build());
 
-        case_span.end();
+        case_span.end().await?;
 
         if !quiet {
             let score_str = all_scores
