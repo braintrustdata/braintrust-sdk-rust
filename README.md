@@ -90,7 +90,8 @@ async fn log(span: &SpanHandle) -> anyhow::Result<()> {
 ```
 
 Writes are batched and submitted automatically. `client.flush()` captures queued
-and active writes through the point of the call and observes their delivery.
+and active writes through the point of the call. Waiting with `.await` or
+`.blocking_wait()` completes only after the consumer finishes the covered work.
 A terminal batch failure fails its write completions and covering flush, then
 retires that batch. Later flushes process new work independently. Failures are
 not retained for replay.
@@ -101,19 +102,19 @@ state. Concurrent shutdown calls share the first call's deadline and outcome.
 
 ## Synchronous applications and runtime selection
 
-The same API works on a plain thread without creating a Tokio runtime. Use a
-future executor to wait for values when needed; for example, with the `futures`
-crate:
+The same API works on a plain thread without creating a Tokio runtime. Writes
+are published to the queue before their calls return. Use `blocking_wait()` to
+wait for a flush acknowledgement or another operation result:
 
 ```rust,no_run
 use braintrust_sdk_rust::BraintrustClient;
-use std::{future::IntoFuture, time::Duration};
+use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
-    let client = futures::executor::block_on(
-        BraintrustClient::builder().build().into_future(),
-    )?;
-    futures::executor::block_on(client.shutdown(Duration::from_secs(10)).into_future())?;
+    let client = BraintrustClient::builder().build().blocking_wait()?;
+    // Submit writes here; their completion tokens may be discarded.
+    client.flush().blocking_wait()?;
+    client.shutdown(Duration::from_secs(10)).blocking_wait()?;
     Ok(())
 }
 ```
@@ -122,6 +123,10 @@ To select your own Tokio runtime, pass `.runtime(current_runtime())` while
 inside it, or `.runtime(Some(handle))`. With an explicit handle, keep that
 runtime alive and driving work until completions finish. `current_runtime()`
 returns `None` outside Tokio, which selects an SDK-owned runtime.
+
+Use `.await` inside asynchronous code. `blocking_wait()` waits on the response
+channel and must be called from synchronous code; it does not drive an explicitly
+supplied runtime. That runtime must continue progressing on another thread.
 
 ## Evaluations
 
@@ -150,7 +155,7 @@ fn main() -> anyhow::Result<()> {
         .build();
     let completion = eval::run(options);
     assert!(completion.is_ok());
-    let summary = futures::executor::block_on(async { completion.await })?;
+    let summary = completion.blocking_wait()?;
     assert_eq!(summary.successful_cases(), 1);
     assert_eq!(summary.results()[0].output().map(String::as_str), Some("HELLO"));
     Ok(())

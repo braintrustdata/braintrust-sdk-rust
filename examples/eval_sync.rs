@@ -1,10 +1,9 @@
 use braintrust_sdk_rust::eval::*;
 use braintrust_sdk_rust::*;
-use std::future::IntoFuture;
 
 fn main() -> anyhow::Result<()> {
     // The client's owned runtime drives work; this thread only waits for tokens.
-    let client = futures::executor::block_on(BraintrustClient::builder().build().into_future())?;
+    let client = BraintrustClient::builder().build().blocking_wait()?;
 
     // Define test cases
     let cases = vec![
@@ -40,7 +39,7 @@ fn main() -> anyhow::Result<()> {
             .build(),
     );
     assert!(completion.is_ok());
-    let result = futures::executor::block_on(completion.into_future())?;
+    let result = completion.blocking_wait()?;
 
     // Print results
     println!("\n=== Results ===\n");

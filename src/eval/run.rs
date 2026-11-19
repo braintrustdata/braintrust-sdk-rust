@@ -17,7 +17,7 @@ use serde::Serialize;
 ///     .quiet(true).build();
 /// let completion = eval::run(options);
 /// assert!(completion.is_ok());
-/// let summary = futures::executor::block_on(async { completion.await })?;
+/// let summary = completion.blocking_wait()?;
 /// assert_eq!(summary.results()[0].output(), Some(&6));
 /// # Ok(())
 /// # }
