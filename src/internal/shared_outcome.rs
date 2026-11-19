@@ -1,28 +1,38 @@
-//! One final write outcome shared by repeated span-end observers.
+//! A bounded final outcome for repeated observers of one logical operation.
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::oneshot;
 
-use crate::{Completion, DeliveryReceipt, EnqueueError, ExecutionError, WriteError};
+use crate::{Completion, EnqueueError, ExecutionError};
 
-type Outcome = Result<DeliveryReceipt, WriteError>;
-type Sender = oneshot::Sender<Outcome>;
+type Sender<T, E> = oneshot::Sender<Result<T, E>>;
 const MAX_PENDING_OBSERVERS: usize = 1024;
 
-/// Lives with a finished span, not with the queue. Holds no command or payload.
-#[derive(Clone, Default)]
-pub(crate) struct WriteOutcome(Arc<Mutex<State>>);
-#[derive(Default)]
-struct State {
-    result: Option<Outcome>,
-    observers: Vec<Sender>,
+/// Lives with its operation owner, not with an active-work registry.
+pub(crate) struct SharedOutcome<T, E>(Arc<Mutex<State<T, E>>>);
+struct State<T, E> {
+    result: Option<Result<T, E>>,
+    observers: Vec<Sender<T, E>>,
+}
+impl<T, E> Clone for SharedOutcome<T, E> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<T, E> Default for SharedOutcome<T, E> {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(State {
+            result: None,
+            observers: Vec::new(),
+        })))
+    }
 }
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-impl WriteOutcome {
-    pub fn observe(&self) -> Completion<DeliveryReceipt, WriteError> {
+impl<T: Clone, E: Clone + From<EnqueueError>> SharedOutcome<T, E> {
+    pub fn observe(&self) -> Completion<T, E> {
         let (sender, mut completion) = Completion::pair();
         let mut state = lock(&self.0);
         if let Some(result) = &state.result {
@@ -40,7 +50,7 @@ impl WriteOutcome {
         completion
     }
 
-    fn finish(&self, result: Outcome) {
+    pub fn finish(&self, result: Result<T, E>) {
         let mut state = lock(&self.0);
         if state.result.is_some() {
             return;
@@ -54,20 +64,20 @@ impl WriteOutcome {
     }
 }
 
-/// Connect the existing batch sender to a span's optional shared final outcome.
+/// Publish to both a one-shot observer and an optional shared final outcome.
 /// No relay task or polling of a completion token is needed.
-pub(crate) struct WriteResponder {
-    sender: Option<Sender>,
-    outcome: Option<WriteOutcome>,
+pub(crate) struct SharedResponder<T: Clone, E: Clone + From<EnqueueError> + From<ExecutionError>> {
+    sender: Option<Sender<T, E>>,
+    outcome: Option<SharedOutcome<T, E>>,
 }
-impl WriteResponder {
-    pub fn new(sender: Sender, outcome: Option<WriteOutcome>) -> Self {
+impl<T: Clone, E: Clone + From<EnqueueError> + From<ExecutionError>> SharedResponder<T, E> {
+    pub fn new(sender: Sender<T, E>, outcome: Option<SharedOutcome<T, E>>) -> Self {
         Self {
             sender: Some(sender),
             outcome,
         }
     }
-    pub fn send(mut self, result: Outcome) -> Result<(), Outcome> {
+    pub fn send(mut self, result: Result<T, E>) -> Result<(), Result<T, E>> {
         if let Some(outcome) = self.outcome.take() {
             outcome.finish(result.clone());
         }
@@ -77,7 +87,9 @@ impl WriteResponder {
         }
     }
 }
-impl Drop for WriteResponder {
+impl<T: Clone, E: Clone + From<EnqueueError> + From<ExecutionError>> Drop
+    for SharedResponder<T, E>
+{
     fn drop(&mut self) {
         if let Some(outcome) = self.outcome.take() {
             outcome.finish(Err(ExecutionError::WorkerLost.into()));
@@ -85,9 +97,13 @@ impl Drop for WriteResponder {
     }
 }
 
+pub(crate) type WriteOutcome = SharedOutcome<crate::DeliveryReceipt, crate::WriteError>;
+pub(crate) type WriteResponder = SharedResponder<crate::DeliveryReceipt, crate::WriteError>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DeliveryReceipt, WriteError};
 
     #[test]
     fn publication_wakes_observers_outside_the_outcome_lock() {

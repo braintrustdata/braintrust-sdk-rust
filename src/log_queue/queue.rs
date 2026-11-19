@@ -7,9 +7,10 @@ use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use crate::error::Result;
 use crate::internal::delivery::WriteService;
+use crate::internal::execution::ExecutionBinding;
 use crate::internal::ports::SpanSubmitter;
 use crate::internal::session::CredentialScope;
-use crate::internal::write_outcome::WriteOutcome;
+use crate::internal::shared_outcome::WriteOutcome;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use crate::{
@@ -49,14 +50,20 @@ struct SubmitCommand {
 struct SpanBatchProcessor {
     config: LogQueueConfig,
     client: reqwest::Client,
+    execution: ExecutionBinding,
     project_cache: TokioMutex<IndexMap<(CredentialScope, String), String>>,
     version_info: TokioMutex<IndexMap<CredentialScope, (usize, bool)>>,
 }
 impl SpanBatchProcessor {
-    fn new(config: LogQueueConfig, client: reqwest::Client) -> Arc<Self> {
+    fn new(
+        config: LogQueueConfig,
+        client: reqwest::Client,
+        execution: ExecutionBinding,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config,
             client,
+            execution,
             project_cache: TokioMutex::new(IndexMap::new()),
             version_info: TokioMutex::new(IndexMap::new()),
         })
@@ -137,25 +144,27 @@ impl SpanBatchProcessor {
 
             for chunk in chunks {
                 let config = self.config.clone();
-                let batches = tokio::task::spawn_blocking(move || {
-                    let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
-                    for row in chunk {
-                        let key = RowKey::from_row(&row);
-                        if let Some(existing) = merged.get_mut(&key) {
-                            if row.is_merge.unwrap_or(false) {
-                                merge_row_into(existing, row);
+                let batches = self
+                    .execution
+                    .spawn_blocking(move || {
+                        let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
+                        for row in chunk {
+                            let key = RowKey::from_row(&row);
+                            if let Some(existing) = merged.get_mut(&key) {
+                                if row.is_merge.unwrap_or(false) {
+                                    merge_row_into(existing, row);
+                                } else {
+                                    *existing = row;
+                                }
                             } else {
-                                *existing = row;
+                                merged.insert(key, row);
                             }
-                        } else {
-                            merged.insert(key, row);
                         }
-                    }
 
-                    let rows: Vec<Logs3Row> = merged.into_values().collect();
-                    batch_and_serialize_rows(rows, &config, effective_batch_bytes)
-                })
-                .await;
+                        let rows: Vec<Logs3Row> = merged.into_values().collect();
+                        batch_and_serialize_rows(rows, &config, effective_batch_bytes)
+                    })
+                    .await;
                 let batches = match batches {
                     Ok(Ok(batches)) => batches,
                     Ok(Err(error)) => {
@@ -445,6 +454,7 @@ impl SpanBatchProcessor {
 
 /// Reports rejected submissions without coupling admission to batch processing.
 struct RejectionReporter {
+    execution: ExecutionBinding,
     dropped_count: AtomicUsize,
     last_drop_log_time: AtomicU64,
     config: LogQueueConfig,
@@ -491,10 +501,7 @@ impl RejectionReporter {
         if dirs.is_empty() {
             return;
         }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        handle.spawn(async move {
+        self.execution.spawn(async move {
             let SubmitCommand {
                 scope: _,
                 payload,
@@ -624,22 +631,24 @@ pub struct LogQueue {
     writes: WriteService<SubmitCommand>,
 }
 impl LogQueue {
-    pub fn new(config: LogQueueConfig, client: reqwest::Client, _worker_queue_size: usize) -> Self {
+    pub fn new(
+        config: LogQueueConfig,
+        client: reqwest::Client,
+        _worker_queue_size: usize,
+        execution: ExecutionBinding,
+    ) -> Self {
         let capacity = config.queue_max_size();
         let rejections = Arc::new(RejectionReporter {
+            execution: execution.clone(),
             dropped_count: AtomicUsize::new(0),
             last_drop_log_time: AtomicU64::new(0),
             config: config.clone(),
         });
-        let processor = SpanBatchProcessor::new(config, client);
-        let writes = WriteService::new(
-            capacity,
-            tokio::runtime::Handle::current(),
-            move |commands| {
-                let processor = processor.clone();
-                Box::pin(async move { processor.process(commands).await })
-            },
-        );
+        let processor = SpanBatchProcessor::new(config, client, execution.clone());
+        let writes = WriteService::new(capacity, execution, move |commands| {
+            let processor = processor.clone();
+            Box::pin(async move { processor.process(commands).await })
+        });
         Self { rejections, writes }
     }
 
@@ -669,6 +678,9 @@ impl LogQueue {
             })
     }
 
+    pub fn cancel(&self, error: crate::ExecutionError) {
+        self.writes.cancel(error);
+    }
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
         self.writes.flush()
     }
@@ -747,6 +759,7 @@ mod tests {
             LogQueueConfig::builder().num_retries(0).build(),
             reqwest::Client::new(),
             32,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
         )
     }
     fn scope(server: &MockServer, token: &str) -> CredentialScope {
@@ -762,6 +775,54 @@ mod tests {
         Some(ParentSpanInfo::Experiment {
             object_id: "experiment".into(),
         })
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_submissions_share_one_bounded_lazy_worker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let queue = LogQueue::new(
+            LogQueueConfig::builder()
+                .queue_max_size(8)
+                .num_retries(0)
+                .build(),
+            reqwest::Client::new(),
+            8,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
+        );
+        let tokens = std::thread::scope(|threads| {
+            (0..32)
+                .map(|number| {
+                    let queue = &queue;
+                    let server = &server;
+                    threads.spawn(move || {
+                        queue.submit(
+                            scope(server, "token"),
+                            payload(&format!("row-{number}"), false),
+                            parent(),
+                            None,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(tokens.iter().filter(|token| token.is_ok()).count(), 8);
+        assert_eq!(queue.flush().await.unwrap().delivered, 8);
+        for token in tokens {
+            let _ = token.await;
+        }
+        queue
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

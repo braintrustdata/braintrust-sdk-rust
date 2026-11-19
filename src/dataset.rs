@@ -132,6 +132,7 @@ impl DatasetWrite {
 
 use crate::error::Result;
 use crate::http::api_result;
+use crate::internal::execution::ExecutionBinding;
 use crate::internal::session::CredentialScope;
 
 // ============================================================================
@@ -368,6 +369,8 @@ pub struct Dataset {
     #[builder(start_fn)]
     api: reqwest::Client,
     #[builder(start_fn)]
+    execution: ExecutionBinding,
+    #[builder(start_fn)]
     scope: CredentialScope,
     /// Project containing the dataset (required).
     #[builder(into)]
@@ -404,9 +407,13 @@ impl Dataset {
                 );
                 request.description = self.description.clone();
                 request.metadata = self.metadata.clone();
-                let response =
-                    api_result(self.scope.api(&self.api)?.register_dataset(&request).await)?
-                        .into_inner();
+                let api = self.scope.api(&self.api)?;
+                let response = self
+                    .execution
+                    .response::<_, crate::BraintrustError, _>(async move {
+                        Ok(api_result(api.register_dataset(&request).await)?.into_inner())
+                    })
+                    .await?;
                 Ok(DatasetMetadata {
                     dataset_id: response.dataset.id,
                     project_id: response.project.id,
@@ -469,6 +476,7 @@ impl Dataset {
         let metadata = self.ensure_registered().await?;
         Ok(DatasetIterator::new(
             self.api.clone(),
+            self.execution.clone(),
             self.scope.clone(),
             metadata.dataset_id.clone(),
             batch_size.unwrap_or(1000).max(1),
@@ -480,13 +488,14 @@ impl Dataset {
         let metadata = self.ensure_registered().await?;
 
         // Fetch summary from API
-        let response = api_result(
-            self.scope
-                .api(&self.api)?
-                .dataset_summary(&metadata.dataset_id)
-                .await,
-        )?
-        .into_inner();
+        let api = self.scope.api(&self.api)?;
+        let id = metadata.dataset_id.clone();
+        let response = self
+            .execution
+            .response::<_, crate::BraintrustError, _>(async move {
+                Ok(api_result(api.dataset_summary(&id).await)?.into_inner())
+            })
+            .await?;
 
         Ok(DatasetSummary {
             project_name: response.project_name,
@@ -500,13 +509,16 @@ impl Dataset {
     }
 
     async fn write_record(&self, row: DatasetWrite) -> Result<()> {
-        api_result(
-            self.scope
-                .api(&self.api)?
-                .logs3(&serde_json::json!({"api_version": crate::types::LOGS_API_VERSION, "rows": [row]}))
-                .await,
-        )?;
-        Ok(())
+        let api = self.scope.api(&self.api)?;
+        self.execution
+            .response::<_, crate::BraintrustError, _>(async move {
+                api_result(
+                    api.logs3(&serde_json::json!({"api_version": crate::types::LOGS_API_VERSION, "rows": [row]}))
+                        .await,
+                )?;
+                Ok(())
+            })
+            .await
     }
 }
 
@@ -528,6 +540,7 @@ impl Dataset {
 /// ```
 pub struct DatasetIterator {
     fetcher: reqwest::Client,
+    execution: ExecutionBinding,
     scope: CredentialScope,
     dataset_id: String,
     batch_size: usize,
@@ -539,12 +552,14 @@ pub struct DatasetIterator {
 impl DatasetIterator {
     fn new(
         fetcher: reqwest::Client,
+        execution: ExecutionBinding,
         scope: CredentialScope,
         dataset_id: String,
         batch_size: usize,
     ) -> Self {
         Self {
             fetcher,
+            execution,
             scope,
             dataset_id,
             batch_size,
@@ -572,13 +587,13 @@ impl DatasetIterator {
                 },
             };
             // A failed request leaves the cursor and EOF state untouched.
-            let response = api_result(
-                self.scope
-                    .api(&self.fetcher)?
-                    .btql_json_as::<_, BTQLResponse>(&query)
-                    .await,
-            )?
-            .into_inner();
+            let api = self.scope.api(&self.fetcher)?;
+            let response = self
+                .execution
+                .response::<_, crate::BraintrustError, _>(async move {
+                    Ok(api_result(api.btql_json_as::<_, BTQLResponse>(&query).await)?.into_inner())
+                })
+                .await?;
             if response.cursor.is_some() && response.cursor == previous_cursor {
                 return Err(crate::BraintrustError::Background(
                     "dataset pagination cursor did not advance".into(),

@@ -12,6 +12,7 @@ use wiremock::{
 
 async fn client(server: &MockServer) -> BraintrustClient {
     BraintrustClient::builder()
+        .runtime(braintrust_sdk_rust::current_runtime())
         .skip_login(true)
         .api_url(server.uri())
         .app_url(server.uri())

@@ -3,7 +3,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::internal::session::CredentialScope;
-use crate::internal::write_outcome::WriteOutcome;
+use crate::internal::shared_outcome::WriteOutcome;
 use crate::types::{ParentSpanInfo, SpanPayload};
 
 #[async_trait]
