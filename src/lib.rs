@@ -51,11 +51,9 @@ pub use span::{
 };
 pub use span_components::{project_logs_identifier, ProjectLogsIdentifier, SpanComponents};
 pub use stream::{
-    wrap_stream_with_span, BraintrustStream, ChatMessage, ChatMessageBuilder,
-    ChatMessageBuilderError, FinalizedStream, FinalizedStreamBuilder, FinalizedStreamBuilderError,
-    FunctionCall, FunctionCallBuilder, FunctionCallBuilderError, OutputChoice, OutputChoiceBuilder,
-    OutputChoiceBuilderError, StreamMetadata, StreamMetadataBuilder, StreamMetadataBuilderError,
-    ToolCall, ToolCallBuilder, ToolCallBuilderError,
+    wrap_stream_with_span, BraintrustStream, ChatMessage, ChatMessageBuilder, FinalizedStream,
+    FinalizedStreamBuilder, FunctionCall, FunctionCallBuilder, OutputChoice, OutputChoiceBuilder,
+    StreamMetadata, StreamMetadataBuilder, ToolCall, ToolCallBuilder,
 };
 pub use types::{
     CompletionTokensDetails, InvalidSpanObjectType, ParentSpanInfo, PromptTokensDetails,
