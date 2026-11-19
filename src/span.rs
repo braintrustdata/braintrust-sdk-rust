@@ -18,7 +18,7 @@ use crate::types::{
     ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
 };
 
-/// Event data to log to a span. All fields are optional.
+/// Event data for span and experiment logging. All fields are optional.
 /// Multiple calls to `log()` will merge data.
 ///
 /// Use `SpanLog::builder()` to construct instances.

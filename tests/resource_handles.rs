@@ -1,7 +1,7 @@
 //! Consumer coverage for the concrete public resource model.
 use braintrust_sdk_rust::{
     BraintrustClient, Dataset, DatasetBuilder, DatasetInsert, DatasetIterator, Experiment,
-    ExperimentBuilder, ExperimentSpanBuilder, ParentSpanInfo, SpanBuilder, SpanHandle, SpanLog,
+    ExperimentBuilder, ParentSpanInfo, SpanBuilder, SpanHandle, SpanLog,
 };
 use serde_json::json;
 use wiremock::{
@@ -24,7 +24,6 @@ fn resource_handles_and_builders_are_send_sync_and_owned() {
     assert_owned::<SpanBuilder>();
     assert_owned::<Experiment>();
     assert_owned::<ExperimentBuilder>();
-    assert_owned::<ExperimentSpanBuilder>();
     assert_owned::<Dataset>();
     assert_owned::<DatasetBuilder>();
     assert_owned::<DatasetIterator>();
@@ -82,7 +81,7 @@ async fn resources_and_detached_span_builders_work_after_the_client_is_dropped()
         dataset: dataset.build(),
     };
     resources.span.log(SpanLog::default()).await.unwrap();
-    let child: ExperimentSpanBuilder = resources.experiment.start_span().await.unwrap();
+    let child: SpanBuilder = resources.experiment.start_span().await.unwrap();
     drop(resources.experiment);
     let child: SpanHandle = child.build();
     child.log(SpanLog::default()).await.unwrap();
