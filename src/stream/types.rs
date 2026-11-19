@@ -1,116 +1,22 @@
 use crate::UsageMetrics;
 use serde::Serialize;
 use serde_json::Value;
-use std::{collections::HashMap, fmt};
-
-// =============================================================================
-// Error types for stream output builders (empty for now, extensible later)
-// =============================================================================
-
-/// Error type for ToolCall builder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum ToolCallBuilderError {}
-
-impl fmt::Display for ToolCallBuilderError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {}
-    }
-}
-
-impl std::error::Error for ToolCallBuilderError {}
-
-/// Error type for FunctionCall builder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum FunctionCallBuilderError {}
-
-impl fmt::Display for FunctionCallBuilderError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {}
-    }
-}
-
-impl std::error::Error for FunctionCallBuilderError {}
-
-/// Error type for ChatMessage builder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum ChatMessageBuilderError {}
-
-impl fmt::Display for ChatMessageBuilderError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {}
-    }
-}
-
-impl std::error::Error for ChatMessageBuilderError {}
-
-/// Error type for OutputChoice builder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum OutputChoiceBuilderError {}
-
-impl fmt::Display for OutputChoiceBuilderError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {}
-    }
-}
-
-impl std::error::Error for OutputChoiceBuilderError {}
-
-/// Error type for StreamMetadata builder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum StreamMetadataBuilderError {}
-
-impl fmt::Display for StreamMetadataBuilderError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {}
-    }
-}
-
-impl std::error::Error for StreamMetadataBuilderError {}
-
-/// Error type for FinalizedStream builder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum FinalizedStreamBuilderError {}
-
-impl fmt::Display for FinalizedStreamBuilderError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {}
-    }
-}
-
-impl std::error::Error for FinalizedStreamBuilderError {}
+use std::collections::HashMap;
 
 /// A tool call in a chat message.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(bon::Builder, Clone, Debug, Default, Serialize)]
 #[non_exhaustive]
 pub struct ToolCall {
+    #[builder(default, into)]
     id: String,
     #[serde(rename = "type")]
+    #[builder(default = "function".to_string(), into)]
     call_type: String, // Always "function"
+    #[builder(default)]
     function: FunctionCall,
 }
 
 impl ToolCall {
-    /// Create a new ToolCallBuilder.
-    pub fn builder() -> ToolCallBuilder {
-        ToolCallBuilder::new()
-    }
-
-    /// Create a new ToolCall (internal use).
-    #[allow(dead_code)]
-    pub(crate) fn new(id: String, call_type: String, function: FunctionCall) -> Self {
-        Self {
-            id,
-            call_type,
-            function,
-        }
-    }
-
     /// Get the tool call ID.
     pub fn id(&self) -> &str {
         &self.id
@@ -127,71 +33,17 @@ impl ToolCall {
     }
 }
 
-/// Builder for ToolCall.
-#[derive(Clone, Default)]
-pub struct ToolCallBuilder {
-    id: String,
-    call_type: String,
-    function: FunctionCall,
-}
-
-impl ToolCallBuilder {
-    /// Create a new ToolCallBuilder.
-    pub fn new() -> Self {
-        Self {
-            call_type: "function".to_string(),
-            ..Default::default()
-        }
-    }
-
-    /// Set the tool call ID.
-    pub fn id(mut self, id: impl Into<String>) -> Self {
-        self.id = id.into();
-        self
-    }
-
-    /// Set the call type.
-    pub fn call_type(mut self, call_type: impl Into<String>) -> Self {
-        self.call_type = call_type.into();
-        self
-    }
-
-    /// Set the function details.
-    pub fn function(mut self, function: FunctionCall) -> Self {
-        self.function = function;
-        self
-    }
-
-    /// Build the ToolCall.
-    pub fn build(self) -> std::result::Result<ToolCall, ToolCallBuilderError> {
-        Ok(ToolCall {
-            id: self.id,
-            call_type: self.call_type,
-            function: self.function,
-        })
-    }
-}
-
 /// Function details in a tool call.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(bon::Builder, Clone, Debug, Default, Serialize)]
 #[non_exhaustive]
 pub struct FunctionCall {
+    #[builder(default, into)]
     name: String,
+    #[builder(default, into)]
     arguments: String,
 }
 
 impl FunctionCall {
-    /// Create a new FunctionCallBuilder.
-    pub fn builder() -> FunctionCallBuilder {
-        FunctionCallBuilder::new()
-    }
-
-    /// Create a new FunctionCall (internal use).
-    #[allow(dead_code)]
-    pub(crate) fn new(name: String, arguments: String) -> Self {
-        Self { name, arguments }
-    }
-
     /// Get the function name.
     pub fn name(&self) -> &str {
         &self.name
@@ -203,71 +55,21 @@ impl FunctionCall {
     }
 }
 
-/// Builder for FunctionCall.
-#[derive(Clone, Default)]
-pub struct FunctionCallBuilder {
-    name: String,
-    arguments: String,
-}
-
-impl FunctionCallBuilder {
-    /// Create a new FunctionCallBuilder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the function name.
-    pub fn name(mut self, name: impl Into<String>) -> Self {
-        self.name = name.into();
-        self
-    }
-
-    /// Set the function arguments.
-    pub fn arguments(mut self, arguments: impl Into<String>) -> Self {
-        self.arguments = arguments.into();
-        self
-    }
-
-    /// Build the FunctionCall.
-    pub fn build(self) -> std::result::Result<FunctionCall, FunctionCallBuilderError> {
-        Ok(FunctionCall {
-            name: self.name,
-            arguments: self.arguments,
-        })
-    }
-}
-
 /// A chat message in the output.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(bon::Builder, Clone, Debug, Default, Serialize)]
 #[non_exhaustive]
 pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl ChatMessage {
-    /// Create a new ChatMessageBuilder.
-    pub fn builder() -> ChatMessageBuilder {
-        ChatMessageBuilder::new()
-    }
-
-    /// Create a new ChatMessage (internal use).
-    pub(crate) fn new(
-        role: Option<String>,
-        content: Option<String>,
-        tool_calls: Option<Vec<ToolCall>>,
-    ) -> Self {
-        Self {
-            role,
-            content,
-            tool_calls,
-        }
-    }
-
     /// Get the message role.
     pub fn role(&self) -> Option<&str> {
         self.role.as_deref()
@@ -284,75 +86,22 @@ impl ChatMessage {
     }
 }
 
-/// Builder for ChatMessage.
-#[derive(Clone, Default)]
-pub struct ChatMessageBuilder {
-    role: Option<String>,
-    content: Option<String>,
-    tool_calls: Option<Vec<ToolCall>>,
-}
-
-impl ChatMessageBuilder {
-    /// Create a new ChatMessageBuilder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the message role.
-    pub fn role(mut self, role: impl Into<String>) -> Self {
-        self.role = Some(role.into());
-        self
-    }
-
-    /// Set the message content.
-    pub fn content(mut self, content: impl Into<String>) -> Self {
-        self.content = Some(content.into());
-        self
-    }
-
-    /// Set the tool calls.
-    pub fn tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
-        self.tool_calls = Some(tool_calls);
-        self
-    }
-
-    /// Build the ChatMessage.
-    pub fn build(self) -> std::result::Result<ChatMessage, ChatMessageBuilderError> {
-        Ok(ChatMessage {
-            role: self.role,
-            content: self.content,
-            tool_calls: self.tool_calls,
-        })
-    }
-}
-
 /// A choice in the output array (matches OpenAI response format).
-#[derive(Clone, Debug, Serialize)]
+#[derive(bon::Builder, Clone, Debug, Serialize)]
 #[non_exhaustive]
 pub struct OutputChoice {
+    #[builder(default)]
     index: usize,
+    #[builder(default)]
     message: ChatMessage,
+    #[builder(skip)]
     logprobs: Option<()>, // Always None
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(into)]
     finish_reason: Option<String>,
 }
 
 impl OutputChoice {
-    /// Create a new OutputChoiceBuilder.
-    pub fn builder() -> OutputChoiceBuilder {
-        OutputChoiceBuilder::new()
-    }
-
-    /// Create a new OutputChoice (internal use).
-    pub(crate) fn new(index: usize, message: ChatMessage, finish_reason: Option<String>) -> Self {
-        Self {
-            index,
-            message,
-            logprobs: None,
-            finish_reason,
-        }
-    }
-
     /// Get the choice index.
     pub fn index(&self) -> usize {
         self.index
@@ -369,49 +118,6 @@ impl OutputChoice {
     }
 }
 
-/// Builder for OutputChoice.
-#[derive(Clone, Default)]
-pub struct OutputChoiceBuilder {
-    index: usize,
-    message: ChatMessage,
-    finish_reason: Option<String>,
-}
-
-impl OutputChoiceBuilder {
-    /// Create a new OutputChoiceBuilder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the choice index.
-    pub fn index(mut self, index: usize) -> Self {
-        self.index = index;
-        self
-    }
-
-    /// Set the message.
-    pub fn message(mut self, message: ChatMessage) -> Self {
-        self.message = message;
-        self
-    }
-
-    /// Set the finish reason.
-    pub fn finish_reason(mut self, finish_reason: impl Into<String>) -> Self {
-        self.finish_reason = Some(finish_reason.into());
-        self
-    }
-
-    /// Build the OutputChoice.
-    pub fn build(self) -> std::result::Result<OutputChoice, OutputChoiceBuilderError> {
-        Ok(OutputChoice {
-            index: self.index,
-            message: self.message,
-            logprobs: None,
-            finish_reason: self.finish_reason,
-        })
-    }
-}
-
 /// Stream metadata with typed known fields and passthrough for extras.
 #[derive(Clone, Debug, Default, Serialize)]
 #[non_exhaustive]
@@ -423,14 +129,14 @@ pub struct StreamMetadata {
     extra: HashMap<String, Value>,
 }
 
+#[bon::bon]
 impl StreamMetadata {
-    /// Create a new StreamMetadataBuilder.
-    pub fn builder() -> StreamMetadataBuilder {
-        StreamMetadataBuilder::new()
-    }
-
-    /// Create a new StreamMetadata (internal use).
-    pub(crate) fn new(model: Option<String>, extra: HashMap<String, Value>) -> Self {
+    /// Build stream metadata with optional model and extra fields.
+    #[builder]
+    pub fn new(
+        #[builder(field)] extra: HashMap<String, Value>,
+        #[builder(into)] model: Option<String>,
+    ) -> Self {
         Self { model, extra }
     }
 
@@ -462,77 +168,21 @@ impl StreamMetadata {
     }
 }
 
-/// Builder for StreamMetadata.
-#[derive(Clone, Default)]
-pub struct StreamMetadataBuilder {
-    model: Option<String>,
-    extra: HashMap<String, Value>,
-}
-
-impl StreamMetadataBuilder {
-    /// Create a new StreamMetadataBuilder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the model name.
-    pub fn model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
-        self
-    }
-
-    /// Add an extra field.
-    pub fn extra_field(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
-        self.extra.insert(key.into(), value.into());
-        self
-    }
-
-    /// Set all extra fields.
-    pub fn extra(mut self, extra: HashMap<String, Value>) -> Self {
-        self.extra = extra;
-        self
-    }
-
-    /// Build the StreamMetadata.
-    pub fn build(self) -> std::result::Result<StreamMetadata, StreamMetadataBuilderError> {
-        Ok(StreamMetadata {
-            model: self.model,
-            extra: self.extra,
-        })
-    }
-}
-
 /// Aggregated result from a streaming response.
-#[derive(Clone)]
+#[derive(bon::Builder, Clone)]
 #[non_exhaustive]
 pub struct FinalizedStream {
     /// The output choices (matches OpenAI response format)
+    #[builder(field)]
     output: Vec<OutputChoice>,
     /// Usage metrics extracted from the stream
     usage: Option<UsageMetrics>,
     /// Metadata (model and any extras)
+    #[builder(default)]
     metadata: StreamMetadata,
 }
 
 impl FinalizedStream {
-    /// Create a new FinalizedStreamBuilder.
-    pub fn builder() -> FinalizedStreamBuilder {
-        FinalizedStreamBuilder::new()
-    }
-
-    /// Create a new FinalizedStream (internal use).
-    pub(crate) fn new(
-        output: Vec<OutputChoice>,
-        usage: Option<UsageMetrics>,
-        metadata: StreamMetadata,
-    ) -> Self {
-        Self {
-            output,
-            usage,
-            metadata,
-        }
-    }
-
     /// Get the output choices.
     pub fn output(&self) -> &[OutputChoice] {
         &self.output
@@ -549,20 +199,21 @@ impl FinalizedStream {
     }
 }
 
-/// Builder for FinalizedStream.
-#[derive(Clone, Default)]
-pub struct FinalizedStreamBuilder {
-    output: Vec<OutputChoice>,
-    usage: Option<UsageMetrics>,
-    metadata: StreamMetadata,
-}
-
-impl FinalizedStreamBuilder {
-    /// Create a new FinalizedStreamBuilder.
-    pub fn new() -> Self {
-        Self::default()
+impl<S: stream_metadata_builder::State> StreamMetadataBuilder<S> {
+    /// Add an extra metadata field.
+    pub fn extra_field(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.extra.insert(key.into(), value.into());
+        self
     }
 
+    /// Set all extra metadata fields.
+    pub fn extra(mut self, extra: HashMap<String, Value>) -> Self {
+        self.extra = extra;
+        self
+    }
+}
+
+impl<S: finalized_stream_builder::State> FinalizedStreamBuilder<S> {
     /// Set the output choices.
     pub fn output(mut self, output: Vec<OutputChoice>) -> Self {
         self.output = output;
@@ -573,26 +224,5 @@ impl FinalizedStreamBuilder {
     pub fn add_output(mut self, choice: OutputChoice) -> Self {
         self.output.push(choice);
         self
-    }
-
-    /// Set the usage metrics.
-    pub fn usage(mut self, usage: UsageMetrics) -> Self {
-        self.usage = Some(usage);
-        self
-    }
-
-    /// Set the metadata.
-    pub fn metadata(mut self, metadata: StreamMetadata) -> Self {
-        self.metadata = metadata;
-        self
-    }
-
-    /// Build the FinalizedStream.
-    pub fn build(self) -> std::result::Result<FinalizedStream, FinalizedStreamBuilderError> {
-        Ok(FinalizedStream {
-            output: self.output,
-            usage: self.usage,
-            metadata: self.metadata,
-        })
     }
 }

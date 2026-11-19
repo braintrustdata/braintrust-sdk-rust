@@ -66,13 +66,12 @@ impl Recorder {
         if self.state.chunk_count().is_multiple_of(UPDATE_CHUNKS)
             || self.last_update.elapsed() > UPDATE_INTERVAL
         {
-            if let Ok(partial) = self.state.current_value() {
-                if let Ok(output) = serde_json::to_value(partial.output()) {
-                    drop(span.log(SpanLog {
-                        output: Some(output),
-                        ..Default::default()
-                    }));
-                }
+            let partial = self.state.current_value();
+            if let Ok(output) = serde_json::to_value(partial.output()) {
+                drop(span.log(SpanLog {
+                    output: Some(output),
+                    ..Default::default()
+                }));
             }
             drop(span.flush());
             self.last_update = Instant::now();
@@ -82,20 +81,19 @@ impl Recorder {
     fn finish(&mut self) -> Option<BoxFuture<'static, ()>> {
         let span = self.span.take()?;
         if !self.state.is_empty() {
-            if let Ok(finalized) = self.state.final_value() {
-                let mut builder = SpanLog::builder();
-                if let Ok(output) = serde_json::to_value(finalized.output()) {
-                    builder = builder.output(output);
-                }
-                if let Some(metadata) = finalized.metadata().to_map() {
-                    builder = builder.metadata(metadata);
-                }
-                if let Some(usage) = finalized.usage() {
-                    builder = builder.metrics(usage_metrics_to_map(usage.clone()));
-                }
-                if let Ok(log) = builder.build() {
-                    drop(span.log(log));
-                }
+            let finalized = self.state.final_value();
+            let mut builder = SpanLog::builder();
+            if let Ok(output) = serde_json::to_value(finalized.output()) {
+                builder = builder.output(output);
+            }
+            if let Some(metadata) = finalized.metadata().to_map() {
+                builder = builder.metadata(metadata);
+            }
+            if let Some(usage) = finalized.usage() {
+                builder = builder.metrics(usage_metrics_to_map(usage.clone()));
+            }
+            if let Ok(log) = builder.build() {
+                drop(span.log(log));
             }
         }
         let end = span.end();

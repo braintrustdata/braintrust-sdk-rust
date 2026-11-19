@@ -39,7 +39,7 @@ fn aggregates_content_from_streaming_values() {
         stream.push(chunk);
     }
 
-    let finalized = stream.final_value().expect("should finalize");
+    let finalized = stream.final_value();
 
     // Check output is array of choices
     assert_eq!(finalized.output().len(), 1);
@@ -84,7 +84,7 @@ fn aggregates_usage_from_final_chunk() {
         stream.push(chunk);
     }
 
-    let finalized = stream.final_value().expect("should finalize");
+    let finalized = stream.final_value();
 
     let usage = finalized.usage().expect("should have usage");
     assert_eq!(usage.prompt_tokens(), Some(10));
@@ -122,7 +122,7 @@ fn aggregates_usage_with_input_output_token_aliases() {
         stream.push(chunk);
     }
 
-    let finalized = stream.final_value().expect("should finalize");
+    let finalized = stream.final_value();
     let usage = finalized.usage().expect("should have usage");
 
     assert_eq!(usage.prompt_tokens(), Some(12));
@@ -193,7 +193,7 @@ fn aggregates_tool_calls_from_streaming_values() {
         stream.push(chunk);
     }
 
-    let finalized = stream.final_value().expect("should finalize");
+    let finalized = stream.final_value();
     let choice = &finalized.output()[0];
     let tool_calls = choice
         .message()
@@ -252,7 +252,7 @@ fn aggregates_detailed_usage_from_final_chunk() {
         stream.push(chunk);
     }
 
-    let finalized = stream.final_value().expect("should finalize");
+    let finalized = stream.final_value();
     let usage = finalized.usage().expect("should have usage");
 
     assert_eq!(usage.prompt_tokens(), Some(100));
@@ -304,7 +304,7 @@ fn caches_finalized_result() {
 
     // First call computes - extract content and drop borrow
     let first_content = {
-        let first = stream.final_value().expect("should finalize");
+        let first = stream.final_value();
         first
             .output()
             .first()
@@ -313,7 +313,7 @@ fn caches_finalized_result() {
 
     // Second call returns cached
     let second_content = {
-        let second = stream.final_value().expect("should finalize");
+        let second = stream.final_value();
         second
             .output()
             .first()
@@ -329,13 +329,11 @@ fn snapshots_follow_new_chunks_and_preserve_sparse_tool_indices() {
     let mut stream = BraintrustStream::new();
     stream.push(json!({"choices":[{"delta":{"content":"first", "tool_calls":[{"index":7,"id":"tool-seven","type":"function","function":{"name":"lookup","arguments":"{\"query\":"}}]}}]}));
     assert_eq!(
-        stream.final_value().unwrap().output()[0]
-            .message()
-            .content(),
+        stream.final_value().output()[0].message().content(),
         Some("first")
     );
     stream.push(json!({"choices":[{"delta":{"content":" second", "tool_calls":[{"index":7,"function":{"arguments":"\"value\"}"}}]}}]}));
-    let snapshot = stream.final_value().unwrap();
+    let snapshot = stream.final_value();
     let message = snapshot.output()[0].message();
     assert_eq!(message.content(), Some("first second"));
     let calls = message.tool_calls().unwrap();
@@ -356,8 +354,90 @@ fn ignores_unknown_and_malformed_chunks_without_losing_valid_output() {
     ] {
         stream.push(chunk);
     }
-    let snapshot = stream.current_value().unwrap();
+    let snapshot = stream.current_value();
     assert_eq!(snapshot.output()[0].message().content(), Some("valid"));
     assert_eq!(snapshot.usage().unwrap().total_tokens(), None);
     assert_eq!(stream.chunk_count(), 5);
+}
+
+#[test]
+fn builders_preserve_defaults_conveniences_and_wire_format() {
+    let function = FunctionCall::builder()
+        .name("lookup")
+        .arguments("{}")
+        .build();
+    let tool = ToolCall::builder().id("call-1").function(function).build();
+    assert_eq!(tool.call_type(), "function");
+    assert_eq!(ToolCall::builder().build().call_type(), "function");
+    assert_eq!(
+        serde_json::to_value(ChatMessage::builder().build()).unwrap(),
+        json!({})
+    );
+    let choice = OutputChoice::builder()
+        .message(
+            ChatMessage::builder()
+                .role("assistant")
+                .tool_calls(vec![tool])
+                .build(),
+        )
+        .finish_reason("tool_calls")
+        .build();
+    let finalized = FinalizedStream::builder()
+        .output(vec![OutputChoice::builder().build()])
+        .add_output(choice)
+        .metadata(
+            StreamMetadata::builder()
+                .extra_field("discarded", true)
+                .extra(std::collections::HashMap::new())
+                .model("test-model")
+                .extra_field("custom", 42)
+                .build(),
+        )
+        .build();
+    assert_eq!(
+        serde_json::to_value(finalized.output()).unwrap(),
+        json!([
+            {"index":0,"message":{},"logprobs":null},
+            {"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ]},"logprobs":null,"finish_reason":"tool_calls"}
+        ])
+    );
+    assert_eq!(
+        serde_json::to_value(finalized.metadata()).unwrap(),
+        json!({"model":"test-model","custom":42})
+    );
+    let collision = StreamMetadata::builder()
+        .model("original")
+        .extra_field("model", "extra")
+        .build();
+    assert_eq!(collision.to_map().unwrap()["model"], "extra");
+    let empty = FinalizedStream::builder().build();
+    assert!(empty.output().is_empty());
+    assert!(empty.usage().is_none());
+    assert!(empty.metadata().is_empty());
+}
+
+#[test]
+fn orders_interleaved_tool_calls_by_index() {
+    let mut stream = BraintrustStream::new();
+    stream.push(json!({"choices":[{"delta":{"tool_calls":[
+        {"index":7,"id":"seven","function":{"arguments":"a"}},
+        {"index":2,"id":"two","function":{"arguments":"x"}}
+    ]}}]}));
+    stream.push(json!({"choices":[{"delta":{"tool_calls":[
+        {"index":2,"function":{"arguments":"y"}},
+        {"index":7,"function":{"arguments":"b"}}
+    ]}}]}));
+    let calls = stream.final_value().output()[0]
+        .message()
+        .tool_calls()
+        .unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|c| (c.id(), c.function().arguments()))
+            .collect::<Vec<_>>(),
+        vec![("two", "xy"), ("seven", "ab")]
+    );
 }

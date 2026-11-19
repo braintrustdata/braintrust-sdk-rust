@@ -1,8 +1,8 @@
-//! Provider-independent retained output state; each parsed chunk is applied once.
-use super::update::Update;
+//! Retained output state, separate from polling and span lifecycle.
+use super::provider::StreamChunk;
 use super::{ChatMessage, FinalizedStream, OutputChoice, StreamMetadata};
 use crate::UsageMetrics;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 /// Accumulates partial tool call information from streaming chunks.
 ///
@@ -46,8 +46,15 @@ impl StreamToolCallAccumulator {
             self.raw_arguments.clone()
         };
 
-        let function = super::FunctionCall::new(function_name, arguments);
-        super::ToolCall::new(self.id, self.call_type, function)
+        let function = super::FunctionCall::builder()
+            .name(function_name)
+            .arguments(arguments)
+            .build();
+        super::ToolCall::builder()
+            .id(self.id)
+            .call_type(self.call_type)
+            .function(function)
+            .build()
     }
 }
 
@@ -61,14 +68,14 @@ pub(super) struct Accumulator {
     tool_calls_by_index: BTreeMap<usize, StreamToolCallAccumulator>,
 }
 impl Accumulator {
-    pub(super) fn apply(&mut self, chunk: Update) {
+    pub(super) fn apply(&mut self, chunk: StreamChunk) {
         // Extract model (take first non-None)
         if self.model.is_none() {
             self.model = chunk.model;
         }
 
         if let Some(usage) = chunk.usage {
-            self.usage = Some(usage);
+            self.usage = Some(super::provider::normalize_usage(&usage));
         }
 
         // Process choices
@@ -126,32 +133,29 @@ impl Accumulator {
         }
     }
     pub(super) fn snapshot(&self) -> FinalizedStream {
-        // Build metadata (finish_reason moved to OutputChoice)
-        let metadata = StreamMetadata::new(self.model.clone(), HashMap::new());
-
-        // Build typed output (matches OpenAI response format)
-        let message = if self.tool_calls_by_index.is_empty() {
-            ChatMessage::new(
-                Some(self.role.clone().unwrap_or_else(|| "assistant".to_string())),
-                Some(self.aggregated_content.clone()),
-                None,
-            )
-        } else {
-            let tool_calls = self
-                .tool_calls_by_index
+        let metadata = StreamMetadata::builder()
+            .maybe_model(self.model.clone())
+            .build();
+        let tool_calls = (!self.tool_calls_by_index.is_empty()).then(|| {
+            self.tool_calls_by_index
                 .values()
                 .cloned()
                 .map(StreamToolCallAccumulator::build)
-                .collect();
-            ChatMessage::new(
-                Some(self.role.clone().unwrap_or_else(|| "assistant".to_string())),
-                Some(self.aggregated_content.clone()),
-                Some(tool_calls),
-            )
-        };
-
-        let choice = OutputChoice::new(0, message, self.finish_reason.clone());
-
-        FinalizedStream::new(vec![choice], self.usage.clone(), metadata)
+                .collect()
+        });
+        let message = ChatMessage::builder()
+            .role(self.role.clone().unwrap_or_else(|| "assistant".to_string()))
+            .content(self.aggregated_content.clone())
+            .maybe_tool_calls(tool_calls)
+            .build();
+        let choice = OutputChoice::builder()
+            .message(message)
+            .maybe_finish_reason(self.finish_reason.clone())
+            .build();
+        FinalizedStream::builder()
+            .add_output(choice)
+            .maybe_usage(self.usage.clone())
+            .metadata(metadata)
+            .build()
     }
 }

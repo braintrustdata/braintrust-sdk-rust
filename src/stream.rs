@@ -5,10 +5,8 @@ mod provider;
 #[cfg(test)]
 mod tests;
 mod types;
-mod update;
 
 use accumulator::Accumulator;
-use anyhow::Result;
 pub use instrumentation::wrap_stream_with_span;
 use serde_json::Value;
 pub use types::*;
@@ -34,16 +32,18 @@ impl BraintrustStream {
         }
         self.chunks += 1;
         self.finalized = None;
-        if let Some(chunk) = provider::parse(value) {
+        if let Ok(chunk) = serde_json::from_value(value) {
             self.state.apply(chunk);
         }
     }
 
-    pub fn final_value(&mut self) -> Result<&FinalizedStream> {
-        Ok(self.finalized.get_or_insert_with(|| self.state.snapshot()))
+    /// Return a cached snapshot, recomputing it after the next pushed chunk.
+    pub fn final_value(&mut self) -> &FinalizedStream {
+        self.finalized.get_or_insert_with(|| self.state.snapshot())
     }
-    pub fn current_value(&self) -> Result<FinalizedStream> {
-        Ok(self.state.snapshot())
+    /// Return an owned snapshot of the output received so far.
+    pub fn current_value(&self) -> FinalizedStream {
+        self.state.snapshot()
     }
     pub fn is_empty(&self) -> bool {
         self.chunks == 0

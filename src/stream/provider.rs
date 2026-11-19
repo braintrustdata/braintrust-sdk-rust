@@ -1,62 +1,62 @@
 //! Parsing of the existing OpenAI-compatible stream format.
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 /// OpenAI-style streaming chunk structure for deserialization.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct StreamChunk {
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct StreamChunk {
     #[serde(default)]
-    model: Option<String>,
+    pub model: Option<String>,
     #[serde(default)]
-    choices: Vec<StreamChoice>,
+    pub choices: Vec<StreamChoice>,
     #[serde(default)]
-    usage: Option<StreamUsage>,
+    pub usage: Option<StreamUsage>,
 }
 
 /// Delta from a streaming chunk (typed for role/content/tool_calls).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-struct StreamDelta {
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(super) struct StreamDelta {
     #[serde(default)]
-    role: Option<String>,
+    pub role: Option<String>,
     #[serde(default)]
-    content: Option<String>,
+    pub content: Option<String>,
     #[serde(default)]
-    tool_calls: Option<Vec<StreamToolCall>>,
+    pub tool_calls: Option<Vec<StreamToolCall>>,
 }
 
 /// A partial tool call from a streaming delta.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-struct StreamToolCall {
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(super) struct StreamToolCall {
     #[serde(default)]
-    index: Option<usize>,
+    pub index: Option<usize>,
     #[serde(default)]
-    id: Option<String>,
+    pub id: Option<String>,
     #[serde(default)]
     #[serde(rename = "type")]
-    call_type: Option<String>,
+    pub call_type: Option<String>,
     #[serde(default)]
-    function: Option<StreamFunctionCall>,
+    pub function: Option<StreamFunctionCall>,
 }
 
 /// A partial function call from a streaming delta.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-struct StreamFunctionCall {
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(super) struct StreamFunctionCall {
     #[serde(default)]
-    name: Option<String>,
+    pub name: Option<String>,
     #[serde(default)]
-    arguments: Option<String>,
+    pub arguments: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct StreamChoice {
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct StreamChoice {
     #[serde(default)]
-    delta: Option<StreamDelta>,
+    pub delta: Option<StreamDelta>,
     #[serde(default)]
-    finish_reason: Option<String>,
+    pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-struct StreamUsage {
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(super) struct StreamUsage {
     #[serde(default, alias = "input_tokens")]
     prompt_tokens: Option<i64>,
     #[serde(default, alias = "output_tokens")]
@@ -81,7 +81,7 @@ struct StreamUsage {
     completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct PromptTokensDetails {
     #[serde(default, alias = "audio_tokens", alias = "prompt_audio_tokens")]
     audio_tokens: Option<i64>,
@@ -96,7 +96,7 @@ struct PromptTokensDetails {
     cache_creation_tokens: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct CompletionTokensDetails {
     #[serde(default, alias = "audio_tokens", alias = "completion_audio_tokens")]
     audio_tokens: Option<i64>,
@@ -106,40 +106,6 @@ struct CompletionTokensDetails {
         alias = "completion_reasoning_tokens"
     )]
     reasoning_tokens: Option<i64>,
-}
-
-pub(super) fn parse(value: Value) -> Option<super::update::Update> {
-    use super::update::*;
-    let chunk: StreamChunk = serde_json::from_value(value).ok()?;
-    Some(Update {
-        model: chunk.model,
-        usage: chunk.usage.as_ref().map(normalize_usage),
-        choices: chunk
-            .choices
-            .into_iter()
-            .map(|choice| Choice {
-                finish_reason: choice.finish_reason,
-                delta: choice.delta.map(|delta| Delta {
-                    role: delta.role,
-                    content: delta.content,
-                    tool_calls: delta.tool_calls.map(|calls| {
-                        calls
-                            .into_iter()
-                            .map(|call| ToolDelta {
-                                index: call.index,
-                                id: call.id,
-                                call_type: call.call_type,
-                                function: call.function.map(|function| FunctionDelta {
-                                    name: function.name,
-                                    arguments: function.arguments,
-                                }),
-                            })
-                            .collect()
-                    }),
-                }),
-            })
-            .collect(),
-    })
 }
 
 /// Meaningful output, excluding role-only, empty-choice and usage-only chunks.
@@ -164,7 +130,7 @@ pub(super) fn has_content(value: &Value) -> bool {
         })
 }
 
-fn normalize_usage(u: &StreamUsage) -> crate::UsageMetrics {
+pub(super) fn normalize_usage(u: &StreamUsage) -> crate::UsageMetrics {
     let prompt_tokens = u.prompt_tokens.and_then(|v| u32::try_from(v).ok());
     let completion_tokens = u.completion_tokens.and_then(|v| u32::try_from(v).ok());
 
