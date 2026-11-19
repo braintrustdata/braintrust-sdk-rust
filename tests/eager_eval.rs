@@ -1,3 +1,5 @@
+#[path = "support/eval_server.rs"]
+mod eval_server;
 use braintrust_sdk_rust::{
     eval::*, BraintrustClient, EnqueueError, ExecutionError, SpanLog, WriteError,
 };
@@ -9,10 +11,7 @@ use std::{
     },
     time::Duration,
 };
-use wiremock::{
-    matchers::{method, path},
-    Mock, MockServer, ResponseTemplate,
-};
+use wiremock::MockServer;
 
 fn options<I: Send + Sync + 'static, O: Send + Sync + 'static>(
     definition: EvalDefinition<I, O>,
@@ -161,32 +160,7 @@ fn invalid_options_return_an_immediate_config_error() {
 }
 
 async fn client(server: &MockServer) -> BraintrustClient {
-    for (endpoint, body) in [
-        (
-            "/api/apikey/login",
-            serde_json::json!({"org_info":[{"id":"org","name":"org"}]}),
-        ),
-        (
-            "/api/project/register",
-            serde_json::json!({"project":{"id":"project"}}),
-        ),
-        (
-            "/api/experiment/register",
-            serde_json::json!({"project":{"id":"project","name":"project"},"experiment":{"id":"experiment","name":"experiment"}}),
-        ),
-        ("/logs3", serde_json::json!({})),
-    ] {
-        Mock::given(method("POST"))
-            .and(path(endpoint))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount(server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-        .mount(server)
-        .await;
+    eval_server::mount(server, true).await;
     BraintrustClient::builder()
         .runtime(braintrust_sdk_rust::current_runtime())
         .app_url(server.uri())

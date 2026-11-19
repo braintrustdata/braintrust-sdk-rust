@@ -1,3 +1,5 @@
+#[path = "../../../tests/support/eval_server.rs"]
+mod eval_server;
 use std::sync::Mutex;
 
 use super::*;
@@ -448,34 +450,10 @@ async fn immediate_rejections_do_not_advance_the_cli_order_tail() {
 #[tokio::test]
 async fn recorded_cli_runs_use_existing_admission_and_finish_does_not_close_shared_clients() {
     use std::time::Duration;
-    use wiremock::{
-        matchers::{method, path},
-        Mock, MockServer, ResponseTemplate,
-    };
+    use wiremock::MockServer;
     for shutdown_first in [true, false] {
         let server = MockServer::start().await;
-        for (endpoint, body) in [
-            (
-                "/api/apikey/login",
-                json!({"org_info":[{"id":"org","name":"org"}]}),
-            ),
-            (
-                "/api/experiment/register",
-                json!({"project":{"id":"project","name":"project"},"experiment":{"id":"experiment","name":"experiment"}}),
-            ),
-            ("/logs3", json!({})),
-        ] {
-            Mock::given(method("POST"))
-                .and(path(endpoint))
-                .respond_with(ResponseTemplate::new(200).set_body_json(body))
-                .mount(&server)
-                .await;
-        }
-        Mock::given(method("GET"))
-            .and(path("/version"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-            .mount(&server)
-            .await;
+        eval_server::mount(&server, false).await;
         let client = BraintrustClient::builder()
             .runtime(crate::current_runtime())
             .api_key("key")

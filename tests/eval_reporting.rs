@@ -1,6 +1,7 @@
+#[path = "support/eval_server.rs"]
+mod eval_server;
 use braintrust_sdk_rust::{eval::*, BraintrustClient};
 use serde::{Serialize, Serializer};
-use serde_json::json;
 use std::{
     cell::Cell,
     io::{self, Write},
@@ -256,33 +257,8 @@ fn serialization_errors_preserve_computed_results_without_writing_fake_json() {
 }
 #[tokio::test]
 async fn reporter_failure_preserves_recorded_results_and_does_not_poison_shutdown() {
-    use wiremock::{
-        matchers::{method, path},
-        Mock, MockServer, ResponseTemplate,
-    };
-    let server = MockServer::start().await;
-    for (endpoint, body) in [
-        (
-            "/api/apikey/login",
-            json!({"org_info":[{"id":"org","name":"org"}]}),
-        ),
-        (
-            "/api/experiment/register",
-            json!({"project":{"id":"project","name":"project"},"experiment":{"id":"experiment","name":"experiment"}}),
-        ),
-        ("/logs3", json!({})),
-    ] {
-        Mock::given(method("POST"))
-            .and(path(endpoint))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&server)
-        .await;
+    let server = wiremock::MockServer::start().await;
+    eval_server::mount(&server, false).await;
     let client = BraintrustClient::builder()
         .runtime(braintrust_sdk_rust::current_runtime())
         .api_key("key")

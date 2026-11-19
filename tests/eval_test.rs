@@ -1,37 +1,13 @@
+#[path = "support/eval_server.rs"]
+mod eval_server;
 use braintrust_sdk_rust::eval::CaseSource;
 use braintrust_sdk_rust::eval::*;
 use braintrust_sdk_rust::*;
 
 async fn recording_client() -> (BraintrustClient, wiremock::MockServer) {
-    use serde_json::json;
-    use wiremock::{
-        matchers::{method, path},
-        Mock, MockServer, ResponseTemplate,
-    };
+    use wiremock::MockServer;
     let server = MockServer::start().await;
-    for (endpoint, response) in [
-        (
-            "/api/apikey/login",
-            json!({"org_info":[{"id":"org","name":"org"}]}),
-        ),
-        ("/api/project/register", json!({"project":{"id":"project"}})),
-        (
-            "/api/experiment/register",
-            json!({"project":{"id":"project","name":"project"},"experiment":{"id":"experiment","name":"experiment"}}),
-        ),
-        ("/logs3", json!({})),
-    ] {
-        Mock::given(method("POST"))
-            .and(path(endpoint))
-            .respond_with(ResponseTemplate::new(200).set_body_json(response))
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&server)
-        .await;
+    eval_server::mount(&server, true).await;
     let client = BraintrustClient::builder()
         .app_url(server.uri())
         .api_url(server.uri())
@@ -235,19 +211,7 @@ async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
     let case = &result.results()[0];
     assert_eq!(case.case_id(), Some("source-case"));
     assert!(matches!(&case.errors()[0], CaseError::Scorer {name,..} if name == "broken"));
-    let rows: Vec<serde_json::Value> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .flat_map(|request| {
-            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .clone()
-        })
-        .collect();
+    let rows = rows(&server.received_requests().await.unwrap());
     assert!(rows
         .iter()
         .any(|row| row["error"][0]["stage"] == "scorer" && row["error"][0]["name"] == "broken"));
@@ -391,19 +355,7 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
     assert_eq!(partial.results()[1].case_id(), Some("case-1"));
     assert_eq!(partial.results()[1].xact_id(), Some("row-version-1"));
     assert_eq!(partial.results()[1].output().unwrap().0, 2);
-    let rows: Vec<serde_json::Value> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .flat_map(|request| {
-            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .clone()
-        })
-        .collect();
+    let rows = rows(&server.received_requests().await.unwrap());
     let ended: std::collections::HashSet<_> = rows
         .iter()
         .filter(|row| row["metrics"]["end"].is_number())
@@ -657,15 +609,8 @@ async fn serialization_failures_keep_outputs_and_finalize_recording() {
     assert_eq!(summary.results()[0].output().unwrap().0, 14);
     assert!(summary.results()[0].span_id().is_some());
     let requests = server.received_requests().await.unwrap();
-    let ended: std::collections::HashSet<_> = requests
-        .iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .flat_map(|request| {
-            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .clone()
-        })
+    let ended: std::collections::HashSet<_> = rows(&requests)
+        .into_iter()
         .filter(|row| row["metrics"]["end"].is_number())
         .map(|row| row["id"].as_str().unwrap().to_owned())
         .collect();
@@ -799,16 +744,7 @@ async fn experiment_is_resolved_before_source_reads_and_case_roots_keep_independ
     assert_eq!(registration["metadata"]["collision"], "run");
     assert!(registration.get("dataset_id").is_none());
     assert!(registration.get("dataset_version").is_none());
-    let rows: Vec<serde_json::Value> = requests
-        .iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .flat_map(|request| {
-            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .clone()
-        })
-        .collect();
+    let rows = rows(&requests);
     assert!(rows
         .iter()
         .all(|row| row["experiment_id"] == "chosen-id" && row.get("project_id").is_none()));
@@ -912,4 +848,17 @@ async fn registration_failure_reads_no_cases_and_a_later_run_can_record_normally
         .shutdown(std::time::Duration::from_secs(5))
         .await
         .unwrap();
+}
+
+fn rows(requests: &[wiremock::Request]) -> Vec<serde_json::Value> {
+    requests
+        .iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .flat_map(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .collect()
 }
