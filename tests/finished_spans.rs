@@ -117,8 +117,7 @@ async fn finishing_a_parent_does_not_finish_its_child_and_explicit_updates_remai
         .log(
             SpanLog::builder()
                 .input(json!("child still active"))
-                .build()
-                .unwrap(),
+                .build(),
         )
         .await
         .unwrap();
@@ -128,10 +127,7 @@ async fn finishing_a_parent_does_not_finish_its_child_and_explicit_updates_remai
             "token",
             "org",
             &exported,
-            SpanLog::builder()
-                .output(json!("explicit patch"))
-                .build()
-                .unwrap(),
+            SpanLog::builder().output(json!("explicit patch")).build(),
         )
         .unwrap();
     client.flush().await.unwrap();
@@ -174,7 +170,7 @@ async fn final_admission_rejection_is_visible_and_keeps_the_chosen_timestamp() {
         Err(WriteError::Admission(EnqueueError::Closed))
     ));
     assert_eq!(span.end_time(), Some(123.0));
-    span.log(SpanLog::builder().input(json!("ignored")).build().unwrap())
+    span.log(SpanLog::builder().input(json!("ignored")).build())
         .await
         .unwrap();
     assert!(server.received_requests().await.unwrap().is_empty());
@@ -204,7 +200,7 @@ async fn named_experiment_span_keeps_its_initial_name_in_the_final_snapshot() {
         .name("original")
         .build();
     span.end_with_time(123.0).await.unwrap();
-    span.log(SpanLog::builder().name("too late").build().unwrap())
+    span.log(SpanLog::builder().name("too late").build())
         .await
         .unwrap();
     let requests = server.received_requests().await.unwrap();

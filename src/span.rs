@@ -1016,7 +1016,7 @@ mod tests {
         assert_eq!(span.end_time(), Some(10.0));
         assert_eq!(submitter.accepted.lock().unwrap().len(), 1);
         assert!(span
-            .log(SpanLog::builder().input(json!("too late")).build().unwrap())
+            .log(SpanLog::builder().input(json!("too late")).build())
             .is_ok());
         submitter.reject.store(false, Ordering::Relaxed);
         assert!(span.end_with_time(20.0).is_ok());
@@ -1033,7 +1033,7 @@ mod tests {
         use crate::internal::write_outcome::WriteResponder;
         struct Submitter(Mutex<Vec<(SpanPayload, WriteResponder)>>);
         #[async_trait]
-        impl crate::internal::ports::DeliveryControl for Submitter {
+        impl SpanSubmitter for Submitter {
             fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
                 let (sender, completion) = crate::Completion::pair();
                 let _ = sender.send(Ok(crate::FlushReport::default()));
@@ -1042,9 +1042,6 @@ mod tests {
             async fn trigger_flush(&self) -> Result<()> {
                 Ok(())
             }
-        }
-        #[async_trait]
-        impl SpanSubmitter for Submitter {
             fn submit(
                 &self,
                 _: CredentialScope,

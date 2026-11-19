@@ -824,7 +824,7 @@ async fn finished_span_ignores_later_mutations() {
     span.end_with_time(123.0);
     let covering = client.flush();
     span.clone()
-        .log(SpanLog::builder().input(json!("too late")).build().unwrap())
+        .log(SpanLog::builder().input(json!("too late")).build())
         .await
         .unwrap();
     covering.await.unwrap();
