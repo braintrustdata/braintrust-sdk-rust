@@ -8,6 +8,18 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+/// Failure to wait synchronously, distinct from the operation's own result.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum BlockingWaitError<E> {
+    /// A pending wait was refused in an entered Tokio runtime context.
+    #[error("cannot block in a Tokio runtime context; await the completion instead")]
+    InRuntime,
+    /// Submission, execution or delivery failed.
+    #[error(transparent)]
+    Operation(#[from] E),
+}
+
 /// A synchronously recorded issuance result and an eventual operation result.
 ///
 /// Inspect [`Completion::submission`] to check admission without waiting. Awaiting returns
@@ -45,22 +57,36 @@ impl<T, E> Completion<T, E> {
 
     /// Wait for the operation's final result from synchronous code.
     ///
-    /// This waits on the response channel; it does not drive or create a runtime.
-    /// The SDK-owned runtime progresses independently. An explicitly supplied
-    /// runtime must remain running on another thread while this thread waits.
-    /// In asynchronous code, await the completion instead.
+    /// Work already runs on the selected runtime; this only waits on its response.
+    /// Ready results can be read anywhere. Pending waits return
+    /// [`BlockingWaitError::InRuntime`] whenever a Tokio runtime context is entered,
+    /// including contexts where blocking might happen to work. Await instead there.
+    /// Refusing a wait does not cancel accepted work.
     ///
-    /// # Panics
-    /// Panics when waiting for the response from a Tokio asynchronous context.
-    #[track_caller]
-    pub fn blocking_wait(self) -> Result<T, E>
+    /// Outside Tokio, the SDK-owned runtime progresses independently. An explicit
+    /// runtime must be kept alive and driven on another thread; its progress
+    /// cannot be inferred from its handle. This method does not drive that runtime.
+    pub fn blocking_wait(mut self) -> Result<T, BlockingWaitError<E>>
     where
         E: From<ExecutionError>,
     {
-        self.issued?;
+        self.issued.map_err(BlockingWaitError::Operation)?;
+        match self.receiver.try_recv() {
+            Ok(result) => return result.map_err(BlockingWaitError::Operation),
+            Err(oneshot::error::TryRecvError::Closed) => {
+                return Err(BlockingWaitError::Operation(
+                    ExecutionError::WorkerLost.into(),
+                ));
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+        }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(BlockingWaitError::InRuntime);
+        }
         self.receiver
             .blocking_recv()
             .unwrap_or_else(|_| Err(ExecutionError::WorkerLost.into()))
+            .map_err(BlockingWaitError::Operation)
     }
 
     pub(crate) fn pair() -> (oneshot::Sender<Result<T, E>>, Self) {
@@ -168,9 +194,86 @@ mod tests {
         worker.join().unwrap();
         let (sender, completion) = Completion::<(), ExecutionError>::pair();
         drop(sender);
-        assert_eq!(completion.blocking_wait(), Err(ExecutionError::WorkerLost));
+        assert_eq!(
+            completion.blocking_wait(),
+            Err(BlockingWaitError::Operation(ExecutionError::WorkerLost))
+        );
         let (_, mut rejected) = Completion::<(), ExecutionError>::pair();
         rejected.record_issuance(Err(ExecutionError::TimedOut));
-        assert_eq!(rejected.blocking_wait(), Err(ExecutionError::TimedOut));
+        assert_eq!(
+            rejected.blocking_wait(),
+            Err(BlockingWaitError::Operation(ExecutionError::TimedOut))
+        );
+    }
+    #[tokio::test]
+    async fn pending_blocking_wait_in_async_context_returns_an_error() {
+        let (_sender, completion) = Completion::<(), ExecutionError>::pair();
+        assert_eq!(
+            completion.blocking_wait(),
+            Err(BlockingWaitError::InRuntime)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_wait_is_also_refused_on_a_multi_thread_runtime() {
+        let (_sender, completion) = Completion::<(), ExecutionError>::pair();
+        assert_eq!(
+            completion.blocking_wait(),
+            Err(BlockingWaitError::InRuntime)
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_results_and_admission_failures_need_no_blocking() {
+        for result in [Ok(42), Err(ExecutionError::TimedOut)] {
+            let (sender, completion) = Completion::pair();
+            sender.send(result).unwrap();
+            assert_eq!(
+                completion.blocking_wait(),
+                result.map_err(BlockingWaitError::Operation)
+            );
+        }
+        let (_, mut rejected) = Completion::<(), ExecutionError>::pair();
+        rejected.record_issuance(Err(ExecutionError::TimedOut));
+        assert_eq!(
+            rejected.blocking_wait(),
+            Err(BlockingWaitError::Operation(ExecutionError::TimedOut))
+        );
+    }
+
+    #[test]
+    fn pending_wait_in_an_entered_handle_is_conservatively_refused() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let (_sender, completion) = Completion::<(), ExecutionError>::pair();
+        assert_eq!(
+            completion.blocking_wait(),
+            Err(BlockingWaitError::InRuntime)
+        );
+    }
+    #[test]
+    fn external_current_thread_work_still_requires_its_runtime_driver() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (sender, completion) = Completion::<usize, ExecutionError>::pair();
+        let operation = runtime.spawn(async move { sender.send(Ok(42)).unwrap() });
+        let (finished, result) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || finished.send(completion.blocking_wait()).unwrap());
+        assert!(matches!(
+            result.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        runtime.block_on(operation).unwrap();
+        assert_eq!(
+            result
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            42
+        );
+        caller.join().unwrap();
     }
 }

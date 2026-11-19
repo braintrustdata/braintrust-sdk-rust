@@ -14,10 +14,10 @@ use crate::{
     Completion, DeliveryReceipt, FlushError, FlushReport, ShutdownError, ShutdownReport, WriteError,
 };
 use futures::stream::{self, StreamExt};
+use indexmap::IndexMap;
 use serde_json::{Map, Value};
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
-use indexmap::IndexMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -202,7 +202,10 @@ impl SpanBatchProcessor {
     /// registration, row building) before batching. Each credential group's spans
     /// are merged by row key, then its spans and caller-built rows are batched and sent with at most
     /// `max_concurrent_log_requests` requests in flight (matching the TypeScript SDK).
-    async fn process(self: &Arc<Self>, cmds: Vec<SubmitCommand>) -> std::result::Result<(), anyhow::Error> {
+    async fn process(
+        self: &Arc<Self>,
+        cmds: Vec<SubmitCommand>,
+    ) -> std::result::Result<(), anyhow::Error> {
         if cmds.is_empty() {
             return Ok(());
         }
@@ -750,7 +753,6 @@ impl SpanBatchProcessor {
         }
         Ok(register_response.project.id)
     }
-
 }
 
 /// Reports rejected submissions without coupling admission to batch processing.
@@ -965,7 +967,8 @@ impl LogQueue {
             last_drop_log_time: AtomicU64::new(0),
             config: config.clone(),
         });
-        let processor = SpanBatchProcessor::new(config, drops, login_state, client, api_url, app_url);
+        let processor =
+            SpanBatchProcessor::new(config, drops, login_state, client, api_url, app_url);
         let writes = WriteService::new(
             capacity,
             tokio::runtime::Handle::current(),
@@ -985,14 +988,20 @@ impl LogQueue {
     ) -> Completion<DeliveryReceipt, WriteError> {
         self.enqueue(SubmitCommand {
             credential: Credential::Token(token.into()),
-            item: QueuedItem::Span { payload, parent_info },
+            item: QueuedItem::Span {
+                payload,
+                parent_info,
+            },
         })
     }
 
     fn enqueue(&self, command: SubmitCommand) -> Completion<DeliveryReceipt, WriteError> {
         self.writes
             .enqueue_with_rejection(command, |command, error| {
-                self.rejections.drops.queue_full.fetch_add(1, Ordering::Relaxed);
+                self.rejections
+                    .drops
+                    .queue_full
+                    .fetch_add(1, Ordering::Relaxed);
                 self.rejections
                     .dropped_count
                     .fetch_add(1, Ordering::Relaxed);
@@ -1050,7 +1059,9 @@ impl LogQueue {
     }
 
     /// Cumulative counts of discarded rows.
-    pub(crate) fn dropped_rows(&self) -> DroppedRows { self.rejections.drops.snapshot() }
+    pub(crate) fn dropped_rows(&self) -> DroppedRows {
+        self.rejections.drops.snapshot()
+    }
 
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
         self.writes.flush()
