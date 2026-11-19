@@ -124,9 +124,13 @@ inside it, or `.runtime(Some(handle))`. With an explicit handle, keep that
 runtime alive and driving work until completions finish. `current_runtime()`
 returns `None` outside Tokio, which selects an SDK-owned runtime.
 
-Use `.await` inside asynchronous code. `blocking_wait()` waits on the response
-channel and must be called from synchronous code; it does not drive an explicitly
-supplied runtime. That runtime must continue progressing on another thread.
+Use `.await` inside asynchronous code. `blocking_wait()` returns
+`BlockingWaitError::InRuntime` instead of blocking when a result is pending and a
+Tokio runtime context is entered. Already-ready results need no blocking and can
+be read anywhere. The check deliberately refuses some contexts where blocking
+might work. It cannot prove that an explicitly supplied runtime is running: that
+runtime must continue progressing on another thread while synchronous code waits.
+Operation failures are returned as `BlockingWaitError::Operation(error)`.
 
 ## Evaluations
 
