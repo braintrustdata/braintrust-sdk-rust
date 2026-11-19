@@ -219,12 +219,7 @@ async fn recorded_run_admitted_before_shutdown_finishes_writes_and_revokes_escap
                         .name("callback-child")
                         .build();
                     child
-                        .log(
-                            SpanLog::builder()
-                                .input(serde_json::json!(input))
-                                .build()
-                                .unwrap(),
-                        )
+                        .log(SpanLog::builder().input(serde_json::json!(input)).build())
                         .await
                         .unwrap();
                     *escaped.lock().unwrap() = Some(child);
@@ -494,8 +489,7 @@ async fn synchronous_callback_can_wait_for_recording_without_blocking_delivery()
                                 .unwrap()
                                 .clone(),
                         )
-                        .build()
-                        .unwrap(),
+                        .build(),
                 )
                 .into_future(),
         )?;

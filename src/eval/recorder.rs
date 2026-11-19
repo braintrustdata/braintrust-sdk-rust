@@ -40,7 +40,7 @@ impl BraintrustRecorder {
         if let Some(tags) = tags {
             log = log.tags(tags);
         }
-        let root_write = tokio::sync::Mutex::new(Some(root.log(log.build().unwrap())));
+        let root_write = tokio::sync::Mutex::new(Some(root.log(log.build())));
         Ok(Self {
             client,
             submitter,
@@ -82,22 +82,22 @@ impl<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static>
             .span_type(crate::SpanType::Eval)
             .build();
         let mut failures = Vec::new();
-        let mut log = SpanLog::builder().name(format!("case-{}", index + 1));
-        if let Some(input) = serialize(&case.input, "input", &mut failures) {
-            log = log.input(input);
-        }
-        if let Some(expected) = &case.expected {
-            if let Some(expected) = serialize(expected, "expected", &mut failures) {
-                log = log.expected(expected);
-            }
-        }
+        let input = serialize(&case.input, "input", &mut failures);
+        let expected = case
+            .expected
+            .as_ref()
+            .and_then(|expected| serialize(expected, "expected", &mut failures));
+        let mut log = SpanLog::builder()
+            .name(format!("case-{}", index + 1))
+            .maybe_input(input)
+            .maybe_expected(expected);
         if let Some(metadata) = &case.metadata {
             log = log.metadata(metadata.clone());
         }
         if let Some(tags) = &case.tags {
             log = log.tags(tags.clone());
         }
-        let initial_write = span.log(log.build().unwrap());
+        let initial_write = span.log(log.build());
         Ok(Box::new(BraintrustCase {
             span,
             initial_write,
@@ -130,30 +130,32 @@ impl<I: Serialize + Send + Sync, O: Serialize + Send + Sync> CaseRecording<I, O>
             Ok(export) => result.span_id = export.span_id,
             Err(error) => self.failures.push(error),
         }
-        let mut log = SpanLog::builder().scores(
-            result
-                .scores
-                .iter()
-                .map(|score| (score.name.clone(), score.score))
-                .collect(),
-        );
-        if let Some(output) = &result.output {
-            if let Some(output) = serialize(output, "output", &mut self.failures) {
-                log = log.output(output);
-            }
-        }
+        let output = result
+            .output
+            .as_ref()
+            .and_then(|output| serialize(output, "output", &mut self.failures));
+        let error = if result.errors.is_empty() {
+            None
+        } else {
+            serialize(&result.errors, "case errors", &mut self.failures)
+        };
+        let mut log = SpanLog::builder()
+            .maybe_output(output)
+            .maybe_error(error)
+            .scores(
+                result
+                    .scores
+                    .iter()
+                    .map(|score| (score.name.clone(), score.score))
+                    .collect(),
+            );
         if let Some(metadata) = &result.metadata {
             log = log.metadata(metadata.clone());
         }
         if let Some(tags) = &result.tags {
             log = log.tags(tags.clone());
         }
-        if !result.errors.is_empty() {
-            if let Some(errors) = serialize(&result.errors, "case errors", &mut self.failures) {
-                log = log.error(errors);
-            }
-        }
-        let final_write = self.span.log(log.build().unwrap());
+        let final_write = self.span.log(log.build());
         let end = self.span.end();
         // Observe every completion, even if serialization or an earlier write
         // failed. The owned computation result is never discarded here.
