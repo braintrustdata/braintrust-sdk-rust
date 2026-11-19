@@ -131,7 +131,7 @@ serialization:
 
 ```rust
 use braintrust_sdk_rust::eval::{
-    self, Case, EvalDefinition, EvalOpts, EvalRequest, ExactMatch, SyncFnTask,
+    self, Case, EvalDefinition, EvalOpts, ExactMatch, SyncFnTask,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -142,30 +142,29 @@ fn main() -> anyhow::Result<()> {
     let options = EvalOpts::builder()
         .name("uppercase".into())
         .definition(definition)
-        .source(vec![Case {
-            input: "hello".to_string(),
-            expected: Some("HELLO".to_string()),
-            ..Default::default()
-        }].into())
+        .source(vec![Case::builder()
+            .input("hello".to_string())
+            .expected("HELLO".to_string())
+            .build()].into())
         .quiet(true)
         .build();
-    let completion = eval::run(EvalRequest::local(options));
+    let completion = eval::run(options);
     assert!(completion.is_ok());
     let summary = futures::executor::block_on(async { completion.await })?;
-    assert_eq!(summary.successful_cases, 1);
-    assert_eq!(summary.results[0].output.as_deref(), Some("HELLO"));
+    assert_eq!(summary.successful_cases(), 1);
+    assert_eq!(summary.results()[0].output().map(String::as_str), Some("HELLO"));
     Ok(())
 }
 ```
 
-Use `EvalRequest::recorded(options, client)` to record an experiment on that
+Use `client.eval(options)` to record an experiment on that
 client's runtime. Recorded inputs and outputs must implement `Serialize`.
 `DatasetCaseSource` reads Braintrust datasets and preserves dataset provenance
 when recording. Run failures retain partial summaries and structured causes.
 
 Use `task(...)` and `scorer(...)` for async callbacks, or `SyncFnTask` and
 `SyncFnScorer` for blocking callbacks. Attach a terminal, JSONL, silent or custom
-reporter with `EvalRequest::with_reporter(...)`. Reporter failures preserve
+reporter with `EvalOpts::with_reporter(...)`. Reporter failures preserve
 computation and recording results.
 
 `BtEvalRunner` adapts the same execution engine to `bt eval`, including discovery,
