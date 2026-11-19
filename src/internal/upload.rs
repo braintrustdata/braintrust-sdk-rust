@@ -91,10 +91,7 @@ impl UploadCoordinator {
         fallback: usize,
         override_bytes: Option<usize>,
     ) -> Capabilities {
-        let server_limit = match api_result(self.logs.version().await)
-            .await
-            .map(|v| v.into_inner())
-        {
+        let server_limit = match api_result(self.logs.version().await).map(|v| v.into_inner()) {
             Ok(version) => version.logs3_payload_max_bytes.filter(|limit| *limit > 0),
             Err(error) => {
                 warn!(%error, "failed to fetch ingestion capabilities");
@@ -126,9 +123,7 @@ impl UploadCoordinator {
             if batch.data.len() <= capabilities.max_request_size {
                 match budget
                     .run(|| async {
-                        api_result(self.logs.logs3_raw(batch.data.clone()).await)
-                            .await
-                            .map(|_| ())
+                        api_result(self.logs.logs3_raw(batch.data.clone()).await).map(|_| ())
                     })
                     .await
                 {
@@ -172,7 +167,6 @@ impl UploadCoordinator {
                         .logs3_overflow_with_org_name(&request, self.logs.organization_name())
                         .await,
                 )
-                .await
                 .map(|v| v.into_inner())
             })
             .await?;
@@ -183,13 +177,12 @@ impl UploadCoordinator {
                         .upload_logs3_overflow(&grant, batch.data.clone())
                         .await,
                 )
-                .await
                 .map(|_| ())
             })
             .await?;
         budget
             .run(|| async {
-                api_result(self.logs.logs3(&serde_json::json!({"rows":grant.reference(), "api_version":LOGS_API_VERSION})).await).await.map(|_| ())
+                api_result(self.logs.logs3(&serde_json::json!({"rows":grant.reference(), "api_version":LOGS_API_VERSION})).await).map(|_| ())
             })
             .await
     }

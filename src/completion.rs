@@ -30,7 +30,7 @@ pub enum BlockingWaitError<E> {
 /// use braintrust_sdk_rust::{BraintrustClient, SpanHandle, SpanLog};
 /// use std::time::Duration;
 ///
-/// # async fn example(client: &BraintrustClient, span: &SpanHandle<BraintrustClient>)
+/// # async fn example(client: &BraintrustClient, span: &SpanHandle)
 /// # -> Result<(), Box<dyn std::error::Error>> {
 /// let completion = span.log(SpanLog::default()); // admission happens now
 /// if let Err(error) = completion.submission() {

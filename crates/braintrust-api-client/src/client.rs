@@ -38,6 +38,7 @@ pub(crate) struct ClientContext {
     pub(crate) app_url: String,
     authorization: Option<HeaderValue>,
     pub(crate) org_name: Option<HeaderValue>,
+    request_org_name: Option<HeaderValue>,
     pub(crate) organization: Option<LoginOrganization>,
     pub(crate) upload_client: reqwest::Client,
 }
@@ -54,6 +55,7 @@ impl Default for ClientContext {
             app_url: DEFAULT_APP_URL.to_owned(),
             authorization: None,
             org_name: None,
+            request_org_name: None,
             organization: None,
             upload_client: reqwest::Client::new(),
         }
@@ -61,6 +63,9 @@ impl Default for ClientContext {
 }
 
 pub(crate) fn authorize_request(context: &ClientContext, request: &mut reqwest::Request) {
+    if let Some(name) = &context.request_org_name {
+        request.headers_mut().insert("x-bt-org-name", name.clone());
+    }
     if let Some(authorization) = &context.authorization {
         request
             .headers_mut()
@@ -78,6 +83,7 @@ pub struct ClientBuilder {
     api_url: Option<String>,
     app_url: Option<String>,
     org_name: Option<String>,
+    request_org_name: Option<String>,
     http_client_builder: Option<reqwest::ClientBuilder>,
     upload_http_client_builder: Option<reqwest::ClientBuilder>,
     http_client: Option<reqwest::Client>,
@@ -111,17 +117,17 @@ pub enum ClientInitError {
 }
 
 impl Client {
-    /// Organization name configured for logging requests.
-    pub fn organization_name(&self) -> Option<&str> {
-        self.inner
-            .org_name
-            .as_ref()
-            .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
-    }
-
     /// The API endpoint used by generated methods, queries and logging.
     pub fn baseurl(&self) -> &str {
         &self.baseurl
+    }
+    /// Organization used for authenticated requests or logging, when configured.
+    pub fn organization_name(&self) -> Option<&str> {
+        self.inner
+            .request_org_name
+            .as_ref()
+            .or(self.inner.org_name.as_ref())
+            .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
     }
     /// Configure authentication, endpoints, and transport settings.
     pub fn builder() -> ClientBuilder {
@@ -163,6 +169,13 @@ impl ClientBuilder {
     /// Select an organization for login, version checks, and log submissions.
     pub fn org_name(mut self, org_name: impl Into<String>) -> Self {
         self.org_name = Some(org_name.into());
+        self
+    }
+
+    /// Scope every authenticated Braintrust request to an organization.
+    /// Signed storage uploads remain independent of this request scope.
+    pub fn organization_scope(mut self, name: impl Into<String>) -> Self {
+        self.request_org_name = Some(name.into());
         self
     }
 
@@ -218,6 +231,10 @@ impl ClientBuilder {
         authorization.set_sensitive(true);
         let api_url = resolve_url(self.api_url, "BRAINTRUST_API_URL", DEFAULT_API_URL)?;
         let app_url = resolve_url(self.app_url, "BRAINTRUST_APP_URL", DEFAULT_APP_URL)?;
+        let request_org_name = self
+            .request_org_name
+            .map(|name| HeaderValue::from_str(&name).map_err(|_| ClientInitError::InvalidOrgName))
+            .transpose()?;
         let org_name = self
             .org_name
             .map(|name| HeaderValue::from_str(&name).map_err(|_| ClientInitError::InvalidOrgName))
@@ -238,11 +255,18 @@ impl ClientBuilder {
             }
             .build()?,
         };
-        let generated = crate::GeneratedClient::with_client(http.clone())
+        let mut generated = crate::GeneratedClient::with_client(http.clone())
             .with_base_url(&api_url)
             .with_api_key(api_key)
             // Logging and query responses may exceed the generator's 8 MiB default.
             .with_max_response_body_bytes(usize::MAX);
+        if let Some(name) = &request_org_name {
+            generated = generated.with_header(
+                "x-bt-org-name",
+                std::str::from_utf8(name.as_bytes())
+                    .map_err(|_| ClientInitError::InvalidOrgName)?,
+            );
+        }
         Ok(Client {
             baseurl: api_url,
             client: http,
@@ -251,6 +275,7 @@ impl ClientBuilder {
                 app_url,
                 authorization: Some(authorization),
                 org_name,
+                request_org_name,
                 organization: None,
                 upload_client,
             },
