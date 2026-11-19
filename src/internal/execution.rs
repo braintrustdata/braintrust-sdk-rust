@@ -1,9 +1,8 @@
 //! Fixed execution binding and ownership of a continuously driven SDK runtime.
 use crate::{BraintrustError, Completion, EnqueueError, ExecutionError};
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc};
 use tokio::{
     runtime::{Handle, Runtime},
-    sync::oneshot,
     task::JoinHandle,
 };
 
@@ -19,33 +18,13 @@ pub(crate) struct ExecutionBinding {
     responses: Arc<ResponseTasks>,
 }
 struct RuntimeOwner {
-    stop: Option<oneshot::Sender<()>>,
-    #[cfg(test)]
-    exit: Arc<ExitProbe>,
-}
-#[cfg(test)]
-#[derive(Default)]
-struct ExitProbe {
-    done: std::sync::atomic::AtomicBool,
-    wake: tokio::sync::Notify,
-}
-#[cfg(test)]
-impl ExitProbe {
-    async fn wait(&self) {
-        let wake = self.wake.notified();
-        if !self.done.load(std::sync::atomic::Ordering::Acquire) {
-            wake.await;
-        }
-    }
-    fn finish(&self) {
-        self.done.store(true, std::sync::atomic::Ordering::Release);
-        self.wake.notify_one();
-    }
+    runtime: Option<Runtime>,
 }
 impl Drop for RuntimeOwner {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
+        if let Some(runtime) = self.runtime.take() {
+            // The final task lease may be released on this runtime's own worker.
+            runtime.shutdown_background();
         }
     }
 }
@@ -54,47 +33,18 @@ impl ExecutionBinding {
         if let Some(handle) = runtime {
             return Ok(Self::external(handle));
         }
-        let (initialized, receiver) = std::sync::mpsc::sync_channel(1);
-        let (stop, stopped) = oneshot::channel();
-        #[cfg(test)]
-        let exit = Arc::new(ExitProbe::default());
-        #[cfg(test)]
-        let host_exit = exit.clone();
-        std::thread::Builder::new()
-            .name("braintrust-runtime".into())
-            .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let _ = initialized.send(Err(error));
-                        return;
-                    }
-                };
-                if initialized.send(Ok(runtime.handle().clone())).is_err() {
-                    return;
-                }
-                drive(runtime, stopped);
-                #[cfg(test)]
-                host_exit.finish();
-            })
-            .map_err(|error| {
-                BraintrustError::InvalidConfig(format!("failed to start SDK runtime: {error}"))
-            })?;
-        let handle = receiver
-            .recv()
-            .map_err(|_| BraintrustError::Execution(ExecutionError::WorkerLost))?
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("braintrust-runtime")
+            .enable_all()
+            .build()
             .map_err(|error| {
                 BraintrustError::InvalidConfig(format!("failed to initialize SDK runtime: {error}"))
             })?;
         Ok(Self {
-            handle,
+            handle: runtime.handle().clone(),
             _owner: Some(Arc::new(RuntimeOwner {
-                stop: Some(stop),
-                #[cfg(test)]
-                exit,
+                runtime: Some(runtime),
             })),
             responses: Arc::new(ResponseTasks::default()),
         })
@@ -163,19 +113,11 @@ impl ExecutionBinding {
         completion
     }
 }
-// Runtime destruction occurs on its host thread after leaving the runtime
-// context. No join or Runtime::drop runs on an SDK worker or caller's executor.
-fn drive(runtime: Runtime, stopped: oneshot::Receiver<()>) {
-    runtime.block_on(async {
-        let _ = stopped.await;
-    });
-    runtime.shutdown_timeout(Duration::from_millis(100));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::{mpsc, Semaphore};
+    use std::time::Duration;
+    use tokio::sync::{mpsc, oneshot, Semaphore};
 
     #[tokio::test]
     async fn default_binding_ignores_ambient_runtime_and_explicit_binding_honors_it() {
@@ -206,7 +148,6 @@ mod tests {
     async fn accepted_response_tasks_retain_the_owner_and_bound_unobserved_work() {
         let binding = ExecutionBinding::new(None).unwrap();
         let owner = Arc::downgrade(binding._owner.as_ref().unwrap());
-        let exit = binding._owner.as_ref().unwrap().exit.clone();
         let gate = Arc::new(Semaphore::new(0));
         let (finished, mut done) = mpsc::unbounded_channel();
         let mut tokens = Vec::new();
@@ -240,13 +181,50 @@ mod tests {
         for _ in 0..MAX_RESPONSE_TASKS {
             done.recv().await.unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(5), exit.wait())
+    }
+
+    #[tokio::test]
+    async fn last_owner_can_drop_on_its_own_async_worker() {
+        let binding = ExecutionBinding::new(None).unwrap();
+        let owner = Arc::downgrade(binding._owner.as_ref().unwrap());
+        let (release, released) = oneshot::channel();
+        let last_task = binding.spawn(async move { released.await.unwrap() });
+        drop(binding);
+        release.send(()).unwrap();
+        // Joining includes destruction of the last lease on the owned worker.
+        tokio::time::timeout(Duration::from_secs(5), last_task)
             .await
+            .unwrap()
             .unwrap();
         assert!(
             owner.upgrade().is_none(),
-            "runtime host must stop after accepted work and owners retire"
+            "the final task must release the runtime owner without panicking"
         );
+    }
+
+    #[tokio::test]
+    async fn blocking_work_retains_the_runtime_until_its_last_lease_is_released() {
+        let binding = ExecutionBinding::new(None).unwrap();
+        let owner = Arc::downgrade(binding._owner.as_ref().unwrap());
+        let (started, running) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let task = binding.spawn_blocking(move || {
+            started.send(()).unwrap();
+            released.recv().unwrap();
+            42
+        });
+        running.await.unwrap();
+        drop(binding);
+        assert!(owner.upgrade().is_some());
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            42
+        );
+        assert!(owner.upgrade().is_none());
     }
 
     #[tokio::test]
