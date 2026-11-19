@@ -4,12 +4,10 @@
 //! use braintrust_sdk_rust::eval::{Case, CaseSource, IterCaseSource};
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! let cases = (0..3).map(|input| Ok(Case::<usize, usize> {
-//!     input, ..Default::default()
-//! }));
+//! let cases = (0..3).map(|input| Ok(Case::<usize, usize>::builder().input(input).build()));
 //! let mut source: Box<dyn CaseSource<usize, usize>> =
 //!     Box::new(IterCaseSource::new(cases));
-//! assert_eq!(source.next().await?.unwrap().input, 0);
+//! assert_eq!(source.next().await?.unwrap().input(), &0);
 //! # Ok(())
 //! # }
 //! ```

@@ -10,15 +10,7 @@ use std::{
 };
 
 fn case<I, O>(input: I) -> Case<I, O> {
-    Case {
-        input,
-        expected: None,
-        metadata: None,
-        tags: None,
-        id: None,
-        xact_id: None,
-        created: None,
-    }
+    Case::builder().input(input).build()
 }
 struct OwnedInput {
     value: Cell<usize>,
@@ -44,7 +36,7 @@ fn vectors_move_nonclone_nonsync_cases_and_release_consumed_values() {
             .collect();
         let mut source: Box<dyn CaseSource<OwnedInput, Cell<usize>>> = cases.into();
         let first = source.next().await.unwrap().unwrap();
-        assert_eq!(first.input.value.get(), 0);
+        assert_eq!(first.input().value.get(), 0);
         drop(first);
         assert_eq!(
             drops.load(Ordering::SeqCst),
@@ -67,7 +59,7 @@ async fn fallible_iterators_keep_error_causes_and_do_not_require_sync() {
         vec![Ok(case(Cell::new(7))), Err(ReadFailure.into())];
     let mut source: Box<dyn CaseSource<Cell<usize>, Cell<usize>>> =
         Box::new(IterCaseSource::new(items.into_iter()));
-    assert_eq!(source.next().await.unwrap().unwrap().input.get(), 7);
+    assert_eq!(source.next().await.unwrap().unwrap().input().get(), 7);
     assert!(source
         .next()
         .await
@@ -87,7 +79,7 @@ async fn pinned_streams_allow_nonunpin_nonsync_state_and_owned_error_causes() {
     });
     let mut source: Box<dyn CaseSource<Cell<usize>, Cell<usize>>> =
         Box::new(StreamCaseSource::new(stream));
-    assert_eq!(source.next().await.unwrap().unwrap().input.get(), 9);
+    assert_eq!(source.next().await.unwrap().unwrap().input().get(), 9);
     assert!(source.next().await.unwrap().is_none());
     let stream =
         futures::stream::once(async { Err::<Case<(), ()>, anyhow::Error>(ReadFailure.into()) });
@@ -107,7 +99,7 @@ async fn empty_and_infallible_sources_end_without_synthetic_cases() {
     assert!(empty.next().await.unwrap().is_none());
     let mut source =
         IterCaseSource::new((0..2).map(|value| Ok::<_, anyhow::Error>(case::<_, usize>(value))));
-    assert_eq!(source.next().await.unwrap().unwrap().input, 0);
-    assert_eq!(source.next().await.unwrap().unwrap().input, 1);
+    assert_eq!(source.next().await.unwrap().unwrap().input(), &0);
+    assert_eq!(source.next().await.unwrap().unwrap().input(), &1);
     assert!(source.next().await.unwrap().is_none());
 }

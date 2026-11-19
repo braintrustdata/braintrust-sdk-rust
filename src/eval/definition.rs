@@ -1,9 +1,10 @@
 //! Reusable computation shared by independent evaluation runs.
 use std::sync::Arc;
 
+#[cfg(test)]
 use async_trait::async_trait;
 
-use super::{EvalConfigError, Scorer, ScorerArgs, Scores, Task};
+use super::{EvalConfigError, Scorer, Task};
 
 /// A validated task and ordered set of scorers, independent of any client or run.
 ///
@@ -14,9 +15,11 @@ pub struct EvalDefinition<I, O> {
     inner: Arc<DefinitionInner<I, O>>,
 }
 
+type FrozenScorer<I, O> = (String, Arc<dyn Scorer<I, O>>);
+
 struct DefinitionInner<I, O> {
     task: Arc<dyn Task<I, O>>,
-    scorers: Vec<Arc<dyn Scorer<I, O>>>,
+    scorers: Vec<FrozenScorer<I, O>>,
 }
 
 impl<I, O> Clone for EvalDefinition<I, O> {
@@ -37,7 +40,7 @@ impl<I: Send + Sync + 'static, O: Send + Sync + 'static> EvalDefinition<I, O> {
         scorers: Vec<Box<dyn Scorer<I, O>>>,
     ) -> Result<Self, EvalConfigError> {
         let mut names = std::collections::HashSet::new();
-        let mut validated: Vec<Arc<dyn Scorer<I, O>>> = Vec::with_capacity(scorers.len());
+        let mut validated: Vec<FrozenScorer<I, O>> = Vec::with_capacity(scorers.len());
         for (index, scorer) in scorers.into_iter().enumerate() {
             let name = scorer.name().to_owned();
             if name.trim().is_empty() {
@@ -46,7 +49,7 @@ impl<I: Send + Sync + 'static, O: Send + Sync + 'static> EvalDefinition<I, O> {
             if !names.insert(name.clone()) {
                 return Err(EvalConfigError::DuplicateScorerName { name });
             }
-            validated.push(Arc::new(NamedScorer { name, scorer }));
+            validated.push((name, Arc::from(scorer)));
         }
         Ok(Self {
             inner: Arc::new(DefinitionInner {
@@ -60,39 +63,15 @@ impl<I: Send + Sync + 'static, O: Send + Sync + 'static> EvalDefinition<I, O> {
 impl<I, O> EvalDefinition<I, O> {
     /// Scorer names in definition order, fixed at construction.
     pub fn scorer_names(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.inner.scorers.iter().map(|scorer| scorer.name())
+        self.inner.scorers.iter().map(|(name, _)| name.as_str())
     }
 
     pub(crate) fn task(&self) -> Arc<dyn Task<I, O>> {
         self.inner.task.clone()
     }
 
-    pub(crate) fn scorers(&self) -> &[Arc<dyn Scorer<I, O>>] {
+    pub(crate) fn scorers(&self) -> &[FrozenScorer<I, O>] {
         &self.inner.scorers
-    }
-}
-
-struct NamedScorer<I, O> {
-    name: String,
-    scorer: Box<dyn Scorer<I, O>>,
-}
-
-#[async_trait]
-impl<I: Send + Sync, O: Send + Sync> Scorer<I, O> for NamedScorer<I, O> {
-    fn is_blocking(&self) -> bool {
-        self.scorer.is_blocking()
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn score_blocking(&self, args: ScorerArgs<'_, I, O>) -> anyhow::Result<Scores> {
-        self.scorer.score_blocking(args)
-    }
-
-    async fn score(&self, args: ScorerArgs<'_, I, O>) -> anyhow::Result<Scores> {
-        self.scorer.score(args).await
     }
 }
 
@@ -100,6 +79,7 @@ impl<I: Send + Sync, O: Send + Sync> Scorer<I, O> for NamedScorer<I, O> {
 mod tests {
     use super::*;
     use crate::eval::{case_runner::CaseRunner, task, Case, CaseError};
+    use crate::eval::{ScorerArgs, Scores};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // No Clone, Serialize, equality or runtime is needed for computation.

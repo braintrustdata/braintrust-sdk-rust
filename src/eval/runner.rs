@@ -1,88 +1,59 @@
-use serde::Serialize;
 use serde_json::{Map, Value};
-use std::marker::PhantomData;
-use std::sync::Arc;
 
-use crate::BraintrustClient;
-
-use super::{
-    source::CaseSource, types::EvalSummary, EvalConfigError, EvalDefinition, EvalRunError,
-};
+use super::{source::CaseSource, EvalConfigError, EvalDefinition};
 
 /// Options for running an evaluation
 #[derive(bon::Builder)]
 pub struct EvalOpts<I, O> {
     /// Name of the evaluation
-    pub name: String,
+    pub(crate) name: String,
     /// Owned source providing test cases
-    pub source: Box<dyn CaseSource<I, O>>,
+    pub(crate) source: Box<dyn CaseSource<I, O>>,
     /// Reusable task and ordered scorers
-    pub definition: EvalDefinition<I, O>,
+    pub(crate) definition: EvalDefinition<I, O>,
     /// Braintrust project to log results to
-    pub project_name: Option<String>,
+    pub(crate) project_name: Option<String>,
     /// Optional experiment name for Braintrust logging
-    pub experiment_name: Option<String>,
+    pub(crate) experiment_name: Option<String>,
     /// Optional metadata for the evaluation
-    pub metadata: Option<Map<String, Value>>,
+    pub(crate) metadata: Option<Map<String, Value>>,
     /// Optional tags for the evaluation
-    pub tags: Option<Vec<String>>,
+    pub(crate) tags: Option<Vec<String>>,
     /// Maximum concurrent evaluations (default: 5)
     #[builder(default = 5)]
-    pub max_concurrency: usize,
+    pub(crate) max_concurrency: usize,
     /// Suppress progress output (default: false)
     #[builder(default = false)]
-    pub quiet: bool,
+    pub(crate) quiet: bool,
+    /// Explicit reporter; overrides default terminal output.
+    pub(crate) reporter: Option<Box<dyn super::EvalReporter<I, O>>>,
     /// Explicit runtime for local runs. Recorded runs inherit their client binding.
-    pub runtime: Option<tokio::runtime::Handle>,
+    pub(crate) runtime: Option<tokio::runtime::Handle>,
 }
 
 impl<I, O> EvalOpts<I, O> {
+    /// Optional experiment label supplied by the caller.
+    pub fn experiment_name(&self) -> Option<&str> {
+        self.experiment_name.as_deref()
+    }
+
+    /// Set run-owned output, overriding the default reporter.
+    pub fn with_reporter(mut self, reporter: impl super::EvalReporter<I, O> + 'static) -> Self {
+        self.reporter = Some(Box::new(reporter));
+        self
+    }
+    pub(crate) fn take_reporter(&mut self) -> Box<dyn super::EvalReporter<I, O>> {
+        self.reporter
+            .take()
+            .unwrap_or_else(|| Box::new(super::reporter::TerminalReporter { quiet: self.quiet }))
+    }
+
     /// Validate execution options without reading cases or creating recording work.
     pub fn validate(&self) -> std::result::Result<(), EvalConfigError> {
         if self.max_concurrency == 0 {
             return Err(EvalConfigError::ZeroConcurrency);
         }
         Ok(())
-    }
-}
-
-/// Client-bound convenience facade for recorded evaluations.
-pub struct Evaluator<I, O> {
-    client: Arc<BraintrustClient>,
-    _phantom: PhantomData<(I, O)>,
-}
-
-impl<I, O> Evaluator<I, O>
-where
-    I: Serialize + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-{
-    /// Create a new evaluator
-    pub fn new(client: BraintrustClient) -> Self {
-        Self {
-            client: Arc::new(client),
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Create a new evaluator from an Arc client (avoids cloning)
-    pub fn from_arc(client: Arc<BraintrustClient>) -> Self {
-        Self {
-            client,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Submit a recorded run immediately on the client binding.
-    /// Dropping the completion does not cancel accepted work.
-    pub fn run(
-        &self,
-        opts: EvalOpts<I, O>,
-    ) -> crate::Completion<EvalSummary<I, O>, EvalRunError<I, O>> {
-        super::run(super::EvalRequest::recorded(
-            opts,
-            self.client.as_ref().clone(),
-        ))
     }
 }
 

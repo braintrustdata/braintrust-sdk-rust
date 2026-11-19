@@ -15,10 +15,7 @@ use serde_json::{json, Value};
 
 use crate::{BraintrustClient, BraintrustError, Result};
 
-use super::{
-    runner::{EvalOpts, Evaluator},
-    types::EvalSummary,
-};
+use super::{runner::EvalOpts, types::EvalSummary};
 
 /// A filter for selecting which evaluators to run, read from `BT_EVAL_FILTER_PARSED`.
 struct EvalFilter {
@@ -198,11 +195,7 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 ///     "my-project",
 ///     EvalOpts::builder()
 ///         .name("my-eval".to_string())
-///         .source(vec![Case {
-///             input: "hello".to_string(),
-///             expected: Some("HELLO".to_string()),
-///             ..Default::default()
-///         }].into())
+///         .source(vec![Case::builder().input("hello".to_string()).expected("HELLO".to_string()).build()].into())
 ///         .definition(definition.clone())
 ///         .build(),
 /// ).await?;
@@ -316,13 +309,11 @@ impl BtEvalRunner {
             .clone()
             .ok_or_else(|| BraintrustError::Background("BtEvalRunner has no client".to_string()))?;
 
-        let evaluator = Evaluator::<I, O>::from_arc(client);
-
         if let Some(sse) = &self.sse {
             sse.send("start", &json!({ "name": name }));
         }
 
-        match evaluator.run(opts).await {
+        match client.eval(opts).await {
             Ok(summary) => {
                 let failed = summary.failed_cases;
 

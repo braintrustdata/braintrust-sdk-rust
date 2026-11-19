@@ -43,12 +43,12 @@ impl CaseRunner {
         let mut scores = Vec::new();
         if let Some(output) = &output {
             let mut pending = FuturesOrdered::new();
-            for scorer in definition.scorers() {
+            for (name, scorer) in definition.scorers() {
                 let case = case.clone();
                 let output = output.clone();
                 let scorer = scorer.clone();
                 pending.push_back(async move {
-                    let name = scorer.name().to_owned();
+                    let name = name.clone();
                     let result = if scorer.is_blocking() {
                         super::blocking::invoke(binding, move || {
                             scorer.score_blocking(ScorerArgs {

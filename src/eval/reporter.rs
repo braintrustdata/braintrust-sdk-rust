@@ -1,5 +1,13 @@
 //! Console presentation, separate from execution and recording.
-use super::{executor::EvalReporter, EvalResult, EvalSummary};
+use super::{EvalResult, EvalSummary};
+
+/// Run-owned progress output. Callbacks execute on the evaluation runtime.
+/// Case callbacks follow completion order; the summary retains source order.
+pub trait EvalReporter<I, O>: Send {
+    fn started(&mut self, name: &str);
+    fn case_finished(&mut self, index: usize, result: &EvalResult<I, O>);
+    fn finished(&mut self, summary: &EvalSummary<I, O>);
+}
 
 pub(crate) struct TerminalReporter {
     pub quiet: bool,

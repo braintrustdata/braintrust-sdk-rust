@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use braintrust_sdk_rust::{
     eval::{
-        scorer, task, Case, CaseSource, EvalConfigError, EvalDefinition, EvalOpts, Evaluator,
-        ExactMatch, Score, Scorer, ScorerArgs, Scores, SimpleFnTask, Task, TaskHooks,
+        scorer, task, Case, CaseSource, EvalConfigError, EvalDefinition, EvalOpts, ExactMatch,
+        Score, Scorer, ScorerArgs, Scores, SimpleFnTask, Task, TaskHooks,
     },
     BraintrustClient,
 };
@@ -22,7 +22,7 @@ fn borrowed_task<'a>(
 ) -> BoxFuture<'a, anyhow::Result<Output>> {
     Box::pin(async move {
         tokio::task::yield_now().await;
-        Ok(Output(input.0 + hooks.expected.unwrap().0))
+        Ok(Output(input.0 + hooks.expected().unwrap().0))
     })
 }
 fn borrowed_score<'a>(
@@ -32,7 +32,7 @@ fn borrowed_score<'a>(
         tokio::task::yield_now().await;
         Ok(vec![Score::new(
             "borrowed",
-            (args.output.0 - args.input.0) as f64,
+            (args.output().0 - args.input().0) as f64,
         )])
     })
 }
@@ -48,15 +48,16 @@ async fn functions_and_plain_named_tuples_borrow_values_across_await() {
     assert_eq!(output.0, 7);
     assert_eq!(scorer.name(), "function");
     let scores = scorer
-        .score(ScorerArgs {
-            input: &input,
-            output: &output,
-            expected: Some(&expected),
-            metadata: None,
-        })
+        .score(
+            ScorerArgs::builder()
+                .input(&input)
+                .output(&output)
+                .expected(&expected)
+                .build(),
+        )
         .await
         .unwrap();
-    assert_eq!(scores[0].score, 3.0);
+    assert_eq!(scores[0].score(), 3.0);
 }
 
 #[tokio::test]
@@ -98,7 +99,7 @@ async fn scorer_helpers_accept_borrowed_and_owned_names_and_captured_state() {
         |args: ScorerArgs<'_, Input, Output>| {
             Box::pin(async move {
                 tokio::task::yield_now().await;
-                Ok(vec![Score::new("value", args.input.0 as f64)])
+                Ok(vec![Score::new("value", args.input().0 as f64)])
             })
         },
     );
@@ -111,7 +112,7 @@ async fn scorer_helpers_accept_borrowed_and_owned_names_and_captured_state() {
             Box::pin(async move {
                 tokio::task::yield_now().await;
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![Score::new("value", args.output.0 as f64)])
+                Ok(vec![Score::new("value", args.output().0 as f64)])
             })
         },
     );
@@ -122,12 +123,7 @@ async fn scorer_helpers_accept_borrowed_and_owned_names_and_captured_state() {
     for callback in [&borrowed as &dyn Scorer<Input, Output>, &owned] {
         assert_eq!(
             callback
-                .score(ScorerArgs {
-                    input: &input,
-                    output: &output,
-                    expected: None,
-                    metadata: None
-                })
+                .score(ScorerArgs::builder().input(&input).output(&output).build())
                 .await
                 .unwrap()
                 .len(),
@@ -156,7 +152,7 @@ async fn invalid_concurrency_and_names_fail_before_login_recording_or_source_acc
         .build()
         .await
         .unwrap();
-    let evaluator = Evaluator::new(client);
+
     let accessed = Arc::new(AtomicBool::new(false));
     for (concurrency, names, expected) in [
         (0, vec!["one"], EvalConfigError::ZeroConcurrency),
@@ -198,8 +194,13 @@ async fn invalid_concurrency_and_names_fail_before_login_recording_or_source_acc
                 .quiet(true)
                 .build();
         assert_eq!(opts.validate(), Err(expected.clone()));
+        let completion = client.eval(opts);
         assert!(
-            matches!(evaluator.run(opts).await, Err(error) if matches!(&error.failures[0], braintrust_sdk_rust::eval::EvalRunFailure::Config(actual) if actual == &expected) && error.partial.is_none())
+            completion.is_err(),
+            "configuration must fail before admission"
+        );
+        assert!(
+            matches!(completion.await, Err(error) if matches!(&error.failures()[0], braintrust_sdk_rust::eval::EvalRunFailure::Config(actual) if actual == &expected) && error.partial().is_none())
         );
     }
     assert!(!accessed.load(Ordering::SeqCst));

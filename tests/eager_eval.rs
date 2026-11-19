@@ -32,10 +32,7 @@ fn numeric() -> EvalOpts<usize, usize> {
             vec![],
         )
         .unwrap(),
-        vec![Case {
-            input: 3,
-            ..Default::default()
-        }],
+        vec![Case::builder().input(3).build()],
     )
 }
 
@@ -48,22 +45,14 @@ fn local_runs_from_a_plain_thread_without_serialization_clone_or_debug() {
         vec![],
     )
     .unwrap();
-    let token = run(EvalRequest::local(options(
+    let token = run(options(
         definition,
-        vec![Case {
-            input: Input(3),
-            expected: None,
-            metadata: None,
-            tags: None,
-            id: None,
-            xact_id: None,
-            created: None,
-        }],
-    )));
+        vec![Case::builder().input(Input(3)).build()],
+    ));
     assert!(token.is_ok());
     let result = futures::executor::block_on(token.into_future()).unwrap();
-    assert_eq!(result.results[0].output.as_ref().unwrap().0, 6);
-    assert!(result.results[0].span_id.is_none());
+    assert_eq!(result.results()[0].output().unwrap().0, 6);
+    assert!(result.results()[0].span_id().is_none());
 }
 
 #[test]
@@ -77,13 +66,7 @@ fn dropping_the_observer_keeps_the_source_and_callbacks_running() {
         vec![],
     )
     .unwrap();
-    let token = run(EvalRequest::local(options(
-        definition,
-        vec![Case {
-            input: 7,
-            ..Default::default()
-        }],
-    )));
+    let token = run(options(definition, vec![Case::builder().input(7).build()]));
     assert!(token.is_ok());
     drop(token);
     assert_eq!(observed.recv_timeout(Duration::from_secs(3)).unwrap(), 7);
@@ -100,16 +83,18 @@ async fn local_runtime_selection_is_explicit_and_never_uses_ambient_by_default()
     )
     .unwrap();
     for explicit in [false, true] {
-        let mut opts = options(
-            definition.clone(),
-            vec![Case {
-                input: 0,
-                ..Default::default()
-            }],
+        let opts = EvalOpts::builder()
+            .name("eager".into())
+            .definition(definition.clone())
+            .source(vec![Case::builder().input(0).build()].into())
+            .quiet(true)
+            .maybe_runtime(explicit.then(tokio::runtime::Handle::current))
+            .build();
+        let summary = run(opts).await.unwrap();
+        assert_eq!(
+            summary.results()[0].output().copied() == Some(ambient),
+            explicit
         );
-        opts.runtime = explicit.then(tokio::runtime::Handle::current);
-        let summary = run(EvalRequest::local(opts)).await.unwrap();
-        assert_eq!(summary.results[0].output == Some(ambient), explicit);
     }
 }
 
@@ -131,21 +116,20 @@ fn external_runtime_loss_before_first_poll_reports_worker_loss_without_fallback(
         vec![],
     )
     .unwrap();
-    let mut opts = options(
-        definition,
-        vec![Case {
-            input: 0,
-            ..Default::default()
-        }],
-    );
-    opts.runtime = Some(runtime.handle().clone());
-    let token = run(EvalRequest::local(opts));
+    let opts = EvalOpts::builder()
+        .name("eager".into())
+        .definition(definition)
+        .source(vec![Case::builder().input(0).build()].into())
+        .quiet(true)
+        .runtime(runtime.handle().clone())
+        .build();
+    let token = run(opts);
     assert!(token.is_ok());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     drop(runtime);
     let error = futures::executor::block_on(token.into_future()).unwrap_err();
     assert!(matches!(
-        error.failures.as_slice(),
+        error.failures(),
         [EvalRunFailure::Execution(ExecutionError::WorkerLost)]
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -153,16 +137,27 @@ fn external_runtime_loss_before_first_poll_reports_worker_loss_without_fallback(
 
 #[test]
 fn invalid_options_return_an_immediate_config_error() {
-    let mut opts = numeric();
-    opts.max_concurrency = 0;
-    let token = run(EvalRequest::local(opts));
+    let opts = EvalOpts::builder()
+        .name("eager".into())
+        .definition(
+            EvalDefinition::new(
+                Box::new(SimpleFnTask::new(|input: &usize| Ok(input * 2))),
+                vec![],
+            )
+            .unwrap(),
+        )
+        .source(vec![Case::builder().input(3).build()].into())
+        .quiet(true)
+        .max_concurrency(0)
+        .build();
+    let token = run(opts);
     assert!(token.is_err());
     let error = futures::executor::block_on(token.into_future()).unwrap_err();
     assert!(matches!(
-        error.failures.as_slice(),
+        error.failures(),
         [EvalRunFailure::Config(EvalConfigError::ZeroConcurrency)]
     ));
-    assert!(error.partial.is_none());
+    assert!(error.partial().is_none());
 }
 
 async fn client(server: &MockServer) -> BraintrustClient {
@@ -212,7 +207,7 @@ async fn recorded_run_admitted_before_shutdown_finishes_writes_and_revokes_escap
                 let escaped = escaped.clone();
                 Box::pin(async move {
                     let child = hooks
-                        .span
+                        .span()
                         .unwrap()
                         .child_builder()
                         .unwrap()
@@ -230,29 +225,20 @@ async fn recorded_run_admitted_before_shutdown_finishes_writes_and_revokes_escap
         vec![],
     )
     .unwrap();
-    let token = run(EvalRequest::recorded(
-        options(
-            definition,
-            vec![Case {
-                input: 7,
-                ..Default::default()
-            }],
-        ),
-        client.clone(),
-    ));
+    let token = client.eval(options(definition, vec![Case::builder().input(7).build()]));
     assert!(token.is_ok());
     let shutdown = client.shutdown(Duration::from_secs(5));
-    let rejected = run(EvalRequest::recorded(numeric(), client.clone()));
+    let rejected = client.eval(numeric());
     assert!(rejected.is_err());
     assert!(matches!(
-        rejected.await.unwrap_err().failures.as_slice(),
+        rejected.await.unwrap_err().failures(),
         [EvalRunFailure::Admission(EnqueueError::Closed)]
     ));
     let (result, shutdown) = tokio::join!(token, shutdown);
     let result = result.unwrap();
     shutdown.unwrap();
-    assert_eq!(result.results[0].output, Some(7));
-    assert!(result.results[0].span_id.is_some());
+    assert_eq!(result.results()[0].output().copied(), Some(7));
+    assert!(result.results()[0].span_id().is_some());
     let escaped = escaped.lock().unwrap().take().unwrap();
     assert!(matches!(
         escaped.end().await,
@@ -264,12 +250,23 @@ async fn recorded_run_admitted_before_shutdown_finishes_writes_and_revokes_escap
 async fn recorded_runtime_override_is_rejected_and_dropped_observer_still_drains() {
     let server = MockServer::start().await;
     let client = client(&server).await;
-    let mut opts = numeric();
-    opts.runtime = braintrust_sdk_rust::current_runtime();
-    let rejected = run(EvalRequest::recorded(opts, client.clone()));
+    let opts = EvalOpts::builder()
+        .name("eager".into())
+        .definition(
+            EvalDefinition::new(
+                Box::new(SimpleFnTask::new(|input: &usize| Ok(input * 2))),
+                vec![],
+            )
+            .unwrap(),
+        )
+        .source(vec![Case::builder().input(3).build()].into())
+        .quiet(true)
+        .maybe_runtime(braintrust_sdk_rust::current_runtime())
+        .build();
+    let rejected = client.eval(opts);
     assert!(rejected.is_err());
     assert!(matches!(
-        rejected.await.unwrap_err().failures.as_slice(),
+        rejected.await.unwrap_err().failures(),
         [EvalRunFailure::Config(EvalConfigError::RecordedRuntime)]
     ));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -284,16 +281,7 @@ async fn recorded_runtime_override_is_rejected_and_dropped_observer_still_drains
         vec![],
     )
     .unwrap();
-    drop(run(EvalRequest::recorded(
-        options(
-            definition,
-            vec![Case {
-                input: 1,
-                ..Default::default()
-            }],
-        ),
-        client.clone(),
-    )));
+    drop(client.eval(options(definition, vec![Case::builder().input(1).build()])));
     client.shutdown(Duration::from_secs(5)).await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -308,26 +296,17 @@ async fn callback_panic_retires_recorded_run_and_revokes_escaped_permission() {
             let escaped = escaped.clone();
             move |_: &usize, hooks| {
                 *escaped.lock().unwrap() =
-                    Some(hooks.span.unwrap().child_builder().unwrap().build());
+                    Some(hooks.span().unwrap().child_builder().unwrap().build());
                 Box::pin(async { panic!("application callback panic") })
             }
         })),
         vec![],
     )
     .unwrap();
-    let token = run(EvalRequest::recorded(
-        options(
-            definition,
-            vec![Case {
-                input: 0,
-                ..Default::default()
-            }],
-        ),
-        client.clone(),
-    ));
+    let token = client.eval(options(definition, vec![Case::builder().input(0).build()]));
     let error = token.await.unwrap_err();
     assert!(matches!(
-        error.failures.as_slice(),
+        error.failures(),
         [EvalRunFailure::Execution(ExecutionError::WorkerLost)]
     ));
     client.shutdown(Duration::from_secs(5)).await.unwrap();
@@ -350,7 +329,7 @@ async fn shutdown_deadline_cancels_pending_run_and_revokes_escaped_permission() 
             let entered = entered.clone();
             move |_: &usize, hooks| {
                 *escaped.lock().unwrap() =
-                    Some(hooks.span.unwrap().child_builder().unwrap().build());
+                    Some(hooks.span().unwrap().child_builder().unwrap().build());
                 entered.notify_one();
                 Box::pin(std::future::pending())
             }
@@ -358,16 +337,7 @@ async fn shutdown_deadline_cancels_pending_run_and_revokes_escaped_permission() 
         vec![],
     )
     .unwrap();
-    let token = run(EvalRequest::recorded(
-        options(
-            definition,
-            vec![Case {
-                input: 0,
-                ..Default::default()
-            }],
-        ),
-        client.clone(),
-    ));
+    let token = client.eval(options(definition, vec![Case::builder().input(0).build()]));
     entered.notified().await;
     assert!(matches!(
         client.shutdown(Duration::from_millis(20)).await,
@@ -377,7 +347,7 @@ async fn shutdown_deadline_cancels_pending_run_and_revokes_escaped_permission() 
     ));
     let error = token.await.unwrap_err();
     assert!(matches!(
-        error.failures.as_slice(),
+        error.failures(),
         [EvalRunFailure::Execution(ExecutionError::TimedOut)]
     ));
     let escaped = escaped.lock().unwrap().take().unwrap();
@@ -420,7 +390,7 @@ async fn running_blocking_callback_keeps_owned_data_after_timeout_but_loses_writ
                 .lock()
                 .unwrap()
                 .recv_timeout(Duration::from_secs(3))?;
-            let rejected = hooks.span.unwrap().log(SpanLog::default()).is_err();
+            let rejected = hooks.span().unwrap().log(SpanLog::default()).is_err();
             report
                 .lock()
                 .unwrap()
@@ -433,30 +403,19 @@ async fn running_blocking_callback_keeps_owned_data_after_timeout_but_loses_writ
     });
     let opts = options(
         EvalDefinition::new(Box::new(callback), vec![]).unwrap(),
-        vec![Case {
-            input: OwnedInput {
+        vec![Case::builder()
+            .input(OwnedInput {
                 value: 17,
                 drops: drops.clone(),
                 dropped: dropped.clone(),
-            },
-            expected: None,
-            metadata: None,
-            tags: None,
-            id: None,
-            xact_id: None,
-            created: None,
-        }],
+            })
+            .build()],
     );
-    let token = run(EvalRequest::recorded(opts, client.clone()));
+    let token = client.eval(opts);
     entered.notified().await;
     assert!(client.shutdown(Duration::from_millis(20)).await.is_err());
     assert!(matches!(
-        token
-            .await
-            .err()
-            .expect("run must time out")
-            .failures
-            .as_slice(),
+        token.await.err().expect("run must time out").failures(),
         [EvalRunFailure::Execution(ExecutionError::TimedOut)]
     ));
     assert_eq!(
@@ -479,7 +438,7 @@ async fn synchronous_callback_can_wait_for_recording_without_blocking_delivery()
         assert_ne!(std::thread::current().id(), worker);
         futures::executor::block_on(
             hooks
-                .span
+                .span()
                 .unwrap()
                 .log(
                     SpanLog::builder()
@@ -495,18 +454,48 @@ async fn synchronous_callback_can_wait_for_recording_without_blocking_delivery()
         )?;
         Ok(*input)
     });
-    let token = run(EvalRequest::recorded(
-        options(
-            EvalDefinition::new(Box::new(callback), vec![]).unwrap(),
-            vec![Case {
-                input: 9,
-                ..Default::default()
-            }],
-        ),
-        client.clone(),
+    let token = client.eval(options(
+        EvalDefinition::new(Box::new(callback), vec![]).unwrap(),
+        vec![Case::builder().input(9).build()],
     ));
     let shutdown = client.shutdown(Duration::from_secs(5));
     let (result, shutdown) = tokio::join!(token, shutdown);
-    assert_eq!(result.unwrap().results[0].output, Some(9));
+    assert_eq!(result.unwrap().results()[0].output(), Some(&9));
     shutdown.unwrap();
+}
+
+#[test]
+fn options_reporter_overrides_quiet_and_observes_local_results() {
+    struct Reporter(Arc<Mutex<Vec<String>>>);
+    // Deliberately no Serialize or Clone on local output.
+    struct Output(usize);
+    impl EvalReporter<usize, Output> for Reporter {
+        fn started(&mut self, name: &str) {
+            self.0.lock().unwrap().push(name.into());
+        }
+        fn case_finished(&mut self, index: usize, result: &EvalResult<usize, Output>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{index}:{}", result.output().unwrap().0));
+        }
+        fn finished(&mut self, summary: &EvalSummary<usize, Output>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("done:{}", summary.total_cases()));
+        }
+    }
+    let events = Arc::new(Mutex::new(vec![]));
+    let opts = options(
+        EvalDefinition::new(
+            Box::new(SimpleFnTask::new(|input: &usize| Ok(Output(input * 2)))),
+            vec![],
+        )
+        .unwrap(),
+        vec![Case::builder().input(3).build()],
+    )
+    .with_reporter(Reporter(events.clone()));
+    futures::executor::block_on(run(opts).into_future()).unwrap();
+    assert_eq!(*events.lock().unwrap(), ["eager", "0:6", "done:1"]);
 }

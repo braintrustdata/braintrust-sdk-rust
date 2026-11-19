@@ -44,19 +44,16 @@ async fn recording_client() -> (BraintrustClient, wiremock::MockServer) {
 #[tokio::test]
 async fn test_basic_eval_flow() {
     let (client, server) = recording_client().await;
-    let evaluator = Evaluator::new(client);
 
     let cases = vec![
-        Case {
-            input: "hello".to_string(),
-            expected: Some("HELLO".to_string()),
-            ..Default::default()
-        },
-        Case {
-            input: "world".to_string(),
-            expected: Some("WORLD".to_string()),
-            ..Default::default()
-        },
+        Case::builder()
+            .input("hello".to_string())
+            .expected("HELLO".to_string())
+            .build(),
+        Case::builder()
+            .input("world".to_string())
+            .expected("WORLD".to_string())
+            .build(),
     ];
 
     let callback = task(|input: &String, _hooks| Box::pin(async move { Ok(input.to_uppercase()) }));
@@ -66,7 +63,7 @@ async fn test_basic_eval_flow() {
             Box::pin(async move {
                 Ok(vec![Score::new(
                     "match",
-                    if args.expected == Some(args.output) {
+                    if args.expected() == Some(args.output()) {
                         1.0
                     } else {
                         0.0
@@ -76,8 +73,8 @@ async fn test_basic_eval_flow() {
         },
     ))];
 
-    let result = evaluator
-        .run(
+    let result = client
+        .eval(
             EvalOpts::builder()
                 .name("test-basic-eval".to_string())
                 .source(cases.into())
@@ -88,12 +85,12 @@ async fn test_basic_eval_flow() {
         .await
         .expect("Evaluation failed");
 
-    assert_eq!(result.total_cases, 2);
-    assert_eq!(result.successful_cases, 2);
+    assert_eq!(result.total_cases(), 2);
+    assert_eq!(result.successful_cases(), 2);
     assert!(result
-        .results
+        .results()
         .iter()
-        .all(|case| case.span_id.is_some() && case.errors.is_empty()));
+        .all(|case| case.span_id().is_some() && case.errors().is_empty()));
     let requests = server.received_requests().await.unwrap();
     assert!(requests
         .iter()
@@ -103,11 +100,10 @@ async fn test_basic_eval_flow() {
 #[test]
 fn test_eval_types_compile() {
     // Test that all the types and builders work correctly
-    let cases = vec![Case {
-        input: "test".to_string(),
-        expected: Some("TEST".to_string()),
-        ..Default::default()
-    }];
+    let cases = vec![Case::builder()
+        .input("test".to_string())
+        .expected("TEST".to_string())
+        .build()];
 
     let _dataset: Box<dyn CaseSource<String, String>> = cases.into();
     let _task: Box<dyn Task<String, String>> =
@@ -116,21 +112,18 @@ fn test_eval_types_compile() {
 
     // Verify Score creation
     let score = Score::new("test_score", 0.95);
-    assert_eq!(score.name, "test_score");
-    assert_eq!(score.score, 0.95);
+    assert_eq!(score.name(), "test_score");
+    assert_eq!(score.score(), 0.95);
 }
 
 #[test]
 fn test_case_default() {
-    let case: Case<String, String> = Case {
-        input: "hello".to_string(),
-        ..Default::default()
-    };
+    let case: Case<String, String> = Case::builder().input("hello".to_string()).build();
 
-    assert_eq!(case.input, "hello");
-    assert_eq!(case.expected, None);
-    assert_eq!(case.metadata, None);
-    assert_eq!(case.tags, None);
+    assert_eq!(case.input(), "hello");
+    assert_eq!(case.expected(), None);
+    assert_eq!(case.metadata(), None);
+    assert_eq!(case.tags(), None);
 }
 
 #[tokio::test]
@@ -140,47 +133,49 @@ async fn test_scorers() {
     // ExactMatch
     let scorer = ExactMatch::new();
     let expected = String::from("TEST");
-    let args = ScorerArgs {
-        input: &"test".to_string(),
-        output: &"TEST".to_string(),
-        expected: Some(&expected),
-        metadata: None,
-    };
+    let input = "test".to_string();
+    let output = "TEST".to_string();
+    let args = ScorerArgs::builder()
+        .input(&input)
+        .output(&output)
+        .expected(&expected)
+        .build();
     let scores = scorer.score(args).await.unwrap();
-    assert_eq!(scores[0].score, 1.0);
+    assert_eq!(scores[0].score(), 1.0);
 
     // Levenshtein
     let scorer = LevenshteinScorer::new();
     let expected = String::from("hallo");
-    let args = ScorerArgs {
-        input: &"test".to_string(),
-        output: &"hello".to_string(),
-        expected: Some(&expected),
-        metadata: None,
-    };
+    let input = "test".to_string();
+    let output = "hello".to_string();
+    let args = ScorerArgs::builder()
+        .input(&input)
+        .output(&output)
+        .expected(&expected)
+        .build();
     let scores = scorer.score(args).await.unwrap();
-    assert!(scores[0].score > 0.7); // ~0.8 similarity
+    assert!(scores[0].score() > 0.7); // ~0.8 similarity
 
     // NumericDiff
     let scorer = NumericDiffScorer::new();
-    let args = ScorerArgs {
-        input: &"test".to_string(),
-        output: &10.0,
-        expected: Some(&8.0),
-        metadata: None,
-    };
+    let input = "test".to_string();
+    let output = 10.0;
+    let args = ScorerArgs::builder()
+        .input(&input)
+        .output(&output)
+        .expected(&8.0)
+        .build();
     let scores = scorer.score(args).await.unwrap();
-    assert_eq!(scores[0].score, 2.0); // absolute difference
+    assert_eq!(scores[0].score(), 2.0); // absolute difference
 }
 
 #[test]
 fn test_eval_opts_builder() {
     // Verify the builder pattern works
-    let cases = vec![Case {
-        input: "test".to_string(),
-        expected: Some("TEST".to_string()),
-        ..Default::default()
-    }];
+    let cases = vec![Case::builder()
+        .input("test".to_string())
+        .expected("TEST".to_string())
+        .build()];
 
     let dataset: Box<dyn CaseSource<String, String>> = cases.into();
     let task: Box<dyn Task<String, String>> =
@@ -199,24 +194,23 @@ fn test_eval_opts_builder() {
 #[tokio::test]
 async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
     let (client, server) = recording_client().await;
-    let evaluator = Evaluator::new(client);
+
     let scorers: Vec<Box<dyn Scorer<String, String>>> = vec![
         Box::new(ExactMatch::new()),
         Box::new(SyncFnScorer::new("broken", |_| {
             anyhow::bail!("scoring failed")
         })),
     ];
-    let result = evaluator
-        .run(
+    let result = client
+        .eval(
             EvalOpts::builder()
                 .name("failed-scorer".into())
                 .source(
-                    vec![Case {
-                        input: "a".to_owned(),
-                        expected: Some("A".to_owned()),
-                        id: Some("source-case".into()),
-                        ..Default::default()
-                    }]
+                    vec![Case::builder()
+                        .input("a".to_owned())
+                        .expected("A".to_owned())
+                        .id("source-case".into())
+                        .build()]
                     .into(),
                 )
                 .definition(
@@ -231,13 +225,13 @@ async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
         )
         .await
         .unwrap();
-    assert_eq!(result.successful_cases, 0);
-    assert_eq!(result.failed_cases, 1);
-    assert_eq!(result.score_stats[0].name, "exact_match");
-    assert_eq!(result.score_stats[0].mean, 1.0);
-    let case = &result.results[0];
-    assert_eq!(case.case_id.as_deref(), Some("source-case"));
-    assert!(matches!(&case.errors[0], CaseError::Scorer {name,..} if name == "broken"));
+    assert_eq!(result.successful_cases(), 0);
+    assert_eq!(result.failed_cases(), 1);
+    assert_eq!(result.score_stats()[0].name(), "exact_match");
+    assert_eq!(result.score_stats()[0].mean(), 1.0);
+    let case = &result.results()[0];
+    assert_eq!(case.case_id().as_deref(), Some("source-case"));
+    assert!(matches!(&case.errors()[0], CaseError::Scorer {name,..} if name == "broken"));
     let rows: Vec<serde_json::Value> = server
         .received_requests()
         .await
@@ -256,8 +250,7 @@ async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
         .any(|row| row["error"][0]["stage"] == "scorer" && row["error"][0]["name"] == "broken"));
     assert!(rows
         .iter()
-        .any(|row| row["span_id"].as_str() == case.span_id.as_deref()
-            && row["metrics"]["end"].is_number()));
+        .any(|row| row["span_id"].as_str() == case.span_id() && row["metrics"]["end"].is_number()));
 }
 
 #[tokio::test]
@@ -295,15 +288,13 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
                 self.failed.notify_one();
                 return Err(ReadFailure.into());
             }
-            Ok(Some(Case {
-                input: Input(index),
-                expected: None,
-                metadata: None,
-                tags: None,
-                id: Some(format!("case-{index}")),
-                xact_id: Some(format!("row-version-{index}")),
-                created: None,
-            }))
+            Ok(Some(
+                Case::builder()
+                    .input(Input(index))
+                    .id(format!("case-{index}"))
+                    .xact_id(format!("row-version-{index}"))
+                    .build(),
+            ))
         }
         fn provenance(&self) -> Option<DatasetVersionRef> {
             Some(DatasetVersionRef {
@@ -352,7 +343,7 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
         .max_concurrency(3)
         .quiet(true)
         .build();
-    let run = tokio::spawn(async move { Evaluator::new(client).run(opts).await });
+    let run = tokio::spawn(async move { client.eval(opts).await });
     tokio::time::timeout(std::time::Duration::from_secs(3), failed.notified())
         .await
         .expect("pending source reads must allow active task progress");
@@ -372,29 +363,29 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
         Ok(_) => panic!("source failure must not become a successful summary"),
     };
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    let [EvalRunFailure::Source { case_index, source }] = error.failures.as_slice() else {
+    let [EvalRunFailure::Source { case_index, source }] = error.failures() else {
         panic!("expected a typed source failure")
     };
     assert_eq!(*case_index, 2);
     assert!(source.downcast_ref::<ReadFailure>().is_some());
-    let partial = error.partial.unwrap();
-    assert_eq!(partial.total_cases, 2);
-    assert_eq!(partial.successful_cases, 2);
-    assert_eq!(partial.failed_cases, 0);
-    let dataset = partial.dataset.unwrap();
+    let partial = error.partial().unwrap();
+    assert_eq!(partial.total_cases(), 2);
+    assert_eq!(partial.successful_cases(), 2);
+    assert_eq!(partial.failed_cases(), 0);
+    let dataset = partial.dataset().unwrap();
     assert_eq!(dataset.dataset_id, "source-dataset");
     assert_eq!(dataset.version.as_deref(), Some("version-0"));
     assert_eq!(
         partial
-            .results
+            .results()
             .iter()
-            .map(|case| case.input.0)
+            .map(|case| case.input().0)
             .collect::<Vec<_>>(),
         [0, 1]
     );
-    assert_eq!(partial.results[1].case_id.as_deref(), Some("case-1"));
-    assert_eq!(partial.results[1].xact_id.as_deref(), Some("row-version-1"));
-    assert_eq!(partial.results[1].output.as_ref().unwrap().0, 2);
+    assert_eq!(partial.results()[1].case_id(), Some("case-1"));
+    assert_eq!(partial.results()[1].xact_id(), Some("row-version-1"));
+    assert_eq!(partial.results()[1].output().unwrap().0, 2);
     let rows: Vec<serde_json::Value> = server
         .received_requests()
         .await
@@ -441,16 +432,16 @@ async fn failure_before_the_first_case_returns_an_empty_partial_run_and_finalize
         )
         .quiet(true)
         .build();
-    let error = Evaluator::new(client).run(opts).await.unwrap_err();
+    let error = client.eval(opts).await.unwrap_err();
     assert!(
-        matches!(&error.failures[0],EvalRunFailure::Source {case_index:0,source} if source.to_string()=="source unavailable")
+        matches!(&error.failures()[0],EvalRunFailure::Source {case_index:0,source} if source.to_string()=="source unavailable")
     );
-    let partial = error.partial.unwrap();
-    assert_eq!(partial.total_cases, 0);
-    assert_eq!(partial.successful_cases, 0);
-    assert_eq!(partial.failed_cases, 0);
-    assert!(partial.results.is_empty());
-    assert!(partial.dataset.is_none());
+    let partial = error.partial().unwrap();
+    assert_eq!(partial.total_cases(), 0);
+    assert_eq!(partial.successful_cases(), 0);
+    assert_eq!(partial.failed_cases(), 0);
+    assert!(partial.results().is_empty());
+    assert!(partial.dataset().is_none());
     let ended = server
         .received_requests()
         .await
@@ -512,10 +503,7 @@ async fn recording_failure_stops_new_cases_but_drains_already_scheduled_cases() 
         .name("record-failure".into())
         .source(
             (0..3)
-                .map(|input| Case {
-                    input,
-                    ..Default::default()
-                })
+                .map(|input| Case::builder().input(input).build())
                 .collect::<Vec<Case<usize, usize>>>()
                 .into(),
         )
@@ -523,7 +511,7 @@ async fn recording_failure_stops_new_cases_but_drains_already_scheduled_cases() 
         .max_concurrency(2)
         .quiet(true)
         .build();
-    let run = tokio::spawn(async move { Evaluator::new(client).run(opts).await });
+    let run = tokio::spawn(async move { client.eval(opts).await });
     tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
         .await
         .unwrap();
@@ -538,37 +526,37 @@ async fn recording_failure_stops_new_cases_but_drains_already_scheduled_cases() 
         2,
         "the third case must remain unread after recording failure"
     );
-    assert!(error.failures.iter().any(|failure| matches!(
+    assert!(error.failures().iter().any(|failure| matches!(
         failure,
         EvalRunFailure::Recording {
             case_index: Some(0),
             ..
         }
     )));
-    assert!(error.failures.iter().any(|failure| matches!(
+    assert!(error.failures().iter().any(|failure| matches!(
         failure,
         EvalRunFailure::Recording {
             case_index: Some(1),
             ..
         }
     )));
-    let partial = error.partial.unwrap();
-    assert_eq!(partial.total_cases, 2);
-    assert_eq!(partial.failed_cases, 0);
-    assert_eq!(partial.successful_cases, 2);
-    assert_eq!(partial.results.len(), 2);
+    let partial = error.partial().unwrap();
+    assert_eq!(partial.total_cases(), 2);
+    assert_eq!(partial.failed_cases(), 0);
+    assert_eq!(partial.successful_cases(), 2);
+    assert_eq!(partial.results().len(), 2);
     assert_eq!(
         partial
-            .results
+            .results()
             .iter()
-            .map(|result| result.output)
+            .map(|result| result.output().copied())
             .collect::<Vec<_>>(),
         [Some(0), Some(1)]
     );
     assert!(partial
-        .results
+        .results()
         .iter()
-        .all(|result| result.errors.is_empty() && result.span_id.is_some()));
+        .all(|result| result.errors().is_empty() && result.span_id().is_some()));
 }
 
 #[tokio::test]
@@ -578,7 +566,7 @@ async fn reusable_definition_keeps_recorded_runs_and_sources_independent() {
         Arc,
     };
     let (client, _server) = recording_client().await;
-    let evaluator = Evaluator::new(client);
+
     let calls = Arc::new(AtomicUsize::new(0));
     let definition = EvalDefinition::new(
         Box::new(task({
@@ -595,36 +583,29 @@ async fn reusable_definition_keeps_recorded_runs_and_sources_independent() {
     let options = |name: &str, input, expected| {
         EvalOpts::builder()
             .name(name.into())
-            .source(
-                vec![Case {
-                    input,
-                    expected: Some(expected),
-                    ..Default::default()
-                }]
-                .into(),
-            )
+            .source(vec![Case::builder().input(input).expected(expected).build()].into())
             .definition(definition.clone())
             .quiet(true)
             .build()
     };
     let (first, second) = tokio::join!(
-        evaluator.run(options("first", 2, 4)),
-        evaluator.run(options("second", 3, 100)),
+        client.eval(options("first", 2, 4)),
+        client.eval(options("second", 3, 100)),
     );
     let first = first.unwrap();
     let second = second.unwrap();
-    assert_eq!(first.name, "first");
-    assert_eq!(second.name, "second");
-    assert_eq!(first.results[0].output, Some(4));
-    assert_eq!(second.results[0].output, Some(6));
-    assert_eq!(first.results[0].scores[0].score, 1.0);
-    assert_eq!(second.results[0].scores[0].score, 0.0);
-    assert_eq!(first.results[0].tags, Some(vec!["input-2".into()]));
-    assert_eq!(second.results[0].tags, Some(vec!["input-3".into()]));
-    assert_ne!(first.results[0].span_id, second.results[0].span_id);
-    let later = evaluator.run(options("later", 5, 10)).await.unwrap();
-    assert_eq!(later.total_cases, 1);
-    assert_eq!(later.results[0].output, Some(10));
+    assert_eq!(first.name(), "first");
+    assert_eq!(second.name(), "second");
+    assert_eq!(first.results()[0].output(), Some(&4));
+    assert_eq!(second.results()[0].output(), Some(&6));
+    assert_eq!(first.results()[0].scores()[0].score(), 1.0);
+    assert_eq!(second.results()[0].scores()[0].score(), 0.0);
+    assert_eq!(first.results()[0].tags(), Some(&vec!["input-2".into()]));
+    assert_eq!(second.results()[0].tags(), Some(&vec!["input-3".into()]));
+    assert_ne!(first.results()[0].span_id(), second.results()[0].span_id());
+    let later = client.eval(options("later", 5, 10)).await.unwrap();
+    assert_eq!(later.total_cases(), 1);
+    assert_eq!(later.results()[0].output(), Some(&10));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
@@ -642,18 +623,7 @@ async fn serialization_failures_keep_outputs_and_finalize_recording() {
     let (client, server) = recording_client().await;
     let options = EvalOpts::builder()
         .name("serialization-failure".into())
-        .source(
-            vec![Case {
-                input: Value(7),
-                expected: Some(Value(14)),
-                metadata: None,
-                tags: None,
-                id: None,
-                xact_id: None,
-                created: None,
-            }]
-            .into(),
-        )
+        .source(vec![Case::builder().input(Value(7)).expected(Value(14)).build()].into())
         .definition(
             EvalDefinition::new(
                 Box::new(SimpleFnTask::new(|input: &Value| Ok(Value(input.0 * 2)))),
@@ -663,9 +633,9 @@ async fn serialization_failures_keep_outputs_and_finalize_recording() {
         )
         .quiet(true)
         .build();
-    let error = Evaluator::new(client).run(options).await.unwrap_err();
+    let error = client.eval(options).await.unwrap_err();
     let fields = error
-        .failures
+        .failures()
         .iter()
         .map(|failure| match failure {
             EvalRunFailure::Recording {
@@ -680,11 +650,11 @@ async fn serialization_failures_keep_outputs_and_finalize_recording() {
         assert!(message.contains(field));
         assert!(message.contains("application serialization failed"));
     }
-    let summary = error.partial.unwrap();
-    assert_eq!(summary.successful_cases, 1);
-    assert_eq!(summary.failed_cases, 0);
-    assert_eq!(summary.results[0].output.as_ref().unwrap().0, 14);
-    assert!(summary.results[0].span_id.is_some());
+    let summary = error.partial().unwrap();
+    assert_eq!(summary.successful_cases(), 1);
+    assert_eq!(summary.failed_cases(), 0);
+    assert_eq!(summary.results()[0].output().unwrap().0, 14);
+    assert!(summary.results()[0].span_id().is_some());
     let requests = server.received_requests().await.unwrap();
     let ended: std::collections::HashSet<_> = requests
         .iter()
@@ -699,4 +669,40 @@ async fn serialization_failures_keep_outputs_and_finalize_recording() {
         .map(|row| row["id"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(ended.len(), 2, "both case and run recording must finalize");
+}
+
+#[test]
+fn case_and_score_keep_their_serde_format() {
+    use serde_json::json;
+    let wire = json!({
+        "input": "hello", "expected": "HELLO", "metadata": {"k": "v"},
+        "tags": ["tag"], "id": "case", "xact_id": "transaction", "created": "timestamp"
+    });
+    let case = Case::builder()
+        .input("hello")
+        .expected("HELLO")
+        .metadata(json!({"k": "v"}).as_object().unwrap().clone())
+        .tags(vec!["tag".into()])
+        .id("case".into())
+        .xact_id("transaction".into())
+        .created("timestamp".into())
+        .build();
+    assert_eq!(serde_json::to_value(case).unwrap(), wire);
+    let decoded: Case<String, String> = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(decoded.id(), Some("case"));
+    assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+    assert_eq!(
+        serde_json::to_value(Case::<_, ()>::builder().input(1).build()).unwrap(),
+        json!({"input":1, "expected":null})
+    );
+    let score = Score::with_metadata("match", 1.0, json!({"k":"v"}).as_object().unwrap().clone());
+    assert_eq!(score.metadata().unwrap()["k"], "v");
+    assert_eq!(
+        serde_json::to_value(score).unwrap(),
+        json!({"name":"match", "score":1.0, "metadata":{"k":"v"}})
+    );
+    let score: Score = serde_json::from_value(json!({"name":"match", "score":1.0})).unwrap();
+    assert_eq!(score.name(), "match");
+    assert_eq!(score.score(), 1.0);
+    assert!(score.metadata().is_none());
 }

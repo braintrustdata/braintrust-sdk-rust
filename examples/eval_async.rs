@@ -16,26 +16,22 @@ async fn main() -> anyhow::Result<()> {
 
     // Define test cases
     let cases = vec![
-        Case {
-            input: "hello".to_string(),
-            expected: Some("HELLO".to_string()),
-            ..Default::default()
-        },
-        Case {
-            input: "world".to_string(),
-            expected: Some("WORLD".to_string()),
-            ..Default::default()
-        },
-        Case {
-            input: "rust".to_string(),
-            expected: Some("RUST".to_string()),
-            ..Default::default()
-        },
-        Case {
-            input: "braintrust".to_string(),
-            expected: Some("BRAINTRUST".to_string()),
-            ..Default::default()
-        },
+        Case::builder()
+            .input("hello".to_string())
+            .expected("HELLO".to_string())
+            .build(),
+        Case::builder()
+            .input("world".to_string())
+            .expected("WORLD".to_string())
+            .build(),
+        Case::builder()
+            .input("rust".to_string())
+            .expected("RUST".to_string())
+            .build(),
+        Case::builder()
+            .input("braintrust".to_string())
+            .expected("BRAINTRUST".to_string())
+            .build(),
     ];
 
     // Share callbacks across runs; each run supplies its own source and options.
@@ -52,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
                     Box::pin(async move {
                         Ok(vec![Score::new(
                             "nonempty",
-                            if args.output.is_empty() { 0.0 } else { 1.0 },
+                            if args.output().is_empty() { 0.0 } else { 1.0 },
                         )])
                     })
                 },

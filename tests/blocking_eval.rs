@@ -12,18 +12,7 @@ fn options(
 ) -> EvalOpts<Input, Output> {
     EvalOpts::builder()
         .name("blocking".into())
-        .source(
-            vec![Case {
-                input: Input(3),
-                expected: Some(Output(6)),
-                metadata: None,
-                tags: None,
-                id: None,
-                xact_id: None,
-                created: None,
-            }]
-            .into(),
-        )
+        .source(vec![Case::builder().input(Input(3)).expected(Output(6)).build()].into())
         .definition(EvalDefinition::new(task, scorers).unwrap())
         .quiet(true)
         .runtime(tokio::runtime::Handle::current())
@@ -48,7 +37,7 @@ async fn synchronous_task_uses_selected_blocking_pool_and_preserves_shared_hooks
             .lock()
             .unwrap()
             .recv_timeout(Duration::from_secs(2))?;
-        Ok(Output(input.0 + hooks.expected.unwrap().0))
+        Ok(Output(input.0 + hooks.expected().unwrap().0))
     });
     // An async case on the same single-thread executor must make progress while
     // the synchronous task is blocked; it releases the callback through a channel.
@@ -56,20 +45,12 @@ async fn synchronous_task_uses_selected_blocking_pool_and_preserves_shared_hooks
         entered.notified().await;
         release.send(()).unwrap();
     });
-    let summary = run(EvalRequest::local(options(Box::new(task), vec![])))
-        .await
-        .unwrap();
+    let summary = run(options(Box::new(task), vec![])).await.unwrap();
     release.await.unwrap();
-    assert!(summary.results[0].errors.is_empty());
-    assert_eq!(summary.results[0].output.as_ref().unwrap().0, 9);
-    assert_eq!(
-        summary.results[0].metadata.as_ref().unwrap()["blocking"],
-        true
-    );
-    assert_eq!(
-        summary.results[0].tags.as_ref().unwrap(),
-        &["from-blocking"]
-    );
+    assert!(summary.results()[0].errors().is_empty());
+    assert_eq!(summary.results()[0].output().unwrap().0, 9);
+    assert_eq!(summary.results()[0].metadata().unwrap()["blocking"], true);
+    assert_eq!(summary.results()[0].tags().unwrap(), &["from-blocking"]);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -89,9 +70,9 @@ async fn synchronous_scorers_run_concurrently_and_keep_definition_order_without_
             move |args: ScorerArgs<'_, Input, Output>| {
                 assert_ne!(std::thread::current().id(), worker);
                 assert_eq!(tokio::runtime::Handle::current().id(), selected);
-                assert_eq!(args.input.0, 3);
-                assert_eq!(args.output.0, 6);
-                assert_eq!(args.expected.unwrap().0, 6);
+                assert_eq!(args.input().0, 3);
+                assert_eq!(args.output().0, 6);
+                assert_eq!(args.expected().unwrap().0, 6);
                 entered.send(name).unwrap();
                 waiting
                     .lock()
@@ -102,7 +83,7 @@ async fn synchronous_scorers_run_concurrently_and_keep_definition_order_without_
         )));
     }
     let task = SimpleFnTask::new(|input: &Input| Ok(Output(input.0 * 2)));
-    let token = run(EvalRequest::local(options(Box::new(task), scorers)));
+    let token = run(options(Box::new(task), scorers));
     let mut names = vec![
         arrivals.recv().await.unwrap(),
         arrivals.recv().await.unwrap(),
@@ -113,12 +94,12 @@ async fn synchronous_scorers_run_concurrently_and_keep_definition_order_without_
         release.send(()).unwrap();
     }
     let summary = token.await.unwrap();
-    assert!(summary.results[0].errors.is_empty());
+    assert!(summary.results()[0].errors().is_empty());
     assert_eq!(
-        summary.results[0]
-            .scores
+        summary.results()[0]
+            .scores()
             .iter()
-            .map(|score| score.name.as_str())
+            .map(|score| score.name())
             .collect::<Vec<_>>(),
         ["first", "second"]
     );
@@ -130,10 +111,7 @@ async fn synchronous_panics_become_case_errors_and_later_cases_continue() {
         .name("panic".into())
         .source(
             (0..2)
-                .map(|input| Case {
-                    input,
-                    ..Default::default()
-                })
+                .map(|input| Case::builder().input(input).build())
                 .collect::<Vec<Case<usize, usize>>>()
                 .into(),
         )
@@ -151,15 +129,15 @@ async fn synchronous_panics_become_case_errors_and_later_cases_continue() {
         )
         .quiet(true)
         .build();
-    let summary = run(EvalRequest::local(opts)).await.unwrap();
-    assert_eq!(summary.failed_cases, 1);
-    assert_eq!(summary.successful_cases, 1);
-    let [CaseError::Task { source }] = summary.results[0].errors.as_slice() else {
+    let summary = run(opts).await.unwrap();
+    assert_eq!(summary.failed_cases(), 1);
+    assert_eq!(summary.successful_cases(), 1);
+    let [CaseError::Task { source }] = summary.results()[0].errors() else {
         panic!("expected task error")
     };
     assert!(source
         .downcast_ref::<tokio::task::JoinError>()
         .unwrap()
         .is_panic());
-    assert_eq!(summary.results[1].output, Some(1));
+    assert_eq!(summary.results()[1].output().copied(), Some(1));
 }

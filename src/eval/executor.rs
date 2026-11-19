@@ -42,11 +42,7 @@ pub(crate) trait CaseRecording<I, O>: Send {
     async fn finish(self: Box<Self>, result: &mut EvalResult<I, O>) -> Vec<BraintrustError>;
 }
 
-pub(crate) trait EvalReporter<I, O> {
-    fn started(&mut self, name: &str);
-    fn case_finished(&mut self, index: usize, result: &EvalResult<I, O>);
-    fn finished(&mut self, summary: &EvalSummary<I, O>);
-}
+pub(crate) use super::reporter::EvalReporter;
 
 struct CaseOutcome<I, O> {
     result: EvalResult<I, O>,
@@ -58,7 +54,7 @@ impl EvalExecutor {
     pub async fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
         mut plan: EvalPlan<I, O>,
         recorder: Option<&dyn EvalRecorder<I, O>>,
-        reporter: &mut impl EvalReporter<I, O>,
+        reporter: &mut (impl EvalReporter<I, O> + ?Sized),
         binding: Option<&crate::internal::execution::ExecutionBinding>,
     ) -> std::result::Result<EvalSummary<I, O>, EvalRunError<I, O>> {
         reporter.started(&plan.name);
@@ -186,7 +182,7 @@ impl EvalExecutor {
         outcome: CaseOutcome<I, O>,
         results: &mut Vec<(usize, EvalResult<I, O>)>,
         failures: &mut Vec<EvalRunFailure>,
-        reporter: &mut impl EvalReporter<I, O>,
+        reporter: &mut (impl EvalReporter<I, O> + ?Sized),
     ) {
         failures.extend(
             outcome

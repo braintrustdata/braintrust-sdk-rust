@@ -20,11 +20,7 @@
 //!     .await?;
 //!
 //! let cases = vec![
-//!     Case {
-//!         input: "hello".to_string(),
-//!         expected: Some("HELLO".to_string()),
-//!         ..Default::default()
-//!     },
+//!     Case::builder().input("hello".to_string()).expected("HELLO".to_string()).build(),
 //! ];
 //!
 //! // Reuse this definition with a fresh source and options for every run.
@@ -34,14 +30,13 @@
 //!     }))),
 //!     vec![Box::new(ExactMatch::new())],
 //! )?;
-//! let completion = run(EvalRequest::recorded(
+//! let completion = client.eval(
 //!         EvalOpts::builder()
 //!             .name("uppercase-eval".to_string())
 //!             .source(cases.into())
 //!             .definition(definition.clone())
 //!             .build(),
-//!     client,
-//! ));
+//! );
 //! let result = completion.await?;
 //!
 //! println!("Results: {:?}", result);
@@ -69,8 +64,9 @@ pub use error::{CaseError, EvalConfigError, EvalRunError, EvalRunFailure};
 
 // Re-export public API
 pub use bt_runner::{summary_to_value, BtEvalRunner};
-pub use run::{run, EvalRequest};
-pub use runner::{EvalOpts, Evaluator};
+pub use reporter::EvalReporter;
+pub use run::run;
+pub use runner::EvalOpts;
 pub use scorer::{scorer, ExactMatch, LevenshteinScorer, NumericDiffScorer, Scorer, SyncFnScorer};
 pub use source::{
     CaseSource, DatasetVersionRef, IterCaseSource, SourceError, StreamCaseSource, VecCaseSource,

@@ -3,6 +3,7 @@ use serde::{ser::SerializeStruct, Serialize, Serializer};
 /// A computation failure retains its stage and original application error.
 /// Other scorers still run after a scorer failure; task failures skip scoring.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CaseError {
     #[error("task failed: {source}")]
     Task {
@@ -40,6 +41,7 @@ impl Serialize for CaseError {
 
 /// Invalid evaluation definitions are rejected before source access or recording.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum EvalConfigError {
     #[error("evaluation concurrency must be greater than zero")]
     ZeroConcurrency,
@@ -54,6 +56,7 @@ pub enum EvalConfigError {
 /// Run-level failures retain their boundary and source location.
 /// Case indices are zero-based; None denotes run-level recording work.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EvalRunFailure {
     #[error("failed to initialize evaluation runtime: {0}")]
     Runtime(#[source] crate::BraintrustError),
@@ -81,8 +84,8 @@ pub enum EvalRunFailure {
 /// Case computation errors remain in those results rather than aborting the run.
 /// Recording failures do not discard computed results or change their success counts.
 pub struct EvalRunError<I, O> {
-    pub failures: Vec<EvalRunFailure>,
-    pub partial: Option<Box<super::EvalSummary<I, O>>>,
+    pub(crate) failures: Vec<EvalRunFailure>,
+    pub(crate) partial: Option<Box<super::EvalSummary<I, O>>>,
 }
 impl<I, O> EvalRunError<I, O> {
     pub(crate) fn new(failure: EvalRunFailure) -> Self {
@@ -142,5 +145,14 @@ impl<I, O> From<crate::ExecutionError> for EvalRunError<I, O> {
 impl<I, O> From<crate::EnqueueError> for EvalRunError<I, O> {
     fn from(error: crate::EnqueueError) -> Self {
         Self::new(EvalRunFailure::Admission(error))
+    }
+}
+
+impl<I, O> EvalRunError<I, O> {
+    pub fn failures(&self) -> &[EvalRunFailure] {
+        &self.failures
+    }
+    pub fn partial(&self) -> Option<&super::EvalSummary<I, O>> {
+        self.partial.as_deref()
     }
 }
