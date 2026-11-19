@@ -503,7 +503,7 @@ impl Dataset {
         api_result(
             self.scope
                 .api(&self.api)?
-                .logs3(&serde_json::json!({"api_version": 2, "rows": [row]}))
+                .logs3(&serde_json::json!({"api_version": crate::types::LOGS_API_VERSION, "rows": [row]}))
                 .await,
         )?;
         Ok(())
