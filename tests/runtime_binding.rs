@@ -1,6 +1,7 @@
+mod support;
+
 use braintrust_sdk_rust::{
-    current_runtime, BraintrustClient, BraintrustError, EnqueueError, ExecutionError,
-    ParentSpanInfo, WriteError,
+    current_runtime, BraintrustClient, BraintrustError, EnqueueError, ExecutionError, WriteError,
 };
 use serde_json::json;
 use std::future::IntoFuture;
@@ -12,29 +13,15 @@ use wiremock::{
 #[tokio::test]
 async fn synchronous_callers_deliver_without_a_tokio_runtime_and_observe_on_another_executor() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
+    support::logs(204).expect(1).mount(&server).await;
     let uri = server.uri();
     let (sender, result) = tokio::sync::oneshot::channel();
     let thread = std::thread::spawn(move || {
         assert!(current_runtime().is_none());
-        let initialization = BraintrustClient::builder()
-            .skip_login(true)
-            .api_url(&uri)
-            .app_url(&uri)
-            .build();
+        let initialization = support::client_builder(&uri).build();
         assert!(initialization.is_ok());
         let client = futures::executor::block_on(initialization.into_future()).unwrap();
-        let span = client
-            .span_builder_with_credentials("token", "org")
-            .parent_info(ParentSpanInfo::ProjectLogs {
-                object_id: "project".into(),
-            })
-            .build();
+        let span = support::span(&client);
         let end = span.end();
         let shutdown = client.shutdown(std::time::Duration::from_secs(5));
         drop(span);
@@ -63,11 +50,9 @@ async fn unobserved_construction_starts_login_without_polling_its_token() {
         .mount(&server)
         .await;
     drop(
-        BraintrustClient::builder()
+        support::endpoints(server.uri())
             .api_key("token")
             .blocking_login(true)
-            .api_url(server.uri())
-            .app_url(server.uri())
             .build(),
     );
     tokio::time::timeout(std::time::Duration::from_secs(5), arrived.notified())
@@ -126,11 +111,8 @@ async fn stopped_explicit_runtime_fails_delivery_and_resource_requests_without_f
             .unwrap();
         selected
             .block_on(
-                BraintrustClient::builder()
-                    .skip_login(true)
+                support::client_builder(&uri)
                     .runtime(Some(selected.handle().clone()))
-                    .api_url(&uri)
-                    .app_url(&uri)
                     .build()
                     .into_future(),
             )
@@ -138,12 +120,7 @@ async fn stopped_explicit_runtime_fails_delivery_and_resource_requests_without_f
     })
     .join()
     .unwrap();
-    let span = client
-        .span_builder_with_credentials("token", "org")
-        .parent_info(ParentSpanInfo::ProjectLogs {
-            object_id: "project".into(),
-        })
-        .build();
+    let span = support::span(&client);
     // A stopped runtime may cancel the worker before or after queue admission.
     let end = span.end().await;
     assert!(

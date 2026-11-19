@@ -1,6 +1,8 @@
+mod support;
+
 use braintrust_sdk_rust::{
-    extract_anthropic_usage, extract_openai_usage, BraintrustClient, ParentSpanInfo,
-    SpanComponents, SpanLog, SpanObjectType, SpanOrigin,
+    extract_anthropic_usage, extract_openai_usage, ParentSpanInfo, SpanComponents, SpanLog,
+    SpanObjectType, SpanOrigin,
 };
 use serde_json::{json, Map, Value};
 use wiremock::matchers::{method, path};
@@ -21,16 +23,10 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
         .mount(&server)
         .await;
 
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
+    support::logs_json().mount(&server).await;
 
-    let client = BraintrustClient::builder()
+    let client = support::endpoints(server.uri())
         .api_key("test-key")
-        .api_url(server.uri())
-        .app_url(server.uri())
         .build()
         .await
         .expect("client");
@@ -50,16 +46,10 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");
 
-    let logs_requests: Vec<_> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .collect();
+    let logs_requests = support::received_logs(&server).await;
     assert_eq!(logs_requests.len(), 1);
 
-    let body: Value = serde_json::from_slice(&logs_requests[0].body).expect("json body");
+    let body: Value = support::body(&logs_requests[0]);
     assert_eq!(body["api_version"], 2);
     let row = body["rows"]
         .as_array()
@@ -73,30 +63,10 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
 async fn client_update_span_uses_exported_ids_for_project_logs() {
     let server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
+    support::logs_json().mount(&server).await;
 
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
-        .build()
-        .await
-        .expect("client");
-    let exported = SpanComponents {
-        object_type: SpanObjectType::ProjectLogs,
-        object_id: Some("proj-id".to_string()),
-        compute_object_metadata_args: None,
-        row_id: Some("row-id".to_string()),
-        span_id: Some("span-id".to_string()),
-        root_span_id: Some("root-id".to_string()),
-        span_parents: None,
-        propagated_event: None,
-    }
-    .to_str();
+    let client = support::client(&server).await;
+    let exported = support::project_context().to_str();
 
     client
         .update_span_with_credentials(
@@ -107,19 +77,14 @@ async fn client_update_span_uses_exported_ids_for_project_logs() {
                 .output(json!({"status": "updated"}))
                 .build(),
         )
+        .await
         .expect("update");
     client.flush().await.expect("flush");
 
-    let logs_requests: Vec<_> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .collect();
+    let logs_requests = support::received_logs(&server).await;
     assert_eq!(logs_requests.len(), 1);
 
-    let body: Value = serde_json::from_slice(&logs_requests[0].body).expect("json body");
+    let body: Value = support::body(&logs_requests[0]);
     let row = body["rows"]
         .as_array()
         .and_then(|rows| rows.first())
@@ -145,31 +110,11 @@ async fn client_update_span_uses_exported_ids_for_project_logs() {
 async fn client_update_span_with_credentials_works_without_priming_login_state() {
     let server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
+    support::logs_json().mount(&server).await;
 
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
-        .build()
-        .await
-        .expect("client");
+    let client = support::client(&server).await;
 
-    let exported = SpanComponents {
-        object_type: SpanObjectType::ProjectLogs,
-        object_id: Some("proj-id".to_string()),
-        compute_object_metadata_args: None,
-        row_id: Some("row-id".to_string()),
-        span_id: Some("span-id".to_string()),
-        root_span_id: Some("root-id".to_string()),
-        span_parents: None,
-        propagated_event: None,
-    }
-    .to_str();
+    let exported = support::project_context().to_str();
 
     client
         .update_span_with_credentials(
@@ -180,19 +125,14 @@ async fn client_update_span_with_credentials_works_without_priming_login_state()
                 .output(json!({"status": "updated"}))
                 .build(),
         )
+        .await
         .expect("update");
     client.flush().await.expect("flush");
 
-    let logs_requests: Vec<_> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .collect();
+    let logs_requests = support::received_logs(&server).await;
     assert_eq!(logs_requests.len(), 1);
 
-    let body: Value = serde_json::from_slice(&logs_requests[0].body).expect("json body");
+    let body: Value = support::body(&logs_requests[0]);
     let row = body["rows"]
         .as_array()
         .and_then(|rows| rows.first())
@@ -207,15 +147,8 @@ async fn client_update_span_with_credentials_works_without_priming_login_state()
 #[tokio::test]
 async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
+    support::logs_json().mount(&server).await;
+    let client = support::client_builder(server.uri())
         .environment("ci", Some("test"))
         .span_origin(SpanOrigin::builder().name("client-origin").build())
         .build()
@@ -258,18 +191,16 @@ async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
             .maybe_context(context.clone());
         client
             .update_span_with_credentials("token", "org-id", &exported, event.build())
+            .await
             .expect("update");
         client.flush().await.expect("flush");
     }
 
     let requests = server.received_requests().await.expect("requests");
-    let logs_requests: Vec<_> = requests
-        .iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .collect();
+    let logs_requests: Vec<_> = support::log_requests(&requests).collect();
     assert_eq!(logs_requests.len(), contexts.len());
     for (request, (context, propagated_context)) in logs_requests.iter().zip(&contexts) {
-        let body: Value = serde_json::from_slice(&request.body).expect("json body");
+        let body: Value = support::body(request);
         let rows = body["rows"].as_array().expect("rows");
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
@@ -285,15 +216,8 @@ async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
 #[tokio::test]
 async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
+    support::logs_json().mount(&server).await;
+    let client = support::client_builder(server.uri())
         .environment("ci", Some("test"))
         .span_origin(SpanOrigin::builder().name("client-origin").build())
         .build()
@@ -325,14 +249,11 @@ async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
     }
 
     let requests = server.received_requests().await.expect("requests");
-    let logs_requests: Vec<_> = requests
-        .iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .collect();
+    let logs_requests: Vec<_> = support::log_requests(&requests).collect();
     assert_eq!(logs_requests.len(), contexts.len() * 3);
     for (requests, context) in logs_requests.as_chunks::<3>().0.iter().zip(&contexts) {
         for (index, request) in requests.iter().enumerate() {
-            let body: Value = serde_json::from_slice(&request.body).expect("json body");
+            let body: Value = support::body(request);
             let rows = body["rows"].as_array().expect("rows");
             assert_eq!(rows.len(), 1);
             let row = &rows[0];
@@ -354,28 +275,12 @@ async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
 async fn client_update_span_includes_exported_span_parents() {
     let server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
+    support::logs_json().mount(&server).await;
 
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
-        .build()
-        .await
-        .expect("client");
+    let client = support::client(&server).await;
     let exported = SpanComponents {
-        object_type: SpanObjectType::ProjectLogs,
-        object_id: Some("proj-id".to_string()),
-        compute_object_metadata_args: None,
-        row_id: Some("row-id".to_string()),
-        span_id: Some("span-id".to_string()),
-        root_span_id: Some("root-id".to_string()),
         span_parents: Some(vec!["parent-id".to_string()]),
-        propagated_event: None,
+        ..support::project_context()
     }
     .to_str();
 
@@ -388,19 +293,14 @@ async fn client_update_span_includes_exported_span_parents() {
                 .output(json!({"status": "updated"}))
                 .build(),
         )
+        .await
         .expect("update");
     client.flush().await.expect("flush");
 
-    let logs_requests: Vec<_> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .collect();
+    let logs_requests = support::received_logs(&server).await;
     assert_eq!(logs_requests.len(), 1);
 
-    let body: Value = serde_json::from_slice(&logs_requests[0].body).expect("json body");
+    let body: Value = support::body(&logs_requests[0]);
     let row = body["rows"]
         .as_array()
         .and_then(|rows| rows.first())
@@ -412,29 +312,13 @@ async fn client_update_span_includes_exported_span_parents() {
 async fn client_update_span_with_credentials_includes_exported_span_parents() {
     let server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
+    support::logs_json().mount(&server).await;
 
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
-        .build()
-        .await
-        .expect("client");
+    let client = support::client(&server).await;
 
     let exported = SpanComponents {
-        object_type: SpanObjectType::ProjectLogs,
-        object_id: Some("proj-id".to_string()),
-        compute_object_metadata_args: None,
-        row_id: Some("row-id".to_string()),
-        span_id: Some("span-id".to_string()),
-        root_span_id: Some("root-id".to_string()),
         span_parents: Some(vec!["parent-id".to_string()]),
-        propagated_event: None,
+        ..support::project_context()
     }
     .to_str();
 
@@ -447,19 +331,14 @@ async fn client_update_span_with_credentials_includes_exported_span_parents() {
                 .output(json!({"status": "updated"}))
                 .build(),
         )
+        .await
         .expect("update");
     client.flush().await.expect("flush");
 
-    let logs_requests: Vec<_> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .collect();
+    let logs_requests = support::received_logs(&server).await;
     assert_eq!(logs_requests.len(), 1);
 
-    let body: Value = serde_json::from_slice(&logs_requests[0].body).expect("json body");
+    let body: Value = support::body(&logs_requests[0]);
     let row = body["rows"]
         .as_array()
         .and_then(|rows| rows.first())
@@ -471,27 +350,11 @@ async fn client_update_span_with_credentials_includes_exported_span_parents() {
 async fn client_update_span_with_credentials_inherits_exported_propagated_event() {
     let server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
+    support::logs_json().mount(&server).await;
 
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
-        .build()
-        .await
-        .expect("client");
+    let client = support::client(&server).await;
 
     let exported = SpanComponents {
-        object_type: SpanObjectType::ProjectLogs,
-        object_id: Some("proj-id".to_string()),
-        compute_object_metadata_args: None,
-        row_id: Some("row-id".to_string()),
-        span_id: Some("span-id".to_string()),
-        root_span_id: Some("root-id".to_string()),
         span_parents: Some(vec!["parent-id".to_string()]),
         propagated_event: Some(Map::from_iter([
             (
@@ -519,6 +382,7 @@ async fn client_update_span_with_credentials_inherits_exported_propagated_event(
                 json!({ "purpose": "scorer", "skip_realtime": true }),
             ),
         ])),
+        ..support::project_context()
     }
     .to_str();
 
@@ -539,21 +403,16 @@ async fn client_update_span_with_credentials_inherits_exported_propagated_event(
                     .output(json!({ "status": output }))
                     .build(),
             )
+            .await
             .expect("update");
         client.flush().await.expect("flush");
     }
 
-    let logs_requests: Vec<_> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .collect();
+    let logs_requests = support::received_logs(&server).await;
     assert_eq!(logs_requests.len(), 2);
 
-    for request in logs_requests {
-        let body: Value = serde_json::from_slice(&request.body).expect("json body");
+    for request in &logs_requests {
+        let body: Value = support::body(request);
         let row = body["rows"]
             .as_array()
             .and_then(|rows| rows.first())
@@ -603,19 +462,9 @@ async fn client_update_span_with_credentials_inherits_exported_propagated_event(
 async fn child_span_inherits_parent_propagated_event() {
     let server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
+    support::logs_json().mount(&server).await;
 
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
-        .build()
-        .await
-        .expect("client");
+    let client = support::client(&server).await;
 
     let span = client
         .span_builder_with_credentials("token", "org-id")
@@ -656,16 +505,10 @@ async fn child_span_inherits_parent_propagated_event() {
     );
     client.flush().await.expect("flush");
 
-    let logs_requests: Vec<_> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .collect();
+    let logs_requests = support::received_logs(&server).await;
     assert_eq!(logs_requests.len(), 1);
 
-    let body: Value = serde_json::from_slice(&logs_requests[0].body).expect("json body");
+    let body: Value = support::body(&logs_requests[0]);
     let row = body["rows"]
         .as_array()
         .and_then(|rows| rows.first())
@@ -712,19 +555,9 @@ async fn client_update_span_resolves_project_name_from_exported_compute_metadata
         .mount(&server)
         .await;
 
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
+    support::logs_json().mount(&server).await;
 
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
-        .build()
-        .await
-        .expect("client");
+    let client = support::client(&server).await;
     let _ = client.span_builder_with_credentials("token", "org-id");
 
     let mut compute_object_metadata_args = Map::new();
@@ -751,19 +584,14 @@ async fn client_update_span_resolves_project_name_from_exported_compute_metadata
                 .output(json!({"status": "updated"}))
                 .build(),
         )
+        .await
         .expect("update");
     client.flush().await.expect("flush");
 
-    let logs_requests: Vec<_> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .collect();
+    let logs_requests = support::received_logs(&server).await;
     assert_eq!(logs_requests.len(), 1);
 
-    let body: Value = serde_json::from_slice(&logs_requests[0].body).expect("json body");
+    let body: Value = support::body(&logs_requests[0]);
     let row = body["rows"]
         .as_array()
         .and_then(|rows| rows.first())
@@ -802,25 +630,9 @@ fn usage_extractors_return_expected_metrics() {
 #[tokio::test]
 async fn finished_span_ignores_later_mutations() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
-        .build()
-        .await
-        .unwrap();
-    let span = client
-        .span_builder_with_credentials("token", "org")
-        .parent_info(ParentSpanInfo::ProjectLogs {
-            object_id: "project".into(),
-        })
-        .build();
+    support::logs(204).expect(1).mount(&server).await;
+    let client = support::client(&server).await;
+    let span = support::span(&client);
     span.end_with_time(123.0);
     let covering = client.flush();
     span.clone()
@@ -830,12 +642,9 @@ async fn finished_span_ignores_later_mutations() {
     covering.await.unwrap();
     client.flush().await.unwrap();
     let requests = server.received_requests().await.unwrap();
-    let uploads: Vec<_> = requests
-        .iter()
-        .filter(|r| r.url.path() == "/logs3")
-        .collect();
+    let uploads: Vec<_> = support::log_requests(&requests).collect();
     assert_eq!(uploads.len(), 1);
-    let body: Value = serde_json::from_slice(&uploads[0].body).unwrap();
+    let body: Value = support::body(uploads[0]);
     assert!(body["rows"][0].get("input").is_none());
     assert_eq!(body["rows"][0]["metrics"]["end"], 123.0);
 }

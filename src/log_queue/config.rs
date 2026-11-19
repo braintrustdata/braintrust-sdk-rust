@@ -66,13 +66,6 @@ fn default_flush_chunk_size() -> usize {
     DEFAULT_FLUSH_CHUNK_SIZE
 }
 
-fn default_sync_flush() -> bool {
-    matches!(
-        std::env::var("BRAINTRUST_SYNC_FLUSH").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
-}
-
 fn default_failed_publish_payloads_dir() -> Option<PathBuf> {
     std::env::var("BRAINTRUST_FAILED_PUBLISH_PAYLOADS_DIR")
         .ok()
@@ -100,7 +93,8 @@ fn default_all_publish_payloads_dir() -> Option<PathBuf> {
 /// ```
 #[derive(bon::Builder, Debug, Clone)]
 pub struct LogQueueConfig {
-    /// Max queue size (BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE, default: 15000)
+    /// Maximum accepted writes, including in-flight work
+    /// (BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE, default: 15000).
     #[builder(default = default_queue_max_size())]
     queue_max_size: usize,
 
@@ -122,15 +116,6 @@ pub struct LogQueueConfig {
     #[builder(default = default_num_retries())]
     num_retries: usize,
 
-    /// Legacy compatibility value. Delivery is always automatic; ignored.
-    #[builder(default = default_sync_flush())]
-    sync_flush: bool,
-
-    /// Legacy compatibility value. Flush reports covered active failures and
-    /// delivery remains automatic; ignored.
-    #[builder(default = false)]
-    checked_delivery: bool,
-
     /// Chunk size for flush processing (BRAINTRUST_LOG_FLUSH_CHUNK_SIZE, default: 25).
     /// Rows drained from the queue are merged and sent in sequential chunks of this size.
     /// Each chunk's batches are sent concurrently (matching TypeScript SDK behavior).
@@ -142,11 +127,6 @@ pub struct LogQueueConfig {
 
     /// Debug: save all payloads (BRAINTRUST_ALL_PUBLISH_PAYLOADS_DIR)
     all_publish_payloads_dir: Option<PathBuf>,
-
-    /// Legacy compatibility value. Admission is always bounded by queue_max_size,
-    /// including in-flight work; ignored.
-    #[builder(default = true)]
-    enforce_queue_size_limit: bool,
 }
 
 impl Default for LogQueueConfig {
@@ -176,14 +156,6 @@ impl LogQueueConfig {
         self.num_retries
     }
 
-    pub fn sync_flush(&self) -> bool {
-        self.sync_flush
-    }
-
-    pub fn checked_delivery(&self) -> bool {
-        self.checked_delivery
-    }
-
     pub fn flush_chunk_size(&self) -> usize {
         self.flush_chunk_size
     }
@@ -199,10 +171,6 @@ impl LogQueueConfig {
             .clone()
             .or_else(default_all_publish_payloads_dir)
     }
-
-    pub fn enforce_queue_size_limit(&self) -> bool {
-        self.enforce_queue_size_limit
-    }
 }
 
 #[cfg(test)]
@@ -216,16 +184,6 @@ mod tests {
         assert_eq!(config.batch_max_items(), DEFAULT_BATCH_MAX_ITEMS);
         assert_eq!(config.batch_max_bytes(), DEFAULT_BATCH_MAX_BYTES);
         assert_eq!(config.num_retries(), DEFAULT_NUM_RETRIES);
-        assert!(!config.sync_flush());
-        assert!(config.enforce_queue_size_limit());
-    }
-
-    #[test]
-    fn test_enforce_queue_size_limit_can_be_enabled() {
-        let config = LogQueueConfig::builder()
-            .enforce_queue_size_limit(true)
-            .build();
-        assert!(config.enforce_queue_size_limit());
     }
 
     #[test]
@@ -234,33 +192,11 @@ mod tests {
             .queue_max_size(5000)
             .batch_max_items(50)
             .num_retries(5)
-            .sync_flush(true)
             .build();
 
         assert_eq!(config.queue_max_size(), 5000);
         assert_eq!(config.batch_max_items(), 50);
         assert_eq!(config.num_retries(), 5);
-        assert!(config.sync_flush());
-    }
-
-    #[test]
-    fn test_sync_flush_env_var_accepts_truthy_strings() {
-        for truthy in &["1", "true", "yes"] {
-            unsafe { std::env::set_var("BRAINTRUST_SYNC_FLUSH", truthy) };
-            assert!(
-                default_sync_flush(),
-                "BRAINTRUST_SYNC_FLUSH={truthy} should enable sync flush"
-            );
-        }
-        for falsy in &["0", "false", "no", ""] {
-            unsafe { std::env::set_var("BRAINTRUST_SYNC_FLUSH", falsy) };
-            assert!(
-                !default_sync_flush(),
-                "BRAINTRUST_SYNC_FLUSH={falsy} should not enable sync flush"
-            );
-        }
-        unsafe { std::env::remove_var("BRAINTRUST_SYNC_FLUSH") };
-        assert!(!default_sync_flush(), "unset should not enable sync flush");
     }
 
     #[test]

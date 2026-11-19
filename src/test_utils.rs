@@ -1,13 +1,11 @@
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-
 use crate::error::Result;
 use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle};
 use crate::types::{ParentSpanInfo, SpanPayload};
 
-use crate::internal::ports::SpanSubmitter;
+use crate::internal::ports::{PreparedSpan, SpanSubmitter};
 use crate::internal::shared_outcome::{WriteOutcome, WriteResponder};
 
 #[derive(Clone, Default)]
@@ -58,7 +56,6 @@ impl MockBraintrustClient {
     }
 }
 
-#[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
     fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         let (sender, completion) = crate::Completion::pair();
@@ -66,9 +63,38 @@ impl SpanSubmitter for MockBraintrustClient {
         completion
     }
 
-    async fn trigger_flush(&self) -> Result<()> {
-        // Mock: no-op for tests
-        Ok(())
+    fn operation(
+        &self,
+    ) -> std::result::Result<crate::internal::ports::SpanOperation, crate::EnqueueError> {
+        Ok(crate::internal::ports::SpanOperation::new(
+            Arc::new(self.clone()),
+            || {},
+        ))
+    }
+    fn submit_deferred(
+        &self,
+        _: String,
+        prepare: futures::future::BoxFuture<'static, Result<PreparedSpan>>,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+        let collector = self.collector.clone();
+        crate::internal::execution::ExecutionBinding::external(tokio::runtime::Handle::current())
+            .response(async move {
+                let PreparedSpan {
+                    scope,
+                    payload,
+                    parent_info,
+                } = prepare.await.map_err(|source| {
+                    crate::WriteError::Delivery(Arc::new(crate::DeliveryError {
+                        source: source.into(),
+                    }))
+                })?;
+                collector.push(CapturedSpan {
+                    token: scope.token().to_owned(),
+                    payload,
+                    parent: parent_info,
+                });
+                Ok(crate::DeliveryReceipt::new())
+            })
     }
 
     fn submit(

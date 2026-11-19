@@ -145,7 +145,7 @@ async fn automatic_delivery_reports_backend_rejection_through_completion() {
 
 #[tokio::test]
 async fn tracked_stateless_update_reports_automatic_delivery_failure() {
-    use braintrust_sdk_rust::{SpanComponents, SpanObjectType, WriteError};
+    use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/logs3"))
@@ -170,15 +170,16 @@ async fn tracked_stateless_update_reports_automatic_delivery_failure() {
         propagated_event: None,
     }
     .to_str();
-    let completion = client
-        .update_span_with_credentials_tracked(
-            "token",
-            "org",
-            &exported,
-            SpanLog::builder().input(json!("input")).build(),
-        )
-        .unwrap();
-    assert!(matches!(completion.await, Err(WriteError::Delivery(_))));
+    let completion = client.update_span_with_credentials(
+        "token",
+        "org",
+        &exported,
+        SpanLog::builder().input(json!("input")).build(),
+    );
+    assert!(matches!(
+        completion.await,
+        Err(BraintrustError::Api { status: 401, .. })
+    ));
     client.flush().await.expect("completed failure is retired");
 }
 

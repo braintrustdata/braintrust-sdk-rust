@@ -6,9 +6,9 @@ use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry}
 use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use crate::error::Result;
-use crate::internal::delivery::WriteService;
+use crate::internal::delivery::{WriteCapability, WriteService};
 use crate::internal::execution::ExecutionBinding;
-use crate::internal::ports::SpanSubmitter;
+use crate::internal::ports::{PreparedSpan, SpanOperation, SpanSubmitter};
 use crate::internal::session::CredentialScope;
 use crate::internal::shared_outcome::WriteOutcome;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
@@ -16,7 +16,7 @@ use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, Spa
 use crate::{
     Completion, DeliveryReceipt, FlushError, FlushReport, ShutdownError, ShutdownReport, WriteError,
 };
-use futures::future::join_all;
+use futures::future::{join_all, BoxFuture};
 use indexmap::IndexMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -38,12 +38,14 @@ fn cache_insert<K: Eq + std::hash::Hash, V>(cache: &mut IndexMap<K, V>, key: K, 
 
 /// A raw span payload queued for deferred preparation and flushing.
 ///
-/// Only the span batch processor interprets these fields; the delivery worker
-/// treats commands as opaque values.
-struct SubmitCommand {
-    scope: CredentialScope,
-    payload: SpanPayload,
-    parent_info: Option<ParentSpanInfo>,
+/// Fields are private — construction and destructuring happen only within this
+/// module. `worker.rs` never touches the fields directly.
+enum SubmitCommand {
+    Ready(Box<PreparedSpan>),
+    Deferred {
+        row_id: String,
+        prepare: BoxFuture<'static, Result<PreparedSpan>>,
+    },
 }
 
 /// Preparation and protocol orchestration, independent of admission/lifecycle.
@@ -104,13 +106,21 @@ impl SpanBatchProcessor {
         // exact scope captured by each producer when its handle was created.
         let mut groups: IndexMap<CredentialScope, Vec<Logs3Row>> = IndexMap::new();
         for cmd in cmds {
-            let SubmitCommand {
-                scope,
-                payload,
-                parent_info,
-            } = cmd;
-            match self.prepare_row(&scope, payload, parent_info).await {
-                Ok(row) => {
+            let prepared = async {
+                let PreparedSpan {
+                    scope,
+                    payload,
+                    parent_info,
+                } = match cmd {
+                    SubmitCommand::Ready(span) => *span,
+                    SubmitCommand::Deferred { prepare, .. } => prepare.await?,
+                };
+                let row = self.prepare_row(&scope, payload, parent_info).await?;
+                Ok::<_, anyhow::Error>((scope, row))
+            }
+            .await;
+            match prepared {
+                Ok((scope, row)) => {
                     groups.entry(scope).or_default().push(row);
                 }
                 Err(e) => {
@@ -502,12 +512,19 @@ impl RejectionReporter {
             return;
         }
         self.execution.spawn(async move {
-            let SubmitCommand {
+            let PreparedSpan {
                 scope: _,
                 payload,
                 parent_info,
-            } = cmd;
-
+            } = match cmd {
+                SubmitCommand::Ready(span) => *span,
+                SubmitCommand::Deferred { row_id, .. } => {
+                    // Rejection must not initiate login or registration merely
+                    // to serialize a concrete wire row for a debug dump.
+                    warn!(%row_id, "cannot dump rejected row with unresolved scope or destination");
+                    return;
+                }
+            };
             let span_components = payload.span_components.clone();
 
             let span_id = payload.span_id.clone();
@@ -629,12 +646,12 @@ impl RejectionReporter {
 pub struct LogQueue {
     rejections: Arc<RejectionReporter>,
     writes: WriteService<SubmitCommand>,
+    capability: Option<WriteCapability<SubmitCommand>>,
 }
 impl LogQueue {
     pub fn new(
         config: LogQueueConfig,
         client: reqwest::Client,
-        _worker_queue_size: usize,
         execution: ExecutionBinding,
     ) -> Self {
         let capacity = config.queue_max_size();
@@ -649,7 +666,11 @@ impl LogQueue {
             let processor = processor.clone();
             Box::pin(async move { processor.process(commands).await })
         });
-        Self { rejections, writes }
+        Self {
+            rejections,
+            writes,
+            capability: None,
+        }
     }
 
     pub fn submit(
@@ -659,31 +680,56 @@ impl LogQueue {
         parent_info: Option<ParentSpanInfo>,
         outcome: Option<WriteOutcome>,
     ) -> Completion<DeliveryReceipt, WriteError> {
-        let command = SubmitCommand {
-            scope,
-            payload,
-            parent_info,
-        };
-        self.writes
-            .enqueue_with_rejection(command, outcome, |command, error| {
-                self.rejections
-                    .dropped_count
-                    .fetch_add(1, Ordering::Relaxed);
-                if matches!(error, crate::EnqueueError::Full) {
-                    self.rejections.log_drop_warning();
-                } else {
-                    warn!(%error, "span submission rejected");
-                }
-                self.rejections.dump_dropped_row_if_configured(command);
-            })
+        self.submit_command(
+            SubmitCommand::Ready(Box::new(PreparedSpan {
+                scope,
+                payload,
+                parent_info,
+            })),
+            outcome,
+        )
+    }
+
+    fn submit_command(
+        &self,
+        command: SubmitCommand,
+        outcome: Option<WriteOutcome>,
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        self.writes.enqueue_with_capability(
+            command,
+            outcome,
+            self.capability.as_ref(),
+            |command, error| self.reject(command, error),
+        )
+    }
+    fn reject(&self, command: SubmitCommand, error: crate::EnqueueError) {
+        self.rejections
+            .dropped_count
+            .fetch_add(1, Ordering::Relaxed);
+        if matches!(error, crate::EnqueueError::Full) {
+            self.rejections.log_drop_warning();
+        } else {
+            warn!(%error, "span submission rejected");
+        }
+        self.rejections.dump_dropped_row_if_configured(command);
     }
 
     pub fn cancel(&self, error: crate::ExecutionError) {
         self.writes.cancel(error);
     }
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
-        self.writes.flush()
+        self.writes.flush_with_capability(self.capability.as_ref())
     }
+    pub fn begin_shutdown(&self) -> Completion<FlushReport, FlushError> {
+        self.writes.begin_shutdown()
+    }
+    pub async fn finish_shutdown(
+        &self,
+        barrier: Completion<FlushReport, FlushError>,
+    ) -> std::result::Result<ShutdownReport, ShutdownError> {
+        self.writes.finish_shutdown(barrier).await
+    }
+    #[cfg(test)]
     pub fn shutdown(
         &self,
         timeout: std::time::Duration,
@@ -694,21 +740,27 @@ impl LogQueue {
     pub(crate) fn is_empty(&self) -> bool {
         self.writes.is_empty()
     }
-    pub async fn trigger_flush_command(&self) -> Result<()> {
-        let token = self.flush();
-        if let Err(error) = token.submission() {
-            return Err(error.clone().into());
-        }
-        Ok(())
-    }
 }
-#[async_trait::async_trait]
 impl SpanSubmitter for LogQueue {
     fn flush(&self) -> Completion<FlushReport, FlushError> {
         LogQueue::flush(self)
     }
-    async fn trigger_flush(&self) -> Result<()> {
-        self.trigger_flush_command().await
+
+    fn operation(&self) -> std::result::Result<SpanOperation, crate::EnqueueError> {
+        let capability = self.writes.capability();
+        let mut scoped = self.clone();
+        scoped.capability = Some(capability.clone());
+        Ok(SpanOperation::new(Arc::new(scoped), move || {
+            capability.revoke()
+        }))
+    }
+
+    fn submit_deferred(
+        &self,
+        row_id: String,
+        prepare: BoxFuture<'static, Result<PreparedSpan>>,
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        self.submit_command(SubmitCommand::Deferred { row_id, prepare }, None)
     }
 
     fn submit(
@@ -758,7 +810,6 @@ mod tests {
         LogQueue::new(
             LogQueueConfig::builder().num_retries(0).build(),
             reqwest::Client::new(),
-            32,
             ExecutionBinding::external(tokio::runtime::Handle::current()),
         )
     }
@@ -792,7 +843,6 @@ mod tests {
                 .num_retries(0)
                 .build(),
             reqwest::Client::new(),
-            8,
             ExecutionBinding::external(tokio::runtime::Handle::current()),
         );
         let tokens = std::thread::scope(|threads| {

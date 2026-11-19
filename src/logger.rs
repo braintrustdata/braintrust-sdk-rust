@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
-use serde_json::{Map, Value};
 use tokio::sync::Notify;
 use url::Url;
 
@@ -13,7 +11,7 @@ use crate::experiments::{Experiment, ExperimentBuilder};
 use crate::http::{build_http_client, CaBundleConfig};
 use crate::internal::execution::ExecutionBinding;
 use crate::internal::lifecycle::Lifecycle;
-use crate::internal::ports::SpanSubmitter;
+use crate::internal::ports::{PreparedSpan, SpanSubmitter};
 use crate::internal::session::CredentialScope;
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment};
@@ -25,7 +23,6 @@ use backon::{ExponentialBuilder, Retryable};
 // The TypeScript SDK applies no explicit timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_QUEUE_SIZE: usize = 256;
 pub use crate::api::{DEFAULT_API_URL, DEFAULT_APP_URL};
 
 pub use crate::api::transport::LoginOrganization as OrgInfo;
@@ -173,18 +170,14 @@ pub struct BraintrustClientBuilder {
     org_name: Option<String>,
     default_project: Option<String>,
     ca_bundle: Option<CaBundleConfig>,
-    queue_size: usize,
     blocking_login: bool,
     skip_login: bool,
     /// Maximum items per HTTP batch.
     batch_max_items: Option<usize>,
     /// Maximum bytes per HTTP batch.
     batch_max_bytes: Option<usize>,
-    /// Maximum queue capacity (None = unlimited).
+    /// Maximum accepted writes, including in-flight work (None uses environment defaults).
     queue_max_size: Option<usize>,
-    /// Whether the queue should enforce `queue_max_size`.
-    enforce_queue_size_limit: bool,
-    checked_delivery: bool,
     environment: Option<SpanOriginEnvironment>,
     span_origin: Option<SpanOrigin>,
     user_agent: Option<String>,
@@ -209,14 +202,11 @@ impl BraintrustClientBuilder {
             org_name: std::env::var("BRAINTRUST_ORG_NAME").ok(),
             default_project: std::env::var("BRAINTRUST_DEFAULT_PROJECT").ok(),
             ca_bundle: CaBundleConfig::from_environment(),
-            queue_size: DEFAULT_QUEUE_SIZE,
             blocking_login: false,
             skip_login: false,
             batch_max_items: None,
             batch_max_bytes: None,
             queue_max_size: None,
-            enforce_queue_size_limit: true,
-            checked_delivery: false,
             environment: None,
             span_origin: None,
             user_agent: None,
@@ -253,26 +243,11 @@ impl BraintrustClientBuilder {
         self
     }
 
-    /// Set the maximum queue capacity.
-    /// When full, the newest arriving events are dropped.
+    /// Set the maximum accepted writes, including in-flight work.
+    /// When full, new writes return `EnqueueError::Full` at issuance.
     /// Default: 15,000 (or `BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE` env var).
     pub fn with_queue_max_size(mut self, max_size: usize) -> Self {
         self.queue_max_size = Some(max_size);
-        self
-    }
-
-    /// Legacy compatibility setting. Delivery admission is always bounded by
-    /// `with_queue_max_size`, including in-flight writes. This value is ignored.
-    pub fn enforce_queue_size_limit(mut self, enforce: bool) -> Self {
-        self.enforce_queue_size_limit = enforce;
-        self
-    }
-
-    /// Legacy compatibility setting. Delivery is always automatic and flush
-    /// reports failures in covered active work. This value is ignored. Await a
-    /// write completion to observe that write's result independently of flush.
-    pub fn checked_delivery(mut self, checked: bool) -> Self {
-        self.checked_delivery = checked;
         self
     }
 
@@ -311,12 +286,6 @@ impl BraintrustClientBuilder {
     /// This overrides `BRAINTRUST_CUSTOM_CA_BUNDLE`.
     pub fn custom_ca_bundle_pem(mut self, pem: impl AsRef<[u8]>) -> Self {
         self.ca_bundle = Some(CaBundleConfig::from_pem(pem, "custom CA bundle"));
-        self
-    }
-
-    /// Set the internal queue size for buffering log events.
-    pub fn queue_size(mut self, size: usize) -> Self {
-        self.queue_size = size;
         self
     }
 
@@ -387,11 +356,7 @@ impl BraintrustClientBuilder {
                 let context = binding.clone();
                 binding.response(async move { self.initialize(context).await })
             }
-            Err(error) => {
-                let (_, mut completion) = crate::Completion::pair();
-                completion.record_issuance(Err(error));
-                completion
-            }
+            Err(error) => crate::Completion::rejected(error),
         }
     }
 
@@ -418,17 +383,10 @@ impl BraintrustClientBuilder {
             .maybe_batch_max_items(self.batch_max_items)
             .maybe_batch_max_bytes(self.batch_max_bytes)
             .maybe_queue_max_size(self.queue_max_size)
-            .enforce_queue_size_limit(self.enforce_queue_size_limit)
-            .checked_delivery(self.checked_delivery)
             .build();
 
         // Commands carry their own immutable scope; the worker has no session fallback.
-        let queue = LogQueue::new(
-            log_config,
-            http_client.clone(),
-            self.queue_size,
-            execution.clone(),
-        );
+        let queue = LogQueue::new(log_config, http_client.clone(), execution.clone());
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
@@ -479,10 +437,53 @@ pub struct BraintrustClient {
     inner: Arc<ClientInner>,
 }
 
+/// Validated, owned patch data without unresolved or placeholder credentials.
+struct SpanUpdate {
+    row_id: String,
+    span_id: String,
+    components: SpanComponents,
+    event_data: SpanEventData,
+}
+impl SpanUpdate {
+    fn into_prepared(self, scope: CredentialScope) -> PreparedSpan {
+        let Self {
+            row_id,
+            span_id,
+            components,
+            event_data,
+        } = self;
+        let payload = SpanPayload {
+            row_id,
+            span_id,
+            is_merge: true,
+            span_components: Some(components),
+            org_id: scope.org_id().to_owned(),
+            org_name: scope.org_name().map(str::to_owned),
+            project_name: None,
+            input: event_data.input,
+            output: event_data.output,
+            expected: event_data.expected,
+            error: event_data.error,
+            scores: event_data.scores,
+            metadata: event_data.metadata,
+            metrics: event_data.metrics,
+            tags: event_data.tags,
+            context: event_data.context,
+            span_attributes: event_data.span_attributes,
+            extra: event_data.extra,
+        };
+
+        PreparedSpan {
+            scope,
+            payload,
+            parent_info: None,
+        }
+    }
+}
+
 struct ClientInner {
     lifecycle: Lifecycle,
     execution: ExecutionBinding,
-    #[allow(dead_code)]
     api_url: Url,
     app_url: Url,
     queue: LogQueue,
@@ -544,31 +545,37 @@ impl BraintrustClient {
         BraintrustClientBuilder::new()
     }
 
-    /// Check if the client is logged in.
-    pub async fn is_logged_in(&self) -> bool {
+    /// Check local login state immediately, without scheduling work.
+    pub fn is_logged_in(&self) -> bool {
         self.inner.login_state.is_logged_in()
     }
 
     /// Wait for login to complete (useful if using background login).
     ///
-    /// Returns the login state once available, or an error if login times out.
-    pub async fn wait_for_login(&self) -> Result<LoginState> {
+    /// Submits the wait immediately on the selected runtime. Awaiting observes
+    /// the login state or a timeout; dropping the token does not cancel the wait.
+    /// Login-dependent methods reject issuance when login was skipped.
+    pub fn wait_for_login(&self) -> crate::Completion<LoginState, BraintrustError> {
         if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+            return crate::Completion::rejected(BraintrustError::InvalidConfig(
                 "wait_for_login() not available when skip_login is enabled".into(),
             ));
         }
-        self.wait_for_login_state().await
+        let client = self.clone();
+        self.inner
+            .execution
+            .response(async move { client.wait_for_login_state().await })
     }
 
-    /// Get the current login state.
-    pub async fn login_state(&self) -> LoginState {
+    /// Get a shared view of local login state without scheduling work.
+    pub fn login_state(&self) -> LoginState {
         self.inner.login_state.clone()
     }
 
     /// Create a span builder using the logged-in state and default project.
     ///
-    /// This waits for login to complete if it hasn't already.
+    /// Submits immediately, waiting for login on the selected runtime if needed.
+    /// Dropping the returned completion does not cancel accepted work.
     ///
     /// # Example
     ///
@@ -586,12 +593,19 @@ impl BraintrustClient {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn span_builder(&self) -> Result<crate::span::SpanBuilder> {
+    pub fn span_builder(&self) -> crate::Completion<crate::span::SpanBuilder, BraintrustError> {
         if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+            return crate::Completion::rejected(BraintrustError::InvalidConfig(
                 "span_builder() requires login; use span_builder_with_credentials() when skip_login is enabled".into(),
             ));
         }
+        let client = self.clone();
+        self.inner
+            .execution
+            .response(async move { client.span_builder_inner().await })
+    }
+
+    async fn span_builder_inner(&self) -> Result<crate::span::SpanBuilder> {
         let state = self.wait_for_login_state().await?;
         let mut builder = crate::span::SpanBuilder::new(self.span_submitter(), state.scope()?);
         if let Some(environment) = &self.inner.environment {
@@ -608,11 +622,19 @@ impl BraintrustClient {
 
     /// Create a dataset builder using the logged-in state.
     ///
-    /// This waits for login to complete if it hasn't already.
-    pub async fn dataset_builder(&self) -> Result<DatasetBuilder> {
+    /// Submits immediately, waiting for login on the selected runtime if needed.
+    /// Dropping the returned completion does not cancel accepted work.
+    pub fn dataset_builder(&self) -> crate::Completion<DatasetBuilder, BraintrustError> {
         if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
+            return crate::Completion::rejected(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
         }
+        let client = self.clone();
+        self.inner
+            .execution
+            .response(async move { client.dataset_builder_inner().await })
+    }
+
+    async fn dataset_builder_inner(&self) -> Result<DatasetBuilder> {
         let state = self.wait_for_login_state().await?;
         Ok(Dataset::new(
             self.inner.http_client.clone(),
@@ -661,67 +683,88 @@ impl BraintrustClient {
         builder
     }
 
-    /// Update an existing span using the output of `SpanHandle::export()`.
-    ///
-    /// Validation happens before queuing. The actual upload remains asynchronous.
-    pub async fn update_span(&self, exported: &str, event: crate::span::SpanLog) -> Result<()> {
-        let login_state = if self.inner.login_state.is_logged_in() {
-            self.inner.login_state.clone()
+    /// Submit an update using exported span context and the shared login state.
+    /// Validation and admission happen immediately. The completion includes
+    /// login (if pending), preparation and full batch delivery.
+    pub fn update_span(
+        &self,
+        exported: &str,
+        event: crate::span::SpanLog,
+    ) -> crate::Completion<(), BraintrustError> {
+        let scope = if self.inner.login_state.is_logged_in() {
+            match self.inner.login_state.scope() {
+                Ok(scope) => Some(scope),
+                Err(error) => return crate::Completion::rejected(error),
+            }
         } else if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+            return crate::Completion::rejected(BraintrustError::InvalidConfig(
                 "update_span() requires a logged-in client; use update_span_with_credentials() when skip_login is enabled".into(),
             ));
         } else {
-            self.wait_for_login_state().await?
+            None
         };
-
-        self.update_span_internal(login_state.scope()?, exported, event)
-            .map(|_| ())
+        self.schedule_span_update(scope, exported, event)
     }
 
-    /// Update an existing span using explicit credentials instead of shared login state.
-    ///
-    /// This is the safe entrypoint for multi-tenant `skip_login` clients: the
-    /// supplied credentials travel with the queued row and are NOT written into
-    /// the client's shared login state.
+    /// Submit an update with immutable explicit credentials and configured routes.
+    /// Credentials travel with this write and never populate shared login state.
+    /// Dropping the token does not cancel an admitted update.
     pub fn update_span_with_credentials(
         &self,
         token: impl Into<String>,
         org_id: impl Into<String>,
         exported: &str,
         event: crate::span::SpanLog,
-    ) -> Result<()> {
-        let token = token.into();
-        let org_id = org_id.into();
-
-        self.update_span_internal(self.explicit_scope(token, org_id, None), exported, event)
-            .map(|_| ())
+    ) -> crate::Completion<(), BraintrustError> {
+        let scope = self.explicit_scope(token.into(), org_id.into(), None);
+        self.schedule_span_update(Some(scope), exported, event)
     }
 
-    /// Update an existing span and retain its eventual delivery result.
-    ///
-    /// Validation and admission are performed before this method returns. The
-    /// returned completion observes delivery even if it finishes before a flush.
-    pub fn update_span_with_credentials_tracked(
+    // None means the immutable session scope is still waiting for login. The
+    // queue owns that resolution before any flush or shutdown can capture it.
+    fn schedule_span_update(
         &self,
-        token: impl Into<String>,
-        org_id: impl Into<String>,
+        scope: Option<CredentialScope>,
         exported: &str,
         event: crate::span::SpanLog,
-    ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
-        self.update_span_internal(
-            self.explicit_scope(token.into(), org_id.into(), None),
-            exported,
-            event,
-        )
+    ) -> crate::Completion<(), BraintrustError> {
+        self.inner.execution.response_try(|| {
+            let update = self.prepare_span_update(exported, event)?;
+            let delivery = match scope {
+                Some(scope) => {
+                    let PreparedSpan {
+                        scope,
+                        payload,
+                        parent_info,
+                    } = update.into_prepared(scope);
+                    self.submit_payload(scope, payload, parent_info)
+                }
+                None => {
+                    let client = self.clone();
+                    self.inner.queue.submit_deferred(
+                        update.row_id.clone(),
+                        Box::pin(async move {
+                            let state = client.wait_for_login_state().await?;
+                            Ok(update.into_prepared(state.scope()?))
+                        }),
+                    )
+                }
+            };
+            if let Err(error) = &*delivery {
+                return Err(error.clone().into());
+            }
+            Ok(async move {
+                delivery.await?;
+                Ok(())
+            })
+        })
     }
 
-    fn update_span_internal(
+    fn prepare_span_update(
         &self,
-        scope: CredentialScope,
         exported: &str,
         event: crate::span::SpanLog,
-    ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
+    ) -> Result<SpanUpdate> {
         let components = SpanComponents::parse(exported)?;
         let row_id = components.row_id.clone().ok_or_else(|| {
             BraintrustError::InvalidConfig("Exported span must have a row_id".into())
@@ -793,32 +836,12 @@ impl BraintrustClient {
             event_data.apply_propagated_event(propagated_event);
         }
 
-        let payload = SpanPayload {
+        Ok(SpanUpdate {
             row_id,
             span_id,
-            is_merge: true,
-            span_components: Some(components),
-            org_id: scope.org_id().to_owned(),
-            org_name: scope.org_name().map(str::to_owned),
-            project_name: None,
-            input: event_data.input,
-            output: event_data.output,
-            expected: event_data.expected,
-            error: event_data.error,
-            scores: event_data.scores,
-            metadata: event_data.metadata,
-            metrics: event_data.metrics,
-            tags: event_data.tags,
-            context: event_data.context,
-            span_attributes: event_data.span_attributes,
-            extra: event_data.extra,
-        };
-
-        let completion = self.submit_payload(scope, payload, None);
-        if let Err(error) = completion.submission() {
-            return Err(BraintrustError::Background(error.to_string()));
-        }
-        Ok(completion)
+            components,
+            event_data,
+        })
     }
 
     /// Perform login synchronously.
@@ -982,164 +1005,6 @@ impl BraintrustClient {
     /// New writes belong to later work; completed failures are never replayed.
     pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         self.inner.queue.flush()
-    }
-
-    /// Trigger a non-blocking background flush.
-    /// Does not wait for completion - useful for streaming writes.
-    pub async fn trigger_flush(&self) -> Result<()> {
-        self.inner.queue.trigger_flush_command().await
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Default)]
-struct MutableSpanEvent {
-    input: Option<Value>,
-    output: Option<Value>,
-    expected: Option<Value>,
-    error: Option<Value>,
-    scores: Option<HashMap<String, f64>>,
-    metadata: Option<Map<String, Value>>,
-    metrics: Option<HashMap<String, f64>>,
-    tags: Option<Vec<String>>,
-    context: Option<Value>,
-    span_attributes: Option<crate::types::SpanAttributes>,
-    extra: HashMap<String, Value>,
-}
-
-#[allow(dead_code)]
-#[derive(Serialize)]
-struct SerializableSpanEvent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expected: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scores: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<Map<String, Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metrics: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tags: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    span_attributes: Option<Value>,
-    #[serde(flatten)]
-    extra: HashMap<String, Value>,
-}
-
-impl MutableSpanEvent {
-    fn to_event_map(&self) -> Map<String, Value> {
-        let serialized = SerializableSpanEvent {
-            input: self.input.clone(),
-            output: self.output.clone(),
-            expected: self.expected.clone(),
-            error: self.error.clone(),
-            scores: self.scores.as_ref().map(numeric_map_to_value),
-            metadata: self.metadata.clone(),
-            metrics: self.metrics.as_ref().map(numeric_map_to_value),
-            tags: self.tags.clone(),
-            context: self.context.clone(),
-            span_attributes: self
-                .span_attributes
-                .clone()
-                .and_then(|value| serde_json::to_value(value).ok()),
-            extra: self.extra.clone(),
-        };
-        serde_json::to_value(serialized)
-            .ok()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default()
-    }
-
-    fn apply_merged_event_map(&mut self, mut event: Map<String, Value>) {
-        self.input = event.remove("input");
-        self.output = event.remove("output");
-        self.expected = event.remove("expected");
-        self.error = event.remove("error");
-        self.scores = event.remove("scores").and_then(parse_numeric_map);
-        self.metadata = event.remove("metadata").and_then(|value| match value {
-            Value::Object(map) => Some(map),
-            _ => None,
-        });
-        self.metrics = event.remove("metrics").and_then(parse_numeric_map);
-        self.tags = event.remove("tags").and_then(parse_string_array);
-        self.context = event.remove("context");
-        self.span_attributes = event
-            .remove("span_attributes")
-            .and_then(|value| serde_json::from_value(value).ok());
-        self.extra = HashMap::from_iter(event);
-    }
-}
-
-#[allow(dead_code)]
-fn numeric_map_to_value(map: &HashMap<String, f64>) -> Value {
-    Value::Object(Map::from_iter(
-        map.iter()
-            .map(|(key, value)| (key.clone(), Value::from(*value))),
-    ))
-}
-
-#[allow(dead_code)]
-fn apply_propagated_event(
-    propagated_event: &Map<String, Value>,
-    event_fields: &mut MutableSpanEvent,
-) {
-    let mut event = event_fields.to_event_map();
-    merge_event_maps(&mut event, propagated_event);
-    event_fields.apply_merged_event_map(event);
-}
-
-#[allow(dead_code)]
-fn merge_event_maps(merge_into: &mut Map<String, Value>, merge_from: &Map<String, Value>) {
-    for (key, merge_from_value) in merge_from {
-        match (merge_into.get_mut(key), merge_from_value) {
-            (Some(Value::Object(merge_into_object)), Value::Object(merge_from_object)) => {
-                merge_event_maps(merge_into_object, merge_from_object);
-            }
-            (Some(Value::Array(merge_into_array)), Value::Array(merge_from_array))
-                if key == "tags" =>
-            {
-                for item in merge_from_array {
-                    if !merge_into_array.iter().any(|existing| existing == item) {
-                        merge_into_array.push(item.clone());
-                    }
-                }
-            }
-            _ => {
-                merge_into.insert(key.clone(), merge_from_value.clone());
-            }
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn parse_numeric_map(value: Value) -> Option<HashMap<String, f64>> {
-    match value {
-        Value::Object(map) => Some(HashMap::from_iter(
-            map.into_iter()
-                .filter_map(|(key, value)| value.as_f64().map(|number| (key, number))),
-        )),
-        _ => None,
-    }
-}
-
-#[allow(dead_code)]
-fn parse_string_array(value: Value) -> Option<Vec<String>> {
-    match value {
-        Value::Array(values) => Some(
-            values
-                .into_iter()
-                .filter_map(|value| value.as_str().map(ToString::to_string))
-                .collect(),
-        ),
-        _ => None,
     }
 }
 
@@ -1518,13 +1383,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_capacity_is_enforced_even_with_the_legacy_unbounded_setting() {
+    async fn builder_capacity_is_always_bounded() {
         let client = BraintrustClient::builder()
+            .runtime(crate::current_runtime())
             .app_url("https://example.com")
             .api_url("https://example.com")
             .skip_login(true)
             .with_queue_max_size(1)
-            .enforce_queue_size_limit(false)
             .build()
             .await
             .expect("client");
@@ -1678,7 +1543,7 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await;
+        let login_state = client.login_state();
         assert!(login_state.is_logged_in(), "should be logged in");
         assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
         assert_eq!(login_state.org_name().as_deref(), Some("First Org"));
@@ -1708,7 +1573,7 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await;
+        let login_state = client.login_state();
         assert!(login_state.is_logged_in(), "should be logged in");
         assert_eq!(login_state.org_id().as_deref(), Some("org-2"));
         assert_eq!(login_state.org_name().as_deref(), Some("Second Org"));
@@ -1801,7 +1666,7 @@ mod tests {
             .expect("client");
 
         // Initially should not be logged in (background login hasn't completed)
-        let is_logged_in = client.is_logged_in().await;
+        let is_logged_in = client.is_logged_in();
         assert!(!is_logged_in);
     }
 
@@ -1826,7 +1691,7 @@ mod tests {
         // Wait for background login to complete
         let login_state = client.wait_for_login().await.expect("login should succeed");
         assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
-        assert!(client.is_logged_in().await);
+        assert!(client.is_logged_in());
     }
 
     #[tokio::test]
@@ -1995,7 +1860,7 @@ mod tests {
 
         // No credential leak into shared global state.
         assert!(
-            !client.is_logged_in().await,
+            !client.is_logged_in(),
             "per-request credentials must not populate the shared login state"
         );
 

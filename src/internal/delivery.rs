@@ -18,12 +18,8 @@ use std::{
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
-    time::Duration,
 };
-use tokio::{
-    sync::{oneshot, Semaphore},
-    task::AbortHandle,
-};
+use tokio::{sync::oneshot, task::AbortHandle};
 use tracing::warn;
 
 use crate::internal::execution::ExecutionBinding;
@@ -48,14 +44,29 @@ impl<C> Clone for WriteService<C> {
 struct Producer<C> {
     inner: Arc<Inner<C>>,
     abort: AbortHandle,
-    runtime: ExecutionBinding,
     exit: Shared<BoxFuture<'static, Result<(), ExecutionError>>>,
     control_limit: usize,
-    shutdown_controls: Arc<Semaphore>,
 }
 impl<C> Drop for Producer<C> {
     fn drop(&mut self) {
         self.inner.close(&mut lock(&self.inner.state));
+    }
+}
+/// Service-specific permission for dependent writes from an accepted response.
+/// ResponseTasks owns operation admission and draining; this only revokes escaped spans.
+pub(crate) struct WriteCapability<C>(Arc<Capability<C>>);
+struct Capability<C> {
+    inner: Arc<Inner<C>>,
+    active: AtomicBool,
+}
+impl<C> Clone for WriteCapability<C> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<C> WriteCapability<C> {
+    pub fn revoke(&self) {
+        self.0.active.store(false, Ordering::Release);
     }
 }
 impl<C: Send + 'static> WriteService<C> {
@@ -69,6 +80,7 @@ impl<C: Send + 'static> WriteService<C> {
         );
         let control_limit = capacity.clamp(1, 1024);
         let inner = Arc::new(Inner {
+            accepting: AtomicBool::new(true),
             state: Mutex::new(State {
                 ready: VecDeque::new(),
                 active: None,
@@ -98,29 +110,61 @@ impl<C: Send + 'static> WriteService<C> {
             producer: Arc::new(Producer {
                 inner,
                 abort: task.abort_handle(),
-                runtime,
                 exit,
                 control_limit,
-                shutdown_controls: Arc::new(Semaphore::new(control_limit)),
             }),
         }
     }
 
+    // Called only inside an already accepted response factory, which may race
+    // begin_shutdown. No second admission decision belongs here.
+    pub fn capability(&self) -> WriteCapability<C> {
+        WriteCapability(Arc::new(Capability {
+            inner: self.producer.inner.clone(),
+            active: AtomicBool::new(true),
+        }))
+    }
+    fn accepts(&self, capability: Option<&WriteCapability<C>>) -> bool {
+        self.producer.inner.terminal_error().is_none()
+            && match capability {
+                Some(_) => self.valid_capability(capability),
+                None => self.producer.inner.accepting.load(Ordering::Acquire),
+            }
+    }
+    fn valid_capability(&self, capability: Option<&WriteCapability<C>>) -> bool {
+        capability.is_some_and(|v| {
+            Arc::ptr_eq(&v.0.inner, &self.producer.inner) && v.0.active.load(Ordering::Acquire)
+        })
+    }
     #[cfg(test)]
     pub fn enqueue(&self, command: C) -> Completion<DeliveryReceipt, WriteError> {
         self.enqueue_with_rejection(command, None, |_, _| {})
     }
 
+    #[cfg(test)]
     pub fn enqueue_with_rejection(
         &self,
         command: C,
         outcome: Option<WriteOutcome>,
         rejected: impl FnOnce(C, EnqueueError),
     ) -> Completion<DeliveryReceipt, WriteError> {
+        self.enqueue_with_capability(command, outcome, None, rejected)
+    }
+    pub fn enqueue_with_capability(
+        &self,
+        command: C,
+        outcome: Option<WriteOutcome>,
+        capability: Option<&WriteCapability<C>>,
+        rejected: impl FnOnce(C, EnqueueError),
+    ) -> Completion<DeliveryReceipt, WriteError> {
         let producer = &self.producer;
         let (sender, mut completion) = Completion::pair();
         let sender = WriteResponder::new(sender, outcome);
-        match producer.inner.admit() {
+        match if capability.is_some() && !self.valid_capability(capability) {
+            Err(EnqueueError::Closed)
+        } else {
+            producer.inner.admit(capability.is_some())
+        } {
             Err(error) => {
                 completion.record_issuance(Err(error.into()));
                 let _ = sender.send(Err(error.into()));
@@ -144,69 +188,88 @@ impl<C: Send + 'static> WriteService<C> {
         completion
     }
 
+    #[cfg(test)]
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
+        self.flush_with_capability(None)
+    }
+    pub fn flush_with_capability(
+        &self,
+        capability: Option<&WriteCapability<C>>,
+    ) -> Completion<FlushReport, FlushError> {
         let producer = &self.producer;
         let (sender, mut completion) = Completion::pair();
         let mut state = lock(&producer.inner.state);
         if let Some(error) = producer.inner.terminal_error() {
             completion.record_issuance(Err(error.into()));
-        } else if producer.inner.ingress.load().closed() {
+        } else if !self.accepts(capability) {
             completion.record_issuance(Err(EnqueueError::Closed.into()));
         } else if state.barriers.len() >= producer.control_limit {
             completion.record_issuance(Err(EnqueueError::Full.into()));
         } else {
             let through = producer.inner.detach(&mut state, false);
-            state.barrier(sender, through);
+            state.barrier(sender, Some(through));
             producer.inner.wake.notify_one();
         }
         completion
     }
 
-    pub fn shutdown(&self, timeout: Duration) -> Completion<ShutdownReport, ShutdownError> {
-        let producer = &self.producer;
+    /// Close ordinary admission and immediately start recording all subsequent
+    /// retirements, including failures while accepted responses are still running.
+    pub fn begin_shutdown(&self) -> Completion<FlushReport, FlushError> {
+        let inner = &self.producer.inner;
         let (sender, mut completion) = Completion::pair();
-        let Ok(permit) = producer.shutdown_controls.clone().try_acquire_owned() else {
-            completion.record_issuance(Err(EnqueueError::Full.into()));
-            return completion;
-        };
-        let (barrier_sender, barrier) = Completion::pair();
-        {
-            let mut state = lock(&producer.inner.state);
-            if let Some(error) = producer.inner.terminal_error() {
-                completion.record_issuance(Err(error.into()));
-                return completion;
-            }
-            producer.inner.close(&mut state);
-            let through = state
-                .ready
-                .back()
-                .cloned()
-                .or_else(|| state.active.as_ref().map(|batch| batch.epoch.clone()));
-            if let Some(through) = through {
-                state.barrier(barrier_sender, through);
-            } else {
-                let _ = barrier_sender.send(Ok(FlushReport::default()));
-            }
+        let mut state = lock(&inner.state);
+        inner.accepting.store(false, Ordering::Release);
+        if let Some(error) = inner.terminal_error() {
+            completion.record_issuance(Err(error.into()));
+        } else {
+            state.barrier(sender, None);
         }
-        let inner = producer.inner.clone();
-        let abort = producer.abort.clone();
-        let exit = producer.exit.clone();
-        producer.runtime.spawn(async move {
-            let _permit = permit;
-            let work = async {
-                let report = barrier.await;
-                exit.await.map_err(ShutdownError::Execution)?;
-                report
-                    .map(|report| ShutdownReport {
-                        delivered: report.delivered,
-                    })
-                    .map_err(Into::into)
-            };
-            let result = match tokio::time::timeout(timeout, work).await {
+        completion
+    }
+
+    /// Seal the final generation only after the accepted responses have drained.
+    pub fn close(&self) {
+        self.producer
+            .inner
+            .close(&mut lock(&self.producer.inner.state));
+    }
+
+    pub async fn finish_shutdown(
+        &self,
+        barrier: Completion<FlushReport, FlushError>,
+    ) -> Result<ShutdownReport, ShutdownError> {
+        self.close();
+        let report = barrier.await;
+        self.producer
+            .exit
+            .clone()
+            .await
+            .map_err(ShutdownError::Execution)?;
+        report
+            .map(|report| ShutdownReport {
+                delivered: report.delivered,
+            })
+            .map_err(Into::into)
+    }
+
+    // Standalone queue tests own their deadline explicitly. Production shutdown
+    // is owned exclusively by Lifecycle.
+    #[cfg(test)]
+    pub fn shutdown(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Completion<ShutdownReport, ShutdownError> {
+        let barrier = self.begin_shutdown();
+        self.close();
+        let service = self.clone();
+        let (sender, completion) = Completion::pair();
+        tokio::spawn(async move {
+            let result = match tokio::time::timeout(timeout, service.finish_shutdown(barrier)).await
+            {
                 Ok(result) => result,
                 Err(_) => {
-                    inner.stop(ExecutionError::TimedOut);
-                    abort.abort();
+                    service.cancel(ExecutionError::TimedOut);
                     Err(ShutdownError::Execution(ExecutionError::TimedOut))
                 }
             };
@@ -320,7 +383,7 @@ fn finish_writes(writes: Vec<WriteSender>, result: Result<(), WriteError>) {
 /// One bounded summary per active flush, rather than cloning every covered
 /// batch into each observer. Its cutoff is the last batch present at admission.
 struct Barrier<C> {
-    through: Arc<QueueEpoch<C>>,
+    through: Option<Arc<QueueEpoch<C>>>,
     sender: FlushSender,
     delivered: u64,
     failure: Option<FlushFailure>,
@@ -356,7 +419,7 @@ struct State<C> {
     barriers: VecDeque<Barrier<C>>,
 }
 impl<C> State<C> {
-    fn barrier(&mut self, sender: FlushSender, through: Arc<QueueEpoch<C>>) {
+    fn barrier(&mut self, sender: FlushSender, through: Option<Arc<QueueEpoch<C>>>) {
         self.barriers.push_back(Barrier {
             through,
             sender,
@@ -378,17 +441,23 @@ impl<C> State<C> {
         }
         // Remove completed cutoffs before admitting another flush. Their
         // notifications are published after capacity retirement.
-        while self
-            .barriers
-            .front()
-            .is_some_and(|barrier| Arc::ptr_eq(&barrier.through, &active.epoch))
-        {
-            completed.push(self.barriers.pop_front().expect("checked above"));
+        let mut index = 0;
+        while index < self.barriers.len() {
+            if self.barriers[index]
+                .through
+                .as_ref()
+                .is_some_and(|epoch| Arc::ptr_eq(epoch, &active.epoch))
+            {
+                completed.push(self.barriers.remove(index).expect("barrier exists"));
+            } else {
+                index += 1;
+            }
         }
         (active.senders, completed)
     }
 }
 struct Inner<C> {
+    accepting: AtomicBool,
     state: Mutex<State<C>>,
     ingress: ArcSwap<QueueEpoch<C>>,
     outstanding: AtomicUsize,
@@ -409,8 +478,13 @@ impl<C> Inner<C> {
     }
 
     #[allow(deprecated, reason = "try_update requires Rust 1.95")]
-    fn admit(&self) -> Result<(EpochGuard<C>, usize), EnqueueError> {
+    fn admit(&self, leased: bool) -> Result<(EpochGuard<C>, usize), EnqueueError> {
         loop {
+            if self.terminal_error().is_some()
+                || (!self.accepting.load(Ordering::Acquire) && !leased)
+            {
+                return Err(EnqueueError::Closed);
+            }
             // Enrollment binds this write to one flush/shutdown cutoff before
             // admission succeeds. A closed current generation rejects new work;
             // a stale generation means a concurrent flush advanced the queue.
@@ -509,8 +583,14 @@ impl<C> Inner<C> {
         error
     }
     fn close(&self, state: &mut State<C>) {
+        self.accepting.store(false, Ordering::Release);
         if !self.ingress.load().closed() {
-            self.detach(state, true);
+            let through = self.detach(state, true);
+            for barrier in &mut state.barriers {
+                if barrier.through.is_none() {
+                    barrier.through = Some(through.clone());
+                }
+            }
         }
         self.wake.notify_one();
     }
@@ -616,11 +696,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use std::{
         future::IntoFuture,
         sync::atomic::{AtomicBool, Ordering},
     };
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Semaphore};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admission_does_not_wait_for_coordinator_lock() {
@@ -647,7 +728,7 @@ mod tests {
         let first = service.enqueue(1);
         assert_eq!(entered.recv().await.unwrap(), vec![1]);
 
-        let (epoch, _) = service.producer.inner.admit().unwrap();
+        let (epoch, _) = service.producer.inner.admit(false).unwrap();
         let (sender, second) = Completion::pair();
         let shutdown = service.shutdown(Duration::from_secs(2));
         let mut shutdown = Box::pin(shutdown.into_future());
@@ -677,7 +758,7 @@ mod tests {
         let first = service.enqueue(1);
         assert_eq!(entered.recv().await.unwrap(), vec![1]);
 
-        let (old_epoch, _) = service.producer.inner.admit().unwrap();
+        let (old_epoch, _) = service.producer.inner.admit(false).unwrap();
         let (sender, before) = Completion::pair();
         let mut flush = Box::pin(service.flush().into_future());
         let blocking_flush = service.flush();
@@ -740,7 +821,7 @@ mod tests {
         let (service, mut entered, _gate) = gated(4);
         let first = service.enqueue(1);
         assert_eq!(entered.recv().await.unwrap(), vec![1]);
-        let (old_epoch, _) = service.producer.inner.admit().unwrap();
+        let (old_epoch, _) = service.producer.inner.admit(false).unwrap();
         let (sender, late) = Completion::pair();
         service.producer.abort.abort();
         assert!(matches!(
@@ -824,24 +905,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_shutdown_after_worker_exit_succeeds_without_new_work() {
+    async fn final_close_is_idempotent_and_drain_observes_worker_exit() {
         let (service, _entered, _gate) = gated(4);
+        let barrier = service.begin_shutdown();
+        service.close();
+        service.close();
         assert_eq!(
-            service
-                .shutdown(Duration::from_secs(1))
-                .await
-                .unwrap()
-                .delivered(),
+            service.finish_shutdown(barrier).await.unwrap().delivered(),
             0
         );
-        assert_eq!(
-            service
-                .shutdown(Duration::from_millis(50))
-                .await
-                .unwrap()
-                .delivered(),
-            0
-        );
+        assert_eq!(service.producer.exit.clone().await, Ok(()));
         assert!(service.is_empty());
     }
 
@@ -1041,11 +1114,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_stops_admission_immediately_drains_and_is_shared_by_clones() {
+    async fn shutdown_stops_admission_immediately_and_drains() {
         let (service, mut entered, gate) = gated(4);
         let write = service.enqueue(1);
         let shutdown = service.shutdown(Duration::from_secs(1));
-        let concurrent = service.clone().shutdown(Duration::from_secs(1));
         assert!(shutdown.is_ok());
         assert!(matches!(
             service.enqueue(2).await,
@@ -1055,7 +1127,6 @@ mod tests {
         gate.add_permits(1);
         write.await.unwrap();
         assert_eq!(shutdown.await.unwrap().delivered, 1);
-        assert_eq!(concurrent.await.unwrap().delivered, 1);
         assert!(service.is_empty());
     }
 
@@ -1370,5 +1441,117 @@ mod tests {
         assert_eq!(delivered, 8);
         service.shutdown(Duration::from_secs(1)).await.unwrap();
         assert!(service.is_empty());
+    }
+    #[tokio::test]
+    async fn shutdown_barrier_covers_dependent_writes_until_owner_closes() {
+        let (service, mut entered, gate) = gated(4);
+        let lease = service.capability();
+        let escaped = lease.clone();
+        assert_eq!(service.flush().await.unwrap().delivered, 0);
+        let barrier = service.begin_shutdown();
+        assert!(matches!(
+            service.enqueue(0).await,
+            Err(WriteError::Admission(EnqueueError::Closed))
+        ));
+        assert!(service.producer.exit.clone().now_or_never().is_none());
+        let write = service.enqueue_with_capability(1, None, Some(&lease), |_, _| {});
+        let flush = service.flush_with_capability(Some(&lease));
+        assert_eq!(entered.recv().await.unwrap(), vec![1]);
+        gate.add_permits(1);
+        write.await.unwrap();
+        assert_eq!(flush.await.unwrap().delivered, 1);
+        assert!(service.producer.exit.clone().now_or_never().is_none());
+        lease.revoke();
+        lease.revoke();
+        service.close();
+        assert_eq!(service.finish_shutdown(barrier).await.unwrap().delivered, 1);
+        assert!(matches!(
+            service
+                .enqueue_with_capability(2, None, Some(&escaped), |_, _| {})
+                .await,
+            Err(WriteError::Admission(EnqueueError::Closed))
+        ));
+        assert!(matches!(
+            service.flush_with_capability(Some(&escaped)).await,
+            Err(FlushError::Admission(EnqueueError::Closed))
+        ));
+    }
+    #[tokio::test]
+    async fn capabilities_are_service_specific_and_revoked_on_cancellation() {
+        let (service, _, _) = gated(1);
+        let lease = service.capability();
+        let _additional = service.capability();
+        lease.revoke();
+        assert!(matches!(
+            service
+                .enqueue_with_capability(0, None, Some(&lease), |_, _| {})
+                .await,
+            Err(WriteError::Admission(EnqueueError::Closed))
+        ));
+        assert!(matches!(
+            service.flush_with_capability(Some(&lease)).await,
+            Err(FlushError::Admission(EnqueueError::Closed))
+        ));
+        let replacement = service.capability();
+        let (other, _, _) = gated(1);
+        let foreign = other.capability();
+        service
+            .producer
+            .inner
+            .close(&mut lock(&service.producer.inner.state));
+        assert!(matches!(
+            service
+                .enqueue_with_capability(1, None, Some(&foreign), |_, _| {})
+                .await,
+            Err(WriteError::Admission(EnqueueError::Closed))
+        ));
+        service.cancel(ExecutionError::TimedOut);
+        assert!(service.producer.inner.terminal_error().is_some());
+        assert!(matches!(
+            service
+                .enqueue_with_capability(2, None, Some(&replacement), |_, _| {})
+                .await,
+            Err(WriteError::Admission(EnqueueError::Closed))
+        ));
+    }
+    #[tokio::test]
+    async fn shutdown_counts_terminal_failures_from_later_dependent_writes_without_replay() {
+        let service = WriteService::new(
+            2,
+            ExecutionBinding::external(tokio::runtime::Handle::current()),
+            |commands: Vec<usize>| {
+                Box::pin(async move {
+                    if commands == [1] {
+                        anyhow::bail!("terminal batch");
+                    }
+                    Ok(())
+                })
+            },
+        );
+        let lease = service.capability();
+        let barrier = service.begin_shutdown();
+        let failed = service.enqueue_with_capability(1, None, Some(&lease), |_, _| {});
+        assert!(matches!(failed.await, Err(WriteError::Delivery(_))));
+        assert!(service.is_empty());
+        assert_eq!(
+            service
+                .flush_with_capability(Some(&lease))
+                .await
+                .unwrap()
+                .delivered,
+            0
+        );
+        service
+            .enqueue_with_capability(2, None, Some(&lease), |_, _| {})
+            .await
+            .unwrap();
+        lease.revoke();
+        service.close();
+        let Err(ShutdownError::Delivery(failure)) = service.finish_shutdown(barrier).await else {
+            panic!("shutdown must report its covered failed batch");
+        };
+        assert_eq!(failure.failed, 1);
+        assert!(service.is_empty());
+        assert!(lock(&service.producer.inner.state).barriers.is_empty());
     }
 }
