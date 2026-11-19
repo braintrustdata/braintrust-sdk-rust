@@ -1224,14 +1224,12 @@ mod tests {
         span.log(
             SpanLog::builder()
                 .tags(vec!["b".into(), "a".into(), "a".into()])
-                .build()
-                .unwrap(),
+                .build(),
         );
         span.log(
             SpanLog::builder()
                 .tags(vec!["a".into(), "c".into()])
-                .build()
-                .unwrap(),
+                .build(),
         );
         span.end();
         let captured = collector.spans();
