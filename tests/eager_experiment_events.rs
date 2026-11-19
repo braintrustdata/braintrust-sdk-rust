@@ -1,49 +1,19 @@
+mod support;
+
 use braintrust_sdk_rust::{
-    BraintrustClient, BraintrustError, EnqueueError, ExecutionError, Experiment, ExperimentLog,
-    FlushError, ParentSpanInfo, ShutdownError, WriteError,
+    BraintrustClient, BraintrustError, EnqueueError, ExecutionError, FlushError, ShutdownError,
+    SpanLog, WriteError,
 };
 use serde_json::json;
 use std::{future::IntoFuture, sync::Arc, time::Duration};
+use support::bound_client as client;
+use support::experiment;
+use support::experiment_response as registration;
+use support::ingestion;
 use wiremock::{
     matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
 };
-
-fn experiment(client: &BraintrustClient) -> Experiment {
-    client
-        .experiment_builder_with_credentials("token", "org")
-        .project_name("project")
-        .build()
-}
-fn registration() -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_json(json!({
-        "project":{"id":"project","name":"project"},
-        "experiment":{"id":"experiment","name":"experiment"}
-    }))
-}
-async fn ingestion(server: &MockServer) {
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(server)
-        .await;
-}
-async fn client(server: &MockServer, queue_size: usize) -> BraintrustClient {
-    BraintrustClient::builder()
-        .runtime(braintrust_sdk_rust::current_runtime())
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .with_queue_max_size(queue_size)
-        .build()
-        .await
-        .unwrap()
-}
 
 #[tokio::test]
 async fn plain_thread_issuance_drains_unobserved_registration_and_delivery_after_drop() {
@@ -62,17 +32,11 @@ async fn plain_thread_issuance_drains_unobserved_registration_and_delivery_after
         .await;
     let uri = server.uri();
     let (flush, shutdown) = std::thread::spawn(move || {
-        let client = futures::executor::block_on(
-            BraintrustClient::builder()
-                .skip_login(true)
-                .app_url(&uri)
-                .api_url(&uri)
-                .build()
-                .into_future(),
-        )
-        .unwrap();
+        let client =
+            futures::executor::block_on(support::client_builder(&uri).build().into_future())
+                .unwrap();
         let experiment = experiment(&client);
-        let event = experiment.log(ExperimentLog::builder().input(json!("accepted")).build());
+        let event = experiment.log(SpanLog::builder().input(json!("accepted")).build());
         assert!(event.is_ok());
         drop(event);
         let flush = experiment.flush();
@@ -90,16 +54,7 @@ async fn plain_thread_issuance_drains_unobserved_registration_and_delivery_after
     flush.await.unwrap();
     shutdown.await.unwrap();
     let requests = server.received_requests().await.unwrap();
-    let rows: Vec<serde_json::Value> = requests
-        .iter()
-        .filter(|r| r.url.path() == "/logs3")
-        .flat_map(|r| {
-            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .clone()
-        })
-        .collect();
+    let rows: Vec<serde_json::Value> = support::log_rows(&requests);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["experiment_id"], "experiment");
     assert_eq!(rows[0]["input"], "accepted");
@@ -112,18 +67,16 @@ async fn plain_thread_issuance_drains_unobserved_registration_and_delivery_after
 async fn shutdown_before_first_poll_covers_registration_and_the_final_write() {
     let server = MockServer::start().await;
     ingestion(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/api/experiment/register"))
-        .respond_with(registration())
+    support::register_experiment()
         .expect(1)
         .mount(&server)
         .await;
     let client = client(&server, 10).await;
     let experiment = experiment(&client);
-    let event = experiment.log(ExperimentLog::default());
+    let event = experiment.log(SpanLog::default());
     let shutdown = client.shutdown(Duration::from_secs(5));
     assert!(event.is_ok());
-    let rejected = experiment.log(ExperimentLog::default());
+    let rejected = experiment.log(SpanLog::default());
     assert!(matches!(
         &*rejected,
         Err(BraintrustError::Admission(EnqueueError::Closed))
@@ -131,14 +84,7 @@ async fn shutdown_before_first_poll_covers_registration_and_the_final_write() {
     assert_eq!(shutdown.await.unwrap().delivered(), 1);
     let id = event.await.unwrap();
     let requests = server.received_requests().await.unwrap();
-    let body: serde_json::Value = serde_json::from_slice(
-        &requests
-            .iter()
-            .find(|r| r.url.path() == "/logs3")
-            .unwrap()
-            .body,
-    )
-    .unwrap();
+    let body: serde_json::Value = support::body(support::log_requests(&requests).next().unwrap());
     assert_eq!(body["rows"][0]["id"], id);
 }
 
@@ -154,23 +100,15 @@ async fn registration_failure_fails_the_batch_then_retires_before_a_fresh_event(
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/api/experiment/register"))
-        .respond_with(registration())
+    support::register_experiment()
         .with_priority(2)
         .expect(1)
         .mount(&server)
         .await;
     let client = client(&server, 10).await;
     let experiment = experiment(&client);
-    let event = experiment.log(ExperimentLog::default());
-    let neighbor = client
-        .span_builder_with_credentials("token", "org")
-        .parent_info(ParentSpanInfo::ProjectLogs {
-            object_id: "project".into(),
-        })
-        .build()
-        .end();
+    let event = experiment.log(SpanLog::default());
+    let neighbor = support::span(&client).end();
     let flush = experiment.flush();
     assert!(matches!(
         event.await,
@@ -179,7 +117,7 @@ async fn registration_failure_fails_the_batch_then_retires_before_a_fresh_event(
     assert!(matches!(neighbor.await, Err(WriteError::Delivery(_))));
     assert!(matches!(flush.await, Err(FlushError::Delivery(failure)) if failure.failed()==2));
     assert_eq!(experiment.flush().await.unwrap().delivered(), 0);
-    let next = experiment.clone().log(ExperimentLog::default());
+    let next = experiment.clone().log(SpanLog::default());
     let fresh = experiment.flush();
     assert!(next.is_ok());
     assert!(!next.await.unwrap().is_empty());
@@ -191,22 +129,14 @@ async fn registration_failure_fails_the_batch_then_retires_before_a_fresh_event(
 async fn queue_rejection_never_registers_and_the_reserved_response_slot_is_retired() {
     let server = MockServer::start().await;
     ingestion(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/api/experiment/register"))
-        .respond_with(registration())
+    support::register_experiment()
         .expect(1)
         .mount(&server)
         .await;
     let client = client(&server, 1).await;
     let experiment = experiment(&client);
-    let existing = client
-        .span_builder_with_credentials("token", "org")
-        .parent_info(ParentSpanInfo::ProjectLogs {
-            object_id: "project".into(),
-        })
-        .build()
-        .end();
-    let rejected = experiment.log(ExperimentLog::default());
+    let existing = support::span(&client).end();
+    let rejected = experiment.log(SpanLog::default());
     assert!(matches!(
         &*rejected,
         Err(BraintrustError::Admission(EnqueueError::Full))
@@ -231,7 +161,7 @@ async fn queue_rejection_never_registers_and_the_reserved_response_slot_is_retir
     ));
     client.flush().await.unwrap();
     existing.await.unwrap();
-    let retry = experiment.log(ExperimentLog::default());
+    let retry = experiment.log(SpanLog::default());
     let flush = experiment.flush();
     assert!(retry.is_ok());
     retry.await.unwrap();
@@ -243,20 +173,18 @@ async fn queue_rejection_never_registers_and_the_reserved_response_slot_is_retir
 async fn full_response_admission_never_creates_an_extra_write_obligation() {
     let server = MockServer::start().await;
     ingestion(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/api/experiment/register"))
-        .respond_with(registration())
+    support::register_experiment()
         .expect(1)
         .mount(&server)
         .await;
     let client = client(&server, 2048).await;
     let experiment = experiment(&client);
     for _ in 0..1024 {
-        let event = experiment.log(ExperimentLog::default());
+        let event = experiment.log(SpanLog::default());
         assert!(event.is_ok());
         drop(event);
     }
-    let rejected = experiment.log(ExperimentLog::default());
+    let rejected = experiment.log(SpanLog::default());
     assert!(matches!(
         &*rejected,
         Err(BraintrustError::Admission(EnqueueError::Full))
@@ -282,12 +210,7 @@ async fn full_response_admission_never_creates_an_extra_write_obligation() {
         .unwrap()
         .iter()
         .filter(|r| r.url.path() == "/logs3")
-        .map(|r| {
-            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .len()
-        })
+        .map(|r| support::body(r)["rows"].as_array().unwrap().len())
         .sum();
     assert_eq!(count, 1024);
 }
@@ -308,7 +231,7 @@ async fn deadline_cancels_deferred_registration_and_never_submits_its_row() {
         .await;
     let client = client(&server, 10).await;
     let experiment = experiment(&client);
-    let event = experiment.log(ExperimentLog::default());
+    let event = experiment.log(SpanLog::default());
     let feedback =
         experiment.log_feedback("feedback", braintrust_sdk_rust::Feedback::builder().build());
     let update = experiment.update_span("update", braintrust_sdk_rust::SpanLog::default());
@@ -325,7 +248,7 @@ async fn deadline_cancels_deferred_registration_and_never_submits_its_row() {
         Err(BraintrustError::Execution(ExecutionError::TimedOut))
     ));
     assert!(matches!(
-        &*experiment.log(ExperimentLog::default()),
+        &*experiment.log(SpanLog::default()),
         Err(BraintrustError::Admission(EnqueueError::Closed))
     ));
     for patch in [feedback, update] {
@@ -355,7 +278,7 @@ fn stopped_runtime_retires_an_unpolled_event_that_owns_the_last_queue_producer()
             )
             .unwrap();
         let experiment = experiment(&client);
-        let event = experiment.log(ExperimentLog::default());
+        let event = experiment.log(SpanLog::default());
         assert!(event.is_ok());
         drop(experiment);
         drop(client);
@@ -379,9 +302,7 @@ async fn unobserved_patches_own_their_ids_and_share_registration_across_shutdown
     use braintrust_sdk_rust::{Feedback, SpanLog};
     let server = MockServer::start().await;
     ingestion(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/api/experiment/register"))
-        .respond_with(registration())
+    support::register_experiment()
         .expect(1)
         .mount(&server)
         .await;
@@ -432,16 +353,7 @@ async fn unobserved_patches_own_their_ids_and_share_registration_across_shutdown
     assert_eq!(flush.await.unwrap().delivered(), 2);
     assert_eq!(shutdown.await.unwrap().delivered(), 2);
     let requests = server.received_requests().await.unwrap();
-    let rows: Vec<serde_json::Value> = requests
-        .iter()
-        .filter(|r| r.url.path() == "/logs3")
-        .flat_map(|r| {
-            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .clone()
-        })
-        .collect();
+    let rows: Vec<serde_json::Value> = support::log_rows(&requests);
     assert_eq!(rows.len(), 2);
     for row in &rows {
         assert_eq!(row["experiment_id"], "experiment");
@@ -480,9 +392,7 @@ async fn patch_registration_failure_retires_the_batch_and_allows_fresh_retry() {
         .expect(2)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/api/experiment/register"))
-        .respond_with(registration())
+    support::register_experiment()
         .with_priority(2)
         .expect(1)
         .mount(&server)
@@ -507,10 +417,7 @@ async fn patch_registration_failure_retires_the_batch_and_allows_fresh_retry() {
     retry.await.unwrap();
     assert_eq!(fresh.await.unwrap().delivered(), 1);
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(
-        requests.iter().filter(|r| r.url.path() == "/logs3").count(),
-        1
-    );
+    assert_eq!(support::log_requests(&requests).count(), 1);
     client.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
@@ -519,9 +426,7 @@ async fn explicit_patches_remain_independent_of_a_finished_live_span() {
     use braintrust_sdk_rust::{Feedback, SpanLog};
     let server = MockServer::start().await;
     ingestion(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/api/experiment/register"))
-        .respond_with(registration())
+    support::register_experiment()
         .expect(1)
         .mount(&server)
         .await;
@@ -545,14 +450,7 @@ async fn explicit_patches_remain_independent_of_a_finished_live_span() {
     feedback.await.unwrap();
     assert_eq!(flush.await.unwrap().delivered(), 3);
     let requests = server.received_requests().await.unwrap();
-    let body: serde_json::Value = serde_json::from_slice(
-        &requests
-            .iter()
-            .find(|r| r.url.path() == "/logs3")
-            .unwrap()
-            .body,
-    )
-    .unwrap();
+    let body: serde_json::Value = support::body(support::log_requests(&requests).next().unwrap());
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
     let row = &body["rows"][0];
     assert_eq!(row["id"], span.row_id());

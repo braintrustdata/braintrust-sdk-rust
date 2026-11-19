@@ -1,6 +1,7 @@
+mod support;
+
 use braintrust_sdk_rust::{
-    BraintrustClient, BraintrustError, EnqueueError, ExecutionError, ParentSpanInfo, ShutdownError,
-    WriteError,
+    BraintrustError, EnqueueError, ExecutionError, ShutdownError, WriteError,
 };
 use std::{sync::Arc, time::Duration};
 use wiremock::{
@@ -29,24 +30,14 @@ async fn one_deadline_fails_active_http_and_ingestion_then_rejects_new_work() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-        .mount(&server)
-        .await;
+    support::version().mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/logs3"))
         .respond_with(held_response(write_arrived.clone(), 204))
         .expect(1)
         .mount(&server)
         .await;
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .build()
-        .await
-        .unwrap();
+    let client = support::client(&server).await;
     let dataset = client
         .dataset_builder_with_credentials("token", "tenant")
         .project_name("p")
@@ -54,12 +45,7 @@ async fn one_deadline_fails_active_http_and_ingestion_then_rejects_new_work() {
         .build();
     let pending = dataset.clone();
     let http = tokio::spawn(async move { pending.dataset_id().await });
-    let span = client
-        .span_builder_with_credentials("token", "org")
-        .parent_info(ParentSpanInfo::ProjectLogs {
-            object_id: "project".into(),
-        })
-        .build();
+    let span = support::span(&client);
     let write = span.end();
     tokio::time::timeout(Duration::from_secs(5), async {
         http_arrived.notified().await;
@@ -87,12 +73,7 @@ async fn one_deadline_fails_active_http_and_ingestion_then_rejects_new_work() {
         dataset.dataset_id().await,
         Err(BraintrustError::Admission(EnqueueError::Closed))
     ));
-    let fresh = client
-        .span_builder_with_credentials("token", "org")
-        .parent_info(ParentSpanInfo::ProjectLogs {
-            object_id: "project".into(),
-        })
-        .build();
+    let fresh = support::span(&client);
     assert!(matches!(
         fresh.end().await,
         Err(WriteError::Admission(EnqueueError::Closed))
@@ -110,11 +91,9 @@ async fn background_login_is_accepted_work_covered_by_shutdown() {
         .expect(1)
         .mount(&server)
         .await;
-    let client = BraintrustClient::builder()
+    let client = support::endpoints(server.uri())
         .api_key("token")
         .blocking_login(false)
-        .app_url(server.uri())
-        .api_url(server.uri())
         .build()
         .await
         .unwrap();

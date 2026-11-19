@@ -1,4 +1,6 @@
 //! Eager dataset operations own admission through all of their subrequests.
+mod support;
+
 use braintrust_sdk_rust::{
     BraintrustClient, BraintrustError, Dataset, DatasetInsert, EnqueueError,
 };
@@ -57,15 +59,9 @@ async fn synchronous_callers_issue_unobserved_operations_and_shutdown_drains_the
         .await;
     let uri = server.uri();
     let shutdown = std::thread::spawn(move || {
-        let client = futures::executor::block_on(
-            BraintrustClient::builder()
-                .skip_login(true)
-                .app_url(&uri)
-                .api_url(&uri)
-                .build()
-                .into_future(),
-        )
-        .unwrap();
+        let client =
+            futures::executor::block_on(support::client_builder(&uri).build().into_future())
+                .unwrap();
         let dataset = dataset(&client);
         for operation in [
             dataset.update("old", record().into()),
@@ -96,17 +92,9 @@ async fn synchronous_callers_issue_unobserved_operations_and_shutdown_drains_the
 async fn saturated_operations_drain_after_shutdown_without_nested_http_admission() {
     let server = MockServer::start().await;
     registration(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let client = BraintrustClient::builder()
+    support::logs(204).expect(1).mount(&server).await;
+    let client = support::client_builder(server.uri())
         .runtime(braintrust_sdk_rust::current_runtime())
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
         .build()
         .await
         .unwrap();
@@ -176,11 +164,8 @@ async fn unobserved_cursor_commands_consume_records_in_order_and_collect_across_
         .expect(1)
         .mount(&server)
         .await;
-    let client = BraintrustClient::builder()
+    let client = support::client_builder(server.uri())
         .runtime(braintrust_sdk_rust::current_runtime())
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
         .build()
         .await
         .unwrap();
@@ -220,11 +205,8 @@ async fn rejected_cursor_admission_preserves_its_position_and_allows_retry() {
         .expect(1)
         .mount(&server)
         .await;
-    let client = BraintrustClient::builder()
+    let client = support::client_builder(server.uri())
         .runtime(braintrust_sdk_rust::current_runtime())
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
         .build()
         .await
         .unwrap();

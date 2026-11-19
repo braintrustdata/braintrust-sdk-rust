@@ -1,33 +1,20 @@
+mod support;
+
 use braintrust_sdk_rust::{
-    BraintrustClient, BraintrustError, EnqueueError, ExecutionError, Experiment, ExperimentLog,
-    ParentSpanInfo, ShutdownError, WriteError,
+    BraintrustError, EnqueueError, ExecutionError, ShutdownError, SpanLog, WriteError,
 };
 use serde_json::json;
 use std::{future::IntoFuture, sync::Arc, time::Duration};
+use support::bound_client as client;
+use support::experiment;
+use support::experiment_response as registration;
 use wiremock::{
     matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
 };
 
-fn experiment(client: &BraintrustClient) -> Experiment {
-    client
-        .experiment_builder_with_credentials("token", "org")
-        .project_name("project")
-        .build()
-}
-fn registration() -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_json(json!({
-        "project":{"id":"project","name":"project"},
-        "experiment":{"id":"experiment","name":"experiment"}
-    }))
-}
 async fn endpoints(server: &MockServer) {
-    Mock::given(method("POST"))
-        .and(path("/api/experiment/register"))
-        .respond_with(registration())
-        .expect(1)
-        .mount(server)
-        .await;
+    support::register_experiment().expect(1).mount(server).await;
     Mock::given(method("POST"))
         .and(path("/api/base_experiment/get_id"))
         .respond_with(ResponseTemplate::new(400))
@@ -38,27 +25,8 @@ async fn endpoints(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(server)
-        .await;
-}
-async fn client(server: &MockServer, capacity: usize) -> BraintrustClient {
-    BraintrustClient::builder()
-        .runtime(braintrust_sdk_rust::current_runtime())
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .with_queue_max_size(capacity)
-        .build()
-        .await
-        .unwrap()
+    support::version().mount(server).await;
+    support::logs(204).mount(server).await;
 }
 
 #[tokio::test]
@@ -67,15 +35,9 @@ async fn plain_thread_reads_complete_unobserved_through_shutdown_after_owner_dro
     endpoints(&server).await;
     let uri = server.uri();
     let (project, exported, base, summary, span, shutdown) = std::thread::spawn(move || {
-        let client = futures::executor::block_on(
-            BraintrustClient::builder()
-                .skip_login(true)
-                .app_url(&uri)
-                .api_url(&uri)
-                .build()
-                .into_future(),
-        )
-        .unwrap();
+        let client =
+            futures::executor::block_on(support::client_builder(&uri).build().into_future())
+                .unwrap();
         let experiment = experiment(&client);
         let project = experiment.project();
         let exported = experiment.export();
@@ -150,7 +112,7 @@ async fn full_task_budget_allows_summary_subrequests_and_rejected_starts_do_not_
         rejected.await,
         Err(BraintrustError::Admission(EnqueueError::Full))
     ));
-    let event = experiment.log(ExperimentLog::default());
+    let event = experiment.log(SpanLog::default());
     assert!(event.is_ok()); // The rejected start left event mode available.
     let flush = experiment.flush();
     event.await.unwrap();
@@ -162,26 +124,22 @@ async fn full_task_budget_allows_summary_subrequests_and_rejected_starts_do_not_
 async fn summary_captures_its_cutoff_before_a_later_write_fails() {
     let server = MockServer::start().await;
     endpoints(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
+    support::logs(204)
         .with_priority(1)
         .up_to_n_times(1)
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(400))
+    support::logs(400)
         .with_priority(2)
         .expect(1)
         .mount(&server)
         .await;
     let client = client(&server, 10).await;
     let experiment = experiment(&client);
-    let prior = experiment.log(ExperimentLog::default());
+    let prior = experiment.log(SpanLog::default());
     let summary = experiment.summarize();
-    let later = experiment.log(ExperimentLog::default());
+    let later = experiment.log(SpanLog::default());
     assert!(summary.is_ok());
     prior.await.unwrap();
     assert!(matches!(
@@ -209,23 +167,23 @@ async fn pending_span_starts_block_events_and_failed_registration_releases_mode(
     let experiment = experiment(&client);
     let start = experiment.start_span();
     assert!(start.is_ok());
-    let blocked = experiment.clone().log(ExperimentLog::default());
+    let blocked = experiment.clone().log(SpanLog::default());
     assert!(matches!(&*blocked, Err(BraintrustError::InvalidConfig(_))));
     assert!(matches!(
         start.await,
         Err(BraintrustError::Api { status: 400, .. })
     ));
-    let event = experiment.log(ExperimentLog::default());
+    let event = experiment.log(SpanLog::default());
     assert!(event.is_ok());
     event.await.unwrap();
     let accepted = experiment.start_span();
     assert!(matches!(
-        &*experiment.log(ExperimentLog::default()),
+        &*experiment.log(SpanLog::default()),
         Err(BraintrustError::InvalidConfig(_))
     ));
     drop(accepted.await.unwrap());
     assert!(matches!(
-        &*experiment.clone().log(ExperimentLog::default()),
+        &*experiment.clone().log(SpanLog::default()),
         Err(BraintrustError::InvalidConfig(_))
     ));
     client.shutdown(Duration::from_secs(5)).await.unwrap();
@@ -308,13 +266,7 @@ async fn summary_flush_rejection_reports_issuance_failure_without_starting_http_
     endpoints(&server).await;
     let client = client(&server, 1).await;
     let experiment = experiment(&client);
-    let write = client
-        .span_builder_with_credentials("token", "org")
-        .parent_info(ParentSpanInfo::ProjectLogs {
-            object_id: "project".into(),
-        })
-        .build()
-        .end();
+    let write = support::span(&client).end();
     let occupied = client.flush();
     let rejected = experiment.summarize();
     assert!(matches!(

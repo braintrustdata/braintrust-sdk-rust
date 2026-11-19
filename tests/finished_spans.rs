@@ -1,8 +1,10 @@
+mod support;
+use support::span;
+
 use std::sync::Arc;
 
 use braintrust_sdk_rust::{
-    BraintrustClient, DeliveryError, EnqueueError, FlushError, ParentSpanInfo, SpanHandle, SpanLog,
-    WriteError,
+    BraintrustClient, DeliveryError, EnqueueError, FlushError, SpanLog, WriteError,
 };
 use serde_json::{json, Value};
 use wiremock::{
@@ -11,22 +13,11 @@ use wiremock::{
 };
 
 async fn client(server: &MockServer) -> BraintrustClient {
-    BraintrustClient::builder()
+    support::client_builder(server.uri())
         .runtime(braintrust_sdk_rust::current_runtime())
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
         .build()
         .await
         .unwrap()
-}
-fn span(client: &BraintrustClient) -> SpanHandle {
-    client
-        .span_builder_with_credentials("token", "org")
-        .parent_info(ParentSpanInfo::ProjectLogs {
-            object_id: "project".into(),
-        })
-        .build()
 }
 async fn delivery_error(
     completion: braintrust_sdk_rust::Completion<braintrust_sdk_rust::DeliveryReceipt, WriteError>,
@@ -41,17 +32,13 @@ async fn delivery_error(
 #[tokio::test]
 async fn repeated_ends_share_a_retired_failure_without_replaying_or_poisoning_fresh_work() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(401))
+    support::logs(401)
         .with_priority(1)
         .up_to_n_times(1)
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
+    support::logs(204)
         .with_priority(2)
         .expect(1)
         .mount(&server)
@@ -98,12 +85,7 @@ async fn repeated_ends_share_a_retired_failure_without_replaying_or_poisoning_fr
 #[tokio::test]
 async fn finishing_a_parent_does_not_finish_its_child_and_explicit_updates_remain_independent() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(4)
-        .mount(&server)
-        .await;
+    support::logs(204).expect(4).mount(&server).await;
     let client = client(&server).await;
     let parent = span(&client);
     let context = parent.export().unwrap();
@@ -139,7 +121,7 @@ async fn finishing_a_parent_does_not_finish_its_child_and_explicit_updates_remai
         .unwrap()
         .iter()
         .filter(|r| r.url.path() == "/logs3")
-        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .map(support::body)
         .collect();
     assert_eq!(bodies[1]["rows"][0]["input"], "child still active");
     assert!(bodies[1]["rows"][0]["metrics"].get("end").is_none());
@@ -184,12 +166,7 @@ async fn named_experiment_span_keeps_its_initial_name_in_the_final_snapshot() {
     Mock::given(method("POST")).and(path("/api/experiment/register"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"project","name":"p"},"experiment":{"id":"experiment","name":"e"}})))
         .expect(1).mount(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
+    support::logs(204).expect(1).mount(&server).await;
     let client = client(&server).await;
     let experiment = client
         .experiment_builder_with_credentials("token", "org")
@@ -207,6 +184,6 @@ async fn named_experiment_span_keeps_its_initial_name_in_the_final_snapshot() {
         .unwrap();
     let requests = server.received_requests().await.unwrap();
     let request = requests.iter().find(|r| r.url.path() == "/logs3").unwrap();
-    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    let body: Value = support::body(request);
     assert_eq!(body["rows"][0]["span_attributes"]["name"], "original");
 }

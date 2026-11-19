@@ -1,3 +1,5 @@
+mod support;
+
 use braintrust_sdk_rust::{BraintrustClient, DatasetInsert, SpanLog};
 use serde_json::json;
 use wiremock::{
@@ -33,13 +35,7 @@ async fn explicit_handles_keep_their_routes_after_shared_login_state_is_populate
         .expect(1)
         .mount(&configured)
         .await;
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(configured.uri())
-        .app_url(configured.uri())
-        .build()
-        .await
-        .unwrap();
+    let client = support::client(&configured).await;
     let builder = client
         .span_builder_with_credentials("explicit", "org")
         .project_name("p");
@@ -78,12 +74,7 @@ async fn logged_in_resources_capture_the_org_route_while_explicit_resources_keep
         .mount(&control)
         .await;
     for server in [&configured, &org_data] {
-        Mock::given(method("POST"))
-            .and(path("/logs3"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(server)
-            .await;
+        support::logs(204).expect(1).mount(server).await;
         Mock::given(method("POST"))
             .and(path("/btql"))
             .respond_with(
@@ -168,13 +159,7 @@ async fn organization_headers_partition_registration_capabilities_and_uploads() 
             .mount(&server)
             .await;
     }
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .build()
-        .await
-        .unwrap();
+    let client = support::client(&server).await;
     let builder = client
         .span_builder_with_credentials("shared-token", "shared-org")
         .project_name("same-name");
@@ -192,7 +177,7 @@ async fn organization_headers_partition_registration_capabilities_and_uploads() 
         .iter()
         .filter(|r| r.url.path() == "/logs3")
     {
-        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let body: serde_json::Value = support::body(request);
         let rows = body["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         let org = rows[0]["project_id"].as_str().unwrap();
@@ -272,7 +257,7 @@ async fn mixed_trace_scopes_keep_separate_routes_and_project_cache_entries() {
             .iter()
             .filter(|r| r.url.path() == "/logs3")
         {
-            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let body: serde_json::Value = support::body(request);
             assert_eq!(body["rows"].as_array().unwrap().len(), 1);
             assert_eq!(body["rows"][0]["project_id"], "shared-project");
             assert!(header("x-bt-org-name", "tenant").matches(request));
@@ -317,13 +302,7 @@ async fn experiment_clones_and_child_spans_preserve_the_explicit_scope() {
         .expect(1)
         .mount(&server)
         .await;
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .build()
-        .await
-        .unwrap();
+    let client = support::client(&server).await;
     let experiment = client
         .experiment_builder_with_credentials("explicit", "org")
         .org_name("tenant")
@@ -370,13 +349,7 @@ async fn project_registration_cannot_reuse_another_tokens_authorization() {
         .expect(1)
         .mount(&server)
         .await;
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .api_url(server.uri())
-        .app_url(server.uri())
-        .build()
-        .await
-        .unwrap();
+    let client = support::client(&server).await;
     let allowed = client
         .span_builder_with_credentials("allowed", "org")
         .project_name("p")
@@ -403,13 +376,7 @@ async fn project_registration_cannot_reuse_another_tokens_authorization() {
 #[tokio::test]
 async fn resource_builders_defer_credential_validation_until_use() {
     let server = MockServer::start().await;
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .build()
-        .await
-        .unwrap();
+    let client = support::client(&server).await;
     for token in ["", "invalid\nheader"] {
         let dataset = client
             .dataset_builder_with_credentials(token, "tenant")

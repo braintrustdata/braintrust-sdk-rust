@@ -1,52 +1,20 @@
+mod support;
+
 use braintrust_sdk_rust::{
-    BraintrustClient, BraintrustError, EnqueueError, ExecutionError, Experiment, ShutdownError,
-    SpanLog, WriteError,
+    BraintrustClient, BraintrustError, EnqueueError, ExecutionError, ShutdownError, SpanLog,
+    WriteError,
 };
 use serde_json::json;
 use std::{future::IntoFuture, sync::Arc, time::Duration};
-use tokio::sync::{oneshot, Notify};
-use wiremock::{
-    matchers::{method, path},
-    Mock, MockServer, ResponseTemplate,
-};
+use support::bound_client as client;
+use support::experiment;
+use tokio::sync::oneshot;
+use wiremock::MockServer;
 
-fn experiment(client: &BraintrustClient) -> Experiment {
-    client
-        .experiment_builder_with_credentials("token", "org")
-        .project_name("project")
-        .build()
-}
 async fn endpoints(server: &MockServer) {
-    Mock::given(method("POST"))
-        .and(path("/api/experiment/register"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "project":{"id":"project","name":"project"},
-            "experiment":{"id":"experiment","name":"experiment"}
-        })))
-        .expect(1)
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(server)
-        .await;
-}
-async fn client(server: &MockServer, capacity: usize) -> BraintrustClient {
-    BraintrustClient::builder()
-        .runtime(braintrust_sdk_rust::current_runtime())
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .with_queue_max_size(capacity)
-        .build()
-        .await
-        .unwrap()
+    support::register_experiment().expect(1).mount(server).await;
+    support::version().mount(server).await;
+    support::logs(204).mount(server).await;
 }
 
 #[tokio::test]
@@ -78,16 +46,7 @@ async fn shutdown_before_first_poll_includes_callback_writes_and_revokes_escaped
         Err(WriteError::Admission(EnqueueError::Closed))
     ));
     let requests = server.received_requests().await.unwrap();
-    let rows: Vec<serde_json::Value> = requests
-        .iter()
-        .filter(|r| r.url.path() == "/logs3")
-        .flat_map(|r| {
-            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .clone()
-        })
-        .collect();
+    let rows: Vec<serde_json::Value> = support::log_rows(&requests);
     let child_row = rows
         .iter()
         .find(|r| r["span_attributes"]["name"] == "child")
@@ -110,15 +69,9 @@ async fn owned_runtime_runs_dropped_callback_observers_from_a_plain_thread() {
     let uri = server.uri();
     let (done, observed) = oneshot::channel();
     let shutdown = std::thread::spawn(move || {
-        let client = futures::executor::block_on(
-            BraintrustClient::builder()
-                .skip_login(true)
-                .app_url(&uri)
-                .api_url(&uri)
-                .build()
-                .into_future(),
-        )
-        .unwrap();
+        let client =
+            futures::executor::block_on(support::client_builder(&uri).build().into_future())
+                .unwrap();
         let experiment = experiment(&client);
         drop(experiment.traced(move |span| async move {
             span.log(SpanLog::builder().input(json!("owned")).build())
@@ -167,24 +120,50 @@ async fn timeout_cancels_callback_and_revokes_its_escaped_write_permission() {
 }
 
 #[tokio::test]
-async fn lease_overload_rejects_before_callback_and_releases_capacity_after_completion() {
+async fn response_overload_rejects_before_callback_and_releases_capacity_after_completion() {
     let server = MockServer::start().await;
     endpoints(&server).await;
-    let client = client(&server, 1).await;
+    let client = client(&server, 2048).await;
     let experiment = experiment(&client);
-    let gate = Arc::new(Notify::new());
-    let waiting = gate.clone();
-    let first = experiment.traced(move |_| async move {
-        waiting.notified().await;
-    });
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut accepted = Vec::new();
+    for _ in 0..1024 {
+        let waiting = gate.clone();
+        let response = experiment.traced(move |_| async move {
+            waiting.acquire().await.unwrap().forget();
+        });
+        assert!(response.submission().is_ok());
+        accepted.push(response);
+    }
     let rejected = experiment.traced(|_| async { panic!("rejected callback ran") });
     assert!(matches!(
         rejected.await,
         Err(BraintrustError::Admission(EnqueueError::Full))
     ));
-    gate.notify_one();
-    first.await.unwrap();
+    gate.add_permits(1024);
+    for response in accepted {
+        response.await.unwrap();
+    }
     assert_eq!(experiment.traced(|_| async { 42 }).await.unwrap(), 42);
+    client.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test]
+async fn response_admission_is_independent_of_write_capacity() {
+    let server = MockServer::start().await;
+    endpoints(&server).await;
+    let client = client(&server, 1).await;
+    let experiment = experiment(&client);
+    let (release_first, first_gate) = oneshot::channel();
+    let (release_second, second_gate) = oneshot::channel();
+    let first = experiment.traced(|_| async { first_gate.await.unwrap() });
+    let second = experiment.traced(|_| async { second_gate.await.unwrap() });
+    assert!(first.submission().is_ok());
+    assert!(second.submission().is_ok());
+    release_first.send(()).unwrap();
+    first.await.unwrap();
+    release_second.send(()).unwrap();
+    second.await.unwrap();
     client.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 

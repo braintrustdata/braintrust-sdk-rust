@@ -6,7 +6,7 @@ use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry}
 use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use crate::error::Result;
-use crate::internal::delivery::{WriteLease, WriteService};
+use crate::internal::delivery::{WriteCapability, WriteService};
 use crate::internal::execution::ExecutionBinding;
 use crate::internal::ports::{PreparedSpan, SpanOperation, SpanSubmitter};
 use crate::internal::session::CredentialScope;
@@ -646,7 +646,7 @@ impl RejectionReporter {
 pub struct LogQueue {
     rejections: Arc<RejectionReporter>,
     writes: WriteService<SubmitCommand>,
-    lease: Option<WriteLease<SubmitCommand>>,
+    capability: Option<WriteCapability<SubmitCommand>>,
 }
 impl LogQueue {
     pub fn new(
@@ -669,7 +669,7 @@ impl LogQueue {
         Self {
             rejections,
             writes,
-            lease: None,
+            capability: None,
         }
     }
 
@@ -695,10 +695,12 @@ impl LogQueue {
         command: SubmitCommand,
         outcome: Option<WriteOutcome>,
     ) -> Completion<DeliveryReceipt, WriteError> {
-        self.writes
-            .enqueue_with_lease(command, outcome, self.lease.as_ref(), |command, error| {
-                self.reject(command, error)
-            })
+        self.writes.enqueue_with_capability(
+            command,
+            outcome,
+            self.capability.as_ref(),
+            |command, error| self.reject(command, error),
+        )
     }
     fn reject(&self, command: SubmitCommand, error: crate::EnqueueError) {
         self.rejections
@@ -716,8 +718,18 @@ impl LogQueue {
         self.writes.cancel(error);
     }
     pub fn flush(&self) -> Completion<FlushReport, FlushError> {
-        self.writes.flush_with_lease(self.lease.as_ref())
+        self.writes.flush_with_capability(self.capability.as_ref())
     }
+    pub fn begin_shutdown(&self) -> Completion<FlushReport, FlushError> {
+        self.writes.begin_shutdown()
+    }
+    pub async fn finish_shutdown(
+        &self,
+        barrier: Completion<FlushReport, FlushError>,
+    ) -> std::result::Result<ShutdownReport, ShutdownError> {
+        self.writes.finish_shutdown(barrier).await
+    }
+    #[cfg(test)]
     pub fn shutdown(
         &self,
         timeout: std::time::Duration,
@@ -735,10 +747,12 @@ impl SpanSubmitter for LogQueue {
     }
 
     fn operation(&self) -> std::result::Result<SpanOperation, crate::EnqueueError> {
-        let lease = self.writes.lease()?;
+        let capability = self.writes.capability();
         let mut scoped = self.clone();
-        scoped.lease = Some(lease.clone());
-        Ok(SpanOperation::new(Arc::new(scoped), move || lease.revoke()))
+        scoped.capability = Some(capability.clone());
+        Ok(SpanOperation::new(Arc::new(scoped), move || {
+            capability.revoke()
+        }))
     }
 
     fn submit_deferred(

@@ -1,8 +1,9 @@
 //! Login-dependent client operations are accepted before their tokens are polled.
+mod support;
+
 use braintrust_sdk_rust::{
     BraintrustClient, BraintrustError, EnqueueError, ExecutionError, ShutdownError,
 };
-use serde_json::json;
 use std::{future::IntoFuture, time::Duration};
 use wiremock::{
     matchers::{method, path},
@@ -50,23 +51,14 @@ fn skipped_login_rejects_issuance_without_polling_or_a_call_site_runtime() {
 #[tokio::test]
 async fn synchronous_issuance_and_cross_executor_observation_share_login_and_shutdown() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/apikey/login"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "org_info":[{"id":"org","name":"tenant"}]
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
+    support::login().expect(1).mount(&server).await;
     let uri = server.uri();
     let (wait, span, dataset, shutdown) = std::thread::spawn(move || {
         assert!(braintrust_sdk_rust::current_runtime().is_none());
         let client = futures::executor::block_on(
-            BraintrustClient::builder()
+            support::endpoints(&uri)
                 .api_key("token")
                 .blocking_login(false)
-                .app_url(&uri)
-                .api_url(&uri)
                 .build()
                 .into_future(),
         )
@@ -107,11 +99,9 @@ async fn shutdown_deadline_resolves_unobserved_login_waits_and_resource_builder_
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
         .mount(&server)
         .await;
-    let client = BraintrustClient::builder()
+    let client = support::endpoints(server.uri())
         .api_key("token")
         .blocking_login(false)
-        .app_url(server.uri())
-        .api_url(server.uri())
         .build()
         .await
         .unwrap();
@@ -153,12 +143,10 @@ async fn unobserved_client_requests_share_the_bounded_task_budget() {
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
         .mount(&server)
         .await;
-    let client = BraintrustClient::builder()
+    let client = support::endpoints(server.uri())
         .runtime(braintrust_sdk_rust::current_runtime())
         .api_key("token")
         .blocking_login(false)
-        .app_url(server.uri())
-        .api_url(server.uri())
         .build()
         .await
         .unwrap();
@@ -196,14 +184,7 @@ async fn unobserved_client_requests_share_the_bounded_task_budget() {
 #[tokio::test]
 async fn cached_login_does_not_move_scheduled_work_off_a_stopped_explicit_runtime() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/apikey/login"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "org_info":[{"id":"org","name":"tenant"}]
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
+    support::login().expect(1).mount(&server).await;
     let uri = server.uri();
     let client = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -212,12 +193,10 @@ async fn cached_login_does_not_move_scheduled_work_off_a_stopped_explicit_runtim
             .unwrap();
         runtime
             .block_on(
-                BraintrustClient::builder()
+                support::endpoints(&uri)
                     .runtime(Some(runtime.handle().clone()))
                     .api_key("token")
                     .blocking_login(true)
-                    .app_url(&uri)
-                    .api_url(&uri)
                     .build()
                     .into_future(),
             )

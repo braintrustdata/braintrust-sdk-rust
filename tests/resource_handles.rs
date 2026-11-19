@@ -1,7 +1,9 @@
 //! Consumer coverage for the concrete public resource model.
+mod support;
+
 use braintrust_sdk_rust::{
-    BraintrustClient, Dataset, DatasetBuilder, DatasetInsert, DatasetIterator, Experiment,
-    ExperimentBuilder, ParentSpanInfo, SpanBuilder, SpanHandle, SpanLog,
+    Dataset, DatasetBuilder, DatasetInsert, DatasetIterator, Experiment, ExperimentBuilder,
+    ParentSpanInfo, SpanBuilder, SpanHandle, SpanLog,
 };
 use serde_json::json;
 use wiremock::{
@@ -43,25 +45,14 @@ async fn resources_and_detached_span_builders_work_after_the_client_is_dropped()
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(3)
-        .mount(&server)
-        .await;
+    support::logs(204).expect(3).mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/btql"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"record"}]})))
         .expect(1)
         .mount(&server)
         .await;
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .build()
-        .await
-        .unwrap();
+    let client = support::client(&server).await;
     let span: SpanBuilder = client
         .span_builder_with_credentials("token", "org")
         .parent_info(ParentSpanInfo::ProjectLogs {
@@ -99,25 +90,9 @@ async fn resources_and_detached_span_builders_work_after_the_client_is_dropped()
 #[tokio::test]
 async fn dropping_the_last_resource_and_client_still_drains_an_accepted_write() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let client = BraintrustClient::builder()
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .build()
-        .await
-        .unwrap();
-    let span: SpanHandle = client
-        .span_builder_with_credentials("token", "org")
-        .parent_info(ParentSpanInfo::ProjectLogs {
-            object_id: "project".into(),
-        })
-        .build();
+    support::logs(204).expect(1).mount(&server).await;
+    let client = support::client(&server).await;
+    let span: SpanHandle = support::span(&client);
     let write = span.log(SpanLog::default());
     assert!(write.is_ok());
     drop(span);

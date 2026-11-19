@@ -1,9 +1,13 @@
+mod support;
+
 use braintrust_sdk_rust::{
-    BraintrustClient, BraintrustError, EnqueueError, ExecutionError, FlushError, ParentSpanInfo,
-    ShutdownError, SpanComponents, SpanLog, SpanObjectType, WriteError,
+    BraintrustClient, BraintrustError, EnqueueError, ExecutionError, FlushError, ShutdownError,
+    SpanComponents, SpanLog, SpanObjectType, WriteError,
 };
 use serde_json::{json, Value};
 use std::{future::IntoFuture, time::Duration};
+use support::bound_client as client;
+use support::ingestion;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::{
     matchers::{header, method, path},
@@ -23,30 +27,6 @@ fn exported(id: &str) -> String {
     }
     .to_str()
 }
-async fn ingestion(server: &MockServer) {
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(server)
-        .await;
-}
-async fn client(server: &MockServer, capacity: usize) -> BraintrustClient {
-    BraintrustClient::builder()
-        .runtime(braintrust_sdk_rust::current_runtime())
-        .skip_login(true)
-        .app_url(server.uri())
-        .api_url(server.uri())
-        .with_queue_max_size(capacity)
-        .build()
-        .await
-        .unwrap()
-}
-
 // Keep login unresolved until the test has issued update, flush and shutdown.
 // This async HTTP gate avoids relying on response latency or blocking a runtime.
 async fn gated_login(
@@ -84,15 +64,9 @@ async fn plain_thread_explicit_updates_progress_unobserved_and_own_exported_cont
     ingestion(&server).await;
     let uri = server.uri();
     let (flush, shutdown) = std::thread::spawn(move || {
-        let client = futures::executor::block_on(
-            BraintrustClient::builder()
-                .skip_login(true)
-                .app_url(&uri)
-                .api_url(&uri)
-                .build()
-                .into_future(),
-        )
-        .unwrap();
+        let client =
+            futures::executor::block_on(support::client_builder(&uri).build().into_future())
+                .unwrap();
         let update = client.update_span_with_credentials(
             "explicit",
             "org",
@@ -114,7 +88,7 @@ async fn plain_thread_explicit_updates_progress_unobserved_and_own_exported_cont
     let requests = server.received_requests().await.unwrap();
     let request = requests.iter().find(|r| r.url.path() == "/logs3").unwrap();
     assert!(header("authorization", "Bearer explicit").matches(request));
-    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    let body: Value = support::body(request);
     let row = &body["rows"][0];
     assert_eq!(row["id"], "row");
     assert_eq!(row["span_id"], "span-row");
@@ -168,14 +142,7 @@ async fn pending_login_update_captures_shutdown_and_uses_the_selected_org_route(
     login.await.unwrap();
     assert!(configured.received_requests().await.unwrap().is_empty());
     let requests = selected.received_requests().await.unwrap();
-    let body: Value = serde_json::from_slice(
-        &requests
-            .iter()
-            .find(|r| r.url.path() == "/logs3")
-            .unwrap()
-            .body,
-    )
-    .unwrap();
+    let body: Value = support::body(support::log_requests(&requests).next().unwrap());
     assert_eq!(body["rows"][0]["org_id"], "selected-org");
     assert_eq!(body["rows"][0]["org_name"], "tenant");
     assert!(matches!(
@@ -188,9 +155,7 @@ async fn pending_login_update_captures_shutdown_and_uses_the_selected_org_route(
 async fn delivery_failure_resolves_update_and_covering_flush_then_fresh_work_succeeds() {
     let server = MockServer::start().await;
     ingestion(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .respond_with(ResponseTemplate::new(400))
+    support::logs(400)
         .with_priority(1)
         .up_to_n_times(1)
         .expect(1)
@@ -203,13 +168,7 @@ async fn delivery_failure_resolves_update_and_covering_flush_then_fresh_work_suc
         &exported("failed"),
         SpanLog::default(),
     );
-    let neighbor = client
-        .span_builder_with_credentials("token", "org")
-        .parent_info(ParentSpanInfo::ProjectLogs {
-            object_id: "project".into(),
-        })
-        .build()
-        .end();
+    let neighbor = support::span(&client).end();
     let flush = client.flush();
     assert!(update.is_ok());
     assert!(matches!(
@@ -276,14 +235,7 @@ async fn validation_and_queue_overload_report_issuance_failure_without_network_w
         Err(BraintrustError::Admission(EnqueueError::Closed))
     ));
     let requests = server.received_requests().await.unwrap();
-    let body: Value = serde_json::from_slice(
-        &requests
-            .iter()
-            .find(|r| r.url.path() == "/logs3")
-            .unwrap()
-            .body,
-    )
-    .unwrap();
+    let body: Value = support::body(support::log_requests(&requests).next().unwrap());
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
     assert_eq!(body["rows"][0]["id"], "accepted");
 }
@@ -327,12 +279,7 @@ async fn full_response_budget_never_admits_an_extra_update() {
         .unwrap()
         .iter()
         .filter(|r| r.url.path() == "/logs3")
-        .map(|r| {
-            serde_json::from_slice::<Value>(&r.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .len()
-        })
+        .map(|r| support::body(r)["rows"].as_array().unwrap().len())
         .sum();
     assert_eq!(rows, 1024);
 }
@@ -345,12 +292,10 @@ async fn shutdown_timeout_fails_updates_still_waiting_for_login_without_ingestio
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
         .mount(&server)
         .await;
-    let client = BraintrustClient::builder()
+    let client = support::endpoints(server.uri())
         .runtime(braintrust_sdk_rust::current_runtime())
         .api_key("session")
         .blocking_login(false)
-        .app_url(server.uri())
-        .api_url(server.uri())
         .build()
         .await
         .unwrap();
@@ -387,12 +332,10 @@ fn stopped_runtime_retires_a_pending_login_update_that_owns_the_client() {
             .unwrap();
         let client = runtime
             .block_on(
-                BraintrustClient::builder()
+                support::endpoints("http://127.0.0.1:9")
                     .runtime(Some(runtime.handle().clone()))
                     .api_key("session")
                     .blocking_login(false)
-                    .app_url("http://127.0.0.1:9")
-                    .api_url("http://127.0.0.1:9")
                     .build()
                     .into_future(),
             )
