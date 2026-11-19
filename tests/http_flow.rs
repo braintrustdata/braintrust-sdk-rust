@@ -38,8 +38,7 @@ async fn submits_with_bearer_token() {
     span.log(
         SpanLog::builder()
             .input(Value::String("input".into()))
-            .build()
-            .expect("build"),
+            .build(),
     );
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");
@@ -89,8 +88,7 @@ async fn preparation_failure_reaches_write_and_covering_flush() {
     let completion = span.log(
         SpanLog::builder()
             .input(Value::String("input".into()))
-            .build()
-            .expect("build"),
+            .build(),
     );
 
     assert!(span.flush().await.is_err());
@@ -131,7 +129,7 @@ async fn automatic_delivery_reports_backend_rejection_through_completion() {
         .span_builder_with_credentials("secret-token", "org")
         .project_name("demo")
         .build();
-    let completion = span.log(SpanLog::builder().input(json!("input")).build().unwrap());
+    let completion = span.log(SpanLog::builder().input(json!("input")).build());
     assert!(
         matches!(completion.await, Err(braintrust_sdk_rust::WriteError::Delivery(error))
         if matches!(error.cause().downcast_ref::<BraintrustError>(), Some(BraintrustError::Api { status: 401, .. })))
@@ -174,7 +172,7 @@ async fn tracked_stateless_update_reports_automatic_delivery_failure() {
             "token",
             "org",
             &exported,
-            SpanLog::builder().input(json!("input")).build().unwrap(),
+            SpanLog::builder().input(json!("input")).build(),
         )
         .unwrap();
     assert!(matches!(completion.await, Err(WriteError::Delivery(_))));
@@ -208,7 +206,7 @@ async fn submission_and_flush_can_be_issued_without_a_call_site_runtime() {
         .project_name("demo")
         .build();
     let (write, flush) = std::thread::spawn(move || {
-        let write = span.log(SpanLog::builder().input(json!("input")).build().unwrap());
+        let write = span.log(SpanLog::builder().input(json!("input")).build());
         let flush = client.flush();
         assert!(write.is_ok());
         assert!(flush.is_ok());

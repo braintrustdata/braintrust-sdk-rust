@@ -230,12 +230,7 @@ async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_cr
         .unwrap()
         .project_name("project")
         .build();
-    span.log(
-        SpanLog::builder()
-            .input(json!("x".repeat(8000)))
-            .build()
-            .unwrap(),
-    );
+    span.log(SpanLog::builder().input(json!("x".repeat(8000))).build());
     span.flush().await.unwrap();
     let requests = api.received_requests().await.unwrap();
     let overflow = requests

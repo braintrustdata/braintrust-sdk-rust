@@ -51,7 +51,7 @@ async fn explicit_handles_keep_their_routes_after_shared_login_state_is_populate
         session.uri()
     ));
     let span = builder.build();
-    let write = span.log(SpanLog::builder().input(json!("explicit")).build().unwrap());
+    let write = span.log(SpanLog::builder().input(json!("explicit")).build());
     client.flush().await.unwrap();
     write.await.unwrap();
     assert!(session.received_requests().await.unwrap().is_empty());
@@ -398,4 +398,37 @@ async fn project_registration_cannot_reuse_another_tokens_authorization() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn resource_builders_defer_credential_validation_until_use() {
+    let server = MockServer::start().await;
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .build()
+        .await
+        .unwrap();
+    for token in ["", "invalid\nheader"] {
+        let dataset = client
+            .dataset_builder_with_credentials(token, "tenant")
+            .project_name("project")
+            .dataset_name("dataset")
+            .build();
+        let experiment = client
+            .experiment_builder_with_credentials(token, "org")
+            .project_name("project")
+            .build();
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(matches!(
+            dataset.dataset_id().await,
+            Err(braintrust_sdk_rust::BraintrustError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            experiment.project().await,
+            Err(braintrust_sdk_rust::BraintrustError::InvalidConfig(_))
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 }

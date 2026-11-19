@@ -12,7 +12,6 @@ use crate::error::{BraintrustError, Result};
 use crate::experiments::{Experiment, ExperimentBuilder};
 use crate::http::{build_http_client, CaBundleConfig};
 use crate::internal::ports::SpanSubmitter;
-use crate::internal::resources::ResourceTransport;
 use crate::internal::session::CredentialScope;
 use crate::log_queue::{DroppedRows, LogQueue, LogQueueConfig, TokenProvider};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment};
@@ -483,10 +482,6 @@ impl std::fmt::Debug for ClientInner {
 }
 
 impl BraintrustClient {
-    fn resource_transport(&self) -> ResourceTransport {
-        ResourceTransport::new(self.inner.http_client.clone())
-    }
-
     fn span_submitter(&self) -> Arc<dyn SpanSubmitter> {
         Arc::new(self.inner.queue.clone())
     }
@@ -595,11 +590,7 @@ impl BraintrustClient {
             return Err(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
         }
         let state = self.wait_for_login_state().await?;
-        Ok(Dataset::new(
-            self.resource_transport(),
-            Arc::new(self.inner.queue.clone()),
-            state.scope()?,
-        ))
+        Ok(Dataset::new(self.inner.http_client.clone(), state.scope()?))
     }
 
     /// Create a dataset builder with immutable explicit credentials, without
@@ -610,8 +601,7 @@ impl BraintrustClient {
         org_name: impl Into<String>,
     ) -> DatasetBuilder {
         Dataset::new(
-            self.resource_transport(),
-            Arc::new(self.inner.queue.clone()),
+            self.inner.http_client.clone(),
             self.explicit_scope(token.into(), String::new(), Some(org_name.into())),
         )
     }
@@ -819,7 +809,7 @@ impl BraintrustClient {
         let client = match result {
             Ok(client) => client,
             Err(crate::api::ClientInitError::Login(error)) => {
-                return crate::http::api_result::<()>(Err(*error)).await;
+                return crate::http::api_result::<()>(Err(*error));
             }
             Err(error) => return Err(BraintrustError::InvalidConfig(error.to_string())),
         };
@@ -924,7 +914,7 @@ impl BraintrustClient {
 
         let submitter = self.span_submitter();
         Experiment::builder(
-            self.resource_transport(),
+            self.inner.http_client.clone(),
             submitter,
             self.explicit_scope(token, org_id, None),
         )
@@ -1412,8 +1402,7 @@ mod tests {
             span.log(
                 SpanLog::builder()
                     .input(Value::String("hello".into()))
-                    .build()
-                    .expect("build"),
+                    .build(),
             );
             span.flush().await.expect("flush");
             client.flush().await.expect("client flush");
@@ -1472,8 +1461,7 @@ mod tests {
         span.log(
             SpanLog::builder()
                 .input(Value::String("input".into()))
-                .build()
-                .expect("build"),
+                .build(),
         );
         span.flush().await.expect("flush");
         client.flush().await.expect("client flush");

@@ -129,10 +129,7 @@ impl UploadCoordinator {
         fallback: usize,
         override_bytes: Option<usize>,
     ) -> Capabilities {
-        let server_limit = match api_result(self.logs.version().await)
-            .await
-            .map(|v| v.into_inner())
-        {
+        let server_limit = match api_result(self.logs.version().await).map(|v| v.into_inner()) {
             Ok(version) => version.logs3_payload_max_bytes.filter(|limit| *limit > 0),
             Err(error) => {
                 warn!(%error, "failed to fetch ingestion capabilities");
@@ -233,7 +230,6 @@ impl UploadCoordinator {
                         .logs3_overflow_with_org_name(&request, self.logs.organization_name())
                         .await,
                 )
-                .await
                 .map(|v| v.into_inner())
             })
             .await?;
@@ -244,7 +240,6 @@ impl UploadCoordinator {
                         .upload_logs3_overflow(&grant, batch.data.clone())
                         .await,
                 )
-                .await
                 .map(|_| ())
             })
             .await?;

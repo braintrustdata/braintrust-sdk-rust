@@ -40,7 +40,6 @@ async fn main() -> anyhow::Result<()> {
             .input(json!({"prompt": "Hello, world!"}))
             .output(json!({"response": "Hi there!"}))
             .build()
-            .expect("Failed to build SpanLog")
     ).await;
 
     // Flush the span data to Braintrust

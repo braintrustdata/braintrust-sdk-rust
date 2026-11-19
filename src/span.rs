@@ -18,130 +18,59 @@ use crate::types::{
     ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
 };
 
-/// Error type for SpanLog builder validation.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum SpanLogBuilderError {
-    /// A score value was outside the valid range (0.0 to 1.0).
-    ScoreOutOfRange { key: String, value: f64 },
-    /// A tag was empty or invalid.
-    InvalidTag { index: usize, reason: String },
-    /// A metric key was empty.
-    EmptyMetricKey,
-    /// A score key was empty.
-    EmptyScoreKey,
-}
-
-impl fmt::Display for SpanLogBuilderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ScoreOutOfRange { key, value } => {
-                write!(
-                    f,
-                    "score '{}' has value {} which is outside the valid range [0.0, 1.0]",
-                    key, value
-                )
-            }
-            Self::InvalidTag { index, reason } => {
-                write!(f, "tag at index {} is invalid: {}", index, reason)
-            }
-            Self::EmptyMetricKey => write!(f, "metric key cannot be empty"),
-            Self::EmptyScoreKey => write!(f, "score key cannot be empty"),
-        }
-    }
-}
-
-impl std::error::Error for SpanLogBuilderError {}
-
 /// Event data to log to a span. All fields are optional.
 /// Multiple calls to `log()` will merge data.
 ///
 /// Use `SpanLog::builder()` to construct instances.
-#[derive(Clone, Default)]
+#[derive(bon::Builder, Clone, Default)]
+#[builder(derive(Clone))]
 #[non_exhaustive]
 pub struct SpanLog {
-    pub(crate) name: Option<String>,
-    pub(crate) input: Option<Value>,
-    pub(crate) output: Option<Value>,
-    /// Expected output for comparison (used in evaluations).
-    pub(crate) expected: Option<Value>,
-    /// Error that occurred during execution.
-    pub(crate) error: Option<Value>,
     /// Score values (0-1 range recommended) for evaluation.
+    #[builder(field)]
     pub(crate) scores: Option<HashMap<String, f64>>,
+    #[builder(field)]
     pub(crate) metadata: Option<Map<String, Value>>,
+    #[builder(field)]
     pub(crate) metrics: Option<HashMap<String, f64>>,
     /// Tags for categorization.
+    #[builder(field)]
     pub(crate) tags: Option<Vec<String>>,
+    /// Arbitrary passthrough key/values for `span_attributes` (the `extra` map).
+    #[builder(field)]
+    pub(crate) span_attributes_extra: Option<HashMap<String, Value>>,
+    #[builder(into)]
+    pub(crate) name: Option<String>,
+    #[builder(into)]
+    pub(crate) input: Option<Value>,
+    #[builder(into)]
+    pub(crate) output: Option<Value>,
+    /// Expected output for comparison (used in evaluations).
+    #[builder(into)]
+    pub(crate) expected: Option<Value>,
+    /// Error that occurred during execution.
+    #[builder(into)]
+    pub(crate) error: Option<Value>,
     /// Arbitrary context data.
+    #[builder(into)]
     pub(crate) context: Option<Value>,
     /// Override for the auto-injected `context.span_origin`.
     pub(crate) span_origin: Option<SpanOrigin>,
     /// Disable automatically generated origin fields, including configured overrides.
+    #[builder(default, with = || true)]
     pub(crate) skip_span_origin: bool,
-    /// Arbitrary passthrough key/values for `span_attributes` (the `extra` map).
-    pub(crate) span_attributes_extra: Option<HashMap<String, Value>>,
 }
 
-impl SpanLog {
-    /// Create a new SpanLog builder.
-    pub fn builder() -> SpanLogBuilder {
-        SpanLogBuilder::new()
-    }
-}
-
-/// Builder for SpanLog.
-#[derive(Clone, Default)]
-pub struct SpanLogBuilder {
-    inner: SpanLog,
-}
-
-impl SpanLogBuilder {
-    /// Create a new SpanLogBuilder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the span name.
-    pub fn name(mut self, name: impl Into<String>) -> Self {
-        self.inner.name = Some(name.into());
-        self
-    }
-
-    /// Set the input data.
-    pub fn input(mut self, input: impl Into<Value>) -> Self {
-        self.inner.input = Some(input.into());
-        self
-    }
-
-    /// Set the output data.
-    pub fn output(mut self, output: impl Into<Value>) -> Self {
-        self.inner.output = Some(output.into());
-        self
-    }
-
-    /// Set the expected output for comparison (used in evaluations).
-    pub fn expected(mut self, expected: impl Into<Value>) -> Self {
-        self.inner.expected = Some(expected.into());
-        self
-    }
-
-    /// Set the error that occurred during execution.
-    pub fn error(mut self, error: impl Into<Value>) -> Self {
-        self.inner.error = Some(error.into());
-        self
-    }
-
+impl<S: span_log_builder::State> SpanLogBuilder<S> {
     /// Set multiple scores at once.
     pub fn scores(mut self, scores: HashMap<String, f64>) -> Self {
-        self.inner.scores = Some(scores);
+        self.scores = Some(scores);
         self
     }
 
     /// Add a single score (0-1 range recommended).
     pub fn score(mut self, key: impl Into<String>, value: f64) -> Self {
-        self.inner
-            .scores
+        self.scores
             .get_or_insert_with(HashMap::new)
             .insert(key.into(), value);
         self
@@ -149,14 +78,13 @@ impl SpanLogBuilder {
 
     /// Set the metadata map.
     pub fn metadata(mut self, metadata: Map<String, Value>) -> Self {
-        self.inner.metadata = Some(metadata);
+        self.metadata = Some(metadata);
         self
     }
 
     /// Add a single metadata entry.
     pub fn metadata_entry(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
-        self.inner
-            .metadata
+        self.metadata
             .get_or_insert_with(Map::new)
             .insert(key.into(), value.into());
         self
@@ -164,14 +92,13 @@ impl SpanLogBuilder {
 
     /// Set the metrics map.
     pub fn metrics(mut self, metrics: HashMap<String, f64>) -> Self {
-        self.inner.metrics = Some(metrics);
+        self.metrics = Some(metrics);
         self
     }
 
     /// Add a single metric.
     pub fn metric(mut self, key: impl Into<String>, value: f64) -> Self {
-        self.inner
-            .metrics
+        self.metrics
             .get_or_insert_with(HashMap::new)
             .insert(key.into(), value);
         self
@@ -179,74 +106,29 @@ impl SpanLogBuilder {
 
     /// Set multiple tags at once.
     pub fn tags(mut self, tags: Vec<String>) -> Self {
-        self.inner.tags = Some(tags);
+        self.tags = Some(tags);
         self
     }
 
     /// Add a single tag for categorization.
     pub fn tag(mut self, tag: impl Into<String>) -> Self {
-        self.inner
-            .tags
-            .get_or_insert_with(Vec::new)
-            .push(tag.into());
-        self
-    }
-
-    /// Set arbitrary context data.
-    pub fn context(mut self, context: impl Into<Value>) -> Self {
-        self.inner.context = Some(context.into());
-        self
-    }
-
-    /// Override the auto-injected `context.span_origin` (name/version/instrumentation/environment).
-    ///
-    /// When set, the provided fields replace the SDK defaults. Fields left as
-    /// `None` on the [`SpanOrigin`] keep their default value.
-    pub fn span_origin(mut self, origin: SpanOrigin) -> Self {
-        self.inner.span_origin = Some(origin);
-        self
-    }
-
-    /// Omit automatically generated `context.span_origin` fields.
-    ///
-    /// This disables SDK name, version, instrumentation, and environment fields,
-    /// including client, span-builder, and event-level origin overrides. Explicit
-    /// context (including any `span_origin`) is preserved without adding defaults.
-    /// If no context is supplied or propagated, the context field is omitted.
-    ///
-    /// When logged to a [`SpanHandle`], this option remains enabled for subsequent
-    /// logs and `end()`. It does not remove origin fields already uploaded.
-    pub fn skip_span_origin(mut self) -> Self {
-        self.inner.skip_span_origin = true;
+        self.tags.get_or_insert_with(Vec::new).push(tag.into());
         self
     }
 
     /// Set the full `span_attributes` passthrough map (the `extra` fields alongside
     /// name/type/purpose). Replaces any extras set by prior calls.
     pub fn span_attributes(mut self, extra: HashMap<String, Value>) -> Self {
-        self.inner.span_attributes_extra = Some(extra);
+        self.span_attributes_extra = Some(extra);
         self
     }
 
     /// Add a single arbitrary passthrough key/value to `span_attributes`.
     pub fn span_attribute(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
-        self.inner
-            .span_attributes_extra
+        self.span_attributes_extra
             .get_or_insert_with(HashMap::new)
             .insert(key.into(), value.into());
         self
-    }
-
-    /// Build the SpanLog.
-    ///
-    /// Currently this always succeeds, but returns a `Result` to allow
-    /// for future validation (e.g., score range checking) without breaking changes.
-    pub fn build(self) -> std::result::Result<SpanLog, SpanLogBuilderError> {
-        // Future validation can be added here, e.g.:
-        // - Validate scores are in 0-1 range
-        // - Validate tags are non-empty
-        // - Validate metric/score keys are non-empty
-        Ok(self.inner)
     }
 }
 
@@ -1066,6 +948,15 @@ mod tests {
         }
         #[async_trait]
         impl SpanSubmitter for Submitter {
+            fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+                let (sender, completion) = crate::Completion::pair();
+                let _ = sender.send(Ok(crate::FlushReport::default()));
+                completion
+            }
+            async fn trigger_flush(&self) -> Result<()> {
+                Ok(())
+            }
+
             fn submit(
                 &self,
                 _: CredentialScope,
@@ -1080,17 +971,6 @@ mod tests {
                     let _ = sender.send(Ok(crate::DeliveryReceipt::new()));
                 }
                 completion
-            }
-        }
-        #[async_trait]
-        impl crate::internal::ports::DeliveryControl for Submitter {
-            fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
-                let (sender, completion) = crate::Completion::pair();
-                let _ = sender.send(Ok(crate::FlushReport::default()));
-                completion
-            }
-            async fn trigger_flush(&self) -> Result<()> {
-                Ok(())
             }
         }
         let submitter = Arc::new(Submitter {
@@ -1124,8 +1004,7 @@ mod tests {
             SpanLog::builder()
                 .input(json!({"input": "hello"}))
                 .output(json!({"output": "world"}))
-                .build()
-                .expect("build"),
+                .build(),
         );
         span.flush().await.expect("flush");
 
@@ -1149,8 +1028,7 @@ mod tests {
                     reasoning_tokens: None,
                     ..Default::default()
                 }))
-                .build()
-                .expect("build"),
+                .build(),
         );
         span.flush().await.expect("flush");
 
@@ -1172,12 +1050,7 @@ mod tests {
                 object_id: "proj-id".into(),
             })
             .build();
-        span.log(
-            SpanLog::builder()
-                .input(json!("data"))
-                .build()
-                .expect("build"),
-        );
+        span.log(SpanLog::builder().input(json!("data")).build());
         span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
@@ -1208,8 +1081,7 @@ mod tests {
                 )
                 .tags(vec!["geography".to_string(), "qa".to_string()])
                 .context(json!({"source": "test"}))
-                .build()
-                .expect("build"),
+                .build(),
         );
         span.flush().await.expect("flush");
 
@@ -1268,8 +1140,7 @@ mod tests {
         span.log(
             SpanLog::builder()
                 .error(json!({"message": "Something went wrong", "code": 500}))
-                .build()
-                .expect("build"),
+                .build(),
         );
         span.flush().await.expect("flush");
 
@@ -1283,12 +1154,7 @@ mod tests {
     #[tokio::test]
     async fn flush_does_not_set_end_metric() {
         let (span, collector) = build_test_span();
-        span.log(
-            SpanLog::builder()
-                .input(json!({"input": "hello"}))
-                .build()
-                .expect("build"),
-        );
+        span.log(SpanLog::builder().input(json!({"input": "hello"})).build());
         span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
@@ -1345,12 +1211,7 @@ mod tests {
         let span = builder.parent_info(parent_info).build();
 
         // Log to the child span
-        span.log(
-            SpanLog::builder()
-                .input(json!({"child": "input"}))
-                .build()
-                .expect("build"),
-        );
+        span.log(SpanLog::builder().input(json!({"child": "input"})).build());
 
         span.flush().await.expect("flush");
 
@@ -1426,7 +1287,7 @@ mod tests {
         // row_id() accessor reflects the caller-supplied id immediately.
         assert_eq!(span.row_id(), "11111111-2222-3333-4444-555555555555");
 
-        span.log(SpanLog::builder().input(json!("x")).build().expect("build"));
+        span.log(SpanLog::builder().input(json!("x")).build());
         span.flush().await.expect("flush");
 
         let captured = collector.spans().into_iter().next().unwrap();
@@ -1513,8 +1374,7 @@ mod tests {
                         .build(),
                 )
                 .span_attribute("session_id", json!("sess-1"))
-                .build()
-                .expect("build"),
+                .build(),
         );
         span.flush().await.expect("flush");
 
@@ -1549,7 +1409,7 @@ mod tests {
                     .build(),
             )
             .build();
-        span.log(SpanLog::builder().input(json!("x")).build().expect("build"));
+        span.log(SpanLog::builder().input(json!("x")).build());
         span.flush().await.expect("flush");
         let captured = collector.spans().into_iter().next().unwrap();
         let name = captured
@@ -1583,14 +1443,12 @@ mod tests {
         span.log(
             SpanLog::builder()
                 .tags(vec!["b".into(), "a".into(), "a".into()])
-                .build()
-                .unwrap(),
+                .build(),
         );
         span.log(
             SpanLog::builder()
                 .tags(vec!["a".into(), "c".into()])
-                .build()
-                .unwrap(),
+                .build(),
         );
         span.end();
         let captured = collector.spans();
@@ -1598,5 +1456,42 @@ mod tests {
             captured.last().unwrap().payload.tags.as_deref(),
             Some(["a".into(), "b".into(), "c".into()].as_slice())
         );
+    }
+}
+
+#[cfg(test)]
+mod log_builder_tests {
+    use super::*;
+
+    #[test]
+    fn builder_preserves_defaults_and_collection_updates() {
+        let empty = SpanLog::builder().build();
+        assert!(!empty.skip_span_origin);
+        assert!(empty.input.is_none() && empty.tags.is_none() && empty.metrics.is_none());
+        let log = SpanLog::builder()
+            .score("old", 0.0)
+            .scores(HashMap::new())
+            .score("accuracy", 1.0)
+            .metadata(Map::new())
+            .metadata_entry("reviewed", true)
+            .metrics(HashMap::new())
+            .metric("latency", 2.0)
+            .tags(vec!["first".into()])
+            .tag("second")
+            .span_attributes(HashMap::new())
+            .span_attribute("custom", "value")
+            .input(Value::Null)
+            .skip_span_origin()
+            .build();
+        assert!(log.skip_span_origin);
+        assert_eq!(log.input, Some(Value::Null));
+        assert_eq!(
+            log.scores.unwrap(),
+            HashMap::from([("accuracy".into(), 1.0)])
+        );
+        assert_eq!(log.metadata.unwrap()["reviewed"], true);
+        assert_eq!(log.metrics.unwrap()["latency"], 2.0);
+        assert_eq!(log.tags.unwrap(), ["first", "second"]);
+        assert_eq!(log.span_attributes_extra.unwrap()["custom"], "value");
     }
 }
