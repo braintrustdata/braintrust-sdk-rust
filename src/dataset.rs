@@ -81,18 +81,8 @@ impl DatasetFields {
     }
 }
 
-/// A dataset row mutation, independent of tracing/span payloads.
-///
-/// Use [`Self::insert`], [`Self::update`], or [`Self::delete`] to select the
-/// operation. Its private fields keep wire flags and payload layout extensible.
-///
-/// ```compile_fail
-/// use braintrust_sdk_rust::DatasetWrite;
-/// let mut write = DatasetWrite::delete("dataset", "row");
-/// write.id = "other".into();
-/// ```
 #[derive(Debug, Clone, Serialize)]
-pub struct DatasetWrite {
+pub(crate) struct DatasetWrite {
     dataset_id: String,
     id: String,
     #[serde(flatten)]
@@ -138,23 +128,10 @@ impl DatasetWrite {
             is_delete: Some(true),
         }
     }
-    /// Return the dataset receiving this mutation.
-    pub fn dataset_id(&self) -> &str {
-        &self.dataset_id
-    }
-    /// Return the record ID.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-    /// Return the supplied record fields. Deletes have no fields.
-    pub fn fields(&self) -> Option<&DatasetFields> {
-        self.fields.as_ref()
-    }
 }
 
 use crate::error::Result;
-use crate::internal::ports::DeliveryControl;
-use crate::internal::resources::ResourceTransport;
+use crate::http::api_result;
 use crate::internal::session::CredentialScope;
 
 // ============================================================================
@@ -389,9 +366,7 @@ use crate::api::DatasetRegisterRequest;
 #[builder(start_fn(name = new, vis = "pub(crate)"), derive(Clone))]
 pub struct Dataset {
     #[builder(start_fn)]
-    api: ResourceTransport,
-    #[builder(start_fn)]
-    lifecycle: Arc<dyn DeliveryControl>,
+    api: reqwest::Client,
     #[builder(start_fn)]
     scope: CredentialScope,
     /// Project containing the dataset (required).
@@ -429,7 +404,9 @@ impl Dataset {
                 );
                 request.description = self.description.clone();
                 request.metadata = self.metadata.clone();
-                let response = self.api.register_dataset(&self.scope, request).await?;
+                let response =
+                    api_result(self.scope.api(&self.api)?.register_dataset(&request).await)?
+                        .into_inner();
                 Ok(DatasetMetadata {
                     dataset_id: response.dataset.id,
                     project_id: response.project.id,
@@ -457,11 +434,7 @@ impl Dataset {
     pub async fn insert(&self, record: DatasetInsert) -> Result<String> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
         let id = Uuid::new_v4().to_string();
-        self.api
-            .write_dataset_record(
-                &self.scope,
-                DatasetWrite::insert(dataset_id, id.clone(), record.into()),
-            )
+        self.write_record(DatasetWrite::insert(dataset_id, id.clone(), record.into()))
             .await?;
         Ok(id)
     }
@@ -478,16 +451,14 @@ impl Dataset {
     /// ```
     pub async fn update(&self, id: &str, fields: DatasetFields) -> Result<()> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
-        self.api
-            .write_dataset_record(&self.scope, DatasetWrite::update(dataset_id, id, fields))
+        self.write_record(DatasetWrite::update(dataset_id, id, fields))
             .await
     }
 
     /// Delete a record, returning after API acknowledgement.
     pub async fn delete(&self, id: &str) -> Result<()> {
         let dataset_id = self.ensure_registered().await?.dataset_id.clone();
-        self.api
-            .write_dataset_record(&self.scope, DatasetWrite::delete(dataset_id, id))
+        self.write_record(DatasetWrite::delete(dataset_id, id))
             .await
     }
 
@@ -509,10 +480,13 @@ impl Dataset {
         let metadata = self.ensure_registered().await?;
 
         // Fetch summary from API
-        let response = self
-            .api
-            .fetch_dataset_summary(&self.scope, &metadata.dataset_id)
-            .await?;
+        let response = api_result(
+            self.scope
+                .api(&self.api)?
+                .dataset_summary(&metadata.dataset_id)
+                .await,
+        )?
+        .into_inner();
 
         Ok(DatasetSummary {
             project_name: response.project_name,
@@ -525,10 +499,14 @@ impl Dataset {
         })
     }
 
-    /// Flush the client's shared trace queue. Dataset mutations are already
-    /// acknowledged when their individual operation completes.
-    pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
-        self.lifecycle.flush()
+    async fn write_record(&self, row: DatasetWrite) -> Result<()> {
+        api_result(
+            self.scope
+                .api(&self.api)?
+                .logs3(&serde_json::json!({"api_version": 2, "rows": [row]}))
+                .await,
+        )?;
+        Ok(())
     }
 }
 
@@ -549,7 +527,7 @@ impl Dataset {
 /// # }
 /// ```
 pub struct DatasetIterator {
-    fetcher: ResourceTransport,
+    fetcher: reqwest::Client,
     scope: CredentialScope,
     dataset_id: String,
     batch_size: usize,
@@ -560,7 +538,7 @@ pub struct DatasetIterator {
 
 impl DatasetIterator {
     fn new(
-        fetcher: ResourceTransport,
+        fetcher: reqwest::Client,
         scope: CredentialScope,
         dataset_id: String,
         batch_size: usize,
@@ -594,10 +572,13 @@ impl DatasetIterator {
                 },
             };
             // A failed request leaves the cursor and EOF state untouched.
-            let response = self
-                .fetcher
-                .fetch_dataset_records(&self.scope, query)
-                .await?;
+            let response = api_result(
+                self.scope
+                    .api(&self.fetcher)?
+                    .btql_json_as::<_, BTQLResponse>(&query)
+                    .await,
+            )?
+            .into_inner();
             if response.cursor.is_some() && response.cursor == previous_cursor {
                 return Err(crate::BraintrustError::Background(
                     "dataset pagination cursor did not advance".into(),

@@ -92,7 +92,7 @@ where
             log_builder = log_builder.tags(tags.clone());
         }
 
-        root_span.log(log_builder.build().unwrap());
+        root_span.log(log_builder.build());
 
         // Get dataset ID if available
         let dataset_id = opts.dataset.id();
@@ -212,17 +212,14 @@ where
             .build();
 
         // Build initial span log with name, input, and expected
-        let mut log_builder = crate::SpanLog::builder().name(format!("case-{}", case_num));
-
-        if let Ok(input_json) = serde_json::to_value(&case.input) {
-            log_builder = log_builder.input(input_json);
-        }
-
-        if let Some(expected) = &case.expected {
-            if let Ok(expected_json) = serde_json::to_value(expected) {
-                log_builder = log_builder.expected(expected_json);
-            }
-        }
+        let mut log_builder = crate::SpanLog::builder()
+            .name(format!("case-{}", case_num))
+            .maybe_input(serde_json::to_value(&case.input).ok())
+            .maybe_expected(
+                case.expected
+                    .as_ref()
+                    .and_then(|expected| serde_json::to_value(expected).ok()),
+            );
 
         // Add case metadata and tags
         if let Some(metadata) = &case.metadata {
@@ -232,7 +229,7 @@ where
             log_builder = log_builder.tags(tags.clone());
         }
 
-        case_span.log(log_builder.build().unwrap());
+        case_span.log(log_builder.build());
 
         // Create hooks for the task
         let hooks = TaskHooks::new(&case_span, case.expected.as_ref());
@@ -245,8 +242,7 @@ where
                 case_span.log(
                     crate::SpanLog::builder()
                         .error(json!(e.to_string()))
-                        .build()
-                        .unwrap(),
+                        .build(),
                 );
                 case_span.end();
 
@@ -265,12 +261,7 @@ where
 
         // Set output in span
         if let Ok(output_json) = serde_json::to_value(&output) {
-            case_span.log(
-                crate::SpanLog::builder()
-                    .output(output_json)
-                    .build()
-                    .unwrap(),
-            );
+            case_span.log(crate::SpanLog::builder().output(output_json).build());
         }
 
         // Run scorers in parallel
@@ -320,7 +311,7 @@ where
         if let Some(tags) = &final_tags {
             final_log = final_log.tags(tags.clone());
         }
-        case_span.log(final_log.build().unwrap());
+        case_span.log(final_log.build());
 
         case_span.end();
 

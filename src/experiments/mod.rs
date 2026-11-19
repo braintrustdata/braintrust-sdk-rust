@@ -37,7 +37,7 @@ mod summary;
 // Public re-exports
 pub use event_log::{ExperimentLog, ExperimentLogBuilder};
 pub use experiment::{Experiment, ExperimentBuilder};
-pub use feedback::{Feedback, FeedbackBuilder, FeedbackBuilderError};
+pub use feedback::{Feedback, FeedbackBuilder};
 pub use metadata::{BaseExperimentInfo, ExportedExperiment, ProjectMetadata, RepoInfo};
 pub use span_builder::ExperimentSpanBuilder;
 pub use summary::{ExperimentSummary, MetricSummary, ScoreSummary};

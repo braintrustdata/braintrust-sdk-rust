@@ -7,7 +7,7 @@ use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use crate::error::Result;
 use crate::internal::delivery::WriteService;
-use crate::internal::ports::{DeliveryControl, SpanSubmitter};
+use crate::internal::ports::SpanSubmitter;
 use crate::internal::session::CredentialScope;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
@@ -431,8 +431,7 @@ impl SpanBatchProcessor {
         request.org_id = (!scope.org_id().is_empty()).then(|| scope.org_id().to_owned());
         request.org_name = scope.org_name().map(str::to_owned);
         let response =
-            crate::http::api_result(scope.api(&self.client)?.register_project(&request).await)
-                .await?
+            crate::http::api_result(scope.api(&self.client)?.register_project(&request).await)?
                 .into_inner();
         cache_insert(
             &mut *self.project_cache.lock().await,
@@ -689,18 +688,15 @@ impl LogQueue {
         Ok(())
     }
 }
-
 #[async_trait::async_trait]
-impl DeliveryControl for LogQueue {
+impl SpanSubmitter for LogQueue {
     fn flush(&self) -> Completion<FlushReport, FlushError> {
         LogQueue::flush(self)
     }
     async fn trigger_flush(&self) -> Result<()> {
         self.trigger_flush_command().await
     }
-}
-#[async_trait::async_trait]
-impl SpanSubmitter for LogQueue {
+
     fn submit(
         &self,
         scope: CredentialScope,

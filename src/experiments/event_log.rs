@@ -30,34 +30,17 @@ impl ExperimentLog {
 
     /// Convert to SpanLog for internal use.
     pub(crate) fn into_span_log(self) -> SpanLog {
-        let mut builder = SpanLog::builder();
-
-        if let Some(input) = self.input {
-            builder = builder.input(input);
+        SpanLog {
+            input: self.input,
+            output: self.output,
+            expected: self.expected,
+            error: self.error,
+            scores: self.scores,
+            metadata: self.metadata,
+            metrics: self.metrics,
+            tags: self.tags,
+            ..SpanLog::default()
         }
-        if let Some(output) = self.output {
-            builder = builder.output(output);
-        }
-        if let Some(expected) = self.expected {
-            builder = builder.expected(expected);
-        }
-        if let Some(error) = self.error {
-            builder = builder.error(error);
-        }
-        if let Some(scores) = self.scores {
-            builder = builder.scores(scores);
-        }
-        if let Some(metadata) = self.metadata {
-            builder = builder.metadata(metadata);
-        }
-        if let Some(metrics) = self.metrics {
-            builder = builder.metrics(metrics);
-        }
-        if let Some(tags) = self.tags {
-            builder = builder.tags(tags);
-        }
-
-        builder.build().expect("SpanLog build should not fail")
     }
 }
 

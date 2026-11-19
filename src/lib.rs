@@ -25,7 +25,7 @@ mod types;
 pub use completion::{BlockingWaitError, Completion, CompletionFuture};
 pub use dataset::{
     Dataset, DatasetBuilder, DatasetFields, DatasetInsert, DatasetInsertBuilder, DatasetIterator,
-    DatasetRecord, DatasetSummary, DatasetWrite,
+    DatasetRecord, DatasetSummary,
 };
 pub use delivery::{
     DeliveryError, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushFailure,
@@ -34,8 +34,7 @@ pub use delivery::{
 pub use error::{BraintrustError, Result};
 pub use experiments::{
     BaseExperimentInfo, Experiment, ExperimentBuilder, ExperimentSummary, ExportedExperiment,
-    Feedback, FeedbackBuilder, FeedbackBuilderError, MetricSummary, ProjectMetadata, RepoInfo,
-    ScoreSummary,
+    Feedback, FeedbackBuilder, MetricSummary, ProjectMetadata, RepoInfo, ScoreSummary,
 };
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
 pub use log_queue::LogQueueConfig;
@@ -45,8 +44,7 @@ pub use logger::{
 };
 pub use logs3::{Logs3BatchUploader, Logs3UploadResult};
 pub use span::{
-    SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanLogBuilderError, SpanOrigin,
-    SpanOriginEnvironment,
+    SpanBuilder, SpanHandle, SpanLog, SpanLogBuilder, SpanOrigin, SpanOriginEnvironment,
 };
 pub use span_components::{project_logs_identifier, ProjectLogsIdentifier, SpanComponents};
 pub use stream::{

@@ -120,7 +120,7 @@ pub(crate) fn api_client(
 }
 
 /// Preserve HTTP status and response body while adapting API client errors.
-pub(crate) async fn api_result<T>(
+pub(crate) fn api_result<T>(
     result: std::result::Result<T, crate::api::Error<serde_json::Value>>,
 ) -> Result<T> {
     match result {
@@ -418,8 +418,8 @@ cb0bfZ7fHHs=
 mod parity_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn decode_errors_keep_http_status_for_retry_classification() {
+    #[test]
+    fn decode_errors_keep_http_status_for_retry_classification() {
         for status in [200, 400, 503] {
             let error = crate::api::Error::Api(crate::api::ApiError {
                 status,
@@ -429,7 +429,7 @@ mod parity_tests {
                 typed: None,
                 parse_error: Some("failed to decode response".into()),
             });
-            let error = api_result::<()>(Err(error)).await.unwrap_err();
+            let error = api_result::<()>(Err(error)).unwrap_err();
             assert!(
                 matches!(error, BraintrustError::Api { status: actual, .. } if actual == status)
             );

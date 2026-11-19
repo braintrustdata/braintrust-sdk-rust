@@ -7,7 +7,7 @@ use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle};
 use crate::types::{ParentSpanInfo, SpanPayload};
 
-use crate::internal::ports::{DeliveryControl, SpanSubmitter};
+use crate::internal::ports::SpanSubmitter;
 
 #[derive(Clone, Default)]
 pub(crate) struct TestSpanCollector {
@@ -59,6 +59,17 @@ impl MockBraintrustClient {
 
 #[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
+    fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+        let (sender, completion) = crate::Completion::pair();
+        let _ = sender.send(Ok(crate::FlushReport::default()));
+        completion
+    }
+
+    async fn trigger_flush(&self) -> Result<()> {
+        // Mock: no-op for tests
+        Ok(())
+    }
+
     fn submit(
         &self,
         scope: CredentialScope,
@@ -73,20 +84,6 @@ impl SpanSubmitter for MockBraintrustClient {
         let (sender, completion) = crate::Completion::pair();
         let _ = sender.send(Ok(crate::DeliveryReceipt::new()));
         completion
-    }
-}
-
-#[async_trait]
-impl DeliveryControl for MockBraintrustClient {
-    fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
-        let (sender, completion) = crate::Completion::pair();
-        let _ = sender.send(Ok(crate::FlushReport::default()));
-        completion
-    }
-
-    async fn trigger_flush(&self) -> Result<()> {
-        // Mock: no-op for tests
-        Ok(())
     }
 }
 

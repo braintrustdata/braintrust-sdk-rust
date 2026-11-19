@@ -116,8 +116,7 @@ async fn experiment_log_feedback_sends_merge_event() {
             Feedback::builder()
                 .score("human_rating", 0.9)
                 .comment("Good response")
-                .build()
-                .expect("build feedback"),
+                .build(),
         )
         .await
         .expect("log event");
@@ -326,7 +325,7 @@ async fn every_registration_dependent_operation_returns_the_real_failure() {
     assert_api_error(experiment.export().await, 400);
     assert_api_error(
         experiment
-            .log_feedback("row", Feedback::builder().build().unwrap())
+            .log_feedback("row", Feedback::builder().build())
             .await,
         400,
     );
@@ -380,7 +379,7 @@ async fn event_feedback_and_update_methods_propagate_delivery_rejection() {
     );
     assert_api_error(
         experiment
-            .log_feedback("row", Feedback::builder().build().unwrap())
+            .log_feedback("row", Feedback::builder().build())
             .await,
         401,
     );
@@ -617,5 +616,45 @@ async fn experiment_builders_preserve_options_and_named_span_configuration() {
         assert_eq!(row["experiment_id"], "experiment");
         assert_eq!(row["span_attributes"]["name"], name);
         assert_eq!(row["span_attributes"]["type"], span_type);
+    }
+}
+
+#[tokio::test]
+async fn base_experiment_requires_both_identity_fields() {
+    for (body, expected) in [
+        (json!({}), None),
+        (json!({"base_exp_id": "base"}), None),
+        (json!({"base_exp_name": "baseline"}), None),
+        (
+            json!({"base_exp_id": "base", "base_exp_name": "baseline"}),
+            Some(("base", "baseline")),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/experiment/register"))
+            .respond_with(registered_experiment())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/base_experiment/get_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .build()
+            .await
+            .unwrap();
+        let experiment = client
+            .experiment_builder_with_credentials("token", "org")
+            .project_name("project")
+            .build();
+        let base = experiment.fetch_base_experiment().await.unwrap();
+        assert_eq!(base.as_ref().map(|b| (b.id(), b.name())), expected);
     }
 }

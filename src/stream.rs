@@ -1054,12 +1054,11 @@ where
                     // Record TTFT on first meaningful chunk
                     if !ttft_recorded.swap(true, Ordering::SeqCst) && value_has_content(value) {
                         let ttft_secs = start_time.elapsed().as_secs_f64();
-                        if let Ok(log) = SpanLog::builder()
-                            .metric("time_to_first_token", ttft_secs)
-                            .build()
-                        {
-                            span.log(log);
-                        }
+                        span.log(
+                            SpanLog::builder()
+                                .metric("time_to_first_token", ttft_secs)
+                                .build(),
+                        );
                     }
 
                     // Accumulate chunk for final aggregation
@@ -1172,19 +1171,14 @@ async fn finalize_span(span: SpanHandle, aggregator: Arc<Mutex<BraintrustStream>
                 // Serialize typed output to Value for SpanLog
                 let output = serde_json::to_value(&finalized.output).ok();
 
-                let mut builder = SpanLog::builder();
-                if let Some(output) = output {
-                    builder = builder.output(output);
-                }
+                let mut builder = SpanLog::builder().maybe_output(output);
                 if let Some(metadata) = metadata {
                     builder = builder.metadata(metadata);
                 }
                 if let Some(metrics) = metrics {
                     builder = builder.metrics(metrics);
                 }
-                if let Ok(log) = builder.build() {
-                    span.log(log);
-                }
+                span.log(builder.build());
             }
             Err(e) => {
                 tracing::warn!("Failed to finalize stream: {}", e);

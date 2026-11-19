@@ -488,8 +488,7 @@ async fn mutations_have_dataset_wire_shapes_and_share_registration_across_clones
         .unwrap();
     dataset.clone().update(&id, record(3).into()).await.unwrap();
     dataset.delete(&id).await.unwrap();
-    // Neither barrier registers or replays dataset work.
-    dataset.flush().await.unwrap();
+    // Flushing traces does not replay acknowledged dataset work.
     client.flush().await.unwrap();
     let requests = server.received_requests().await.unwrap();
     let bodies: Vec<serde_json::Value> = requests
@@ -652,9 +651,7 @@ async fn mutation_errors_are_direct_and_do_not_replay_or_poison_later_operations
                 other => panic!("expected API error, got {other:?}"),
             }
         }
-        dataset.flush().await.unwrap();
         let id = dataset.insert(record(4)).await.unwrap();
-        dataset.flush().await.unwrap();
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 5); // One registration and four one-attempt writes.
         assert_eq!(
@@ -666,7 +663,7 @@ async fn mutation_errors_are_direct_and_do_not_replay_or_poison_later_operations
 }
 
 #[tokio::test]
-async fn registration_failure_prevents_mutation_and_flush_does_not_register_a_dataset() {
+async fn registration_failure_prevents_mutation_and_build_does_not_register_a_dataset() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/dataset/register"))
@@ -676,7 +673,7 @@ async fn registration_failure_prevents_mutation_and_flush_does_not_register_a_da
         .await;
     let client = isolated_client(&server).await;
     let dataset = dataset(&client);
-    dataset.flush().await.unwrap();
+
     assert!(server.received_requests().await.unwrap().is_empty());
     assert!(dataset.insert(record(1)).await.is_err());
     assert!(dataset.update("old", record(2).into()).await.is_err());
@@ -749,7 +746,7 @@ fn request_header<'a>(request: &'a wiremock::Request, name: &str) -> &'a str {
 }
 
 #[tokio::test]
-async fn dataset_flush_observes_the_shared_trace_queue_and_retires_its_failure() {
+async fn client_flush_observes_the_shared_trace_queue_and_retires_its_failure() {
     use braintrust_sdk_rust::{FlushError, ParentSpanInfo, SpanLog};
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -759,18 +756,17 @@ async fn dataset_flush_observes_the_shared_trace_queue_and_retires_its_failure()
         .mount(&server)
         .await;
     let client = isolated_client(&server).await;
-    let dataset = dataset(&client);
     let span = client
         .span_builder_with_credentials("token", "org")
         .parent_info(ParentSpanInfo::Experiment {
             object_id: "experiment".into(),
         })
         .build();
-    let write = span.log(SpanLog::builder().input(json!(1)).build().unwrap());
-    let flush = dataset.flush();
+    let write = span.log(SpanLog::builder().input(json!(1)).build());
+    let flush = client.flush();
     assert!(matches!(flush.await, Err(FlushError::Delivery(failure)) if failure.failed() == 1));
     assert!(write.await.is_err());
-    assert_eq!(dataset.flush().await.unwrap().delivered(), 0);
+    assert_eq!(client.flush().await.unwrap().delivered(), 0);
     let requests = server.received_requests().await.unwrap();
     assert!(requests
         .iter()
