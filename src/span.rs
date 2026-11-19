@@ -1219,6 +1219,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn span_tags_remain_unique_across_log_updates() {
+        let (span, collector) = build_test_span();
+        span.log(
+            SpanLog::builder()
+                .tags(vec!["b".into(), "a".into(), "a".into()])
+                .build(),
+        );
+        span.log(
+            SpanLog::builder()
+                .tags(vec!["a".into(), "c".into()])
+                .build(),
+        );
+        span.end();
+        let captured = collector.spans();
+        assert_eq!(
+            captured.last().unwrap().payload.tags.as_deref(),
+            Some(["a".into(), "b".into(), "c".into()].as_slice())
+        );
+    }
+
+    #[tokio::test]
     async fn span_logs_scores_expected_and_tags() {
         let (span, collector) = build_test_span();
         span.log(
@@ -1590,26 +1611,6 @@ mod tests {
             Some(ProjectLogsIdentifier::ProjectName(
                 "demo-project".to_string()
             ))
-        );
-    }
-    #[tokio::test]
-    async fn span_tags_remain_unique_across_log_updates() {
-        let (span, collector) = build_test_span();
-        span.log(
-            SpanLog::builder()
-                .tags(vec!["b".into(), "a".into(), "a".into()])
-                .build(),
-        );
-        span.log(
-            SpanLog::builder()
-                .tags(vec!["a".into(), "c".into()])
-                .build(),
-        );
-        span.end();
-        let captured = collector.spans();
-        assert_eq!(
-            captured.last().unwrap().payload.tags.as_deref(),
-            Some(["a".into(), "b".into(), "c".into()].as_slice())
         );
     }
 }

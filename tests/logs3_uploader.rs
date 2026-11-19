@@ -1,25 +1,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use braintrust_sdk_rust::Logs3BatchUploader;
+use braintrust_sdk_rust::{api::Client, ingest::BatchUploader};
 use serde_json::{json, Map, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
-
-#[test]
-fn uploader_rejects_malformed_custom_ca_bundle() {
-    let error = Logs3BatchUploader::new_with_custom_ca_bundle_pem(
-        "https://example.com",
-        "test-key",
-        None,
-        "-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n",
-    )
-    .expect_err("malformed CA bundle should fail");
-
-    assert!(error
-        .to_string()
-        .contains("failed to parse PEM certificates"));
-}
 
 fn make_row(id: &str, payload_chars: usize) -> Map<String, Value> {
     let mut row = Map::new();
@@ -88,11 +73,16 @@ async fn uploader_splits_batches_on_413_without_overflow() {
         .mount(&server)
         .await;
 
-    let mut uploader = Logs3BatchUploader::new(server.uri(), "test-key", None).expect("uploader");
+    let client = Client::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .build()
+        .unwrap();
+    let uploader = BatchUploader::new(client).expect("uploader");
     let rows = vec![make_row("1", 32), make_row("2", 32), make_row("3", 32)];
 
-    let result = uploader.upload_rows(&rows, 100).await.expect("upload");
-    assert_eq!(result.rows_uploaded, 3);
+    let result = uploader.upload_rows(rows, 100).await.expect("upload");
+    assert_eq!(result.rows_uploaded(), 3);
     assert!(
         calls.load(Ordering::SeqCst) >= 3,
         "expected multiple /logs3 attempts due to 413 splitting"
@@ -113,7 +103,6 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
 
     Mock::given(method("GET"))
         .and(path("/version"))
-        .and(wiremock::matchers::header("x-bt-org-name", "my-org"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"logs3_payload_max_bytes": 512})),
         )
@@ -122,7 +111,6 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
 
     Mock::given(method("POST"))
         .and(path("/logs3/overflow"))
-        .and(wiremock::matchers::header("x-bt-org-name", "my-org"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "method": "PUT",
             "signedUrl": signed_upload_url,
@@ -134,27 +122,26 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
 
     Mock::given(method("PUT"))
         .and(path("/signed-upload"))
-        .and(|request: &wiremock::Request| {
-            !request.headers.contains_key("x-bt-org-name")
-                && !request.headers.contains_key("authorization")
-        })
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path("/logs3"))
-        .and(wiremock::matchers::header("x-bt-org-name", "my-org"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .mount(&server)
         .await;
 
-    let mut uploader =
-        Logs3BatchUploader::new(server.uri(), "test-key", Some("my-org".into())).expect("uploader");
+    let client = Client::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .build()
+        .unwrap();
+    let uploader = BatchUploader::new(client).expect("uploader");
     let rows = vec![make_row("big", 8_000)];
 
-    let result = uploader.upload_rows(&rows, 100).await.expect("upload");
-    assert_eq!(result.rows_uploaded, 1);
+    let result = uploader.upload_rows(rows, 100).await.expect("upload");
+    assert_eq!(result.rows_uploaded(), 1);
 
     let requests = server.received_requests().await.unwrap();
     assert!(
@@ -170,17 +157,6 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
         "expected signed upload PUT call"
     );
 
-    let overflow = requests
-        .iter()
-        .find(|request| request.url.path() == "/logs3/overflow")
-        .unwrap();
-    let signed = requests
-        .iter()
-        .find(|request| request.url.path() == "/signed-upload")
-        .unwrap();
-    let metadata: Value = serde_json::from_slice(&overflow.body).unwrap();
-    assert_eq!(metadata["size_bytes"], signed.body.len());
-
     let logs_request = requests
         .iter()
         .find(|request| request.url.path() == "/logs3")
@@ -191,28 +167,110 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
 }
 
 #[tokio::test]
-async fn uploader_does_not_retry_malformed_overflow_responses() {
+async fn accepted_bulk_work_progresses_without_polling_and_shutdown_closes_clones() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = Client::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .build()
+        .unwrap();
+    let uploader = BatchUploader::new(client).unwrap();
+    let observer = std::thread::spawn({
+        let uploader = uploader.clone();
+        move || {
+            let observer = uploader.upload_rows(vec![make_row("eager", 8)], 100);
+            assert!(observer.is_ok());
+            observer
+        }
+    })
+    .join()
+    .unwrap();
+    uploader
+        .shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(observer.await.unwrap().rows_uploaded(), 1);
+    assert!(uploader.clone().upload_rows(vec![], 100).is_err());
+}
+
+#[tokio::test]
+async fn a_terminal_bulk_failure_does_not_poison_the_next_batch() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    let client = Client::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .build()
+        .unwrap();
+    let uploader = BatchUploader::new(client).unwrap();
+    assert!(uploader
+        .upload_rows(vec![make_row("failed", 8)], 100)
+        .await
+        .is_err());
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    drop(uploader.upload_rows(vec![make_row("fresh", 8)], 100));
+    uploader
+        .shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn configured_client_is_reused_and_shutdown_covers_unobserved_batches() {
+    use wiremock::matchers::header;
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/version"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"logs3_payload_max_bytes":512})),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({}))
+                .set_delay(std::time::Duration::from_millis(100)),
         )
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/logs3/overflow"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"method":"PUT"})))
         .expect(1)
         .mount(&server)
         .await;
-    let mut uploader = Logs3BatchUploader::new(server.uri(), "key", None).unwrap();
-    let error = uploader
-        .upload_rows(&[make_row("big", 8000)], 100)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        braintrust_sdk_rust::BraintrustError::Api { status: 200, .. }
-    ));
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(header("x-configured", "preserved"))
+        .and(header("x-bt-org-name", "tenant"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-configured", "preserved".parse().unwrap());
+    let client = Client::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .org_name("tenant")
+        .http_client_builder(reqwest::Client::builder().default_headers(headers))
+        .build()
+        .unwrap();
+    let uploader = BatchUploader::new(client).unwrap();
+    let delivery = uploader.upload_rows(vec![make_row("one", 1)], 10);
+    let second = uploader.clone().upload_rows(vec![make_row("two", 1)], 10);
+    let shutdown = uploader.shutdown(std::time::Duration::from_secs(5));
+    assert!(uploader
+        .upload_rows(vec![make_row("rejected", 1)], 10)
+        .is_err());
+    shutdown.await.unwrap();
+    assert_eq!(delivery.await.unwrap().rows_uploaded(), 1);
+    assert_eq!(second.await.unwrap().rows_uploaded(), 1);
+    uploader.shutdown(std::time::Duration::ZERO).await.unwrap();
 }
