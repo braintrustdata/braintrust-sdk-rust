@@ -1,33 +1,25 @@
 use braintrust_sdk_rust::eval::*;
 use braintrust_sdk_rust::*;
+use std::future::IntoFuture;
 
 fn main() -> anyhow::Result<()> {
-    // Note: No #[tokio::main] needed! SyncEvaluator handles async internally
-
-    // Create Braintrust client
-    let rt = tokio::runtime::Runtime::new().map_err(|e| anyhow::anyhow!(e))?;
-    let client = rt.block_on(async { BraintrustClient::builder().build().await })?;
-
-    // Create sync evaluator
-    let evaluator = SyncEvaluator::new(client)?;
+    // The client's owned runtime drives work; this thread only waits for tokens.
+    let client = futures::executor::block_on(BraintrustClient::builder().build().into_future())?;
 
     // Define test cases
     let cases = vec![
-        Case {
-            input: "hello".to_string(),
-            expected: Some("HELLO".to_string()),
-            ..Default::default()
-        },
-        Case {
-            input: "world".to_string(),
-            expected: Some("WORLD".to_string()),
-            ..Default::default()
-        },
-        Case {
-            input: "sync".to_string(),
-            expected: Some("SYNC".to_string()),
-            ..Default::default()
-        },
+        Case::builder()
+            .input("hello".to_string())
+            .expected("HELLO".to_string())
+            .build(),
+        Case::builder()
+            .input("world".to_string())
+            .expected("WORLD".to_string())
+            .build(),
+        Case::builder()
+            .input("sync".to_string())
+            .expected("SYNC".to_string())
+            .build(),
     ];
 
     // Define a simple sync task: uppercase the input
@@ -39,26 +31,33 @@ fn main() -> anyhow::Result<()> {
     // Run evaluation synchronously
     println!("Starting synchronous evaluation...\n");
 
-    let result = evaluator.run(
-        EvalOpts::builder()
-            .name("sync-uppercase-eval".to_string())
-            .dataset(cases.into())
-            .task(Box::new(task))
-            .scorers(scorers)
-            .build(),
+    let definition = EvalDefinition::new(Box::new(task), scorers)?;
+    let result = futures::executor::block_on(
+        client
+            .eval(
+                EvalOpts::builder()
+                    .name("sync-uppercase-eval".to_string())
+                    .source(cases.into())
+                    .definition(definition.clone())
+                    .build(),
+            )
+            .into_future(),
     )?;
 
     // Print results
     println!("\n=== Results ===\n");
-    println!("Total cases: {}", result.total_cases);
-    println!("Successful: {}", result.successful_cases);
-    println!("Failed: {}", result.failed_cases);
+    println!("Total cases: {}", result.total_cases());
+    println!("Successful: {}", result.successful_cases());
+    println!("Failed: {}", result.failed_cases());
 
     println!("\n=== Score Statistics ===\n");
-    for stat in &result.score_stats {
+    for stat in result.score_stats() {
         println!(
             "{}: mean={:.3}, min={:.3}, max={:.3}",
-            stat.name, stat.mean, stat.min, stat.max
+            stat.name(),
+            stat.mean(),
+            stat.min(),
+            stat.max()
         );
     }
 
