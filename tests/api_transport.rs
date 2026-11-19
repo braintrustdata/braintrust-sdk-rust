@@ -6,7 +6,6 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 #[tokio::test]
 async fn dataset_queries_and_summaries_use_the_discovered_api() {
     let app = MockServer::start().await;
-    let fallback = MockServer::start().await;
     let api = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/apikey/login"))
@@ -49,7 +48,6 @@ async fn dataset_queries_and_summaries_use_the_discovered_api() {
     let client = BraintrustClient::builder()
         .api_key("key")
         .app_url(app.uri())
-        .api_url(fallback.uri())
         .org_name("my-org")
         .blocking_login(true)
         .build()
@@ -73,7 +71,31 @@ async fn dataset_queries_and_summaries_use_the_discovered_api() {
     );
     assert_eq!(records[0].xact_id.as_deref(), Some("version"));
     assert_eq!(dataset.summarize().await.unwrap().total_records(), Some(2));
-    assert!(fallback.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn explicit_api_url_overrides_discovered_url() {
+    let app = MockServer::start().await;
+    let api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"org_info": [
+                {"id":"org", "name":"test-org", "api_url":"https://discovered.example"}
+            ]})),
+        )
+        .mount(&app)
+        .await;
+    let client = BraintrustClient::builder()
+        .api_key("test-key")
+        .app_url(app.uri())
+        .api_url(api.uri())
+        .blocking_login(true)
+        .build()
+        .await
+        .unwrap();
+    let login = client.wait_for_login().await.unwrap();
+    assert_eq!(login.api_url().as_deref(), Some(api.uri().as_str()));
 }
 
 #[tokio::test]

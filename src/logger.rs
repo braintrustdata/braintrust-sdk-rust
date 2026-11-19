@@ -18,7 +18,7 @@ use crate::experiments::api::{
     ExperimentRegistrar,
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
-use crate::http::{api_client, api_client_builder, api_result, build_http_client, CaBundleConfig};
+use crate::http::{api_client, api_result, build_http_client, CaBundleConfig};
 use crate::log_queue::{LogQueue, LogQueueConfig};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
@@ -375,6 +375,7 @@ impl BraintrustClientBuilder {
     /// Otherwise, login happens in the background with retry logic.
     pub async fn build(self) -> Result<BraintrustClient> {
         let app_url_str = self.app_url.unwrap_or_else(|| DEFAULT_APP_URL.into());
+        let explicit_api_url = self.api_url.is_some();
         let api_url_str = self.api_url.unwrap_or_else(|| DEFAULT_API_URL.into());
 
         let app_url = Url::parse(&app_url_str)
@@ -416,6 +417,7 @@ impl BraintrustClientBuilder {
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
                 api_url,
+                explicit_api_url,
                 app_url,
                 queue,
                 login_state,
@@ -463,6 +465,7 @@ pub struct BraintrustClient {
 struct ClientInner {
     #[allow(dead_code)]
     api_url: Url,
+    explicit_api_url: bool,
     app_url: Url,
     queue: LogQueue,
     login_state: LoginState,
@@ -776,15 +779,18 @@ impl BraintrustClient {
 
     /// Log in and discover the selected organization's API endpoint.
     async fn perform_login(&self, api_key: &str, org_name: Option<&str>) -> Result<()> {
-        let result = api_client_builder(
-            &self.inner.http_client,
-            self.inner.api_url.as_str(),
-            self.inner.app_url.as_str(),
-            api_key,
-            org_name,
-        )
-        .build_with_login()
-        .await;
+        let mut builder = crate::api::Client::builder()
+            .api_key(api_key)
+            .app_url(self.inner.app_url.as_str())
+            .http_client(self.inner.http_client.clone())
+            .upload_http_client(self.inner.http_client.clone());
+        if self.inner.explicit_api_url {
+            builder = builder.api_url(self.inner.api_url.as_str());
+        }
+        if let Some(org_name) = org_name {
+            builder = builder.org_name(org_name);
+        }
+        let result = builder.build_with_login().await;
         let client = match result {
             Ok(client) => client,
             Err(crate::api::ClientInitError::Login(error)) => {

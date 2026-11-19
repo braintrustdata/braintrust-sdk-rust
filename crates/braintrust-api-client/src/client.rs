@@ -257,13 +257,15 @@ impl ClientBuilder {
         })
     }
 
-    /// Log in and use the selected organization's API endpoint.
+    /// Log in and use the explicit API endpoint, or the selected organization's endpoint.
     ///
     /// Selects the first organization when no name was provided. If the server
     /// omits its API URL, retains the configured API endpoint. Discovery happens
     /// before returning the client; existing clones are never retargeted.
     pub async fn build_with_login(self) -> Result<Client, ClientInitError> {
         let org_name = self.org_name.clone();
+        let explicit_api_url =
+            self.api_url.is_some() || env::var_os("BRAINTRUST_API_URL").is_some();
         let mut client = self.build()?;
         let response = client.login().await.map_err(Box::new)?.into_inner();
         let organization = if let Some(name) = org_name {
@@ -279,10 +281,12 @@ impl ClientBuilder {
                 .next()
                 .ok_or(ClientInitError::NoOrganizations)?
         };
-        if let Some(url) = &organization.api_url {
-            client.baseurl = validate_url(url, "login API URL")?;
-            client.generated = client.generated.with_base_url(&client.baseurl);
-        }
+        let selected = resolve_login_api_url(
+            explicit_api_url.then_some(client.baseurl.as_str()),
+            organization.api_url.as_deref(),
+        );
+        client.baseurl = validate_url(selected, "login API URL")?;
+        client.generated = client.generated.with_base_url(&client.baseurl);
         client.inner.org_name = Some(
             HeaderValue::from_str(&organization.name)
                 .map_err(|_| ClientInitError::InvalidOrgName)?,
@@ -290,6 +294,14 @@ impl ClientBuilder {
         client.inner.organization = Some(organization);
         Ok(client)
     }
+}
+
+/// Select an explicit API URL, then the organization's URL, then the hosted default.
+pub fn resolve_login_api_url<'a>(
+    explicit: Option<&'a str>,
+    organization: Option<&'a str>,
+) -> &'a str {
+    explicit.or(organization).unwrap_or(DEFAULT_API_URL)
 }
 
 fn resolve_url(
