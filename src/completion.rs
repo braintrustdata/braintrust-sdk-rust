@@ -43,6 +43,26 @@ impl<T, E> Completion<T, E> {
         &self.issued
     }
 
+    /// Wait for the operation's final result from synchronous code.
+    ///
+    /// This waits on the response channel; it does not drive or create a runtime.
+    /// The SDK-owned runtime progresses independently. An explicitly supplied
+    /// runtime must remain running on another thread while this thread waits.
+    /// In asynchronous code, await the completion instead.
+    ///
+    /// # Panics
+    /// Panics when waiting for the response from a Tokio asynchronous context.
+    #[track_caller]
+    pub fn blocking_wait(self) -> Result<T, E>
+    where
+        E: From<ExecutionError>,
+    {
+        self.issued?;
+        self.receiver
+            .blocking_recv()
+            .unwrap_or_else(|_| Err(ExecutionError::WorkerLost.into()))
+    }
+
     pub(crate) fn pair() -> (oneshot::Sender<Result<T, E>>, Self) {
         let (sender, receiver) = oneshot::channel();
         (
@@ -137,5 +157,20 @@ mod tests {
         let (sender, token) = Completion::<(), ExecutionError>::pair();
         drop(sender);
         assert_eq!(token.await, Err(ExecutionError::WorkerLost));
+    }
+    #[test]
+    fn blocking_wait_observes_the_background_response_without_a_runtime() {
+        #[derive(Debug)]
+        struct Value(usize);
+        let (sender, completion) = Completion::<Value, ExecutionError>::pair();
+        let worker = std::thread::spawn(move || sender.send(Ok(Value(42))).unwrap());
+        assert_eq!(completion.blocking_wait().unwrap().0, 42);
+        worker.join().unwrap();
+        let (sender, completion) = Completion::<(), ExecutionError>::pair();
+        drop(sender);
+        assert_eq!(completion.blocking_wait(), Err(ExecutionError::WorkerLost));
+        let (_, mut rejected) = Completion::<(), ExecutionError>::pair();
+        rejected.record_issuance(Err(ExecutionError::TimedOut));
+        assert_eq!(rejected.blocking_wait(), Err(ExecutionError::TimedOut));
     }
 }
