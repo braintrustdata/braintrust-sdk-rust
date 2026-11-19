@@ -154,7 +154,7 @@ async fn unobserved_cursor_commands_consume_records_in_order_and_collect_across_
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data":[{"id":"first"}], "cursor":"next"
         })))
-        .with_priority(2)
+        .with_priority(3)
         .expect(1)
         .mount(&server)
         .await;
@@ -164,7 +164,15 @@ async fn unobserved_cursor_commands_consume_records_in_order_and_collect_across_
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data":[{"id":"second"},{"id":"third"}]
         })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/btql"))
+        .respond_with(ResponseTemplate::new(400))
         .with_priority(1)
+        .up_to_n_times(1)
         .expect(1)
         .mount(&server)
         .await;
@@ -178,6 +186,7 @@ async fn unobserved_cursor_commands_consume_records_in_order_and_collect_across_
         .unwrap();
     let dataset = dataset(&client);
     let mut cursor = dataset.fetch(Some(1)).await.unwrap();
+    let failed = cursor.next();
     drop(cursor.next());
     let next = cursor.next();
     let rest = cursor.collect();
@@ -187,6 +196,7 @@ async fn unobserved_cursor_commands_consume_records_in_order_and_collect_across_
     drop(dataset);
     drop(client);
     shutdown.await.unwrap();
+    assert!(failed.await.is_err());
     assert_eq!(next.await.unwrap().unwrap().id(), "second");
     assert_eq!(
         rest.await

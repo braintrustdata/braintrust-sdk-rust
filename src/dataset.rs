@@ -27,7 +27,6 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
-use futures::{future::BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::OnceCell;
@@ -578,7 +577,7 @@ struct DatasetCursor {
 pub struct DatasetIterator {
     execution: ExecutionBinding,
     cursor: Arc<tokio::sync::Mutex<DatasetCursor>>,
-    tail: futures::future::Shared<BoxFuture<'static, ()>>,
+    tail: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl DatasetIterator {
@@ -591,7 +590,7 @@ impl DatasetIterator {
     ) -> Self {
         Self {
             execution,
-            tail: futures::future::ready(()).boxed().shared(),
+            tail: None,
             cursor: Arc::new(tokio::sync::Mutex::new(DatasetCursor {
                 fetcher,
                 scope,
@@ -631,25 +630,20 @@ impl DatasetIterator {
         Fut: std::future::Future<Output = Result<T>> + Send + 'static,
     {
         let cursor = self.cursor.clone();
-        let previous = self.tail.clone();
-        let (release, released) = tokio::sync::oneshot::channel::<()>();
-        let completion = self.execution.response(async move {
-            // Holding the sender across the whole operation preserves issuance
-            // order even if runtime task polling is reordered. Drop releases
-            // the next operation on success, error, panic or cancellation.
-            let _release = release;
-            previous.await;
-            work(cursor.lock_owned().await).await
-        });
-        if completion.is_ok() {
-            self.tail = async move {
-                let _ = released.await;
-            }
-            .boxed()
-            .shared();
-        }
-        // Rejected work leaves the existing chain and cursor untouched.
-        completion
+        let execution = self.execution.clone();
+        execution.response_try(|| {
+            let previous = self.tail.take();
+            let (release, released) = tokio::sync::oneshot::channel();
+            self.tail = Some(released);
+            Ok(async move {
+                // The sender releases the next command on success, error or cancellation.
+                let _release = release;
+                if let Some(previous) = previous {
+                    let _ = previous.await;
+                }
+                work(cursor.lock_owned().await).await
+            })
+        })
     }
 }
 
