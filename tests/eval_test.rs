@@ -230,7 +230,7 @@ async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
     assert_eq!(result.score_stats()[0].name(), "exact_match");
     assert_eq!(result.score_stats()[0].mean(), 1.0);
     let case = &result.results()[0];
-    assert_eq!(case.case_id().as_deref(), Some("source-case"));
+    assert_eq!(case.case_id(), Some("source-case"));
     assert!(matches!(&case.errors()[0], CaseError::Scorer {name,..} if name == "broken"));
     let rows: Vec<serde_json::Value> = server
         .received_requests()
