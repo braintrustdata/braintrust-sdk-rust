@@ -16,6 +16,7 @@ use crate::experiments::metadata::{
 };
 use crate::experiments::summary::{ExperimentSummary, MetricSummary, ScoreSummary};
 use crate::http::api_result;
+use crate::internal::execution::ExecutionBinding;
 use crate::internal::ports::SpanSubmitter;
 use crate::internal::session::CredentialScope;
 use crate::span::{SpanBuilder, SpanHandle, SpanLog};
@@ -42,6 +43,7 @@ pub(crate) struct ExperimentMetadata {
 #[derive(Clone)]
 pub struct Experiment {
     pub(crate) api: reqwest::Client,
+    pub(crate) execution: ExecutionBinding,
     pub(crate) submitter: Arc<dyn SpanSubmitter>,
     pub(crate) scope: CredentialScope,
     pub(crate) project_name: String,
@@ -70,6 +72,7 @@ impl Experiment {
     #[builder(start_fn(name = builder, vis = "pub(crate)"), builder_type(vis = "pub"), derive(Clone))]
     pub(crate) fn new(
         #[builder(start_fn)] api: reqwest::Client,
+        #[builder(start_fn)] execution: ExecutionBinding,
         #[builder(start_fn)] submitter: Arc<dyn SpanSubmitter>,
         #[builder(start_fn)] scope: CredentialScope,
         #[builder(into)] project_name: String,
@@ -92,6 +95,7 @@ impl Experiment {
         };
         Self {
             api,
+            execution,
             submitter,
             scope,
             project_name,
@@ -244,13 +248,17 @@ impl Experiment {
         let base_exp_id = self.fetch_base_experiment().await?.map(|base| base.id);
 
         // Fetch comparison data from API
-        let comparison = api_result(
-            self.scope
-                .api(&self.api)?
-                .experiment_comparison(&metadata.experiment_id, base_exp_id.as_deref())
-                .await,
-        )?
-        .into_inner();
+        let api = self.scope.api(&self.api)?;
+        let id = metadata.experiment_id.clone();
+        let comparison = self
+            .execution
+            .response::<_, crate::BraintrustError, _>(async move {
+                Ok(
+                    api_result(api.experiment_comparison(&id, base_exp_id.as_deref()).await)?
+                        .into_inner(),
+                )
+            })
+            .await?;
 
         let scores = comparison
             .scores
@@ -411,12 +419,15 @@ impl Experiment {
     /// Returns `None` if no base experiment has been configured or detected.
     pub async fn fetch_base_experiment(&self) -> Result<Option<BaseExperimentInfo>> {
         let metadata = self.ensure_registered().await?;
-        let response = match api_result(
-            self.scope
-                .api(&self.api)?
-                .base_experiment(&metadata.experiment_id)
-                .await,
-        ) {
+        let api = self.scope.api(&self.api)?;
+        let id = metadata.experiment_id.clone();
+        let response = match self
+            .execution
+            .response::<_, crate::BraintrustError, _>(async move {
+                api_result(api.base_experiment(&id).await)
+            })
+            .await
+        {
             Ok(value) => value.into_inner(),
             Err(crate::BraintrustError::Api { status: 400, .. }) => return Ok(None),
             Err(error) => return Err(error),
@@ -455,13 +466,13 @@ impl Experiment {
                 request.public = self.public;
                 request.update = self.update;
                 request.repo_info = self.repo_info.clone().map(Into::into);
-                let response = api_result(
-                    self.scope
-                        .api(&self.api)?
-                        .register_experiment(&request)
-                        .await,
-                )?
-                .into_inner();
+                let api = self.scope.api(&self.api)?;
+                let response = self
+                    .execution
+                    .response::<_, crate::BraintrustError, _>(async move {
+                        Ok(api_result(api.register_experiment(&request).await)?.into_inner())
+                    })
+                    .await?;
                 Ok(ExperimentMetadata {
                     project_id: response.project.id,
                     experiment_id: response.experiment.id,

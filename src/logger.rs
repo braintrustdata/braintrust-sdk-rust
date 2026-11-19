@@ -506,7 +506,6 @@ impl std::fmt::Debug for ClientInner {
 }
 
 impl BraintrustClient {
-
     fn span_submitter(&self) -> Arc<dyn SpanSubmitter> {
         Arc::new(self.inner.queue.clone())
     }
@@ -615,7 +614,11 @@ impl BraintrustClient {
             return Err(BraintrustError::InvalidConfig("dataset_builder() requires login; use dataset_builder_with_credentials() when skip_login is enabled".into()));
         }
         let state = self.wait_for_login_state().await?;
-        Ok(Dataset::new(self.inner.http_client.clone(), state.scope()?))
+        Ok(Dataset::new(
+            self.inner.http_client.clone(),
+            self.inner.execution.clone(),
+            state.scope()?,
+        ))
     }
 
     /// Create a dataset builder with immutable explicit credentials, without
@@ -627,6 +630,7 @@ impl BraintrustClient {
     ) -> DatasetBuilder {
         Dataset::new(
             self.inner.http_client.clone(),
+            self.inner.execution.clone(),
             self.explicit_scope(token.into(), String::new(), Some(org_name.into())),
         )
     }
@@ -947,6 +951,7 @@ impl BraintrustClient {
         let submitter = self.span_submitter();
         Experiment::builder(
             self.inner.http_client.clone(),
+            self.inner.execution.clone(),
             submitter,
             self.explicit_scope(token, org_id, None),
         )
