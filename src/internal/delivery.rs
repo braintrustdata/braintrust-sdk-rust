@@ -668,6 +668,11 @@ mod tests {
         let (old_epoch, _) = service.producer.inner.admit().unwrap();
         let (sender, before) = Completion::pair();
         let mut flush = Box::pin(service.flush().into_future());
+        let blocking_flush = service.flush();
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        let synchronous_caller = std::thread::spawn(move || {
+            acknowledged.send(blocking_flush.blocking_wait()).unwrap();
+        });
         assert!(!Arc::ptr_eq(
             &old_epoch,
             &service.producer.inner.ingress.load_full()
@@ -685,6 +690,8 @@ mod tests {
         gate.add_permits(1);
         before.await.unwrap();
         assert_eq!(flush.await.unwrap().delivered(), 2);
+        assert_eq!(acknowledgement.await.unwrap().unwrap().delivered(), 2);
+        synchronous_caller.join().unwrap();
         assert_eq!(entered.recv().await.unwrap(), vec![3]);
         gate.add_permits(1);
         after.await.unwrap();
