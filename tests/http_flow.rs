@@ -174,7 +174,7 @@ async fn tracked_stateless_update_reports_automatic_delivery_failure() {
         "token",
         "org",
         &exported,
-        SpanLog::builder().input(json!("input")).build().unwrap(),
+        SpanLog::builder().input(json!("input")).build(),
     );
     assert!(matches!(
         completion.await,

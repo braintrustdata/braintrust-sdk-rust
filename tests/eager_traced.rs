@@ -56,12 +56,12 @@ async fn shutdown_before_first_poll_includes_callback_writes_and_revokes_escaped
     let client = client(&server, 8).await;
     let experiment = experiment(&client);
     let traced = experiment.traced(|root| async move {
-        root.log(SpanLog::builder().input(json!(1)).build().unwrap())
+        root.log(SpanLog::builder().input(json!(1)).build())
             .await
             .unwrap();
         let child = root.child_builder().unwrap().name("child").build();
         child
-            .log(SpanLog::builder().output(json!(2)).build().unwrap())
+            .log(SpanLog::builder().output(json!(2)).build())
             .await
             .unwrap();
         child
@@ -121,7 +121,7 @@ async fn owned_runtime_runs_dropped_callback_observers_from_a_plain_thread() {
         .unwrap();
         let experiment = experiment(&client);
         drop(experiment.traced(move |span| async move {
-            span.log(SpanLog::builder().input(json!("owned")).build().unwrap())
+            span.log(SpanLog::builder().input(json!("owned")).build())
                 .await
                 .unwrap();
             done.send(()).unwrap();

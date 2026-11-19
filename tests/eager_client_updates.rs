@@ -97,10 +97,7 @@ async fn plain_thread_explicit_updates_progress_unobserved_and_own_exported_cont
             "explicit",
             "org",
             &exported("row"),
-            SpanLog::builder()
-                .output(json!("accepted"))
-                .build()
-                .unwrap(),
+            SpanLog::builder().output(json!("accepted")).build(),
         );
         assert!(update.is_ok());
         assert!(!client.is_logged_in());

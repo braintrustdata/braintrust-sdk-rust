@@ -211,10 +211,7 @@ async fn queue_rejection_never_registers_and_the_reserved_response_slot_is_retir
         &*rejected,
         Err(BraintrustError::Admission(EnqueueError::Full))
     ));
-    let feedback = experiment.log_feedback(
-        "row",
-        braintrust_sdk_rust::Feedback::builder().build().unwrap(),
-    );
+    let feedback = experiment.log_feedback("row", braintrust_sdk_rust::Feedback::builder().build());
     let update = experiment.update_span("row", braintrust_sdk_rust::SpanLog::default());
     for patch in [feedback, update] {
         assert!(matches!(
@@ -264,10 +261,7 @@ async fn full_response_admission_never_creates_an_extra_write_obligation() {
         &*rejected,
         Err(BraintrustError::Admission(EnqueueError::Full))
     ));
-    let feedback = experiment.log_feedback(
-        "row",
-        braintrust_sdk_rust::Feedback::builder().build().unwrap(),
-    );
+    let feedback = experiment.log_feedback("row", braintrust_sdk_rust::Feedback::builder().build());
     let update = experiment.update_span("row", braintrust_sdk_rust::SpanLog::default());
     for patch in [feedback, update] {
         assert!(matches!(
@@ -315,10 +309,8 @@ async fn deadline_cancels_deferred_registration_and_never_submits_its_row() {
     let client = client(&server, 10).await;
     let experiment = experiment(&client);
     let event = experiment.log(ExperimentLog::default());
-    let feedback = experiment.log_feedback(
-        "feedback",
-        braintrust_sdk_rust::Feedback::builder().build().unwrap(),
-    );
+    let feedback =
+        experiment.log_feedback("feedback", braintrust_sdk_rust::Feedback::builder().build());
     let update = experiment.update_span("update", braintrust_sdk_rust::SpanLog::default());
     tokio::time::timeout(Duration::from_secs(5), arrived.notified())
         .await
@@ -404,8 +396,7 @@ async fn unobserved_patches_own_their_ids_and_share_registration_across_shutdown
             .comment("reviewed")
             .source("external")
             .tag("checked")
-            .build()
-            .unwrap(),
+            .build(),
     );
     let update = experiment.clone().update_span(
         &String::from("update"),
@@ -419,8 +410,7 @@ async fn unobserved_patches_own_their_ids_and_share_registration_across_shutdown
             .metric("tokens", 12.0)
             .tag("patched")
             .name("updated span")
-            .build()
-            .unwrap(),
+            .build(),
     );
     assert!(feedback.is_ok());
     assert!(update.is_ok());
@@ -428,7 +418,7 @@ async fn unobserved_patches_own_their_ids_and_share_registration_across_shutdown
     drop(update);
     let flush = experiment.flush();
     let shutdown = client.shutdown(Duration::from_secs(5));
-    let closed = experiment.log_feedback("after", Feedback::builder().build().unwrap());
+    let closed = experiment.log_feedback("after", Feedback::builder().build());
     assert!(matches!(
         &*closed,
         Err(BraintrustError::Admission(EnqueueError::Closed))
@@ -499,7 +489,7 @@ async fn patch_registration_failure_retires_the_batch_and_allows_fresh_retry() {
         .await;
     let client = client(&server, 10).await;
     let experiment = experiment(&client);
-    let feedback = experiment.log_feedback("row", Feedback::builder().build().unwrap());
+    let feedback = experiment.log_feedback("row", Feedback::builder().build());
     let update = experiment.update_span("row", SpanLog::default());
     let flush = experiment.flush();
     for patch in [feedback, update] {
@@ -512,10 +502,7 @@ async fn patch_registration_failure_retires_the_batch_and_allows_fresh_retry() {
     assert!(matches!(flush.await, Err(FlushError::Delivery(failure)) if failure.failed()==2));
     assert_eq!(experiment.flush().await.unwrap().delivered(), 0);
     assert_eq!(experiment.experiment_id(), None);
-    let retry = experiment.update_span(
-        "row",
-        SpanLog::builder().output(json!("retry")).build().unwrap(),
-    );
+    let retry = experiment.update_span("row", SpanLog::builder().output(json!("retry")).build());
     let fresh = experiment.flush();
     retry.await.unwrap();
     assert_eq!(fresh.await.unwrap().delivered(), 1);
@@ -544,14 +531,11 @@ async fn explicit_patches_remain_independent_of_a_finished_live_span() {
     let end = span.end();
     let update = experiment.update_span(
         span.row_id(),
-        SpanLog::builder()
-            .output(json!("after finish"))
-            .build()
-            .unwrap(),
+        SpanLog::builder().output(json!("after finish")).build(),
     );
     let feedback = experiment.log_feedback(
         span.row_id(),
-        Feedback::builder().score("review", 1.0).build().unwrap(),
+        Feedback::builder().score("review", 1.0).build(),
     );
     let flush = experiment.flush();
     assert!(update.is_ok());

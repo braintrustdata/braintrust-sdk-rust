@@ -995,12 +995,6 @@ mod tests {
                 completion
             }
 
-            fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
-                let (sender, completion) = crate::Completion::pair();
-                let _ = sender.send(Ok(crate::FlushReport::default()));
-                completion
-            }
-
             fn operation(
                 &self,
             ) -> std::result::Result<crate::internal::ports::SpanOperation, crate::EnqueueError>
@@ -1072,6 +1066,11 @@ mod tests {
         struct Submitter(Mutex<Vec<(SpanPayload, WriteResponder)>>);
 
         impl SpanSubmitter for Submitter {
+            fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
+                let (sender, completion) = crate::Completion::pair();
+                let _ = sender.send(Ok(crate::FlushReport::default()));
+                completion
+            }
             fn operation(
                 &self,
             ) -> std::result::Result<crate::internal::ports::SpanOperation, crate::EnqueueError>

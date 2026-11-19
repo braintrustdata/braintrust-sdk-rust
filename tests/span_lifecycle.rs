@@ -259,12 +259,7 @@ async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
             .output(json!({"status": "updated"}))
             .maybe_context(context.clone());
         client
-            .update_span_with_credentials(
-                "token",
-                "org-id",
-                &exported,
-                event.build().expect("build"),
-            )
+            .update_span_with_credentials("token", "org-id", &exported, event.build())
             .await
             .expect("update");
         client.flush().await.expect("flush");

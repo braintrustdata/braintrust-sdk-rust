@@ -729,14 +729,11 @@ impl LogQueue {
         self.writes.is_empty()
     }
 }
-#[async_trait::async_trait]
 impl SpanSubmitter for LogQueue {
     fn flush(&self) -> Completion<FlushReport, FlushError> {
         LogQueue::flush(self)
     }
-}
-#[async_trait::async_trait]
-impl SpanSubmitter for LogQueue {
+
     fn operation(&self) -> std::result::Result<SpanOperation, crate::EnqueueError> {
         let lease = self.writes.lease()?;
         let mut scoped = self.clone();
