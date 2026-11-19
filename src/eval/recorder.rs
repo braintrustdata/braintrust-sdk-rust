@@ -1,7 +1,7 @@
 //! Braintrust serialization and write completions, outside the run engine.
 use super::{
     executor::{CaseRecording, EvalRecorder},
-    Case, EvalResult,
+    Case, DatasetVersionRef, EvalRecording, EvalResult,
 };
 use crate::{
     BraintrustClient, BraintrustError, Completion, DeliveryReceipt, Result, SpanHandle, SpanLog,
@@ -17,36 +17,67 @@ type Write = Completion<DeliveryReceipt, WriteError>;
 pub(crate) struct BraintrustRecorder {
     client: BraintrustClient,
     submitter: Arc<dyn crate::internal::ports::SpanSubmitter>,
-    root: SpanHandle,
-    root_write: tokio::sync::Mutex<Option<Write>>,
+    project_name: Option<String>,
+    experiment_name: String,
+    metadata: Option<Map<String, Value>>,
+    ready: Option<RecordingState>,
+}
+struct RecordingState {
+    template: crate::span::SpanBuilder,
+    target: EvalRecording,
+    dataset: Option<DatasetVersionRef>,
 }
 impl BraintrustRecorder {
-    pub async fn new(
+    pub fn new(
         client: BraintrustClient,
         submitter: Arc<dyn crate::internal::ports::SpanSubmitter>,
-        name: String,
+        project_name: Option<String>,
+        experiment_name: String,
         metadata: Option<Map<String, Value>>,
-        tags: Option<Vec<String>>,
-    ) -> Result<Self> {
-        let root = client
-            .span_builder_for_operation(submitter.clone())
-            .await?
-            .span_type(crate::SpanType::Eval)
-            .build();
-        let mut log = SpanLog::builder().name(format!("eval-{name}"));
-        if let Some(metadata) = metadata {
-            log = log.metadata(metadata);
-        }
-        if let Some(tags) = tags {
-            log = log.tags(tags);
-        }
-        let root_write = tokio::sync::Mutex::new(Some(root.log(log.build())));
-        Ok(Self {
+    ) -> Self {
+        Self {
             client,
             submitter,
-            root,
-            root_write,
-        })
+            project_name,
+            experiment_name,
+            metadata,
+            ready: None,
+        }
+    }
+    async fn initialize(&mut self, dataset: Option<&DatasetVersionRef>) -> Result<()> {
+        let (builder, project) = self
+            .client
+            .experiment_builder_for_operation(self.submitter.clone(), self.project_name.clone())
+            .await?;
+        let experiment = builder
+            .project_name(project)
+            .experiment_name(self.experiment_name.clone())
+            .maybe_metadata(self.metadata.clone())
+            .maybe_dataset_id(dataset.map(|d| d.dataset_id.clone()))
+            .maybe_dataset_version(dataset.and_then(|d| d.version.clone()))
+            .build();
+        let resolved = experiment.register_metadata().await?;
+        let target = EvalRecording {
+            project_id: resolved.project_id.clone(),
+            experiment_id: resolved.experiment_id.clone(),
+            experiment_name: resolved.experiment_name.clone(),
+        };
+        let template = self
+            .client
+            .span_builder_for_operation(
+                self.submitter.clone(),
+                Some(crate::types::ParentSpanInfo::Experiment {
+                    object_id: target.experiment_id.clone(),
+                }),
+            )
+            .await?
+            .span_type(crate::SpanType::Eval);
+        self.ready = Some(RecordingState {
+            template,
+            target,
+            dataset: dataset.cloned(),
+        });
+        Ok(())
     }
 }
 
@@ -74,13 +105,30 @@ fn serialize<T: Serialize>(
 impl<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static> EvalRecorder<I, O>
     for BraintrustRecorder
 {
+    async fn prepare(&mut self, dataset: Option<&DatasetVersionRef>) -> Result<()> {
+        self.initialize(dataset).await
+    }
     async fn start(&self, index: usize, case: &Case<I, O>) -> Result<Box<dyn CaseRecording<I, O>>> {
-        let span = self
-            .client
-            .span_builder_for_operation(self.submitter.clone())
-            .await?
-            .span_type(crate::SpanType::Eval)
-            .build();
+        let ready = self.ready.as_ref().ok_or_else(|| {
+            BraintrustError::Background("evaluation recorder is not initialized".into())
+        })?;
+        let mut builder = ready.template.clone().name(format!("case-{}", index + 1));
+        // Match the dataset object-reference contract: both row identity and row
+        // transaction are required. The selected dataset version is run metadata,
+        // not a substitute for a particular record's transaction.
+        if let (Some(dataset), Some(id), Some(xact_id)) = (
+            &ready.dataset,
+            case.id.as_ref().filter(|id| !id.is_empty()),
+            case.xact_id.as_ref().filter(|id| !id.is_empty()),
+        ) {
+            builder = builder.dataset_record_origin(crate::types::DatasetRecordOrigin {
+                object_id: dataset.dataset_id.clone(),
+                id: id.clone(),
+                xact_id: xact_id.clone(),
+                created: case.created.clone(),
+            });
+        }
+        let span = builder.build();
         let mut failures = Vec::new();
         let input = serialize(&case.input, "input", &mut failures);
         let expected = case
@@ -104,18 +152,14 @@ impl<I: Serialize + Send + Sync + 'static, O: Serialize + Send + Sync + 'static>
             failures,
         }))
     }
+    fn target(&self) -> Option<EvalRecording> {
+        self.ready.as_ref().map(|ready| ready.target.clone())
+    }
+
     async fn finish(&self) -> Vec<BraintrustError> {
-        let end = self.root.end();
-        let mut failures = Vec::new();
-        if let Some(write) = self.root_write.lock().await.take() {
-            if let Err(error) = write.await {
-                failures.push(error.into());
-            }
-        }
-        if let Err(error) = end.await {
-            failures.push(error.into());
-        }
-        failures
+        // Every owned case write and end has been observed before the executor
+        // finalizes this recorder. The run summary is not a trace span.
+        Vec::new()
     }
 }
 #[async_trait]

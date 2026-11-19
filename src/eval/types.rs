@@ -59,6 +59,16 @@ pub struct Score {
 }
 
 impl Score {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn score(&self) -> f64 {
+        self.score
+    }
+    pub fn metadata(&self) -> Option<&Map<String, Value>> {
+        self.metadata.as_ref()
+    }
+
     pub fn new(name: impl Into<String>, score: f64) -> Self {
         Self {
             name: name.into(),
@@ -144,6 +154,14 @@ pub struct ScoreStats {
     pub(crate) count: usize,
 }
 
+/// Experiment identity captured before a recorded run reads cases.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalRecording {
+    pub(crate) project_id: String,
+    pub(crate) experiment_id: String,
+    pub(crate) experiment_name: String,
+}
+
 /// Summary of evaluation results
 #[derive(Debug, Serialize)]
 pub struct EvalSummary<I, O> {
@@ -162,6 +180,9 @@ pub struct EvalSummary<I, O> {
     /// Full dataset provenance captured before source consumption.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) dataset: Option<DatasetVersionRef>,
+    /// Resolved recording target; absent for local runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recording: Option<EvalRecording>,
 }
 
 impl<I, O> EvalSummary<I, O> {
@@ -372,6 +393,17 @@ impl ScoreStats {
         self.count
     }
 }
+impl EvalRecording {
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub fn experiment_id(&self) -> &str {
+        &self.experiment_id
+    }
+    pub fn experiment_name(&self) -> &str {
+        &self.experiment_name
+    }
+}
 impl<I, O> EvalSummary<I, O> {
     pub fn name(&self) -> &str {
         &self.name
@@ -394,6 +426,9 @@ impl<I, O> EvalSummary<I, O> {
     pub fn dataset(&self) -> Option<&DatasetVersionRef> {
         self.dataset.as_ref()
     }
+    pub fn recording(&self) -> Option<&EvalRecording> {
+        self.recording.as_ref()
+    }
 }
 impl<'a, I, O> TaskHooks<'a, I, O> {
     pub fn span(&self) -> Option<&'a SpanHandle> {
@@ -401,17 +436,5 @@ impl<'a, I, O> TaskHooks<'a, I, O> {
     }
     pub fn expected(&self) -> Option<&'a O> {
         self.expected
-    }
-}
-
-impl Score {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn score(&self) -> f64 {
-        self.score
-    }
-    pub fn metadata(&self) -> Option<&Map<String, Value>> {
-        self.metadata.as_ref()
     }
 }

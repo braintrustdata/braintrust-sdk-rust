@@ -79,6 +79,10 @@ pub struct ExperimentRegisterRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_experiment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public: Option<bool>,
@@ -95,6 +99,8 @@ impl ExperimentRegisterRequest {
             experiment_name: None,
             description: None,
             base_experiment: None,
+            dataset_id: None,
+            dataset_version: None,
             metadata: None,
             public: None,
             update: None,

@@ -136,6 +136,11 @@ async fn scorer_helpers_accept_borrowed_and_owned_names_and_captured_state() {
 struct UntouchedSource(Arc<AtomicBool>);
 #[async_trait]
 impl CaseSource<usize, usize> for UntouchedSource {
+    async fn prepare(&mut self) -> anyhow::Result<()> {
+        self.0.store(true, Ordering::SeqCst);
+        panic!("invalid plans must not prepare their source");
+    }
+
     async fn next(&mut self) -> anyhow::Result<Option<Case<usize, usize>>> {
         self.0.store(true, Ordering::SeqCst);
         panic!("invalid plans must not read their source");
@@ -152,7 +157,7 @@ async fn invalid_concurrency_and_names_fail_before_login_recording_or_source_acc
         .build()
         .await
         .unwrap();
-
+    let execute = |options| client.clone().eval(options);
     let accessed = Arc::new(AtomicBool::new(false));
     for (concurrency, names, expected) in [
         (0, vec!["one"], EvalConfigError::ZeroConcurrency),
@@ -194,7 +199,7 @@ async fn invalid_concurrency_and_names_fail_before_login_recording_or_source_acc
                 .quiet(true)
                 .build();
         assert_eq!(opts.validate(), Err(expected.clone()));
-        let completion = client.eval(opts);
+        let completion = execute(opts);
         assert!(
             completion.is_err(),
             "configuration must fail before admission"

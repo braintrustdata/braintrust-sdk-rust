@@ -11,43 +11,43 @@ pub struct EvalOpts<I, O> {
     pub(crate) source: Box<dyn CaseSource<I, O>>,
     /// Reusable task and ordered scorers
     pub(crate) definition: EvalDefinition<I, O>,
-    /// Braintrust project to log results to
+    /// Braintrust project for recording; falls back to the client default project.
     pub(crate) project_name: Option<String>,
-    /// Optional experiment name for Braintrust logging
+    /// Experiment name for recording; defaults to the evaluation name.
     pub(crate) experiment_name: Option<String>,
-    /// Optional metadata for the evaluation
+    /// Run metadata stored on the experiment and used as case defaults.
+    /// Case metadata overrides matching keys.
     pub(crate) metadata: Option<Map<String, Value>>,
-    /// Optional tags for the evaluation
+    /// Case tag defaults, combined with source case tags without duplicates.
     pub(crate) tags: Option<Vec<String>>,
     /// Maximum concurrent evaluations (default: 5)
     #[builder(default = 5)]
     pub(crate) max_concurrency: usize,
-    /// Suppress progress output (default: false)
+    /// Suppress default terminal output (default: false). An explicit reporter takes precedence.
     #[builder(default = false)]
     pub(crate) quiet: bool,
-    /// Explicit reporter; overrides default terminal output.
+    /// Explicit reporter; overrides the default terminal output.
     pub(crate) reporter: Option<Box<dyn super::EvalReporter<I, O>>>,
     /// Explicit runtime for local runs. Recorded runs inherit their client binding.
     pub(crate) runtime: Option<tokio::runtime::Handle>,
 }
 
 impl<I, O> EvalOpts<I, O> {
-    /// Optional experiment label supplied by the caller.
-    pub fn experiment_name(&self) -> Option<&str> {
-        self.experiment_name.as_deref()
-    }
-
     /// Set run-owned output, overriding the default reporter.
     pub fn with_reporter(mut self, reporter: impl super::EvalReporter<I, O> + 'static) -> Self {
         self.reporter = Some(Box::new(reporter));
         self
     }
-    pub(crate) fn take_reporter(&mut self) -> Box<dyn super::EvalReporter<I, O>> {
-        self.reporter
-            .take()
-            .unwrap_or_else(|| Box::new(super::reporter::TerminalReporter { quiet: self.quiet }))
-    }
 
+    pub(crate) fn take_reporter(&mut self) -> Box<dyn super::EvalReporter<I, O>> {
+        self.reporter.take().unwrap_or_else(|| {
+            if self.quiet {
+                Box::new(super::SilentReporter)
+            } else {
+                Box::new(super::TerminalReporter::default())
+            }
+        })
+    }
     /// Validate execution options without reading cases or creating recording work.
     pub fn validate(&self) -> std::result::Result<(), EvalConfigError> {
         if self.max_concurrency == 0 {

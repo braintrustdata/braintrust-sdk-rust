@@ -1,9 +1,5 @@
 //! Immediate submission of local and recorded evaluations.
-use super::{
-    executor::{EvalExecutor, EvalPlan},
-    recorder::BraintrustRecorder,
-    EvalConfigError, EvalOpts, EvalRunError, EvalRunFailure, EvalSummary,
-};
+use super::{executor::EvalPlan, submission, EvalOpts, EvalRunError, EvalRunFailure, EvalSummary};
 use crate::{internal::execution::ExecutionBinding, BraintrustClient, Completion};
 use serde::Serialize;
 
@@ -30,7 +26,7 @@ pub fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
     mut options: EvalOpts<I, O>,
 ) -> Completion<EvalSummary<I, O>, EvalRunError<I, O>> {
     let runtime = options.runtime.take();
-    let mut reporter = options.take_reporter();
+    let reporter = options.take_reporter();
     let plan = match EvalPlan::new(options) {
         Ok(plan) => plan,
         Err(error) => return Completion::rejected(error.into()),
@@ -41,9 +37,8 @@ pub fn run<I: Send + Sync + 'static, O: Send + Sync + 'static>(
             return Completion::rejected(EvalRunError::new(EvalRunFailure::Runtime(source)))
         }
     };
-    let callbacks = binding.clone();
-    binding.response(async move {
-        EvalExecutor::run(plan, None, reporter.as_mut(), Some(&callbacks)).await
+    submission::local(plan, binding, reporter, || {
+        Ok((std::future::ready(Ok(())), std::convert::identity, |_| {}))
     })
 }
 
@@ -54,39 +49,9 @@ impl BraintrustClient {
         &self,
         mut options: EvalOpts<I, O>,
     ) -> Completion<EvalSummary<I, O>, EvalRunError<I, O>> {
-        if options.runtime.is_some() {
-            return Completion::rejected(EvalConfigError::RecordedRuntime.into());
-        }
-        let mut reporter = options.take_reporter();
-        let name = options.name.clone();
-        let metadata = options.metadata.clone();
-        let tags = options.tags.clone();
-        let plan = match EvalPlan::new(options) {
-            Ok(plan) => plan,
-            Err(error) => return Completion::rejected(error.into()),
-        };
-        let client = self.clone();
-        let binding = client.execution_binding();
-        let callbacks = binding.clone();
-        binding.response_try(|| {
-            let operation = client.span_operation()?;
-            Ok(async move {
-                let recorder = BraintrustRecorder::new(
-                    client,
-                    operation.submitter.clone(),
-                    name,
-                    metadata,
-                    tags,
-                )
-                .await?;
-                let result =
-                    EvalExecutor::run(plan, Some(&recorder), reporter.as_mut(), Some(&callbacks))
-                        .await;
-                drop(recorder);
-                // Revoke write permission before publishing, including escaped spans.
-                drop(operation);
-                result
-            })
+        let reporter = options.take_reporter();
+        submission::recorded(self.clone(), options, reporter, || {
+            Ok((std::future::ready(Ok(())), std::convert::identity, |_| {}))
         })
     }
 }

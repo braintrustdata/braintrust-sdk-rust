@@ -32,17 +32,15 @@ fn main() -> anyhow::Result<()> {
     println!("Starting synchronous evaluation...\n");
 
     let definition = EvalDefinition::new(Box::new(task), scorers)?;
-    let result = futures::executor::block_on(
-        client
-            .eval(
-                EvalOpts::builder()
-                    .name("sync-uppercase-eval".to_string())
-                    .source(cases.into())
-                    .definition(definition.clone())
-                    .build(),
-            )
-            .into_future(),
-    )?;
+    let completion = client.eval(
+        EvalOpts::builder()
+            .name("sync-uppercase-eval".to_string())
+            .source(cases.into())
+            .definition(definition.clone())
+            .build(),
+    );
+    assert!(completion.is_ok());
+    let result = futures::executor::block_on(completion.into_future())?;
 
     // Print results
     println!("\n=== Results ===\n");

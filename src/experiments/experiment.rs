@@ -45,6 +45,8 @@ pub struct Experiment {
     pub(crate) experiment_name: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) base_experiment: Option<String>,
+    pub(crate) dataset_id: Option<String>,
+    pub(crate) dataset_version: Option<String>,
     pub(crate) metadata: Option<Map<String, Value>>,
     pub(crate) public: Option<bool>,
     pub(crate) update: Option<bool>,
@@ -98,6 +100,8 @@ impl Experiment {
         #[builder(into)] experiment_name: Option<String>,
         #[builder(into)] description: Option<String>,
         #[builder(into)] base_experiment: Option<String>,
+        #[builder(into)] dataset_id: Option<String>,
+        #[builder(into)] dataset_version: Option<String>,
         metadata: Option<Map<String, Value>>,
         public: Option<bool>,
         /// Continue an existing experiment with this name when true; otherwise create a new one.
@@ -121,6 +125,8 @@ impl Experiment {
             experiment_name,
             description,
             base_experiment,
+            dataset_id,
+            dataset_version,
             metadata,
             public,
             update,
@@ -574,7 +580,7 @@ impl Experiment {
     }
 
     /// Polled only on the selected context, by preparation or a bound operation.
-    async fn register_metadata(&self) -> Result<&ExperimentMetadata> {
+    pub(crate) async fn register_metadata(&self) -> Result<&ExperimentMetadata> {
         self.state
             .metadata
             .get_or_try_init(|| async {
@@ -589,6 +595,8 @@ impl Experiment {
                 request.public = self.public;
                 request.update = self.update;
                 request.repo_info = self.repo_info.clone().map(Into::into);
+                request.dataset_id = self.dataset_id.clone();
+                request.dataset_version = self.dataset_version.clone();
                 let response = api_result(
                     self.scope
                         .api(&self.api)?

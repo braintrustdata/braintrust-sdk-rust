@@ -167,7 +167,7 @@ pub(crate) struct TaskGuard {
     finished: bool,
 }
 impl TaskGuard {
-    pub fn complete<T, E>(mut self, response: &Response<T, E>, result: Result<T, E>) {
+    pub fn complete<T, E>(mut self, response: &Response<T, E>, result: Result<T, E>) -> bool {
         self.finished = true;
         if let Some((entry, publication)) = self.tasks.completing(self.id) {
             let unused = response.send(result);
@@ -176,8 +176,10 @@ impl TaskGuard {
             // under the registry lock; both can reenter SDK scheduling.
             drop(unused);
             drop(publication);
+            true
         } else {
             drop(result); // Cancellation already published this task's outcome.
+            false
         }
     }
 }
