@@ -1,3 +1,5 @@
+#[path = "support/eval_server.rs"]
+mod eval_server;
 use braintrust_sdk_rust::{
     eval::*, BraintrustClient, EnqueueError, ExecutionError, SpanLog, WriteError,
 };
@@ -9,10 +11,7 @@ use std::{
     },
     time::Duration,
 };
-use wiremock::{
-    matchers::{method, path},
-    Mock, MockServer, ResponseTemplate,
-};
+use wiremock::MockServer;
 
 fn options<I: Send + Sync + 'static, O: Send + Sync + 'static>(
     definition: EvalDefinition<I, O>,
@@ -121,7 +120,7 @@ fn external_runtime_loss_before_first_poll_reports_worker_loss_without_fallback(
         .definition(definition)
         .source(vec![Case::builder().input(0).build()].into())
         .quiet(true)
-        .runtime(runtime.handle().clone())
+        .maybe_runtime(Some(runtime.handle().clone()))
         .build();
     let token = run(opts);
     assert!(token.is_ok());
@@ -161,28 +160,7 @@ fn invalid_options_return_an_immediate_config_error() {
 }
 
 async fn client(server: &MockServer) -> BraintrustClient {
-    for (endpoint, body) in [
-        (
-            "/api/apikey/login",
-            serde_json::json!({"org_info":[{"id":"org","name":"org"}]}),
-        ),
-        (
-            "/api/project/register",
-            serde_json::json!({"project":{"id":"project"}}),
-        ),
-        ("/logs3", serde_json::json!({})),
-    ] {
-        Mock::given(method("POST"))
-            .and(path(endpoint))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount(server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-        .mount(server)
-        .await;
+    eval_server::mount(server, true).await;
     BraintrustClient::builder()
         .runtime(braintrust_sdk_rust::current_runtime())
         .app_url(server.uri())
@@ -225,10 +203,12 @@ async fn recorded_run_admitted_before_shutdown_finishes_writes_and_revokes_escap
         vec![],
     )
     .unwrap();
-    let token = client.eval(options(definition, vec![Case::builder().input(7).build()]));
+    let token = client
+        .clone()
+        .eval(options(definition, vec![Case::builder().input(7).build()]));
     assert!(token.is_ok());
     let shutdown = client.shutdown(Duration::from_secs(5));
-    let rejected = client.eval(numeric());
+    let rejected = client.clone().eval(numeric());
     assert!(rejected.is_err());
     assert!(matches!(
         rejected.await.unwrap_err().failures(),
@@ -263,7 +243,7 @@ async fn recorded_runtime_override_is_rejected_and_dropped_observer_still_drains
         .quiet(true)
         .maybe_runtime(braintrust_sdk_rust::current_runtime())
         .build();
-    let rejected = client.eval(opts);
+    let rejected = client.clone().eval(opts);
     assert!(rejected.is_err());
     assert!(matches!(
         rejected.await.unwrap_err().failures(),
@@ -281,7 +261,11 @@ async fn recorded_runtime_override_is_rejected_and_dropped_observer_still_drains
         vec![],
     )
     .unwrap();
-    drop(client.eval(options(definition, vec![Case::builder().input(1).build()])));
+    drop(
+        client
+            .clone()
+            .eval(options(definition, vec![Case::builder().input(1).build()])),
+    );
     client.shutdown(Duration::from_secs(5)).await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -303,7 +287,9 @@ async fn callback_panic_retires_recorded_run_and_revokes_escaped_permission() {
         vec![],
     )
     .unwrap();
-    let token = client.eval(options(definition, vec![Case::builder().input(0).build()]));
+    let token = client
+        .clone()
+        .eval(options(definition, vec![Case::builder().input(0).build()]));
     let error = token.await.unwrap_err();
     assert!(matches!(
         error.failures(),
@@ -337,7 +323,9 @@ async fn shutdown_deadline_cancels_pending_run_and_revokes_escaped_permission() 
         vec![],
     )
     .unwrap();
-    let token = client.eval(options(definition, vec![Case::builder().input(0).build()]));
+    let token = client
+        .clone()
+        .eval(options(definition, vec![Case::builder().input(0).build()]));
     entered.notified().await;
     assert!(matches!(
         client.shutdown(Duration::from_millis(20)).await,
@@ -411,7 +399,7 @@ async fn running_blocking_callback_keeps_owned_data_after_timeout_but_loses_writ
             })
             .build()],
     );
-    let token = client.eval(opts);
+    let token = client.clone().eval(opts);
     entered.notified().await;
     assert!(client.shutdown(Duration::from_millis(20)).await.is_err());
     assert!(matches!(
@@ -454,14 +442,62 @@ async fn synchronous_callback_can_wait_for_recording_without_blocking_delivery()
         )?;
         Ok(*input)
     });
-    let token = client.eval(options(
+    let token = client.clone().eval(options(
         EvalDefinition::new(Box::new(callback), vec![]).unwrap(),
         vec![Case::builder().input(9).build()],
     ));
     let shutdown = client.shutdown(Duration::from_secs(5));
     let (result, shutdown) = tokio::join!(token, shutdown);
-    assert_eq!(result.unwrap().results()[0].output(), Some(&9));
+    assert_eq!(result.unwrap().results()[0].output().copied(), Some(9));
     shutdown.unwrap();
+}
+
+#[test]
+fn local_run_context_uses_case_overrides_without_a_recording_target() {
+    let definition = EvalDefinition::new(
+        Box::new(SyncFnTask::new(
+            |input: &usize, hooks: &TaskHooks<'_, usize, usize>| {
+                assert_eq!(hooks.get_metadata().unwrap()["run"], true);
+                assert_eq!(hooks.get_metadata().unwrap()["collision"], "case");
+                hooks.add_metadata("task", serde_json::json!(true));
+                Ok(*input)
+            },
+        )),
+        vec![],
+    )
+    .unwrap();
+    let opts = EvalOpts::builder()
+        .name("eager".into())
+        .definition(definition)
+        .source(
+            vec![Case::builder()
+                .input(1)
+                .metadata(
+                    serde_json::json!({"collision":"case"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+                .tags(vec!["shared".into(), "case".into()])
+                .build()]
+            .into(),
+        )
+        .quiet(true)
+        .metadata(
+            serde_json::json!({"run":true, "collision":"run"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .tags(vec!["run".into(), "shared".into()])
+        .build();
+    let summary = futures::executor::block_on(run(opts).into_future()).unwrap();
+    assert!(summary.recording().is_none());
+    assert_eq!(summary.results()[0].metadata().unwrap()["task"], true);
+    assert_eq!(
+        summary.results()[0].tags().unwrap(),
+        &["run", "shared", "case"]
+    );
 }
 
 #[test]
@@ -470,20 +506,27 @@ fn options_reporter_overrides_quiet_and_observes_local_results() {
     // Deliberately no Serialize or Clone on local output.
     struct Output(usize);
     impl EvalReporter<usize, Output> for Reporter {
-        fn started(&mut self, name: &str) {
+        fn started(&mut self, name: &str) -> Result<(), ReportError> {
             self.0.lock().unwrap().push(name.into());
+            Ok(())
         }
-        fn case_finished(&mut self, index: usize, result: &EvalResult<usize, Output>) {
+        fn case_finished(
+            &mut self,
+            index: usize,
+            result: &EvalResult<usize, Output>,
+        ) -> Result<(), ReportError> {
             self.0
                 .lock()
                 .unwrap()
                 .push(format!("{index}:{}", result.output().unwrap().0));
+            Ok(())
         }
-        fn finished(&mut self, summary: &EvalSummary<usize, Output>) {
+        fn finished(&mut self, summary: &EvalSummary<usize, Output>) -> Result<(), ReportError> {
             self.0
                 .lock()
                 .unwrap()
                 .push(format!("done:{}", summary.total_cases()));
+            Ok(())
         }
     }
     let events = Arc::new(Mutex::new(vec![]));

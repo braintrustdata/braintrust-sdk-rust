@@ -1,33 +1,13 @@
+#[path = "support/eval_server.rs"]
+mod eval_server;
 use braintrust_sdk_rust::eval::CaseSource;
 use braintrust_sdk_rust::eval::*;
 use braintrust_sdk_rust::*;
 
 async fn recording_client() -> (BraintrustClient, wiremock::MockServer) {
-    use serde_json::json;
-    use wiremock::{
-        matchers::{method, path},
-        Mock, MockServer, ResponseTemplate,
-    };
+    use wiremock::MockServer;
     let server = MockServer::start().await;
-    for (endpoint, response) in [
-        (
-            "/api/apikey/login",
-            json!({"org_info":[{"id":"org","name":"org"}]}),
-        ),
-        ("/api/project/register", json!({"project":{"id":"project"}})),
-        ("/logs3", json!({})),
-    ] {
-        Mock::given(method("POST"))
-            .and(path(endpoint))
-            .respond_with(ResponseTemplate::new(200).set_body_json(response))
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&server)
-        .await;
+    eval_server::mount(&server, true).await;
     let client = BraintrustClient::builder()
         .app_url(server.uri())
         .api_url(server.uri())
@@ -44,6 +24,7 @@ async fn recording_client() -> (BraintrustClient, wiremock::MockServer) {
 #[tokio::test]
 async fn test_basic_eval_flow() {
     let (client, server) = recording_client().await;
+    let execute = |options| client.clone().eval(options);
 
     let cases = vec![
         Case::builder()
@@ -73,17 +54,16 @@ async fn test_basic_eval_flow() {
         },
     ))];
 
-    let result = client
-        .eval(
-            EvalOpts::builder()
-                .name("test-basic-eval".to_string())
-                .source(cases.into())
-                .definition(EvalDefinition::new(Box::new(callback), scorers).unwrap())
-                .quiet(true)
-                .build(),
-        )
-        .await
-        .expect("Evaluation failed");
+    let result = execute(
+        EvalOpts::builder()
+            .name("test-basic-eval".to_string())
+            .source(cases.into())
+            .definition(EvalDefinition::new(Box::new(callback), scorers).unwrap())
+            .quiet(true)
+            .build(),
+    )
+    .await
+    .expect("Evaluation failed");
 
     assert_eq!(result.total_cases(), 2);
     assert_eq!(result.successful_cases(), 2);
@@ -194,37 +174,36 @@ fn test_eval_opts_builder() {
 #[tokio::test]
 async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
     let (client, server) = recording_client().await;
-
+    let execute = |options| client.clone().eval(options);
     let scorers: Vec<Box<dyn Scorer<String, String>>> = vec![
         Box::new(ExactMatch::new()),
         Box::new(SyncFnScorer::new("broken", |_| {
             anyhow::bail!("scoring failed")
         })),
     ];
-    let result = client
-        .eval(
-            EvalOpts::builder()
-                .name("failed-scorer".into())
-                .source(
-                    vec![Case::builder()
-                        .input("a".to_owned())
-                        .expected("A".to_owned())
-                        .id("source-case".into())
-                        .build()]
-                    .into(),
+    let result = execute(
+        EvalOpts::builder()
+            .name("failed-scorer".into())
+            .source(
+                vec![Case::builder()
+                    .input("a".to_owned())
+                    .expected("A".to_owned())
+                    .id("source-case".into())
+                    .build()]
+                .into(),
+            )
+            .definition(
+                EvalDefinition::new(
+                    Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()))),
+                    scorers,
                 )
-                .definition(
-                    EvalDefinition::new(
-                        Box::new(SimpleFnTask::new(|input: &String| Ok(input.to_uppercase()))),
-                        scorers,
-                    )
-                    .unwrap(),
-                )
-                .quiet(true)
-                .build(),
-        )
-        .await
-        .unwrap();
+                .unwrap(),
+            )
+            .quiet(true)
+            .build(),
+    )
+    .await
+    .unwrap();
     assert_eq!(result.successful_cases(), 0);
     assert_eq!(result.failed_cases(), 1);
     assert_eq!(result.score_stats()[0].name(), "exact_match");
@@ -232,19 +211,7 @@ async fn recorded_scorer_failure_keeps_valid_scores_and_finishes_the_case() {
     let case = &result.results()[0];
     assert_eq!(case.case_id(), Some("source-case"));
     assert!(matches!(&case.errors()[0], CaseError::Scorer {name,..} if name == "broken"));
-    let rows: Vec<serde_json::Value> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .flat_map(|request| {
-            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .clone()
-        })
-        .collect();
+    let rows = rows(&server.received_requests().await.unwrap());
     assert!(rows
         .iter()
         .any(|row| row["error"][0]["stage"] == "scorer" && row["error"][0]["name"] == "broken"));
@@ -297,10 +264,12 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
             ))
         }
         fn provenance(&self) -> Option<DatasetVersionRef> {
-            Some(DatasetVersionRef {
-                dataset_id: "source-dataset".into(),
-                version: Some(format!("version-{}", self.reads.get())),
-            })
+            Some(
+                DatasetVersionRef::builder()
+                    .dataset_id("source-dataset".into())
+                    .version(format!("version-{}", self.reads.get()))
+                    .build(),
+            )
         }
     }
     let (client, server) = recording_client().await;
@@ -373,8 +342,8 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
     assert_eq!(partial.successful_cases(), 2);
     assert_eq!(partial.failed_cases(), 0);
     let dataset = partial.dataset().unwrap();
-    assert_eq!(dataset.dataset_id, "source-dataset");
-    assert_eq!(dataset.version.as_deref(), Some("version-0"));
+    assert_eq!(dataset.dataset_id(), "source-dataset");
+    assert_eq!(dataset.version(), Some("version-0"));
     assert_eq!(
         partial
             .results()
@@ -386,19 +355,7 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
     assert_eq!(partial.results()[1].case_id(), Some("case-1"));
     assert_eq!(partial.results()[1].xact_id(), Some("row-version-1"));
     assert_eq!(partial.results()[1].output().unwrap().0, 2);
-    let rows: Vec<serde_json::Value> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|request| request.url.path() == "/logs3")
-        .flat_map(|request| {
-            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .clone()
-        })
-        .collect();
+    let rows = rows(&server.received_requests().await.unwrap());
     let ended: std::collections::HashSet<_> = rows
         .iter()
         .filter(|row| row["metrics"]["end"].is_number())
@@ -406,13 +363,13 @@ async fn source_failure_drains_active_cases_preserves_provenance_and_finishes_re
         .collect();
     assert_eq!(
         ended.len(),
-        3,
-        "both cases and the run span must finish before returning partial results"
+        2,
+        "both case roots must finish before returning partial results"
     );
 }
 
 #[tokio::test]
-async fn failure_before_the_first_case_returns_an_empty_partial_run_and_finalizes_root() {
+async fn failure_before_the_first_case_returns_the_resolved_target_without_trace_rows() {
     let (client, server) = recording_client().await;
     let items: Vec<anyhow::Result<Case<String, String>>> =
         vec![Err(anyhow::anyhow!("source unavailable"))];
@@ -442,23 +399,13 @@ async fn failure_before_the_first_case_returns_an_empty_partial_run_and_finalize
     assert_eq!(partial.failed_cases(), 0);
     assert!(partial.results().is_empty());
     assert!(partial.dataset().is_none());
-    let ended = server
+    assert_eq!(partial.recording().unwrap().experiment_id(), "experiment");
+    assert!(!server
         .received_requests()
         .await
         .unwrap()
         .iter()
-        .filter(|r| r.url.path() == "/logs3")
-        .any(|request| {
-            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["rows"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|row| row["metrics"]["end"].is_number())
-        });
-    assert!(
-        ended,
-        "the run span must finish even when source failure precedes all cases"
-    );
+        .any(|request| request.url.path() == "/logs3"));
 }
 
 #[tokio::test]
@@ -566,7 +513,7 @@ async fn reusable_definition_keeps_recorded_runs_and_sources_independent() {
         Arc,
     };
     let (client, _server) = recording_client().await;
-
+    let execute = |options| client.clone().eval(options);
     let calls = Arc::new(AtomicUsize::new(0));
     let definition = EvalDefinition::new(
         Box::new(task({
@@ -589,23 +536,29 @@ async fn reusable_definition_keeps_recorded_runs_and_sources_independent() {
             .build()
     };
     let (first, second) = tokio::join!(
-        client.eval(options("first", 2, 4)),
-        client.eval(options("second", 3, 100)),
+        execute(options("first", 2, 4)),
+        execute(options("second", 3, 100)),
     );
     let first = first.unwrap();
     let second = second.unwrap();
     assert_eq!(first.name(), "first");
     assert_eq!(second.name(), "second");
-    assert_eq!(first.results()[0].output(), Some(&4));
-    assert_eq!(second.results()[0].output(), Some(&6));
+    assert_eq!(first.results()[0].output().copied(), Some(4));
+    assert_eq!(second.results()[0].output().copied(), Some(6));
     assert_eq!(first.results()[0].scores()[0].score(), 1.0);
     assert_eq!(second.results()[0].scores()[0].score(), 0.0);
-    assert_eq!(first.results()[0].tags(), Some(&vec!["input-2".into()]));
-    assert_eq!(second.results()[0].tags(), Some(&vec!["input-3".into()]));
+    assert_eq!(
+        first.results()[0].tags().cloned(),
+        Some(vec!["input-2".into()])
+    );
+    assert_eq!(
+        second.results()[0].tags().cloned(),
+        Some(vec!["input-3".into()])
+    );
     assert_ne!(first.results()[0].span_id(), second.results()[0].span_id());
-    let later = client.eval(options("later", 5, 10)).await.unwrap();
+    let later = execute(options("later", 5, 10)).await.unwrap();
     assert_eq!(later.total_cases(), 1);
-    assert_eq!(later.results()[0].output(), Some(&10));
+    assert_eq!(later.results()[0].output().copied(), Some(10));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
@@ -656,7 +609,249 @@ async fn serialization_failures_keep_outputs_and_finalize_recording() {
     assert_eq!(summary.results()[0].output().unwrap().0, 14);
     assert!(summary.results()[0].span_id().is_some());
     let requests = server.received_requests().await.unwrap();
-    let ended: std::collections::HashSet<_> = requests
+    let ended: std::collections::HashSet<_> = rows(&requests)
+        .into_iter()
+        .filter(|row| row["metrics"]["end"].is_number())
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ended.len(), 1, "case recording must finalize");
+}
+
+#[tokio::test]
+async fn experiment_is_resolved_before_source_reads_and_case_roots_keep_independent_traces() {
+    use serde_json::json;
+    use std::{
+        cell::Cell,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+    use wiremock::{
+        matchers::{header, method, path},
+        Mock, ResponseTemplate,
+    };
+    let (client, server) = recording_client().await;
+    let registered = Arc::new(AtomicBool::new(false));
+    let prepared = Arc::new(AtomicBool::new(false));
+    Mock::given(method("POST")).and(path("/api/experiment/register"))
+        .and(header("authorization", "Bearer test-key"))
+        .and(header("x-bt-org-name", "org"))
+        .respond_with({
+            let registered = registered.clone();
+            let prepared = prepared.clone();
+            move |_: &wiremock::Request| {
+                assert!(prepared.load(Ordering::SeqCst));
+                registered.store(true, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"chosen-project","name":"chosen"},"experiment":{"id":"chosen-id","name":"resolved-name"}}))
+            }
+        }).with_priority(1).expect(1).mount(&server).await;
+    struct Source {
+        cursor: Cell<usize>,
+        registered: Arc<AtomicBool>,
+        prepared: Arc<AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl CaseSource<usize, usize> for Source {
+        async fn prepare(&mut self) -> anyhow::Result<()> {
+            assert!(
+                !self.prepared.swap(true, Ordering::SeqCst),
+                "prepare exactly once"
+            );
+            assert!(!self.registered.load(Ordering::SeqCst));
+            Ok(())
+        }
+        async fn next(&mut self) -> anyhow::Result<Option<Case<usize, usize>>> {
+            assert!(self.registered.load(Ordering::SeqCst));
+            let index = self.cursor.get();
+            self.cursor.set(index + 1);
+            Ok((index < 2).then(|| {
+                Case::builder()
+                    .input(index)
+                    .id(format!("application-case-{index}"))
+                    .xact_id("application-version".into())
+                    .metadata(json!({"collision":"case"}).as_object().unwrap().clone())
+                    .tags(vec!["shared".into(), "case".into()])
+                    .build()
+            }))
+        }
+    }
+    let definition = EvalDefinition::new(
+        Box::new(task(|input: &usize, hooks| {
+            Box::pin(async move {
+                assert_eq!(hooks.get_metadata().unwrap()["shared"], "run");
+                assert_eq!(hooks.get_metadata().unwrap()["collision"], "case");
+                let child = hooks
+                    .span()
+                    .unwrap()
+                    .child_builder()
+                    .unwrap()
+                    .name("nested")
+                    .build();
+                child
+                    .log(SpanLog::builder().input(json!(input)).build())
+                    .await?;
+                child.end().await?;
+                hooks.add_tag("task");
+                Ok(*input * 2)
+            })
+        })),
+        vec![],
+    )
+    .unwrap();
+    let opts = EvalOpts::builder()
+        .name("named-eval".into())
+        .source(Box::new(Source {
+            cursor: Cell::new(0),
+            registered,
+            prepared,
+        }))
+        .definition(definition)
+        .project_name("chosen".into())
+        .experiment_name("requested-name".into())
+        .metadata(
+            json!({"shared":"run", "collision":"run"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .tags(vec!["run".into(), "shared".into()])
+        .quiet(true)
+        .build();
+    let summary = client.eval(opts).await.unwrap();
+    let recording = summary.recording().unwrap();
+    assert_eq!(recording.project_id(), "chosen-project");
+    assert_eq!(recording.experiment_id(), "chosen-id");
+    assert_eq!(recording.experiment_name(), "resolved-name");
+    assert_eq!(
+        summary.results()[0].tags().unwrap(),
+        &["run", "shared", "case", "task"]
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests
+        .iter()
+        .any(|request| request.url.path() == "/api/project/register"));
+    let registration: serde_json::Value = serde_json::from_slice(
+        &requests
+            .iter()
+            .find(|request| request.url.path() == "/api/experiment/register")
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert_eq!(registration["project_name"], "chosen");
+    assert_eq!(registration["experiment_name"], "requested-name");
+    assert_eq!(registration["metadata"]["collision"], "run");
+    assert!(registration.get("dataset_id").is_none());
+    assert!(registration.get("dataset_version").is_none());
+    let rows = rows(&requests);
+    assert!(rows
+        .iter()
+        .all(|row| row["experiment_id"] == "chosen-id" && row.get("project_id").is_none()));
+    assert!(rows
+        .iter()
+        .all(|row| row["span_attributes"]["name"] != "eval-named-eval"));
+    assert!(rows.iter().all(|row| row.get("origin").is_none()));
+    let mut roots = std::collections::HashSet::new();
+    for case in summary.results() {
+        let id = case.span_id().unwrap();
+        let root = rows
+            .iter()
+            .find(|row| row["span_id"] == id && row["metrics"]["end"].is_number())
+            .unwrap();
+        assert_eq!(root["root_span_id"], *id);
+        roots.insert(id);
+        let child = rows
+            .iter()
+            .find(|row| row["span_attributes"]["name"] == "nested" && row["root_span_id"] == *id)
+            .unwrap();
+        assert_eq!(child["span_parents"][0], *id);
+    }
+    assert_eq!(roots.len(), 2);
+    assert_eq!(
+        summary_to_value(&summary).unwrap()["recording"]["experiment_id"],
+        "chosen-id"
+    );
+}
+
+#[tokio::test]
+async fn registration_failure_reads_no_cases_and_a_later_run_can_record_normally() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use wiremock::{
+        matchers::{method, path},
+        Mock, ResponseTemplate,
+    };
+    let (client, server) = recording_client().await;
+    Mock::given(method("POST"))
+        .and(path("/api/experiment/register"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("registration denied"))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let definition = EvalDefinition::new(
+        Box::new(SimpleFnTask::new({
+            let calls = calls.clone();
+            move |input: &usize| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(*input)
+            }
+        })),
+        vec![],
+    )
+    .unwrap();
+    let opts = EvalOpts::builder()
+        .name("blocked".into())
+        .source(Box::new(IterCaseSource::new({
+            let reads = reads.clone();
+            (0..1).map(move |input| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(Case::builder().input(input).build())
+            })
+        })))
+        .definition(definition.clone())
+        .quiet(true)
+        .build();
+    let error = client.clone().eval(opts).await.unwrap_err();
+    assert!(matches!(
+        error.failures(),
+        [EvalRunFailure::Recording {
+            case_index: None,
+            source: BraintrustError::Api { status: 403, .. }
+        }]
+    ));
+    assert_eq!(error.partial().as_ref().unwrap().total_cases(), 0);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| request.url.path() == "/logs3"));
+    let opts = EvalOpts::builder()
+        .name("later".into())
+        .source(vec![Case::builder().input(5).build()].into())
+        .definition(definition)
+        .quiet(true)
+        .build();
+    let summary = client.clone().eval(opts).await.unwrap();
+    assert_eq!(summary.results()[0].output().copied(), Some(5));
+    assert_eq!(summary.recording().unwrap().experiment_id(), "experiment");
+    client
+        .shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+}
+
+fn rows(requests: &[wiremock::Request]) -> Vec<serde_json::Value> {
+    requests
         .iter()
         .filter(|request| request.url.path() == "/logs3")
         .flat_map(|request| {
@@ -665,44 +860,5 @@ async fn serialization_failures_keep_outputs_and_finalize_recording() {
                 .unwrap()
                 .clone()
         })
-        .filter(|row| row["metrics"]["end"].is_number())
-        .map(|row| row["id"].as_str().unwrap().to_owned())
-        .collect();
-    assert_eq!(ended.len(), 2, "both case and run recording must finalize");
-}
-
-#[test]
-fn case_and_score_keep_their_serde_format() {
-    use serde_json::json;
-    let wire = json!({
-        "input": "hello", "expected": "HELLO", "metadata": {"k": "v"},
-        "tags": ["tag"], "id": "case", "xact_id": "transaction", "created": "timestamp"
-    });
-    let case = Case::builder()
-        .input("hello")
-        .expected("HELLO")
-        .metadata(json!({"k": "v"}).as_object().unwrap().clone())
-        .tags(vec!["tag".into()])
-        .id("case".into())
-        .xact_id("transaction".into())
-        .created("timestamp".into())
-        .build();
-    assert_eq!(serde_json::to_value(case).unwrap(), wire);
-    let decoded: Case<String, String> = serde_json::from_value(wire.clone()).unwrap();
-    assert_eq!(decoded.id(), Some("case"));
-    assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
-    assert_eq!(
-        serde_json::to_value(Case::<_, ()>::builder().input(1).build()).unwrap(),
-        json!({"input":1, "expected":null})
-    );
-    let score = Score::with_metadata("match", 1.0, json!({"k":"v"}).as_object().unwrap().clone());
-    assert_eq!(score.metadata().unwrap()["k"], "v");
-    assert_eq!(
-        serde_json::to_value(score).unwrap(),
-        json!({"name":"match", "score":1.0, "metadata":{"k":"v"}})
-    );
-    let score: Score = serde_json::from_value(json!({"name":"match", "score":1.0})).unwrap();
-    assert_eq!(score.name(), "match");
-    assert_eq!(score.score(), 1.0);
-    assert!(score.metadata().is_none());
+        .collect()
 }
