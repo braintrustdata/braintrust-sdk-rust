@@ -10,12 +10,10 @@ use tokio::sync::OnceCell;
 
 use crate::api::ExperimentRegisterRequest;
 use crate::error::Result;
-use crate::experiments::event_log::ExperimentLog;
 use crate::experiments::feedback::Feedback;
 use crate::experiments::metadata::{
     BaseExperimentInfo, ExportedExperiment, ProjectMetadata, RepoInfo,
 };
-use crate::experiments::span_builder::ExperimentSpanBuilder;
 use crate::experiments::summary::{ExperimentSummary, MetricSummary, ScoreSummary};
 use crate::http::api_result;
 use crate::internal::ports::SpanSubmitter;
@@ -114,7 +112,7 @@ impl Experiment {
     ///
     /// Returns an error if registration/delivery fails, or if start_span() has
     /// already selected the span-recording interface for this experiment.
-    pub async fn log(&self, event: ExperimentLog) -> Result<String> {
+    pub async fn log(&self, event: SpanLog) -> Result<String> {
         if self.state.called_start_span.load(Ordering::Acquire) {
             return Err(crate::BraintrustError::InvalidConfig(
                 "cannot use log() after start_span(); use the span to log events".into(),
@@ -144,7 +142,7 @@ impl Experiment {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs_f64())
             .unwrap_or(0.0);
-        let mut span_log = event.into_span_log();
+        let mut span_log = event;
         span_log
             .metrics
             .get_or_insert_with(HashMap::new)
@@ -164,10 +162,14 @@ impl Experiment {
     ///
     /// Use this for more control over span lifecycle. Once called,
     /// you cannot use `log()` on this experiment.
-    pub async fn start_span(&self) -> Result<ExperimentSpanBuilder> {
+    pub async fn start_span(&self) -> Result<SpanBuilder> {
         let metadata = self.ensure_registered().await?;
         self.state.called_start_span.store(true, Ordering::Release);
-        Ok(ExperimentSpanBuilder::new(self, &metadata.experiment_id))
+        Ok(SpanBuilder::new(self.submitter.clone(), self.scope.clone())
+            .parent_info(ParentSpanInfo::Experiment {
+                object_id: metadata.experiment_id.clone(),
+            })
+            .span_type(SpanType::Eval))
     }
 
     /// Log feedback on an existing span/record.
@@ -250,62 +252,52 @@ impl Experiment {
         )?
         .into_inner();
 
-        // Build summary from comparison response
-        let mut summary = ExperimentSummary::new(
-            self.project_name.clone(),
-            metadata.experiment_name.clone(),
-            Some(metadata.project_id.clone()),
-            Some(metadata.experiment_id.clone()),
-        );
-
-        // Set comparison experiment name if present
-        if let Some(base_name) = comparison.base_experiment_name {
-            summary.set_comparison_experiment_name(base_name);
-        }
-
-        // Convert scores from comparison response
-        let scores: HashMap<String, ScoreSummary> = comparison
+        let scores = comparison
             .scores
             .into_iter()
-            .map(|(name, data)| {
-                let mut score_summary = ScoreSummary::new(name.clone(), data.score);
-                if let Some(diff) = data.diff {
-                    score_summary.set_diff(diff);
-                }
-                if let Some(improvements) = data.improvements {
-                    score_summary.set_improvements(improvements);
-                }
-                if let Some(regressions) = data.regressions {
-                    score_summary.set_regressions(regressions);
-                }
-                (name, score_summary)
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    ScoreSummary {
+                        name,
+                        score: value.score,
+                        diff: value.diff,
+                        improvements: value.improvements,
+                        regressions: value.regressions,
+                    },
+                )
             })
             .collect();
-        summary.set_scores(scores);
-
-        // Convert metrics from comparison response
-        if !comparison.metrics.is_empty() {
-            let metrics: HashMap<String, MetricSummary> = comparison
+        let metrics = (!comparison.metrics.is_empty()).then(|| {
+            comparison
                 .metrics
                 .into_iter()
-                .map(|(name, data)| {
-                    let mut metric_summary = MetricSummary::new(name.clone(), data.metric);
-                    if let Some(diff) = data.diff {
-                        metric_summary.set_diff(diff);
-                    }
-                    if let Some(improvements) = data.improvements {
-                        metric_summary.set_improvements(improvements);
-                    }
-                    if let Some(regressions) = data.regressions {
-                        metric_summary.set_regressions(regressions);
-                    }
-                    (name, metric_summary)
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        MetricSummary {
+                            name,
+                            metric: value.metric,
+                            unit: None,
+                            diff: value.diff,
+                            improvements: value.improvements,
+                            regressions: value.regressions,
+                        },
+                    )
                 })
-                .collect();
-            summary.set_metrics(metrics);
-        }
-
-        Ok(summary)
+                .collect()
+        });
+        Ok(ExperimentSummary {
+            project_name: self.project_name.clone(),
+            experiment_name: metadata.experiment_name.clone(),
+            project_id: Some(metadata.project_id.clone()),
+            experiment_id: Some(metadata.experiment_id.clone()),
+            project_url: None,
+            experiment_url: None,
+            comparison_experiment_name: comparison.base_experiment_name,
+            scores,
+            metrics,
+        })
     }
 
     /// Flush all pending experiment data to Braintrust.

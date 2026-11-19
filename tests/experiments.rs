@@ -1,4 +1,4 @@
-use braintrust_sdk_rust::{BraintrustClient, ExperimentLog, Feedback};
+use braintrust_sdk_rust::{BraintrustClient, Feedback, SpanLog};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -39,7 +39,7 @@ async fn experiment_log_flushes_to_logs_endpoint() {
 
     let _id = experiment
         .log(
-            ExperimentLog::builder()
+            SpanLog::builder()
                 .input(json!({"question": "What is 2+2?"}))
                 .output(json!({"answer": "4"}))
                 .expected(json!({"answer": "4"}))
@@ -105,7 +105,7 @@ async fn experiment_log_feedback_sends_merge_event() {
 
     // Log an event
     let id = experiment
-        .log(ExperimentLog::builder().input(json!("test input")).build())
+        .log(SpanLog::builder().input(json!("test input")).build())
         .await
         .expect("log event");
 
@@ -196,7 +196,7 @@ async fn experiment_summarize_returns_summary() {
 
     // Log an event first
     experiment
-        .log(ExperimentLog::builder().input(json!("test")).build())
+        .log(SpanLog::builder().input(json!("test")).build())
         .await
         .expect("log event");
 
@@ -278,7 +278,7 @@ async fn registration_failure_has_no_invented_id_and_clones_share_a_successful_r
         "experiment"
     );
     experiment
-        .log(ExperimentLog::builder().input(json!("value")).build())
+        .log(SpanLog::builder().input(json!("value")).build())
         .await
         .unwrap();
     let requests = server.received_requests().await.unwrap();
@@ -317,7 +317,7 @@ async fn every_registration_dependent_operation_returns_the_real_failure() {
     assert_api_error(experiment.start_span().await, 400);
     assert_api_error(
         experiment
-            .log(ExperimentLog::builder().input(json!("value")).build())
+            .log(SpanLog::builder().input(json!("value")).build())
             .await,
         400,
     );
@@ -373,7 +373,7 @@ async fn event_feedback_and_update_methods_propagate_delivery_rejection() {
         .build();
     assert_api_error(
         experiment
-            .log(ExperimentLog::builder().input(json!("value")).build())
+            .log(SpanLog::builder().input(json!("value")).build())
             .await,
         401,
     );
@@ -486,7 +486,7 @@ async fn clones_share_the_selected_span_recording_interface() {
     experiment.start_span().await.unwrap();
     assert!(matches!(
         clone
-            .log(ExperimentLog::builder().input(json!("value")).build())
+            .log(SpanLog::builder().input(json!("value")).build())
             .await,
         Err(braintrust_sdk_rust::BraintrustError::InvalidConfig(_))
     ));
