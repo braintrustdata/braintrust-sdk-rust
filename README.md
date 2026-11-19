@@ -71,7 +71,7 @@ ignored with a diagnostic. Create child spans for separate operations; use
 ## Submission and completion
 
 Methods that schedule work return `Completion<T, E>`. Calling the method submits
-the operation; awaiting its token observes the result. Inspect `&*completion`
+the operation; awaiting its token observes the result. Inspect `completion.submission()`
 for the immediate admission `Result<(), E>`, such as a full or closed queue.
 An admitted operation can still fail later. Dropping the token leaves accepted
 work running.
@@ -81,7 +81,7 @@ use braintrust_sdk_rust::{SpanHandle, SpanLog};
 
 async fn log(span: &SpanHandle) -> anyhow::Result<()> {
     let completion = span.log(SpanLog::default());
-    if let Err(error) = &*completion {
+    if let Err(error) = completion.submission() {
         eprintln!("submission rejected: {error}");
     }
     completion.await?;
