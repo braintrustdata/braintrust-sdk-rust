@@ -145,6 +145,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocking_wait_keeps_the_selected_runtime_and_refusal_does_not_cancel_work() {
+        for binding in [
+            ExecutionBinding::new(None).unwrap(),
+            ExecutionBinding::external(Handle::current()),
+        ] {
+            let expected = binding.handle.id();
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = completed.clone();
+            let (release, gate) = oneshot::channel();
+            let pending = binding.response::<_, BraintrustError, _>(async move {
+                gate.await.unwrap();
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            });
+            assert!(matches!(
+                pending.blocking_wait(),
+                Err(crate::BlockingWaitError::InRuntime)
+            ));
+            release.send(()).unwrap();
+            binding.responses_drained().await.unwrap();
+            assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+
+            let (sender, result) = oneshot::channel();
+            let thread = std::thread::spawn(move || {
+                let completion =
+                    binding.response::<_, BraintrustError, _>(async { Ok(Handle::current().id()) });
+                sender.send(completion.blocking_wait()).unwrap();
+            });
+            assert_eq!(result.await.unwrap().unwrap(), expected);
+            thread.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn accepted_response_tasks_retain_the_owner_and_bound_unobserved_work() {
         let binding = ExecutionBinding::new(None).unwrap();
         let owner = Arc::downgrade(binding._owner.as_ref().unwrap());
