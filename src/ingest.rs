@@ -32,7 +32,7 @@ use crate::internal::{
 use crate::{api, BraintrustError, Completion, ShutdownError};
 use serde_json::{Map, Value};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::Mutex;
+use tokio::sync::OnceCell;
 
 #[derive(Debug, Clone, Default)]
 pub struct UploadResult {
@@ -48,7 +48,7 @@ type ShutdownOutcome = SharedOutcome<(), ShutdownError>;
 #[derive(Clone)]
 pub struct BatchUploader {
     api: api::Client,
-    limits: Arc<Mutex<Option<Capabilities>>>,
+    limits: Arc<OnceCell<Capabilities>>,
     execution: ExecutionBinding,
     shutdown: Arc<std::sync::Mutex<Option<ShutdownOutcome>>>,
 }
@@ -65,7 +65,7 @@ impl BatchUploader {
         Ok(Self {
             api,
             execution: ExecutionBinding::new(runtime)?,
-            limits: Arc::new(Mutex::new(None)),
+            limits: Arc::new(OnceCell::new()),
             shutdown: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -84,17 +84,9 @@ impl BatchUploader {
                 return Ok(UploadResult::default());
             }
             let coordinator = UploadCoordinator::new(api, UploadPolicy::Standalone);
-            let limits = {
-                let mut cached = cache.lock().await;
-                match *cached {
-                    Some(limits) => limits,
-                    None => {
-                        let limits = coordinator.capabilities(6 * 1024 * 1024, None).await;
-                        *cached = Some(limits);
-                        limits
-                    }
-                }
-            };
+            let limits = *cache
+                .get_or_init(|| coordinator.capabilities(6 * 1024 * 1024, None))
+                .await;
             let row_payloads = rows
                 .iter()
                 .map(EncodedRow::from_map)

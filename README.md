@@ -189,7 +189,7 @@ and [synchronous example](https://github.com/braintrustdata/braintrust-sdk-rust/
 - `api::Client` exposes direct endpoint operations with one HTTP attempt per
   call. Use it when your application owns delivery and retry policy.
 - `ingest::BatchUploader` uploads caller-owned bulk import batches with SDK
-  splitting, retries and overflow handling. It accepts `api::Config`, returns
+  splitting, retries and overflow handling. It accepts `api::Client`, returns
   eager completions from `upload_rows(rows, max_items)`, and supports `shutdown`.
 - Usage extractors support OpenAI and Anthropic responses; streaming helpers
   support provider response assembly.

@@ -237,7 +237,11 @@ async fn configured_client_is_reused_and_shutdown_covers_unobserved_batches() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({}))
+                .set_delay(std::time::Duration::from_millis(100)),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -246,7 +250,7 @@ async fn configured_client_is_reused_and_shutdown_covers_unobserved_batches() {
         .and(header("x-configured", "preserved"))
         .and(header("x-bt-org-name", "tenant"))
         .respond_with(ResponseTemplate::new(204))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     let mut headers = reqwest::header::HeaderMap::new();
@@ -260,11 +264,13 @@ async fn configured_client_is_reused_and_shutdown_covers_unobserved_batches() {
         .unwrap();
     let uploader = BatchUploader::new(client).unwrap();
     let delivery = uploader.upload_rows(vec![make_row("one", 1)], 10);
+    let second = uploader.clone().upload_rows(vec![make_row("two", 1)], 10);
     let shutdown = uploader.shutdown(std::time::Duration::from_secs(5));
     assert!(uploader
         .upload_rows(vec![make_row("rejected", 1)], 10)
         .is_err());
     shutdown.await.unwrap();
     assert_eq!(delivery.await.unwrap().rows_uploaded(), 1);
+    assert_eq!(second.await.unwrap().rows_uploaded(), 1);
     uploader.shutdown(std::time::Duration::ZERO).await.unwrap();
 }
