@@ -55,12 +55,13 @@ impl Recorder {
         };
         if !self.ttft && super::provider::has_content(value) {
             self.ttft = true;
-            if let Ok(log) = SpanLog::builder()
-                .metric("time_to_first_token", self.started.elapsed().as_secs_f64())
-                .build()
-            {
-                drop(span.log(log));
-            }
+            drop(
+                span.log(
+                    SpanLog::builder()
+                        .metric("time_to_first_token", self.started.elapsed().as_secs_f64())
+                        .build(),
+                ),
+            );
         }
         self.state.push(value.clone());
         if self.state.chunk_count().is_multiple_of(UPDATE_CHUNKS)
@@ -82,19 +83,15 @@ impl Recorder {
         let span = self.span.take()?;
         if !self.state.is_empty() {
             let finalized = self.state.final_value();
-            let mut builder = SpanLog::builder();
-            if let Ok(output) = serde_json::to_value(finalized.output()) {
-                builder = builder.output(output);
-            }
+            let mut builder =
+                SpanLog::builder().maybe_output(serde_json::to_value(finalized.output()).ok());
             if let Some(metadata) = finalized.metadata().to_map() {
                 builder = builder.metadata(metadata);
             }
             if let Some(usage) = finalized.usage() {
                 builder = builder.metrics(usage_metrics_to_map(usage.clone()));
             }
-            if let Ok(log) = builder.build() {
-                drop(span.log(log));
-            }
+            drop(span.log(builder.build()));
         }
         let end = span.end();
         let flush = span.flush();
@@ -136,9 +133,7 @@ where
                         Ok(value) => this.recorder.push(value),
                         Err(_) => {
                             if let Some(span) = &this.recorder.span {
-                                if let Ok(log) = SpanLog::builder().error("stream failed").build() {
-                                    drop(span.log(log));
-                                }
+                                drop(span.log(SpanLog::builder().error("stream failed").build()));
                             }
                         }
                     }
