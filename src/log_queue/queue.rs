@@ -12,7 +12,7 @@ use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{unbounded, Receiver, Sender, TrySendError};
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -252,12 +252,12 @@ impl LogQueueCore {
             .await
     }
 
-    /// Internal flush implementation: drain → prepare → chunk → merge → batch → send.
+    /// Internal flush implementation: drain → prepare → merge → batch → send.
     ///
     /// Commands are drained atomically. Each command is prepared (project
-    /// registration, row building) before batching. Rows are then processed in
-    /// sequential chunks of `min(batch_max_items, flush_chunk_size)`.
-    /// Within each chunk, batches are sent concurrently.
+    /// registration, row building) before batching. Each credential group's rows
+    /// are merged and batched together, then sent with at most
+    /// `max_concurrent_log_requests` requests in flight (matching the TypeScript SDK).
     async fn flush_internal(self: &Arc<Self>) -> std::result::Result<(), anyhow::Error> {
         let cmds = self.drain_all();
         if cmds.is_empty() {
@@ -339,83 +339,68 @@ impl LogQueueCore {
         // `maxRequestSize / 2` as the batching limit, where maxRequestSize comes from /version.
         let effective_batch_bytes = self.config.batch_max_bytes().min(max_request_size / 2);
 
-        // Chunk size matches TypeScript SDK: max(1, min(batchMaxItems, flushChunkSize))
-        let chunk_size = std::cmp::max(
-            1,
-            std::cmp::min(
-                self.config.batch_max_items(),
-                self.config.flush_chunk_size(),
-            ),
-        );
+        let max_concurrent_requests = self.config.max_concurrent_log_requests();
 
         for ((token, _org_id), (org_name, rows)) in groups {
-            // Process chunks sequentially (matches TypeScript SDK)
-            let chunks: Vec<Vec<Logs3Row>> = rows.chunks(chunk_size).map(<[_]>::to_vec).collect();
-
-            for chunk in chunks {
-                let config = self.config.clone();
-                let batches = tokio::task::spawn_blocking(move || {
-                    let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
-                    for row in chunk {
-                        let key = RowKey::from_row(&row);
-                        if let Some(existing) = merged.get_mut(&key) {
-                            if row.is_merge.unwrap_or(false) {
-                                merge_row_into(existing, row);
-                            } else {
-                                *existing = row;
-                            }
+            let config = self.config.clone();
+            let batches = tokio::task::spawn_blocking(move || {
+                let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
+                for row in rows {
+                    let key = RowKey::from_row(&row);
+                    if let Some(existing) = merged.get_mut(&key) {
+                        if row.is_merge.unwrap_or(false) {
+                            merge_row_into(existing, row);
                         } else {
-                            merged.insert(key, row);
+                            *existing = row;
                         }
+                    } else {
+                        merged.insert(key, row);
                     }
+                }
 
-                    let rows: Vec<Logs3Row> = merged.into_values().collect();
-                    batch_and_serialize_rows(rows, &config, effective_batch_bytes)
-                })
-                .await;
-                let batches = match batches {
-                    Ok(Ok(batches)) => batches,
-                    Ok(Err(error)) => {
-                        warn!(%error, "failed to serialize batch");
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                        vec![]
+                let rows: Vec<Logs3Row> = merged.into_values().collect();
+                batch_and_serialize_rows(rows, &config, effective_batch_bytes)
+            })
+            .await;
+            let batches = match batches {
+                Ok(Ok(batches)) => batches,
+                Ok(Err(error)) => {
+                    warn!(%error, "failed to serialize batch");
+                    if first_error.is_none() {
+                        first_error = Some(error);
                     }
-                    Err(error) => {
-                        warn!(%error, "serialization task panicked");
-                        if first_error.is_none() {
-                            first_error = Some(error.into());
-                        }
-                        vec![]
+                    vec![]
+                }
+                Err(error) => {
+                    warn!(%error, "serialization task panicked");
+                    if first_error.is_none() {
+                        first_error = Some(error.into());
                     }
-                };
+                    vec![]
+                }
+            };
 
-                // Send all batches in this chunk concurrently (matches TypeScript SDK's Promise.all).
-                // Each request uses THIS group's per-request token and org.
-                let send_futures: Vec<_> = batches
-                    .into_iter()
-                    .map(|batch| {
-                        send_batch_with_retry(
-                            &self.client,
-                            &api_url,
-                            &token,
-                            org_name.as_deref(),
-                            batch,
-                            &self.config,
-                            max_request_size,
-                            can_use_overflow,
-                        )
-                    })
-                    .collect();
-
-                let results = join_all(send_futures).await;
-                for result in results {
-                    if let Err(e) = result {
-                        warn!(error = %e, "batch send failed");
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+            // Each request uses THIS group's per-request token and org.
+            let results: Vec<_> = stream::iter(batches.into_iter().map(|batch| {
+                send_batch_with_retry(
+                    &self.client,
+                    &api_url,
+                    &token,
+                    org_name.as_deref(),
+                    batch,
+                    &self.config,
+                    max_request_size,
+                    can_use_overflow,
+                )
+            }))
+            .buffer_unordered(max_concurrent_requests)
+            .collect()
+            .await;
+            for result in results {
+                if let Err(e) = result {
+                    warn!(error = %e, "batch send failed");
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
                 }
             }

@@ -10,7 +10,7 @@ pub(crate) const DEFAULT_BATCH_MAX_BYTES: usize = 3 * 1024 * 1024; // 3MB (half 
 // When BRAINTRUST_NUM_RETRIES=N is set, both SDKs produce N+1 total attempts
 // (TypeScript does `numTries = env + 1`; Rust loops `0..=num_retries`).
 const DEFAULT_NUM_RETRIES: usize = 2;
-const DEFAULT_FLUSH_CHUNK_SIZE: usize = 25;
+const DEFAULT_MAX_CONCURRENT_LOG_REQUESTS: usize = 8;
 
 fn default_queue_max_size() -> usize {
     std::env::var("BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE")
@@ -51,19 +51,27 @@ fn default_num_retries() -> usize {
 }
 
 fn default_flush_chunk_size() -> usize {
-    if let Ok(s) = std::env::var("BRAINTRUST_LOG_FLUSH_CHUNK_SIZE") {
-        if let Ok(v) = s.parse::<usize>() {
-            if v > 0 {
-                return v;
-            }
-            tracing::warn!(
-                value = v,
-                "BRAINTRUST_LOG_FLUSH_CHUNK_SIZE must be > 0, using default ({})",
-                DEFAULT_FLUSH_CHUNK_SIZE
-            );
+    if std::env::var_os("BRAINTRUST_LOG_FLUSH_CHUNK_SIZE").is_some() {
+        tracing::warn!(
+            "BRAINTRUST_LOG_FLUSH_CHUNK_SIZE is deprecated and has no effect. \
+             Use BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS to bound upload concurrency."
+        );
+    }
+    0
+}
+
+fn default_max_concurrent_log_requests() -> usize {
+    if let Ok(s) = std::env::var("BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS") {
+        match s.parse::<usize>() {
+            Ok(v) if v > 0 => return v,
+            _ => tracing::warn!(
+                value = %s,
+                "BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS must be a positive integer, using default ({})",
+                DEFAULT_MAX_CONCURRENT_LOG_REQUESTS
+            ),
         }
     }
-    DEFAULT_FLUSH_CHUNK_SIZE
+    DEFAULT_MAX_CONCURRENT_LOG_REQUESTS
 }
 
 fn default_sync_flush() -> bool {
@@ -132,11 +140,15 @@ pub struct LogQueueConfig {
     #[builder(default = false)]
     checked_delivery: bool,
 
-    /// Chunk size for flush processing (BRAINTRUST_LOG_FLUSH_CHUNK_SIZE, default: 25).
-    /// Rows drained from the queue are merged and sent in sequential chunks of this size.
-    /// Each chunk's batches are sent concurrently (matching TypeScript SDK behavior).
+    /// Deprecated and ignored, matching the TypeScript SDK. Flushes now batch every
+    /// drained row and bound upload concurrency with `max_concurrent_log_requests`.
     #[builder(default = default_flush_chunk_size())]
     flush_chunk_size: usize,
+
+    /// Max concurrent `/logs3` requests per flush (BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS,
+    /// default: 8, matching the TypeScript SDK).
+    #[builder(default = default_max_concurrent_log_requests())]
+    max_concurrent_log_requests: usize,
 
     /// Debug: save failed payloads (BRAINTRUST_FAILED_PUBLISH_PAYLOADS_DIR)
     failed_publish_payloads_dir: Option<PathBuf>,
@@ -187,8 +199,13 @@ impl LogQueueConfig {
         self.checked_delivery
     }
 
+    #[deprecated(note = "has no effect; use `max_concurrent_log_requests`")]
     pub fn flush_chunk_size(&self) -> usize {
         self.flush_chunk_size
+    }
+
+    pub fn max_concurrent_log_requests(&self) -> usize {
+        self.max_concurrent_log_requests.max(1)
     }
 
     pub fn failed_publish_payloads_dir(&self) -> Option<PathBuf> {
@@ -221,6 +238,20 @@ mod tests {
         assert_eq!(config.num_retries(), DEFAULT_NUM_RETRIES);
         assert!(!config.sync_flush());
         assert!(!config.enforce_queue_size_limit()); // unbounded by default (matches TS SDK)
+        if std::env::var("BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS").is_err() {
+            assert_eq!(
+                config.max_concurrent_log_requests(),
+                DEFAULT_MAX_CONCURRENT_LOG_REQUESTS
+            );
+        }
+    }
+
+    #[test]
+    fn test_max_concurrent_log_requests_is_at_least_one() {
+        let config = LogQueueConfig::builder()
+            .max_concurrent_log_requests(0)
+            .build();
+        assert_eq!(config.max_concurrent_log_requests(), 1);
     }
 
     #[test]
