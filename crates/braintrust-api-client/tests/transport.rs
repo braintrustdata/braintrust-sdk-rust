@@ -41,7 +41,6 @@ async fn discovery_selects_an_org_and_routes_generated_and_manual_operations() {
     let builder = Client::builder()
         .api_key("discovery-key")
         .app_url(format!("{}/app/", app.uri()))
-        .api_url(fallback.uri())
         .org_name("selected-org");
     let client = builder.build_with_login().await.unwrap();
     assert_eq!(client.organization().unwrap().id, "selected");
@@ -58,6 +57,40 @@ async fn discovery_selects_an_org_and_routes_generated_and_manual_operations() {
         Some(12345)
     );
     assert!(fallback.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn login_url_selection_distinguishes_explicit_default_from_no_override() {
+    use braintrust_api_client::{DEFAULT_API_URL, resolve_login_api_url};
+    assert_eq!(
+        resolve_login_api_url(None, Some("https://org.example")),
+        "https://org.example"
+    );
+    assert_eq!(
+        resolve_login_api_url(Some(DEFAULT_API_URL), Some("https://org.example")),
+        DEFAULT_API_URL
+    );
+    assert_eq!(resolve_login_api_url(None, None), DEFAULT_API_URL);
+}
+
+#[tokio::test]
+async fn explicit_url_wins_over_discovery() {
+    let app = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/api/apikey/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"org_info": [{"id":"org", "name":"org", "api_url":"https://discovered.example"}]})))
+        .mount(&app).await;
+    let client = Client::builder()
+        .api_key("test-key")
+        .app_url(app.uri())
+        .api_url("https://explicit.example")
+        .build_with_login()
+        .await
+        .unwrap();
+    assert_eq!(client.baseurl(), "https://explicit.example");
+    assert_eq!(
+        client.organization().unwrap().api_url.as_deref(),
+        Some("https://discovered.example")
+    );
 }
 
 #[tokio::test]
@@ -118,10 +151,7 @@ async fn discovery_reports_missing_orgs_and_invalid_discovered_urls() {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"org_info":orgs})))
             .mount(&app)
             .await;
-        let builder = Client::builder()
-            .api_key("test-key")
-            .app_url(app.uri())
-            .api_url("https://fallback.example");
+        let builder = Client::builder().api_key("test-key").app_url(app.uri());
         let builder = if let Some(name) = selected {
             builder.org_name(name)
         } else {

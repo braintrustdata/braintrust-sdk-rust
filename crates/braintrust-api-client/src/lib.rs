@@ -10,7 +10,9 @@ mod response;
 mod sdk_types;
 pub mod transport;
 
-pub use client::{Client, ClientBuilder, ClientInitError, DEFAULT_API_URL, DEFAULT_APP_URL};
+pub use client::{
+    Client, ClientBuilder, ClientInitError, DEFAULT_API_URL, DEFAULT_APP_URL, resolve_login_api_url,
+};
 pub use generated::client::{HttpClient as GeneratedClient, *};
 pub use generated::{sse, types};
 pub(crate) use request::{Request, Transport};
