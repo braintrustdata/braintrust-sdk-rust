@@ -63,9 +63,8 @@ async fn submits_with_bearer_token() {
 }
 
 #[tokio::test]
-async fn flush_is_fire_and_forget() {
-    // flush() should succeed even when project registration would fail.
-    // Errors are logged but not propagated (resilient design).
+async fn preparation_failure_reaches_write_and_covering_flush() {
+    // Preparation failure terminates the logical batch, then is forgotten.
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -87,28 +86,26 @@ async fn flush_is_fire_and_forget() {
         .project_name("demo")
         .build();
 
-    span.log(
+    let completion = span.log(
         SpanLog::builder()
             .input(Value::String("input".into()))
             .build()
             .expect("build"),
     );
 
-    // flush() waits for queued work to be processed. Background submission errors
-    // are still swallowed by the queue and should not bubble out here.
-    let result = span.flush().await;
-    assert!(
-        result.is_ok(),
-        "flush() should not surface background submission errors"
-    );
-
-    // Drain pending items before drop so the Drop impl's synchronous flush path
-    // is a no-op (queue is empty). The 500 from project registration is swallowed.
-    let _ = client.flush().await;
+    assert!(span.flush().await.is_err());
+    assert!(matches!(
+        completion.await,
+        Err(braintrust_sdk_rust::WriteError::Delivery(_))
+    ));
+    client
+        .flush()
+        .await
+        .expect("old failures must not poison a later flush");
 }
 
 #[tokio::test]
-async fn checked_flush_reports_backend_rejection() {
+async fn automatic_delivery_reports_backend_rejection_through_completion() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/project/register"))
@@ -125,7 +122,6 @@ async fn checked_flush_reports_backend_rejection() {
 
     let client = BraintrustClient::builder()
         .skip_login(true)
-        .checked_delivery(true)
         .api_url(server.uri())
         .app_url(server.uri())
         .build()
@@ -135,9 +131,91 @@ async fn checked_flush_reports_backend_rejection() {
         .span_builder_with_credentials("secret-token", "org")
         .project_name("demo")
         .build();
-    span.log(SpanLog::builder().input(json!("input")).build().unwrap());
-    assert!(matches!(
-        client.flush().await,
-        Err(BraintrustError::Api { status: 401, .. })
-    ));
+    let completion = span.log(SpanLog::builder().input(json!("input")).build().unwrap());
+    assert!(
+        matches!(completion.await, Err(braintrust_sdk_rust::WriteError::Delivery(error))
+        if matches!(error.cause().downcast_ref::<BraintrustError>(), Some(BraintrustError::Api { status: 401, .. })))
+    );
+    client
+        .flush()
+        .await
+        .expect("completed background failure is retired");
+}
+
+#[tokio::test]
+async fn tracked_stateless_update_reports_automatic_delivery_failure() {
+    use braintrust_sdk_rust::{SpanComponents, SpanObjectType, WriteError};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build()
+        .await
+        .unwrap();
+    let exported = SpanComponents {
+        object_type: SpanObjectType::ProjectLogs,
+        object_id: Some("project".into()),
+        compute_object_metadata_args: None,
+        row_id: Some("row".into()),
+        span_id: Some("span".into()),
+        root_span_id: Some("root".into()),
+        span_parents: None,
+        propagated_event: None,
+    }
+    .to_str();
+    let completion = client
+        .update_span_with_credentials_tracked(
+            "token",
+            "org",
+            &exported,
+            SpanLog::builder().input(json!("input")).build().unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(completion.await, Err(WriteError::Delivery(_))));
+    client.flush().await.expect("completed failure is retired");
+}
+
+#[tokio::test]
+async fn submission_and_flush_can_be_issued_without_a_call_site_runtime() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/project/register"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"proj"}})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build()
+        .await
+        .unwrap();
+    let span = client
+        .span_builder_with_credentials("token", "org")
+        .project_name("demo")
+        .build();
+    let (write, flush) = std::thread::spawn(move || {
+        let write = span.log(SpanLog::builder().input(json!("input")).build().unwrap());
+        let flush = client.flush();
+        assert!(write.is_ok());
+        assert!(flush.is_ok());
+        (write, flush)
+    })
+    .join()
+    .unwrap();
+    write.await.unwrap();
+    assert_eq!(flush.await.unwrap().delivered(), 1);
 }

@@ -1,4 +1,6 @@
+mod completion;
 mod dataset;
+mod delivery;
 mod error;
 pub mod eval;
 mod experiments;
@@ -19,9 +21,14 @@ mod types;
 /// Generated client for the public Braintrust REST API.
 pub use braintrust_api_client as api;
 
+pub use completion::{BlockingWaitError, Completion, CompletionFuture};
 pub use dataset::{
     DatasetBuilder, DatasetBuilderError, DatasetInsert, DatasetInsertBuilder,
     DatasetInsertBuilderError, DatasetIterator, DatasetRecord, DatasetSummary,
+};
+pub use delivery::{
+    DeliveryError, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushFailure,
+    FlushReport, ShutdownError, ShutdownReport, WriteError,
 };
 pub use error::{BraintrustError, Result};
 pub use experiments::{
