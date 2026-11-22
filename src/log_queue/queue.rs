@@ -397,19 +397,21 @@ impl LogQueueCore {
 
         for ((token, _org_id), (org_name, rows, raw)) in groups {
             // Process chunks sequentially (matches TypeScript SDK)
-            let mut chunks: Vec<Vec<Logs3Row>> =
-                rows.chunks(chunk_size).map(<[_]>::to_vec).collect();
-            let mut raw_batches =
-                EncodedBatch::partition(raw, self.config.batch_max_items(), effective_batch_bytes);
-            if !raw_batches.is_empty() {
-                chunks.push(Vec::new());
-            }
-
-            for chunk in chunks {
+            let span_chunks = rows.chunks(chunk_size).map(|chunk| (chunk.to_vec(), None));
+            let raw_chunks = raw
+                .chunks(chunk_size)
+                .map(|chunk| (Vec::new(), Some(chunk.to_vec())));
+            for (chunk, raw_chunk) in span_chunks.chain(raw_chunks) {
                 let config = self.config.clone();
-                let chunk_is_empty = chunk.is_empty();
-                let chunk_count = chunk.len();
+                let chunk_count = raw_chunk.as_ref().map_or(chunk.len(), Vec::len);
                 let batches = tokio::task::spawn_blocking(move || {
+                    if let Some(raw) = raw_chunk {
+                        return Ok(EncodedBatch::partition(
+                            raw,
+                            config.batch_max_items(),
+                            effective_batch_bytes,
+                        ));
+                    }
                     let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
                     for row in chunk {
                         let key = RowKey::from_row(&row);
@@ -428,7 +430,7 @@ impl LogQueueCore {
                     batch_and_serialize_rows(rows, &config, effective_batch_bytes)
                 })
                 .await;
-                let mut batches = match batches {
+                let batches = match batches {
                     Ok(Ok(batches)) => batches,
                     Ok(Err(error)) => {
                         self.notify_drop(chunk_count, "prepare_failed");
@@ -447,10 +449,6 @@ impl LogQueueCore {
                         vec![]
                     }
                 };
-
-                if chunk_is_empty {
-                    batches.append(&mut raw_batches);
-                }
 
                 // Send all batches in this chunk concurrently (matches TypeScript SDK's Promise.all).
                 // Each request uses THIS group's per-request token and org.
