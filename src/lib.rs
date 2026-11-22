@@ -4,6 +4,7 @@ pub mod eval;
 mod experiments;
 mod extractors;
 mod http;
+mod internal;
 mod json_merge;
 mod log_queue;
 mod logger;
@@ -14,6 +15,9 @@ mod stream;
 #[cfg(test)]
 pub(crate) mod test_utils;
 mod types;
+
+/// Generated client for the public Braintrust REST API.
+pub use braintrust_api_client as api;
 
 pub use dataset::{
     DatasetBuilder, DatasetBuilderError, DatasetInsert, DatasetInsertBuilder,

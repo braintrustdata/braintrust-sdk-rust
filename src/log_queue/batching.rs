@@ -1,179 +1,30 @@
 use super::config::LogQueueConfig;
-use crate::types::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, Logs3Row, LOGS_API_VERSION};
+use crate::types::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, Logs3Row};
 use tracing::warn;
 
-/// Generic batching function — matches TypeScript SDK's `batchItems()`.
-///
-/// Splits `items` into batches respecting `max_items` and `max_bytes` limits.
-/// `byte_size` is called once per item to determine its size.
-///
-/// Flush condition (matches TypeScript): a new batch is started when the current
-/// batch is non-empty AND (`batch.len() >= max_items` OR `batch_bytes + item_size >= max_bytes`).
-/// This means a single item that exceeds `max_bytes` on its own is always placed in its own batch.
-///
-/// Note: the byte comparison uses `>=` (not `>`), so two items that sum to exactly `max_bytes`
-/// are split into separate batches. This matches the TypeScript SDK's strict `<` check in the
-/// negated condition (`!(size < max && len < max)`). The test
-/// `test_byte_boundary_flushes_at_exact_limit` verifies this invariant explicitly.
-pub(crate) fn batch_items<T>(
-    items: Vec<T>,
-    max_items: usize,
-    max_bytes: usize,
-    byte_size: impl Fn(&T) -> usize,
-) -> Vec<Vec<T>> {
-    let max_items = max_items.max(1);
-    let max_bytes = max_bytes.max(1);
-    let mut output = Vec::new();
-    let mut batch: Vec<T> = Vec::new();
-    let mut batch_bytes = 0usize;
+pub(crate) use crate::internal::ingest::EncodedBatch as SerializedBatch;
+use crate::internal::ingest::EncodedRow;
 
-    for item in items {
-        let item_size = byte_size(&item);
-        if !batch.is_empty() && (batch.len() >= max_items || batch_bytes + item_size >= max_bytes) {
-            output.push(batch);
-            batch = Vec::new();
-            batch_bytes = 0;
-        }
-        batch_bytes += item_size;
-        batch.push(item);
-    }
-    if !batch.is_empty() {
-        output.push(batch);
-    }
-    output
-}
-
-/// A serialized batch with per-row overflow metadata.
-pub(crate) struct SerializedBatch {
-    /// The full batch serialized as a Logs3Request JSON payload.
-    pub data: Vec<u8>,
-    /// Per-row overflow metadata (for `POST logs3/overflow` requests).
-    pub overflow_rows: Vec<Logs3OverflowInputRow>,
-}
-
-/// Batch rows respecting size limits, then serialize each batch to JSON.
-///
-/// Each row is serialized once directly to bytes, and overflow metadata is
-/// extracted from the `Logs3Row` struct without intermediate `Value` representation.
-///
-/// `batch_max_bytes` is the effective byte limit for this flush, which may be
-/// lower than `config.batch_max_bytes()` when the server advertises a tighter
-/// limit via `GET /version` (callers should use `min(config, server_limit / 2)`).
+/// Encode rows once, then partition using the complete request size.
 pub(crate) fn batch_and_serialize_rows(
     rows: Vec<Logs3Row>,
     config: &LogQueueConfig,
     batch_max_bytes: usize,
-) -> Vec<SerializedBatch> {
-    // Serialize each row once directly to bytes, extract overflow metadata from struct
-    let prepared: Vec<(Vec<u8>, Logs3OverflowInputRow)> = rows
-        .into_iter()
-        .filter_map(|row| {
-            let overflow_row = build_overflow_row_from_logs3row(&row);
-            let row_bytes = match serde_json::to_vec(&row) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, "failed to serialize row, skipping");
-                    return None;
-                }
-            };
-            let overflow_row = Logs3OverflowInputRow {
-                input_row: Logs3OverflowInputRowMeta {
-                    byte_size: row_bytes.len(),
-                },
-                ..overflow_row
-            };
-            Some((row_bytes, overflow_row))
-        })
-        .collect();
-
-    // Split into batches using the shared batch_items logic.
-    let batches = batch_items(
-        prepared,
-        config.batch_max_items(),
-        batch_max_bytes,
-        |(row_bytes, _)| row_bytes.len(),
-    );
-
-    // Assemble each batch by concatenating the pre-serialized row bytes.
-    batches
-        .into_iter()
-        .filter_map(|batch| {
-            let (row_bytes, overflow_rows): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
-            match assemble_logs3_request(&row_bytes, overflow_rows) {
-                Ok(b) => Some(b),
-                Err(e) => {
-                    warn!(error = %e, "failed to assemble batch");
-                    None
-                }
-            }
-        })
-        .collect()
-}
-
-pub(crate) fn batch_and_serialize_maps(
-    rows: Vec<serde_json::Map<String, serde_json::Value>>,
-    config: &LogQueueConfig,
-    batch_max_bytes: usize,
-) -> Vec<SerializedBatch> {
-    let prepared = rows
+) -> Result<Vec<SerializedBatch>, anyhow::Error> {
+    let rows = rows
         .into_iter()
         .map(|row| {
-            let object_ids = crate::types::OBJECT_ID_KEYS
-                .iter()
-                .filter_map(|key| {
-                    row.get(*key)
-                        .map(|value| ((*key).to_owned(), value.clone()))
-                })
-                .collect();
-            let data = serde_json::to_vec(&row).expect("JSON map serialization cannot fail");
-            let overflow = Logs3OverflowInputRow {
-                object_ids,
-                is_delete: row
-                    .get("_object_delete")
-                    .and_then(serde_json::Value::as_bool),
-                input_row: Logs3OverflowInputRowMeta {
-                    byte_size: data.len(),
-                },
-            };
-            (data, overflow)
+            EncodedRow::encode(&row, build_overflow_row_from_logs3row(&row)).map_err(|error| {
+                warn!(%error, "failed to serialize row");
+                error
+            })
         })
-        .collect();
-    batch_items(
-        prepared,
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SerializedBatch::partition(
+        rows,
         config.batch_max_items(),
         batch_max_bytes,
-        |(data, _)| data.len(),
-    )
-    .into_iter()
-    .map(|batch| {
-        let (rows, overflow) = batch.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
-        assemble_logs3_request(&rows, overflow).expect("pre-serialized row assembly cannot fail")
-    })
-    .collect()
-}
-
-/// Assemble a `Logs3Request` payload by concatenating pre-serialized row bytes.
-///
-/// Produces `{"rows":[<row1>,<row2>,...],"api_version":<N>}` without re-serializing rows.
-fn assemble_logs3_request(
-    row_bytes: &[Vec<u8>],
-    overflow_rows: Vec<Logs3OverflowInputRow>,
-) -> Result<SerializedBatch, anyhow::Error> {
-    let mut data = Vec::new();
-    data.extend_from_slice(b"{\"rows\":[");
-    for (i, row) in row_bytes.iter().enumerate() {
-        if i > 0 {
-            data.push(b',');
-        }
-        data.extend_from_slice(row);
-    }
-    data.extend_from_slice(b"],\"api_version\":");
-    data.extend_from_slice(LOGS_API_VERSION.to_string().as_bytes());
-    data.push(b'}');
-    Ok(SerializedBatch {
-        data,
-        overflow_rows,
-    })
+    ))
 }
 
 /// Build overflow metadata directly from a Logs3Row struct.
@@ -215,10 +66,10 @@ fn build_overflow_row_from_logs3row(row: &Logs3Row) -> Logs3OverflowInputRow {
         );
     }
 
-    Logs3OverflowInputRow {
-        object_ids,
-        is_delete: row.object_delete.filter(|&b| b),
-        input_row: Logs3OverflowInputRowMeta { byte_size: 0 }, // Will be updated after serialization
+    {
+        let mut value = Logs3OverflowInputRow::new(object_ids, Logs3OverflowInputRowMeta::new(0));
+        value.is_delete = row.object_delete.filter(|&b| b);
+        value
     }
 }
 
@@ -227,6 +78,7 @@ mod tests {
     use super::*;
     use crate::log_queue::config::LogQueueConfig;
     use crate::types::LogDestination;
+    use crate::types::LOGS_API_VERSION;
     use chrono::Utc;
     use std::collections::HashMap;
 
@@ -269,7 +121,7 @@ mod tests {
         // Create rows that will exceed byte limit
         let rows: Vec<Logs3Row> = (0..5).map(|i| make_row(&format!("row-{i}"), 50)).collect();
 
-        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes());
+        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes()).unwrap();
 
         // Should create multiple batches due to byte limit
         assert!(batches.len() > 1, "Should split into multiple batches");
@@ -279,7 +131,7 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_slice(&batch.data).unwrap();
             assert!(parsed.get("rows").is_some());
             assert_eq!(parsed["api_version"], LOGS_API_VERSION);
-            assert!(!batch.overflow_rows.is_empty());
+            assert!(!batch.overflow_rows().is_empty());
         }
     }
 
@@ -291,7 +143,7 @@ mod tests {
             .build();
 
         let rows: Vec<Logs3Row> = (0..5).map(|i| make_row(&format!("row-{i}"), 10)).collect();
-        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes());
+        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes()).unwrap();
 
         // 5 rows / 2 per batch = 3 batches
         assert_eq!(batches.len(), 3);
@@ -301,13 +153,13 @@ mod tests {
     fn test_overflow_metadata_contains_object_ids() {
         let config = LogQueueConfig::default();
         let rows = vec![make_row("row-1", 10)];
-        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes());
+        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes()).unwrap();
 
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].overflow_rows.len(), 1);
+        assert_eq!(batches[0].overflow_rows().len(), 1);
 
         // Should have experiment_id in object_ids
-        let overflow_row = &batches[0].overflow_rows[0];
+        let overflow_row = &batches[0].overflow_rows()[0];
         assert!(overflow_row.object_ids.contains_key("experiment_id"));
         assert!(!overflow_row.object_ids.contains_key("project_id"));
     }
@@ -316,25 +168,10 @@ mod tests {
     fn test_overflow_metadata_byte_size() {
         let config = LogQueueConfig::default();
         let rows = vec![make_row("row-1", 10)];
-        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes());
+        let batches = batch_and_serialize_rows(rows, &config, config.batch_max_bytes()).unwrap();
 
-        let overflow_row = &batches[0].overflow_rows[0];
+        let overflow_row = &batches[0].overflow_rows()[0];
         assert!(overflow_row.input_row.byte_size > 0);
-    }
-
-    #[test]
-    fn test_byte_boundary_flushes_at_exact_limit() {
-        // A batch should flush when adding the next item would reach the limit (>=),
-        // not just exceed it (>). With max_bytes=100, two items of 50 bytes each
-        // should NOT be in the same batch (50 + 50 >= 100).
-        let items: Vec<Vec<u8>> = vec![vec![0u8; 50], vec![0u8; 50]];
-        let batches = batch_items(items, 1000, 100, |b| b.len());
-
-        assert_eq!(
-            batches.len(),
-            2,
-            "Items summing to exactly max_bytes should be split"
-        );
     }
 
     #[test]
@@ -342,10 +179,11 @@ mod tests {
         let config = LogQueueConfig::default();
         let mut row = make_row("row-del", 10);
         row.object_delete = Some(true);
-        let batches = batch_and_serialize_rows(vec![row], &config, config.batch_max_bytes());
+        let batches =
+            batch_and_serialize_rows(vec![row], &config, config.batch_max_bytes()).unwrap();
 
         assert_eq!(batches.len(), 1);
-        let overflow_row = &batches[0].overflow_rows[0];
+        let overflow_row = &batches[0].overflow_rows()[0];
         assert_eq!(
             overflow_row.is_delete,
             Some(true),
@@ -357,23 +195,13 @@ mod tests {
     fn test_overflow_metadata_is_delete_none_when_not_set() {
         let config = LogQueueConfig::default();
         let row = make_row("row-1", 10); // object_delete is None
-        let batches = batch_and_serialize_rows(vec![row], &config, config.batch_max_bytes());
+        let batches =
+            batch_and_serialize_rows(vec![row], &config, config.batch_max_bytes()).unwrap();
 
-        let overflow_row = &batches[0].overflow_rows[0];
+        let overflow_row = &batches[0].overflow_rows()[0];
         assert!(
             overflow_row.is_delete.is_none(),
             "is_delete should be None when _object_delete is not set"
         );
-    }
-
-    #[test]
-    fn test_single_oversized_item_gets_its_own_batch() {
-        // An item larger than max_bytes should still be placed in a batch alone.
-        let items: Vec<Vec<u8>> = vec![vec![0u8; 200], vec![0u8; 10]];
-        let batches = batch_items(items, 1000, 100, |b| b.len());
-
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), 1); // oversized item alone
-        assert_eq!(batches[1].len(), 1);
     }
 }

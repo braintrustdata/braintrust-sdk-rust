@@ -6,6 +6,7 @@ use reqwest::Client;
 use crate::error::{BraintrustError, Result};
 
 pub(crate) const CUSTOM_CA_BUNDLE_ENV: &str = "BRAINTRUST_CUSTOM_CA_BUNDLE";
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug)]
 pub(crate) enum CaBundleConfig {
@@ -55,8 +56,12 @@ impl CaBundleConfig {
 pub(crate) fn build_http_client(
     timeout: std::time::Duration,
     ca_bundle: Option<&CaBundleConfig>,
+    user_agent: Option<&str>,
 ) -> Result<Client> {
-    let mut builder = Client::builder().timeout(timeout);
+    let mut builder = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .user_agent(user_agent.unwrap_or(USER_AGENT));
 
     if let Some(ca_bundle) = ca_bundle {
         let (pem, source) = ca_bundle.load_pem()?;
@@ -82,6 +87,65 @@ pub(crate) fn build_http_client(
         .map_err(|err| BraintrustError::InvalidConfig(err.to_string()))
 }
 
+/// Scope shared connection pools to one request's credentials and endpoints.
+pub(crate) fn api_client_builder(
+    http: &reqwest::Client,
+    api_url: &str,
+    app_url: &str,
+    token: &str,
+    org_name: Option<&str>,
+) -> crate::api::ClientBuilder {
+    let builder = crate::api::Client::builder()
+        .api_key(token)
+        .api_url(api_url)
+        .app_url(app_url)
+        .http_client(http.clone())
+        .upload_http_client(http.clone());
+    match org_name {
+        Some(org) => builder.org_name(org),
+        None => builder,
+    }
+}
+
+pub(crate) fn api_client(
+    http: &reqwest::Client,
+    api_url: &str,
+    app_url: &str,
+    token: &str,
+    org_name: Option<&str>,
+) -> Result<crate::api::Client> {
+    api_client_builder(http, api_url, app_url, token, org_name)
+        .build()
+        .map_err(|error| BraintrustError::InvalidConfig(error.to_string()))
+}
+
+/// Preserve HTTP status and response body while adapting API client errors.
+pub(crate) async fn api_result<T>(
+    result: std::result::Result<T, crate::api::Error<serde_json::Value>>,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(crate::api::Error::Api(response)) => {
+            let message = match response.parse_error {
+                Some(error) => format!("{error}; response body: {}", response.body),
+                None => response.body,
+            };
+            Err(BraintrustError::Api {
+                status: response.status,
+                message,
+            })
+        }
+        Err(crate::api::Error::Transport(crate::api::HttpError::Network(error)))
+        | Err(crate::api::Error::Transport(crate::api::HttpError::Middleware(
+            reqwest_middleware::Error::Reqwest(error),
+        ))) => Err(BraintrustError::Http(error)),
+        Err(crate::api::Error::Transport(
+            crate::api::HttpError::Config(message) | crate::api::HttpError::Serialization(message),
+        )) => Err(BraintrustError::InvalidConfig(message)),
+        Err(error) => Err(BraintrustError::Background(error.to_string())),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::{Arc, Once};
@@ -97,7 +161,25 @@ pub(crate) mod tests {
 
     use super::*;
 
-    pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Returns true in the parent once the isolated test has completed.
+    pub(crate) fn run_isolated(name: &str) -> bool {
+        const CHILD: &str = "BRAINTRUST_SDK_ISOLATED_TEST";
+        if std::env::var(CHILD).ok().as_deref() == Some(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated test {name} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
     static CRYPTO_PROVIDER: Once = Once::new();
 
     pub(crate) const VALID_TEST_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
@@ -193,7 +275,7 @@ cb0bfZ7fHHs=
         ));
 
         let config = CaBundleConfig::File(path);
-        let err = build_http_client(Duration::from_secs(1), Some(&config)).unwrap_err();
+        let err = build_http_client(Duration::from_secs(1), Some(&config), None).unwrap_err();
 
         assert!(matches!(err, BraintrustError::InvalidConfig(_)));
         assert!(err.to_string().contains("failed to read CA bundle"));
@@ -204,7 +286,7 @@ cb0bfZ7fHHs=
         let path = write_temp_bundle("");
 
         let config = CaBundleConfig::File(path.clone());
-        let err = build_http_client(Duration::from_secs(1), Some(&config)).unwrap_err();
+        let err = build_http_client(Duration::from_secs(1), Some(&config), None).unwrap_err();
         std::fs::remove_file(&path).expect("remove temp bundle");
 
         assert!(matches!(err, BraintrustError::InvalidConfig(_)));
@@ -220,7 +302,7 @@ cb0bfZ7fHHs=
         );
 
         let config = CaBundleConfig::File(path.clone());
-        let err = build_http_client(Duration::from_secs(1), Some(&config)).unwrap_err();
+        let err = build_http_client(Duration::from_secs(1), Some(&config), None).unwrap_err();
         std::fs::remove_file(&path).expect("remove temp bundle");
 
         assert!(matches!(err, BraintrustError::InvalidConfig(_)));
@@ -234,7 +316,7 @@ cb0bfZ7fHHs=
             CUSTOM_CA_BUNDLE_ENV,
         );
 
-        let err = build_http_client(Duration::from_secs(1), Some(&config)).unwrap_err();
+        let err = build_http_client(Duration::from_secs(1), Some(&config), None).unwrap_err();
 
         assert!(matches!(err, BraintrustError::InvalidConfig(_)));
         assert!(err.to_string().contains(CUSTOM_CA_BUNDLE_ENV));
@@ -246,7 +328,7 @@ cb0bfZ7fHHs=
         let path = write_temp_bundle(VALID_TEST_CERT_PEM);
 
         let config = CaBundleConfig::File(path.clone());
-        let client = build_http_client(Duration::from_secs(1), Some(&config));
+        let client = build_http_client(Duration::from_secs(1), Some(&config), None);
         std::fs::remove_file(&path).expect("remove temp bundle");
 
         assert!(client.is_ok());
@@ -257,7 +339,7 @@ cb0bfZ7fHHs=
         let bundle = format!("{VALID_TEST_CERT_PEM}{VALID_TEST_CERT_PEM}");
         let config = CaBundleConfig::from_pem(bundle, "test bundle");
 
-        let client = build_http_client(Duration::from_secs(1), Some(&config));
+        let client = build_http_client(Duration::from_secs(1), Some(&config), None);
 
         assert!(client.is_ok());
     }
@@ -267,18 +349,36 @@ cb0bfZ7fHHs=
         let (url, certificate_pem, server) = start_tls_server(2).await;
 
         let default_client =
-            build_http_client(Duration::from_secs(1), None).expect("default client");
-        assert!(default_client.get(&url).send().await.is_err());
+            build_http_client(Duration::from_secs(1), None, None).expect("default client");
+        let api = api_client(
+            &default_client,
+            &url,
+            crate::api::DEFAULT_APP_URL,
+            "test-key",
+            None,
+        )
+        .unwrap();
+        assert!(api
+            .btql(&serde_json::json!({"query":"select 1"}))
+            .await
+            .is_err());
 
         let unrelated_certificate = generate_simple_self_signed(vec!["unrelated.test".to_string()])
             .expect("generate unrelated test certificate");
         let bundle = format!("{}{certificate_pem}", unrelated_certificate.cert.pem());
         let config = CaBundleConfig::from_pem(bundle, "test bundle");
-        let custom_ca_client =
-            build_http_client(Duration::from_secs(1), Some(&config)).expect("custom CA client");
-        let response = custom_ca_client
-            .get(&url)
-            .send()
+        let custom_ca_client = build_http_client(Duration::from_secs(1), Some(&config), None)
+            .expect("custom CA client");
+        let api = api_client(
+            &custom_ca_client,
+            &url,
+            crate::api::DEFAULT_APP_URL,
+            "test-key",
+            None,
+        )
+        .unwrap();
+        let response = api
+            .btql(&serde_json::json!({"query":"select 1"}))
             .await
             .expect("custom CA request");
         assert!(response.status().is_success());
@@ -288,15 +388,21 @@ cb0bfZ7fHHs=
 
     #[tokio::test]
     async fn environment_ca_bundle_enables_private_tls_server() {
-        let _lock = ENV_LOCK.lock().await;
+        if run_isolated("http::tests::environment_ca_bundle_enables_private_tls_server") {
+            return;
+        }
         let original = std::env::var_os(CUSTOM_CA_BUNDLE_ENV);
         let (url, certificate_pem, server) = start_tls_server(1).await;
         std::env::set_var(CUSTOM_CA_BUNDLE_ENV, certificate_pem);
 
         let config = CaBundleConfig::from_environment().expect("environment CA bundle");
-        let client =
-            build_http_client(Duration::from_secs(1), Some(&config)).expect("custom CA client");
-        let response = client.get(&url).send().await.expect("custom CA request");
+        let client = build_http_client(Duration::from_secs(1), Some(&config), None)
+            .expect("custom CA client");
+        let api = api_client(&client, &url, crate::api::DEFAULT_APP_URL, "test-key", None).unwrap();
+        let response = api
+            .btql(&serde_json::json!({"query":"select 1"}))
+            .await
+            .expect("custom CA request");
 
         match original {
             Some(value) => std::env::set_var(CUSTOM_CA_BUNDLE_ENV, value),
@@ -305,5 +411,28 @@ cb0bfZ7fHHs=
 
         assert!(response.status().is_success());
         server.await.expect("TLS test server task");
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn decode_errors_keep_http_status_for_retry_classification() {
+        for status in [200, 400, 503] {
+            let error = crate::api::Error::Api(crate::api::ApiError {
+                status,
+                headers: Default::default(),
+                body: "payload".into(),
+                raw_body: b"payload".to_vec(),
+                typed: None,
+                parse_error: Some("failed to decode response".into()),
+            });
+            let error = api_result::<()>(Err(error)).await.unwrap_err();
+            assert!(
+                matches!(error, BraintrustError::Api { status: actual, .. } if actual == status)
+            );
+        }
     }
 }

@@ -1,4 +1,4 @@
-use braintrust_sdk_rust::{BraintrustClient, SpanLog};
+use braintrust_sdk_rust::{BraintrustClient, BraintrustError, SpanLog};
 use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -24,6 +24,7 @@ async fn submits_with_bearer_token() {
 
     let client = BraintrustClient::builder()
         .api_key("test-key")
+        .user_agent("bt/0.20.0")
         .api_url(server.uri())
         .app_url(server.uri())
         .build()
@@ -43,10 +44,18 @@ async fn submits_with_bearer_token() {
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");
 
-    let logs_calls = server
-        .received_requests()
-        .await
-        .unwrap()
+    let requests = server.received_requests().await.unwrap();
+    let logs3 = requests
+        .iter()
+        .find(|request| request.url.path() == "/logs3")
+        .expect("logs3 request");
+    let has_expected_user_agent = logs3
+        .headers
+        .get("user-agent")
+        .is_some_and(|value| value.to_str().is_ok_and(|value| value == "bt/0.20.0"));
+    assert!(has_expected_user_agent);
+
+    let logs_calls = requests
         .into_iter()
         .filter(|req| req.url.path() == "/logs3")
         .count();
@@ -96,6 +105,41 @@ async fn flush_is_fire_and_forget() {
     // Drain pending items before drop so the Drop impl's synchronous flush path
     // is a no-op (queue is empty). The 500 from project registration is swallowed.
     let _ = client.flush().await;
+}
+
+#[tokio::test]
+async fn checked_flush_reports_backend_rejection() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/project/register"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "project": { "id": "proj" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("login expired"))
+        .mount(&server)
+        .await;
+
+    let client = BraintrustClient::builder()
+        .skip_login(true)
+        .checked_delivery(true)
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build()
+        .await
+        .unwrap();
+    let span = client
+        .span_builder_with_credentials("secret-token", "org")
+        .project_name("demo")
+        .build();
+    span.log(SpanLog::builder().input(json!("input")).build().unwrap());
+    assert!(matches!(
+        client.flush().await,
+        Err(BraintrustError::Api { status: 401, .. })
+    ));
 }
 
 #[tokio::test]
@@ -159,14 +203,18 @@ async fn raw_rows_preserve_payload_credentials_and_report_drops() {
         assert_eq!(
             request
                 .headers
-                .get(&"authorization".parse().unwrap())
+                .get("authorization")
+                .unwrap()
+                .to_str()
                 .unwrap(),
             &format!("Bearer {token}")
         );
         assert_eq!(
             request
                 .headers
-                .get(&"x-bt-org-name".parse().unwrap())
+                .get("x-bt-org-name")
+                .unwrap()
+                .to_str()
                 .unwrap(),
             org
         );

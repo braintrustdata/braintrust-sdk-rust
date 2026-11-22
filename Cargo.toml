@@ -1,8 +1,12 @@
+[workspace]
+members = ["crates/braintrust-api-client"]
+resolver = "3"
+
 [package]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
 edition = "2021"
-rust-version = "1.86.0"
+rust-version = "1.88.0"
 authors = ["Braintrust Team <team@braintrust.dev>"]
 description = "Rust SDK for Braintrust logging and tracing"
 repository = "https://github.com/braintrustdata/braintrust-sdk-rust"
@@ -11,22 +15,24 @@ keywords = ["braintrust", "logging", "tracing", "observability"]
 categories = ["api-bindings", "asynchronous", "development-tools"]
 
 [dependencies]
+braintrust-api-client = { version = "=0.1.0-alpha.2", path = "crates/braintrust-api-client" }
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 bon = "3"
 arc-swap = "1"
 async-trait = "0.1"
-backoff = { version = "0.4", features = ["tokio"] }
+backon = { version = "1.6", default-features = false, features = ["std", "tokio-sleep"] }
 bytes = "1"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam = "0.8"
 indexmap = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls-native-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest-middleware = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1"
-thiserror = "1"
+thiserror = "2"
 regex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing = "0.1"
@@ -37,8 +43,8 @@ url = "2"
 bytes = "1"
 rcgen = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
-tokio-rustls = "0.26"
-wiremock = "0.5.22"
+tokio-rustls = { version = "0.26", features = ["ring"] }
+wiremock = "0.6"
 
 [package.metadata.docs.rs]
 all-features = true

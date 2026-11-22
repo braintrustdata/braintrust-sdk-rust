@@ -126,6 +126,12 @@ pub struct LogQueueConfig {
     #[builder(default = default_sync_flush())]
     sync_flush: bool,
 
+    /// Return preparation and HTTP failures to an explicit flush caller.
+    /// Checked clients also disable automatic flushing so no failure can be
+    /// consumed before that caller observes it.
+    #[builder(default = false)]
+    checked_delivery: bool,
+
     /// Chunk size for flush processing (BRAINTRUST_LOG_FLUSH_CHUNK_SIZE, default: 25).
     /// Rows drained from the queue are merged and sent in sequential chunks of this size.
     /// Each chunk's batches are sent concurrently (matching TypeScript SDK behavior).
@@ -175,6 +181,10 @@ impl LogQueueConfig {
 
     pub fn sync_flush(&self) -> bool {
         self.sync_flush
+    }
+
+    pub fn checked_delivery(&self) -> bool {
+        self.checked_delivery
     }
 
     pub fn flush_chunk_size(&self) -> usize {
@@ -287,6 +297,11 @@ mod tests {
 
     #[test]
     fn test_dir_getter_falls_back_to_env_var() {
+        if crate::http::tests::run_isolated(
+            "log_queue::config::tests::test_dir_getter_falls_back_to_env_var",
+        ) {
+            return;
+        }
         let failed_key = "BRAINTRUST_FAILED_PUBLISH_PAYLOADS_DIR";
         let all_key = "BRAINTRUST_ALL_PUBLISH_PAYLOADS_DIR";
 

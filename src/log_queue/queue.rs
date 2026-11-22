@@ -1,10 +1,9 @@
-use anyhow::Context;
+use crate::internal::ingest::{EncodedBatch, EncodedRow};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::RwLock;
 
-use super::batching::{batch_and_serialize_maps, batch_and_serialize_rows};
+use super::batching::batch_and_serialize_rows;
 use super::config::LogQueueConfig;
 use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry};
 use super::merge::merge_row_into;
@@ -25,28 +24,6 @@ use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, OnceCell};
 use tokio::task::JoinHandle;
 use tracing::warn;
 use url::Url;
-
-/// Request body for project registration.
-#[derive(Serialize)]
-struct ProjectRegisterRequest<'a> {
-    project_name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    org_name: Option<&'a str>,
-}
-
-/// Response from project registration.
-#[derive(Deserialize)]
-struct ProjectRegisterResponse {
-    project: ProjectInfo,
-}
-
-/// Project info in registration response.
-#[derive(Deserialize)]
-struct ProjectInfo {
-    id: String,
-}
 
 /// A raw span payload queued for deferred preparation and flushing.
 ///
@@ -234,10 +211,7 @@ impl LogQueueCore {
         };
 
         let core = self.clone();
-        let join_handle = runtime_handle.spawn(async move {
-            core.flush_internal().await;
-            Ok(())
-        });
+        let join_handle = runtime_handle.spawn(async move { core.flush_internal().await });
 
         *guard = Some(join_handle);
     }
@@ -310,11 +284,12 @@ impl LogQueueCore {
     /// registration, row building) before batching. Rows are then processed in
     /// sequential chunks of `min(batch_max_items, flush_chunk_size)`.
     /// Within each chunk, batches are sent concurrently.
-    async fn flush_internal(self: &Arc<Self>) {
+    async fn flush_internal(self: &Arc<Self>) -> std::result::Result<(), anyhow::Error> {
         let cmds = self.drain_all();
         if cmds.is_empty() {
-            return;
+            return Ok(());
         }
+        let mut first_error = None;
 
         // Resolve the data-plane URL. Prefer the shared login state (covers the
         // logged-in path, including an org-specific api_url returned by login) and
@@ -328,7 +303,11 @@ impl LogQueueCore {
             Ok(url) => url,
             Err(e) => {
                 warn!(error = %e, "Invalid API URL");
-                return;
+                return if self.config.checked_delivery() {
+                    Err(e.into())
+                } else {
+                    Ok(())
+                };
             }
         };
 
@@ -337,10 +316,8 @@ impl LogQueueCore {
         // orgs must never be merged or batched into the same request under one
         // token. `org_name` is carried alongside for the `x-bt-org-name` header.
         type CredKey = (String, String);
-        let mut groups: IndexMap<
-            CredKey,
-            (Option<String>, Vec<Logs3Row>, Vec<Map<String, Value>>),
-        > = IndexMap::new();
+        let mut groups: IndexMap<CredKey, (Option<String>, Vec<Logs3Row>, Vec<EncodedRow>)> =
+            IndexMap::new();
         for cmd in cmds {
             let (token, payload, parent_info) = match cmd {
                 SubmitCommand::Row {
@@ -349,11 +326,17 @@ impl LogQueueCore {
                     org_name,
                     row,
                 } => {
-                    groups
-                        .entry((token, org_id))
-                        .or_insert_with(|| (org_name, Vec::new(), Vec::new()))
-                        .2
-                        .push(row);
+                    match EncodedRow::from_map(&row) {
+                        Ok(row) => groups
+                            .entry((token, org_id))
+                            .or_insert_with(|| (org_name, Vec::new(), Vec::new()))
+                            .2
+                            .push(row),
+                        Err(error) => {
+                            self.notify_drop(1, "prepare_failed");
+                            first_error.get_or_insert(error.into());
+                        }
+                    }
                     continue;
                 }
                 SubmitCommand::Span {
@@ -375,12 +358,17 @@ impl LogQueueCore {
                 Err(e) => {
                     self.notify_drop(1, "prepare_failed");
                     warn!(error = %e, "failed to prepare span, dropping");
+                    first_error.get_or_insert(e);
                 }
             }
         }
 
         if groups.is_empty() {
-            return;
+            return if self.config.checked_delivery() {
+                first_error.map_or(Ok(()), Err)
+            } else {
+                Ok(())
+            };
         }
 
         // Version info reflects a server-wide limit, so it is fetched once and
@@ -409,17 +397,19 @@ impl LogQueueCore {
 
         for ((token, _org_id), (org_name, rows, raw)) in groups {
             // Process chunks sequentially (matches TypeScript SDK)
-            let span_chunks = rows.chunks(chunk_size).map(|chunk| (chunk.to_vec(), None));
-            let raw_chunks = raw
-                .chunks(chunk_size)
-                .map(|chunk| (Vec::new(), Some(chunk.to_vec())));
-            for (chunk, raw_chunk) in span_chunks.chain(raw_chunks) {
+            let mut chunks: Vec<Vec<Logs3Row>> =
+                rows.chunks(chunk_size).map(<[_]>::to_vec).collect();
+            let mut raw_batches =
+                EncodedBatch::partition(raw, self.config.batch_max_items(), effective_batch_bytes);
+            if !raw_batches.is_empty() {
+                chunks.push(Vec::new());
+            }
+
+            for chunk in chunks {
                 let config = self.config.clone();
-                let count = raw_chunk.as_ref().map_or(chunk.len(), Vec::len);
+                let chunk_is_empty = chunk.is_empty();
+                let chunk_count = chunk.len();
                 let batches = tokio::task::spawn_blocking(move || {
-                    if let Some(raw) = raw_chunk {
-                        return batch_and_serialize_maps(raw, &config, effective_batch_bytes);
-                    }
                     let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
                     for row in chunk {
                         let key = RowKey::from_row(&row);
@@ -437,19 +427,37 @@ impl LogQueueCore {
                     let rows: Vec<Logs3Row> = merged.into_values().collect();
                     batch_and_serialize_rows(rows, &config, effective_batch_bytes)
                 })
-                .await
-                .unwrap_or_else(|e| {
-                    self.notify_drop(count, "prepare_failed");
-                    tracing::error!(error = %e, "serialization task panicked, chunk dropped");
-                    vec![]
-                });
+                .await;
+                let mut batches = match batches {
+                    Ok(Ok(batches)) => batches,
+                    Ok(Err(error)) => {
+                        self.notify_drop(chunk_count, "prepare_failed");
+                        warn!(%error, "failed to serialize batch");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        vec![]
+                    }
+                    Err(error) => {
+                        self.notify_drop(chunk_count, "prepare_failed");
+                        warn!(%error, "serialization task panicked");
+                        if first_error.is_none() {
+                            first_error = Some(error.into());
+                        }
+                        vec![]
+                    }
+                };
+
+                if chunk_is_empty {
+                    batches.append(&mut raw_batches);
+                }
 
                 // Send all batches in this chunk concurrently (matches TypeScript SDK's Promise.all).
                 // Each request uses THIS group's per-request token and org.
                 let send_futures: Vec<_> = batches
                     .into_iter()
                     .map(|batch| async {
-                        let count = batch.overflow_rows.len();
+                        let count = batch.row_count();
                         let result = send_batch_with_retry(
                             &self.client,
                             &api_url,
@@ -472,9 +480,17 @@ impl LogQueueCore {
                 for result in results {
                     if let Err(e) = result {
                         warn!(error = %e, "batch send failed");
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
                     }
                 }
             }
+        }
+        if self.config.checked_delivery() {
+            first_error.map_or(Ok(()), Err)
+        } else {
+            Ok(())
         }
     }
 
@@ -735,33 +751,20 @@ impl LogQueueCore {
             }
             None => self.app_url.clone(),
         };
-        let url = app_url
-            .join("api/project/register")
-            .map_err(|e| anyhow::anyhow!("invalid project register url: {e}"))?;
+        let mut request = crate::api::ProjectRegisterRequest::new(project_name.to_owned());
+        request.org_id = (!org_id.is_empty()).then(|| org_id.to_owned());
+        request.org_name = org_name.map(str::to_owned);
 
-        let request = ProjectRegisterRequest {
-            project_name,
-            org_id: (!org_id.is_empty()).then_some(org_id),
+        let client = crate::http::api_client(
+            &self.client,
+            self.api_url.as_str(),
+            app_url.as_str(),
+            token,
             org_name,
-        };
-
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .json(&request)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("register project failed: [{status}] {text}");
-        }
-
-        let register_response: ProjectRegisterResponse = response
-            .json()
-            .await
-            .context("failed to parse project registration response")?;
+        )?;
+        let register_response = crate::http::api_result(client.register_project(&request).await)
+            .await?
+            .into_inner();
 
         {
             let mut cache = self.project_cache.lock().await;
@@ -1122,7 +1125,14 @@ impl LogQueue {
             .map_err(|_| BraintrustError::ChannelClosed)?;
         rx.await
             .map_err(|_| BraintrustError::ChannelClosed)?
-            .map_err(|e| BraintrustError::Background(e.to_string()))
+            .map_err(|error| {
+                error.downcast::<BraintrustError>().unwrap_or_else(|error| {
+                    error
+                        .downcast::<reqwest::Error>()
+                        .map(BraintrustError::Http)
+                        .unwrap_or_else(|error| BraintrustError::Background(error.to_string()))
+                })
+            })
     }
 
     /// Return true if the lock-free row queue is approximately empty.

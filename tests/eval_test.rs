@@ -88,10 +88,11 @@ async fn test_scorers() {
 
     // ExactMatch
     let scorer = ExactMatch::new();
+    let expected = "TEST".to_string();
     let args = ScorerArgs {
         input: &"test".to_string(),
         output: &"TEST".to_string(),
-        expected: Some(&"TEST".to_string()),
+        expected: Some(&expected),
         metadata: None,
     };
     let scores = scorer.score(args).await.unwrap();
@@ -99,10 +100,11 @@ async fn test_scorers() {
 
     // Levenshtein
     let scorer = LevenshteinScorer::new();
+    let expected = "hallo".to_string();
     let args = ScorerArgs {
         input: &"test".to_string(),
         output: &"hello".to_string(),
-        expected: Some(&"hallo".to_string()),
+        expected: Some(&expected),
         metadata: None,
     };
     let scores = scorer.score(args).await.unwrap();

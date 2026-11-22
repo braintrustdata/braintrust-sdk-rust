@@ -1,0 +1,194 @@
+//! Logs3 encoding and size-limited batching.
+use crate::types::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, LOGS_API_VERSION};
+use bytes::Bytes;
+use serde::Serialize;
+use serde_json::{Map, Value};
+
+#[derive(Debug, Clone)]
+pub(crate) struct EncodedRow {
+    data: Bytes,
+    overflow: Logs3OverflowInputRow,
+}
+
+impl EncodedRow {
+    pub fn encode(
+        row: &impl Serialize,
+        mut overflow: Logs3OverflowInputRow,
+    ) -> Result<Self, serde_json::Error> {
+        let data = serde_json::to_vec(row)?;
+        overflow.input_row.byte_size = data.len();
+        Ok(Self {
+            data: data.into(),
+            overflow,
+        })
+    }
+
+    pub fn from_map(row: &Map<String, Value>) -> Result<Self, serde_json::Error> {
+        let object_ids = [
+            "experiment_id",
+            "dataset_id",
+            "prompt_session_id",
+            "project_id",
+            "log_id",
+            "function_data",
+        ]
+        .into_iter()
+        .filter_map(|key| row.get(key).map(|value| (key.to_owned(), value.clone())))
+        .collect();
+        Self::encode(row, {
+            let mut value =
+                Logs3OverflowInputRow::new(object_ids, Logs3OverflowInputRowMeta::new(0));
+            value.is_delete = row.get("_object_delete").and_then(Value::as_bool);
+            value
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EncodedBatch {
+    pub data: Bytes,
+    rows: Vec<EncodedRow>,
+}
+
+impl EncodedBatch {
+    fn encode(rows: Vec<EncodedRow>) -> Self {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"{\"rows\":[");
+        for (index, row) in rows.iter().enumerate() {
+            if index > 0 {
+                data.push(b',');
+            }
+            data.extend_from_slice(&row.data);
+        }
+        data.extend_from_slice(format!("],\"api_version\":{LOGS_API_VERSION}}}").as_bytes());
+        Self {
+            data: data.into(),
+            rows,
+        }
+    }
+
+    pub fn partition(rows: Vec<EncodedRow>, max_items: usize, max_bytes: usize) -> Vec<Self> {
+        let container_bytes = Self::encode(Vec::new()).data.len();
+        let mut batches = Vec::new();
+        let mut batch = Vec::new();
+        let mut bytes = container_bytes;
+        for row in rows {
+            let next = bytes
+                .checked_add(usize::from(!batch.is_empty()))
+                .and_then(|bytes| bytes.checked_add(row.data.len()));
+            if !batch.is_empty()
+                && (batch.len() >= max_items.max(1) || next.is_none_or(|size| size > max_bytes))
+            {
+                batches.push(Self::encode(std::mem::take(&mut batch)));
+                bytes = container_bytes;
+            }
+            // An oversized row remains a singleton for overflow or a clear error.
+            bytes = bytes
+                .saturating_add(usize::from(!batch.is_empty()))
+                .saturating_add(row.data.len());
+            batch.push(row);
+        }
+        if !batch.is_empty() {
+            batches.push(Self::encode(batch));
+        }
+        batches
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn overflow_rows(&self) -> Vec<Logs3OverflowInputRow> {
+        self.rows.iter().map(|row| row.overflow.clone()).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn split(mut self) -> (Self, Self) {
+        let right = self.rows.split_off(self.rows.len() / 2);
+        (Self::encode(self.rows), Self::encode(right))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rows() -> Vec<EncodedRow> {
+        ["é\\\"", "second", "third"]
+            .into_iter()
+            .map(|id| {
+                EncodedRow::from_map(
+                    json!({"id":id,"dataset_id":"ds","_object_delete":true})
+                        .as_object()
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn encoded_limits_include_envelope_separators_and_utf8() {
+        let expected = EncodedBatch::encode(rows());
+        let exact = EncodedBatch::partition(rows(), 3, expected.data.len());
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].data, expected.data);
+        let smaller = EncodedBatch::partition(rows(), 3, expected.data.len() - 1);
+        assert_eq!(smaller.len(), 2);
+        for batch in smaller {
+            assert!(batch.data.len() < expected.data.len());
+            let value: Value = serde_json::from_slice(&batch.data).unwrap();
+            for (row, meta) in value["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(batch.overflow_rows())
+            {
+                assert_eq!(
+                    meta.input_row.byte_size,
+                    serde_json::to_vec(row).unwrap().len()
+                );
+                assert_eq!(meta.object_ids["dataset_id"], "ds");
+                assert_eq!(meta.is_delete, Some(true));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_rows_do_not_reorder_neighboring_batches() {
+        let input: Vec<_> = ["a".to_owned(), "x".repeat(200), "b".to_owned()]
+            .iter()
+            .map(|id| EncodedRow::from_map(json!({"id": id}).as_object().unwrap()).unwrap())
+            .collect();
+        let batches = EncodedBatch::partition(input.clone(), 100, 100);
+        assert_eq!(batches.len(), 3);
+        for (batch, row) in batches.into_iter().zip(input) {
+            assert_eq!(batch.len(), 1);
+            let value: Value = serde_json::from_slice(&batch.data).unwrap();
+            assert_eq!(
+                value["rows"][0],
+                serde_json::from_slice::<Value>(&row.data).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_rows_stay_in_order_and_empty_input_has_no_batches() {
+        assert!(EncodedBatch::partition(vec![], 0, 0).is_empty());
+        let input = rows();
+        let batches = EncodedBatch::partition(input.clone(), 0, 0);
+        assert_eq!(batches.len(), input.len());
+        for (batch, row) in batches.iter().zip(input) {
+            assert_eq!(batch.len(), 1);
+            let value: Value = serde_json::from_slice(&batch.data).unwrap();
+            assert_eq!(
+                value["rows"][0],
+                serde_json::from_slice::<Value>(&row.data).unwrap()
+            );
+        }
+    }
+}
