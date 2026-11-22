@@ -119,9 +119,33 @@ impl UploadCoordinator {
         batch: EncodedBatch,
         capabilities: Capabilities,
     ) -> Result<UploadResult> {
-        let mut pending = vec![batch];
+        let (result, outcome) = self.upload_counting(batch, capabilities).await;
+        outcome.map(|()| result)
+    }
+
+    /// Upload a batch, reporting what was delivered even when a later split fails.
+    pub async fn upload_counting(
+        &self,
+        batch: EncodedBatch,
+        capabilities: Capabilities,
+    ) -> (UploadResult, Result<()>) {
         let mut budget = self.policy.budget();
         let mut result = UploadResult::default();
+        let outcome = self
+            .upload_into(batch, capabilities, &mut budget, &mut result)
+            .await;
+        result.requests_sent = budget.requests;
+        (result, outcome)
+    }
+
+    async fn upload_into(
+        &self,
+        batch: EncodedBatch,
+        capabilities: Capabilities,
+        budget: &mut RetryBudget,
+        result: &mut UploadResult,
+    ) -> Result<()> {
+        let mut pending = vec![batch];
         while let Some(batch) = pending.pop() {
             if batch.data.len() <= capabilities.max_request_size {
                 match budget
@@ -142,7 +166,7 @@ impl UploadCoordinator {
                 }
             }
             if capabilities.overflow {
-                self.overflow(&batch, &mut budget).await?;
+                self.overflow(&batch, budget).await?;
                 result.rows_uploaded += batch.len();
                 result.bytes_processed += batch.data.len();
             } else if batch.len() > 1 {
@@ -157,8 +181,7 @@ impl UploadCoordinator {
                 });
             }
         }
-        result.requests_sent = budget.requests;
-        Ok(result)
+        Ok(())
     }
 
     async fn overflow(&self, batch: &EncodedBatch, budget: &mut RetryBudget) -> Result<()> {

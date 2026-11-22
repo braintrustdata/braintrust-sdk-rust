@@ -19,7 +19,7 @@ use crate::experiments::api::{
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
 use crate::http::{api_client, api_result, build_http_client, CaBundleConfig};
-use crate::log_queue::{LogQueue, LogQueueConfig};
+use crate::log_queue::{DroppedRows, LogQueue, LogQueueConfig};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
@@ -924,6 +924,55 @@ impl BraintrustClient {
         parent_info: Option<ParentSpanInfo>,
     ) {
         self.inner.queue.submit(token, payload, parent_info)
+    }
+
+    /// Queue caller-built rows for upload to `/logs3` using the logged-in credentials.
+    ///
+    /// See [`BraintrustClient::log_rows_with_credentials`] for how rows are uploaded.
+    /// This waits for login to complete if it hasn't already.
+    pub async fn log_rows(&self, rows: impl IntoIterator<Item = Map<String, Value>>) -> Result<()> {
+        if self.inner.login_skipped {
+            return Err(BraintrustError::InvalidConfig(
+                "log_rows() requires login; use log_rows_with_credentials() when skip_login is enabled".into(),
+            ));
+        }
+        let state = self.wait_for_login_state().await?;
+        let api_key = state
+            .api_key()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        let org_id = state
+            .org_id()
+            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+        self.log_rows_with_credentials(&api_key, &org_id, state.org_name().as_deref(), rows);
+        Ok(())
+    }
+
+    /// Queue caller-built rows for upload to `/logs3` with explicit credentials.
+    ///
+    /// Rows are uploaded as given: the SDK does not register projects, resolve
+    /// destinations, or merge rows that share an id, so each row must already carry
+    /// the fields the server expects. Like
+    /// [`BraintrustClient::span_builder_with_credentials`], the credentials travel
+    /// with the rows and never touch the shared login state, and rows with different
+    /// `token`/`org_id` pairs are never sent in the same request. `org_name`, when
+    /// set, is sent as the `x-bt-org-name` header.
+    ///
+    /// Returns immediately; the background worker batches and uploads the rows. Use
+    /// [`BraintrustClient::flush`] to wait for delivery and
+    /// [`BraintrustClient::dropped_rows`] to observe rows that were discarded.
+    pub fn log_rows_with_credentials(
+        &self,
+        token: &str,
+        org_id: &str,
+        org_name: Option<&str>,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+    ) {
+        self.inner.queue.submit_rows(token, org_id, org_name, rows);
+    }
+
+    /// Cumulative counts of rows this client discarded instead of uploading.
+    pub fn dropped_rows(&self) -> DroppedRows {
+        self.inner.queue.dropped_rows()
     }
 
     /// Flush all pending log events.
@@ -1871,6 +1920,151 @@ mod tests {
         };
         assert_eq!(org_for("token-a").map(String::as_str), Some("org-a"));
         assert_eq!(org_for("token-b").map(String::as_str), Some("org-b"));
+    }
+
+    #[tokio::test]
+    async fn log_rows_with_credentials_uploads_rows_as_given() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .skip_login(true)
+            .build()
+            .await
+            .expect("client");
+
+        let row = |value: Value| value.as_object().expect("object").clone();
+        let rows_a = vec![
+            row(serde_json::json!({"id": "same", "project_id": "p", "metrics": {"n": 1}})),
+            row(serde_json::json!({"id": "same", "project_id": "p", "metrics": {"n": 2}})),
+        ];
+        let rows_b = vec![row(serde_json::json!({"id": "other", "custom": [1, 2]}))];
+        client.log_rows_with_credentials("token-a", "org-a", Some("org-name-a"), rows_a.clone());
+        client.log_rows_with_credentials("token-b", "org-b", None, rows_b.clone());
+        client.flush().await.expect("flush");
+
+        assert!(!client.is_logged_in().await);
+        assert_eq!(client.dropped_rows(), DroppedRows::default());
+        let requests = server.received_requests().await.unwrap();
+        let mut uploaded = HashMap::new();
+        for request in requests.iter().filter(|r| r.url.path() == "/logs3") {
+            let auth = request.headers["authorization"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let org_name = request
+                .headers
+                .get("x-bt-org-name")
+                .map(|value| value.to_str().unwrap().to_owned());
+            let body: Value = serde_json::from_slice(&request.body).expect("json");
+            let rows: Vec<Value> = body["rows"].as_array().expect("rows").clone();
+            uploaded
+                .entry((auth, org_name))
+                .or_insert_with(Vec::new)
+                .extend(rows);
+        }
+        let as_values = |rows: Vec<Map<String, Value>>| -> Vec<Value> {
+            rows.into_iter().map(Value::Object).collect()
+        };
+        assert_eq!(uploaded.len(), 2, "one upload per credential: {uploaded:?}");
+        assert_eq!(
+            uploaded[&("Bearer token-a".to_owned(), Some("org-name-a".to_owned()))],
+            as_values(rows_a),
+            "rows sharing an id are not merged and are not modified"
+        );
+        assert_eq!(
+            uploaded[&("Bearer token-b".to_owned(), None)],
+            as_values(rows_b)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_rows_counts_rejected_uploads() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("rejected"))
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .skip_login(true)
+            .build()
+            .await
+            .expect("client");
+
+        let rows = (0..3).map(|i| {
+            serde_json::json!({"id": format!("row-{i}")})
+                .as_object()
+                .unwrap()
+                .clone()
+        });
+        client.log_rows_with_credentials("token", "org", None, rows);
+        let _ = client.flush().await;
+
+        assert_eq!(client.dropped_rows().upload_failed, 3);
+        assert_eq!(client.dropped_rows().queue_full, 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_rows_excludes_rows_delivered_before_a_split_fails() {
+        struct SplitThenReject(std::sync::atomic::AtomicUsize);
+        impl wiremock::Respond for SplitThenReject {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(413).set_body_string("too large"),
+                    1 => ResponseTemplate::new(200).set_body_string("{}"),
+                    _ => ResponseTemplate::new(400).set_body_string("rejected"),
+                }
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(SplitThenReject(std::sync::atomic::AtomicUsize::new(0)))
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .skip_login(true)
+            .build()
+            .await
+            .expect("client");
+
+        let rows = (0..4).map(|i| {
+            serde_json::json!({"id": format!("row-{i}")})
+                .as_object()
+                .unwrap()
+                .clone()
+        });
+        client.log_rows_with_credentials("token", "org", None, rows);
+        let _ = client.flush().await;
+
+        // The 413 splits the batch in half: the first half is delivered, the second rejected.
+        assert_eq!(client.dropped_rows().upload_failed, 2);
+    }
+
+    #[tokio::test]
+    async fn log_rows_requires_login() {
+        let client = BraintrustClient::builder()
+            .app_url("https://example.com")
+            .api_url("https://example.com")
+            .skip_login(true)
+            .build()
+            .await
+            .expect("client");
+        let error = client
+            .log_rows([Map::new()])
+            .await
+            .expect_err("skip_login clients must pass credentials explicitly");
+        assert!(matches!(error, BraintrustError::InvalidConfig(_)));
     }
 
     #[tokio::test]
