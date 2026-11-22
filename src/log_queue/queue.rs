@@ -2,7 +2,7 @@ use chrono::Utc;
 
 use super::batching::{batch_and_serialize_maps, batch_and_serialize_rows, SerializedBatch};
 use super::config::LogQueueConfig;
-use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry};
+use super::http::{fetch_version_info, save_payload_debug, send_batch_counting};
 use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use super::worker::LogCommand;
@@ -545,7 +545,7 @@ impl LogQueueCore {
     }
 
     /// Send a chunk's batches concurrently (matches TypeScript SDK's Promise.all),
-    /// counting the rows of failed batches as dropped. Returns the first error.
+    /// counting undelivered rows of failed batches as dropped. Returns the first error.
     #[allow(clippy::too_many_arguments)]
     async fn send_batches(
         &self,
@@ -558,7 +558,7 @@ impl LogQueueCore {
     ) -> std::result::Result<(), anyhow::Error> {
         let send_futures = batches.into_iter().map(|batch| async move {
             let count = batch.len();
-            let result = send_batch_with_retry(
+            let (delivered, result) = send_batch_counting(
                 &self.client,
                 api_url,
                 token,
@@ -572,7 +572,7 @@ impl LogQueueCore {
             if result.is_err() {
                 self.drops
                     .upload_failed
-                    .fetch_add(count as u64, Ordering::Relaxed);
+                    .fetch_add(count.saturating_sub(delivered) as u64, Ordering::Relaxed);
             }
             result
         });

@@ -2013,6 +2013,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_rows_excludes_rows_delivered_before_a_split_fails() {
+        struct SplitThenReject(std::sync::atomic::AtomicUsize);
+        impl wiremock::Respond for SplitThenReject {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(413).set_body_string("too large"),
+                    1 => ResponseTemplate::new(200).set_body_string("{}"),
+                    _ => ResponseTemplate::new(400).set_body_string("rejected"),
+                }
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(SplitThenReject(std::sync::atomic::AtomicUsize::new(0)))
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .skip_login(true)
+            .build()
+            .await
+            .expect("client");
+
+        let rows = (0..4).map(|i| {
+            serde_json::json!({"id": format!("row-{i}")})
+                .as_object()
+                .unwrap()
+                .clone()
+        });
+        client.log_rows_with_credentials("token", "org", None, rows);
+        let _ = client.flush().await;
+
+        // The 413 splits the batch in half: the first half is delivered, the second rejected.
+        assert_eq!(client.dropped_rows().upload_failed, 2);
+    }
+
+    #[tokio::test]
     async fn log_rows_requires_login() {
         let client = BraintrustClient::builder()
             .app_url("https://example.com")
