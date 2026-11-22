@@ -97,3 +97,90 @@ async fn flush_is_fire_and_forget() {
     // is a no-op (queue is empty). The 500 from project registration is swallowed.
     let _ = client.flush().await;
 }
+
+#[tokio::test]
+async fn raw_rows_preserve_payload_credentials_and_report_drops() {
+    use std::sync::{Arc, Mutex};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .skip_login(true)
+        .with_queue_max_size(1)
+        .enforce_queue_size_limit(true)
+        .build()
+        .await
+        .unwrap();
+    let drops = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&drops);
+    client.set_log_drop_handler(Arc::new(move |count, reason| {
+        captured.lock().unwrap().push((count, reason))
+    }));
+    let row = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+        "id": "row-1", "custom_field": {"nested": [1, 2]}, "project_id": "project-1"
+    }))
+    .unwrap();
+    client.log_row_with_credentials(
+        "first-token",
+        "org-1",
+        Some("first-org".into()),
+        row.clone(),
+    );
+    client.log_row_with_credentials("discarded", "org-1", Some("first-org".into()), row.clone());
+    assert_eq!(*drops.lock().unwrap(), vec![(1, "queue_full")]);
+    client.flush().await.unwrap();
+    client.log_row_with_credentials(
+        "second-token",
+        "org-2",
+        Some("second-org".into()),
+        row.clone(),
+    );
+    client.flush().await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let logs = requests
+        .iter()
+        .filter(|req| req.url.path() == "/logs3")
+        .collect::<Vec<_>>();
+    assert_eq!(logs.len(), 2);
+    for (request, token, org) in [
+        (logs[0], "first-token", "first-org"),
+        (logs[1], "second-token", "second-org"),
+    ] {
+        assert_eq!(
+            request
+                .headers
+                .get(&"authorization".parse().unwrap())
+                .unwrap(),
+            &format!("Bearer {token}")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get(&"x-bt-org-name".parse().unwrap())
+                .unwrap(),
+            org
+        );
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["rows"], json!([row]));
+        assert!(body["api_version"].is_number());
+    }
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    client.log_row_with_credentials("first-token", "org-1", Some("first-org".into()), row);
+    client.flush().await.unwrap();
+    assert!(drops.lock().unwrap().contains(&(1, "publish_failed")));
+}

@@ -1,8 +1,10 @@
 use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::sync::RwLock;
 
-use super::batching::batch_and_serialize_rows;
+use super::batching::{batch_and_serialize_maps, batch_and_serialize_rows};
 use super::config::LogQueueConfig;
 use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry};
 use super::merge::merge_row_into;
@@ -50,10 +52,18 @@ struct ProjectInfo {
 ///
 /// Fields are private — construction and destructuring happen only within this
 /// module. `worker.rs` never touches the fields directly.
-struct SubmitCommand {
-    token: String,
-    payload: SpanPayload,
-    parent_info: Option<ParentSpanInfo>,
+enum SubmitCommand {
+    Span {
+        token: String,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    },
+    Row {
+        token: String,
+        org_id: String,
+        org_name: Option<String>,
+        row: Map<String, Value>,
+    },
 }
 
 struct CmdChannel {
@@ -105,6 +115,7 @@ pub(super) struct LogQueueCore {
     /// building) happens during `flush_internal`.
     channel: ArcSwap<CmdChannel>,
     dropped_count: AtomicUsize,
+    drop_handler: RwLock<Option<crate::logger::LogDropHandler>>,
     last_drop_log_time: AtomicU64,
     queue_depth_warning_emitted: AtomicBool,
     config: LogQueueConfig,
@@ -139,6 +150,7 @@ impl LogQueueCore {
         Arc::new(Self {
             channel: ArcSwap::from_pointee(channel),
             dropped_count: AtomicUsize::new(0),
+            drop_handler: RwLock::new(None),
             last_drop_log_time: AtomicU64::new(0),
             queue_depth_warning_emitted: AtomicBool::new(false),
             config,
@@ -164,6 +176,7 @@ impl LogQueueCore {
             self.config.queue_max_size(),
             self.config.enforce_queue_size_limit(),
         ) {
+            self.notify_drop(1, "queue_full");
             self.dropped_count.fetch_add(1, Ordering::Relaxed);
             self.log_drop_warning();
             self.dump_dropped_row_if_configured(cmd);
@@ -175,9 +188,21 @@ impl LogQueueCore {
             Err(TrySendError::Full(_)) => unreachable!("the log queue is unbounded"),
             Err(TrySendError::Disconnected(_)) => {
                 channel.queued_count.fetch_sub(1, Ordering::Relaxed);
+                self.notify_drop(1, "queue_closed");
                 self.dropped_count.fetch_add(1, Ordering::Relaxed);
                 self.log_drop_warning();
             }
+        }
+    }
+
+    fn notify_drop(&self, count: usize, reason: &'static str) {
+        let handler = self
+            .drop_handler
+            .read()
+            .expect("log drop handler lock poisoned")
+            .clone();
+        if let Some(handler) = handler {
+            handler(count, reason);
         }
     }
 
@@ -312,24 +337,43 @@ impl LogQueueCore {
         // orgs must never be merged or batched into the same request under one
         // token. `org_name` is carried alongside for the `x-bt-org-name` header.
         type CredKey = (String, String);
-        let mut groups: IndexMap<CredKey, (Option<String>, Vec<Logs3Row>)> = IndexMap::new();
+        let mut groups: IndexMap<
+            CredKey,
+            (Option<String>, Vec<Logs3Row>, Vec<Map<String, Value>>),
+        > = IndexMap::new();
         for cmd in cmds {
-            let SubmitCommand {
-                token,
-                payload,
-                parent_info,
-            } = cmd;
+            let (token, payload, parent_info) = match cmd {
+                SubmitCommand::Row {
+                    token,
+                    org_id,
+                    org_name,
+                    row,
+                } => {
+                    groups
+                        .entry((token, org_id))
+                        .or_insert_with(|| (org_name, Vec::new(), Vec::new()))
+                        .2
+                        .push(row);
+                    continue;
+                }
+                SubmitCommand::Span {
+                    token,
+                    payload,
+                    parent_info,
+                } => (token, payload, parent_info),
+            };
             match self.prepare_row(&token, payload, parent_info).await {
                 Ok(row) => {
                     let key = (token, row.org_id.clone());
                     let org_name = row.org_name.clone().or_else(|| self.login_state.org_name());
                     groups
                         .entry(key)
-                        .or_insert_with(|| (org_name, Vec::new()))
+                        .or_insert_with(|| (org_name, Vec::new(), Vec::new()))
                         .1
                         .push(row);
                 }
                 Err(e) => {
+                    self.notify_drop(1, "prepare_failed");
                     warn!(error = %e, "failed to prepare span, dropping");
                 }
             }
@@ -342,7 +386,7 @@ impl LogQueueCore {
         // Version info reflects a server-wide limit, so it is fetched once and
         // reused across all credential groups (using any group's credentials).
         let (probe_token, probe_org) = {
-            let ((token, _org_id), (org_name, _rows)) = groups.get_index(0).unwrap();
+            let ((token, _org_id), (org_name, _rows, _raw)) = groups.get_index(0).unwrap();
             (token.clone(), org_name.clone())
         };
         let (max_request_size, can_use_overflow) = self
@@ -363,13 +407,19 @@ impl LogQueueCore {
             ),
         );
 
-        for ((token, _org_id), (org_name, rows)) in groups {
+        for ((token, _org_id), (org_name, rows, raw)) in groups {
             // Process chunks sequentially (matches TypeScript SDK)
-            let chunks: Vec<Vec<Logs3Row>> = rows.chunks(chunk_size).map(<[_]>::to_vec).collect();
-
-            for chunk in chunks {
+            let span_chunks = rows.chunks(chunk_size).map(|chunk| (chunk.to_vec(), None));
+            let raw_chunks = raw
+                .chunks(chunk_size)
+                .map(|chunk| (Vec::new(), Some(chunk.to_vec())));
+            for (chunk, raw_chunk) in span_chunks.chain(raw_chunks) {
                 let config = self.config.clone();
+                let count = raw_chunk.as_ref().map_or(chunk.len(), Vec::len);
                 let batches = tokio::task::spawn_blocking(move || {
+                    if let Some(raw) = raw_chunk {
+                        return batch_and_serialize_maps(raw, &config, effective_batch_bytes);
+                    }
                     let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
                     for row in chunk {
                         let key = RowKey::from_row(&row);
@@ -389,6 +439,7 @@ impl LogQueueCore {
                 })
                 .await
                 .unwrap_or_else(|e| {
+                    self.notify_drop(count, "prepare_failed");
                     tracing::error!(error = %e, "serialization task panicked, chunk dropped");
                     vec![]
                 });
@@ -397,8 +448,9 @@ impl LogQueueCore {
                 // Each request uses THIS group's per-request token and org.
                 let send_futures: Vec<_> = batches
                     .into_iter()
-                    .map(|batch| {
-                        send_batch_with_retry(
+                    .map(|batch| async {
+                        let count = batch.overflow_rows.len();
+                        let result = send_batch_with_retry(
                             &self.client,
                             &api_url,
                             &token,
@@ -408,6 +460,11 @@ impl LogQueueCore {
                             max_request_size,
                             can_use_overflow,
                         )
+                        .await;
+                        if result.is_err() {
+                            self.notify_drop(count, "publish_failed");
+                        }
+                        result
                     })
                     .collect();
 
@@ -807,11 +864,20 @@ impl LogQueueCore {
             return;
         };
         handle.spawn(async move {
-            let SubmitCommand {
+            let cmd = match cmd {
+                SubmitCommand::Row { row, .. } => {
+                    if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({"rows": [row], "api_version": crate::types::LOGS_API_VERSION})) {
+                        for dir in dirs { let _ = save_payload_debug(&bytes, Some(dir), "dropped"); }
+                    }
+                    return;
+                }
+                cmd => cmd,
+            };
+            let SubmitCommand::Span {
                 token: _,
                 payload,
                 parent_info,
-            } = cmd;
+            } = cmd else { unreachable!() };
 
             let span_components = payload.span_components.clone();
 
@@ -1005,7 +1071,7 @@ impl LogQueue {
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) {
-        self.core.push(SubmitCommand {
+        self.core.push(SubmitCommand::Span {
             token: token.into(),
             payload,
             parent_info,
@@ -1015,6 +1081,32 @@ impl LogQueue {
         if !self.core.config.sync_flush() {
             let _ = self.worker_sender.try_send(LogCommand::TriggerFlush);
         }
+    }
+
+    pub(crate) fn submit_row(
+        &self,
+        token: String,
+        org_id: String,
+        org_name: Option<String>,
+        row: Map<String, Value>,
+    ) {
+        self.core.push(SubmitCommand::Row {
+            token,
+            org_id,
+            org_name,
+            row,
+        });
+        if !self.core.config.sync_flush() {
+            let _ = self.worker_sender.try_send(LogCommand::TriggerFlush);
+        }
+    }
+
+    pub(crate) fn set_drop_handler(&self, handler: crate::logger::LogDropHandler) {
+        *self
+            .core
+            .drop_handler
+            .write()
+            .expect("log drop handler lock poisoned") = Some(handler);
     }
 
     /// Flush all pending data through the worker, waiting for completion.
@@ -1099,7 +1191,7 @@ mod tests {
     use crate::log_queue::config::LogQueueConfig;
 
     fn make_test_cmd(id: &str) -> SubmitCommand {
-        SubmitCommand {
+        SubmitCommand::Span {
             token: "test-token".to_string(),
             payload: SpanPayload {
                 row_id: id.to_string(),

@@ -110,6 +110,48 @@ pub(crate) fn batch_and_serialize_rows(
         .collect()
 }
 
+pub(crate) fn batch_and_serialize_maps(
+    rows: Vec<serde_json::Map<String, serde_json::Value>>,
+    config: &LogQueueConfig,
+    batch_max_bytes: usize,
+) -> Vec<SerializedBatch> {
+    let prepared = rows
+        .into_iter()
+        .map(|row| {
+            let object_ids = crate::types::OBJECT_ID_KEYS
+                .iter()
+                .filter_map(|key| {
+                    row.get(*key)
+                        .map(|value| ((*key).to_owned(), value.clone()))
+                })
+                .collect();
+            let data = serde_json::to_vec(&row).expect("JSON map serialization cannot fail");
+            let overflow = Logs3OverflowInputRow {
+                object_ids,
+                is_delete: row
+                    .get("_object_delete")
+                    .and_then(serde_json::Value::as_bool),
+                input_row: Logs3OverflowInputRowMeta {
+                    byte_size: data.len(),
+                },
+            };
+            (data, overflow)
+        })
+        .collect();
+    batch_items(
+        prepared,
+        config.batch_max_items(),
+        batch_max_bytes,
+        |(data, _)| data.len(),
+    )
+    .into_iter()
+    .map(|batch| {
+        let (rows, overflow) = batch.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+        assemble_logs3_request(&rows, overflow).expect("pre-serialized row assembly cannot fail")
+    })
+    .collect()
+}
+
 /// Assemble a `Logs3Request` payload by concatenating pre-serialized row bytes.
 ///
 /// Produces `{"rows":[<row1>,<row2>,...],"api_version":<N>}` without re-serializing rows.

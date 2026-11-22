@@ -463,7 +463,31 @@ impl std::fmt::Debug for ClientInner {
     }
 }
 
+/// Receives the number of rows discarded by a queue and a stable reason.
+pub type LogDropHandler = Arc<dyn Fn(usize, &'static str) + Send + Sync>;
+
 impl BraintrustClient {
+    /// Queue an already formed `/logs3` row without resolving a span destination.
+    /// The caller supplies the row's identifiers and credentials. Delivery uses
+    /// the same batching, retries, queue limits, and flush as span logging.
+    pub fn log_row_with_credentials(
+        &self,
+        token: impl Into<String>,
+        org_id: impl Into<String>,
+        org_name: Option<String>,
+        row: serde_json::Map<String, serde_json::Value>,
+    ) {
+        self.inner
+            .queue
+            .submit_row(token.into(), org_id.into(), org_name, row);
+    }
+
+    /// Set a nonblocking callback for queue overflow and delivery failures.
+    /// Replaces any previous callback. It must not panic or call back into logging.
+    pub fn set_log_drop_handler(&self, handler: LogDropHandler) {
+        self.inner.queue.set_drop_handler(handler);
+    }
+
     /// Create a new builder for configuring the client.
     ///
     /// # Example

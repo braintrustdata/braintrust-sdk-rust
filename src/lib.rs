@@ -29,8 +29,8 @@ pub use experiments::{
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
 pub use log_queue::LogQueueConfig;
 pub use logger::{
-    BraintrustClient, BraintrustClientBuilder, LoginState, OrgInfo, DEFAULT_API_URL,
-    DEFAULT_APP_URL,
+    BraintrustClient, BraintrustClientBuilder, LogDropHandler, LoginState, OrgInfo,
+    DEFAULT_API_URL, DEFAULT_APP_URL,
 };
 pub use logs3::{Logs3BatchUploader, Logs3UploadResult};
 pub use span::{
