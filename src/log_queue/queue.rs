@@ -15,6 +15,8 @@ use crossbeam::channel::{unbounded, Receiver, Sender, TrySendError};
 use futures::future::join_all;
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,13 +25,71 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use url::Url;
 
-/// An item queued for deferred preparation and flushing, with the token used to
-/// upload it.
+/// Supplies the bearer token for queued uploads when they are sent.
+///
+/// The queue calls [`TokenProvider::token`] once per upload group each time it
+/// flushes, so cache tokens that are expensive to mint, and bound how long a call
+/// can take: a call that never returns stalls this client's uploads. When it
+/// returns an error, the rows waiting on it are dropped and counted in
+/// [`DroppedRows::upload_failed`].
+#[async_trait::async_trait]
+pub trait TokenProvider: Send + Sync {
+    /// Return the token for the next upload.
+    async fn token(&self) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// How a queued item authenticates its upload.
+#[derive(Clone)]
+enum Credential {
+    Token(String),
+    /// Fetched when the item is sent. Items share a credential only if they share
+    /// the provider `Arc`.
+    Provider(Arc<dyn TokenProvider>),
+}
+
+impl Credential {
+    async fn token(&self) -> std::result::Result<Cow<'_, str>, anyhow::Error> {
+        match self {
+            Self::Token(token) => Ok(Cow::Borrowed(token)),
+            Self::Provider(provider) => provider
+                .token()
+                .await
+                .map(Cow::Owned)
+                .map_err(|error| anyhow::anyhow!("token provider failed: {error}")),
+        }
+    }
+}
+
+impl PartialEq for Credential {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Token(a), Self::Token(b)) => a == b,
+            (Self::Provider(a), Self::Provider(b)) => {
+                std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Credential {}
+
+impl Hash for Credential {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Token(token) => token.hash(state),
+            Self::Provider(provider) => Arc::as_ptr(provider).cast::<()>().hash(state),
+        }
+    }
+}
+
+/// An item queued for deferred preparation and flushing, with the credential used
+/// to upload it.
 ///
 /// Fields are private — construction and destructuring happen only within this
 /// module. `worker.rs` never touches the fields directly.
 struct SubmitCommand {
-    token: String,
+    credential: Credential,
     item: QueuedItem,
 }
 
@@ -81,7 +141,7 @@ impl DropCounters {
     }
 }
 
-/// Rows bound for one upload credential (token and org).
+/// Rows bound for one upload credential (token or token provider, and org).
 struct CredentialGroup {
     org_name: Option<String>,
     spans: Vec<Logs3Row>,
@@ -349,21 +409,22 @@ impl LogQueueCore {
         };
 
         // Prepare rows and bucket them by their upload credentials. The batch
-        // "destination" is (token, org_id): rows uploaded with different tokens or
-        // orgs must never be merged or batched into the same request under one
-        // token. `org_name` is carried alongside for the `x-bt-org-name` header.
-        let mut groups: IndexMap<(String, String), CredentialGroup> = IndexMap::new();
+        // "destination" is (credential, org_id): rows uploaded with different
+        // credentials or orgs must never be merged or batched into the same request
+        // under one token. `org_name` is carried alongside for the `x-bt-org-name`
+        // header.
+        let mut groups: IndexMap<(Credential, String), CredentialGroup> = IndexMap::new();
         for cmd in cmds {
-            let SubmitCommand { token, item } = cmd;
+            let SubmitCommand { credential, item } = cmd;
             match item {
                 QueuedItem::Span {
                     payload,
                     parent_info,
-                } => match self.prepare_row(&token, payload, parent_info).await {
+                } => match self.prepare_span(&credential, payload, parent_info).await {
                     Ok(row) => {
                         let org_id = row.org_id.clone();
                         let org_name = row.org_name.clone();
-                        self.credential_group(&mut groups, token, org_id, org_name)
+                        self.credential_group(&mut groups, credential, org_id, org_name)
                             .spans
                             .push(row);
                     }
@@ -382,7 +443,7 @@ impl LogQueueCore {
                     org_name,
                     row,
                 } => self
-                    .credential_group(&mut groups, token, org_id, org_name)
+                    .credential_group(&mut groups, credential, org_id, org_name)
                     .rows
                     .push(row),
             }
@@ -396,21 +457,6 @@ impl LogQueueCore {
             };
         }
 
-        // Version info reflects a server-wide limit, so it is fetched once and
-        // reused across all credential groups (using any group's credentials).
-        let (probe_token, probe_org) = {
-            let ((token, _org_id), group) = groups.get_index(0).unwrap();
-            (token.clone(), group.org_name.clone())
-        };
-        let (max_request_size, can_use_overflow) = self
-            .get_version_info(&api_url, &probe_token, probe_org.as_deref())
-            .await;
-
-        // Effective batch byte limit: the smaller of the locally configured limit and half the
-        // server-advertised max request size. This mirrors the TypeScript SDK which uses
-        // `maxRequestSize / 2` as the batching limit, where maxRequestSize comes from /version.
-        let effective_batch_bytes = self.config.batch_max_bytes().min(max_request_size / 2);
-
         // Chunk size matches TypeScript SDK: max(1, min(batchMaxItems, flushChunkSize))
         let chunk_size = std::cmp::max(
             1,
@@ -420,12 +466,36 @@ impl LogQueueCore {
             ),
         );
 
-        for ((token, _org_id), group) in groups {
+        for ((credential, _org_id), group) in groups {
             let CredentialGroup {
                 org_name,
                 spans,
                 rows,
             } = group;
+            // Tokens from a provider are fetched now, so rows that waited in the
+            // queue still go out with a current token.
+            let token = match credential.token().await {
+                Ok(token) => token,
+                Err(e) => {
+                    warn!(error = %e, "failed to get upload token, dropping rows");
+                    self.drops
+                        .upload_failed
+                        .fetch_add((spans.len() + rows.len()) as u64, Ordering::Relaxed);
+                    first_error.get_or_insert(e);
+                    continue;
+                }
+            };
+
+            // Version info reflects a server-wide limit, so it is fetched once
+            // (with the first group's credentials) and cached.
+            let (max_request_size, can_use_overflow) = self
+                .get_version_info(&api_url, &token, org_name.as_deref())
+                .await;
+
+            // Effective batch byte limit: the smaller of the locally configured limit and half the
+            // server-advertised max request size. This mirrors the TypeScript SDK which uses
+            // `maxRequestSize / 2` as the batching limit, where maxRequestSize comes from /version.
+            let effective_batch_bytes = self.config.batch_max_bytes().min(max_request_size / 2);
             // Process chunks sequentially (matches TypeScript SDK)
             for chunk in spans.chunks(chunk_size).map(<[_]>::to_vec) {
                 let config = self.config.clone();
@@ -502,13 +572,13 @@ impl LogQueueCore {
     /// org name fall back to the shared login state's.
     fn credential_group<'a>(
         &self,
-        groups: &'a mut IndexMap<(String, String), CredentialGroup>,
-        token: String,
+        groups: &'a mut IndexMap<(Credential, String), CredentialGroup>,
+        credential: Credential,
         org_id: String,
         org_name: Option<String>,
     ) -> &'a mut CredentialGroup {
         groups
-            .entry((token, org_id))
+            .entry((credential, org_id))
             .or_insert_with(|| CredentialGroup {
                 org_name: org_name.or_else(|| self.login_state.org_name()),
                 spans: Vec::new(),
@@ -584,6 +654,17 @@ impl LogQueueCore {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Prepare a span with its credential's token, which project registration uses.
+    async fn prepare_span(
+        &self,
+        credential: &Credential,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    ) -> std::result::Result<Logs3Row, anyhow::Error> {
+        let token = credential.token().await?;
+        self.prepare_row(&token, payload, parent_info).await
     }
 
     /// Prepare a `Logs3Row` from a submit command's token, payload, and parent info.
@@ -959,7 +1040,10 @@ impl LogQueueCore {
             return;
         };
         handle.spawn(async move {
-            let SubmitCommand { token: _, item } = cmd;
+            let SubmitCommand {
+                credential: _,
+                item,
+            } = cmd;
             let (payload, parent_info) = match item {
                 QueuedItem::Span {
                     payload,
@@ -1169,7 +1253,7 @@ impl LogQueue {
         parent_info: Option<ParentSpanInfo>,
     ) {
         self.core.push(SubmitCommand {
-            token: token.into(),
+            credential: Credential::Token(token.into()),
             item: QueuedItem::Span {
                 payload,
                 parent_info,
@@ -1188,9 +1272,31 @@ impl LogQueue {
         org_name: Option<&str>,
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
+        self.submit_rows_with(Credential::Token(token.to_owned()), org_id, org_name, rows);
+    }
+
+    /// Submit caller-built rows whose token is fetched from `provider` when they
+    /// are sent.
+    pub(crate) fn submit_rows_with_provider(
+        &self,
+        provider: Arc<dyn TokenProvider>,
+        org_id: &str,
+        org_name: Option<&str>,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+    ) {
+        self.submit_rows_with(Credential::Provider(provider), org_id, org_name, rows);
+    }
+
+    fn submit_rows_with(
+        &self,
+        credential: Credential,
+        org_id: &str,
+        org_name: Option<&str>,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+    ) {
         for row in rows {
             self.core.push(SubmitCommand {
-                token: token.to_owned(),
+                credential: credential.clone(),
                 item: QueuedItem::Row {
                     org_id: org_id.to_owned(),
                     org_name: org_name.map(str::to_owned),
@@ -1304,7 +1410,7 @@ mod tests {
 
     fn make_test_cmd(id: &str) -> SubmitCommand {
         SubmitCommand {
-            token: "test-token".to_string(),
+            credential: Credential::Token("test-token".to_string()),
             item: QueuedItem::Span {
                 payload: SpanPayload {
                     row_id: id.to_string(),
