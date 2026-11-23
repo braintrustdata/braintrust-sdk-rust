@@ -19,7 +19,7 @@ use crate::experiments::api::{
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
 use crate::http::{api_client, api_result, build_http_client, CaBundleConfig};
-use crate::log_queue::{DroppedRows, LogQueue, LogQueueConfig};
+use crate::log_queue::{DroppedRows, LogQueue, LogQueueConfig, TokenProvider};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
@@ -968,6 +968,26 @@ impl BraintrustClient {
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
         self.inner.queue.submit_rows(token, org_id, org_name, rows);
+    }
+
+    /// Queue caller-built rows for upload to `/logs3`, fetching the token from
+    /// `provider` when they are sent.
+    ///
+    /// Behaves like [`BraintrustClient::log_rows_with_credentials`], except that the
+    /// token is requested when the rows are uploaded rather than when they are
+    /// queued, so rows that wait in the queue still go out with a current token.
+    /// Rows are batched together only if they share the provider `Arc` and
+    /// `org_id`. See [`TokenProvider`] for how the provider is called.
+    pub fn log_rows_with_token_provider(
+        &self,
+        provider: Arc<dyn TokenProvider>,
+        org_id: &str,
+        org_name: Option<&str>,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+    ) {
+        self.inner
+            .queue
+            .submit_rows_with_provider(provider, org_id, org_name, rows);
     }
 
     /// Cumulative counts of rows this client discarded instead of uploading.
@@ -1981,6 +2001,131 @@ mod tests {
             uploaded[&("Bearer token-b".to_owned(), None)],
             as_values(rows_b)
         );
+    }
+
+    #[tokio::test]
+    async fn log_rows_with_token_provider_fetches_the_token_when_sending() {
+        struct Rotating {
+            token: std::sync::Mutex<String>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl TokenProvider for Rotating {
+            async fn token(
+                &self,
+            ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(self.token.lock().unwrap().clone())
+            }
+        }
+        let provider = |token: &str| {
+            Arc::new(Rotating {
+                token: std::sync::Mutex::new(token.to_owned()),
+                calls: Default::default(),
+            })
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .skip_login(true)
+            .checked_delivery(true)
+            .build()
+            .await
+            .expect("client");
+
+        let row = |id: &str| serde_json::json!({ "id": id }).as_object().unwrap().clone();
+        let rotating = provider("first");
+        let other = provider("other");
+        client.log_rows_with_token_provider(rotating.clone(), "org", Some("org-name"), [row("a")]);
+        client.log_rows_with_token_provider(rotating.clone(), "org", Some("org-name"), [row("b")]);
+        client.log_rows_with_token_provider(other.clone(), "org", Some("org-name"), [row("c")]);
+        assert_eq!(rotating.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        *rotating.token.lock().unwrap() = "rotated".to_owned();
+        client.flush().await.expect("flush");
+
+        assert_eq!(client.dropped_rows(), DroppedRows::default());
+        assert_eq!(rotating.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut uploaded = HashMap::new();
+        for request in server.received_requests().await.unwrap() {
+            if request.url.path() != "/logs3" {
+                continue;
+            }
+            let body: Value = serde_json::from_slice(&request.body).expect("json");
+            let ids: Vec<String> = body["rows"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|row| row["id"].as_str().unwrap().to_owned())
+                .collect();
+            let auth = request.headers["authorization"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                uploaded.insert(auth, ids).is_none(),
+                "one request per provider"
+            );
+        }
+        assert_eq!(
+            uploaded,
+            HashMap::from([
+                (
+                    "Bearer rotated".to_owned(),
+                    vec!["a".to_owned(), "b".to_owned()]
+                ),
+                ("Bearer other".to_owned(), vec!["c".to_owned()]),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn token_provider_errors_drop_the_rows_waiting_on_them() {
+        struct Unavailable;
+        #[async_trait::async_trait]
+        impl TokenProvider for Unavailable {
+            async fn token(
+                &self,
+            ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                Err("credential unavailable".into())
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .skip_login(true)
+            .build()
+            .await
+            .expect("client");
+
+        let rows = (0..3).map(|i| {
+            serde_json::json!({"id": format!("row-{i}")})
+                .as_object()
+                .unwrap()
+                .clone()
+        });
+        client.log_rows_with_token_provider(Arc::new(Unavailable), "org", None, rows);
+        let _ = client.flush().await;
+
+        assert_eq!(client.dropped_rows().upload_failed, 3);
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() != "/logs3"));
     }
 
     #[tokio::test]
