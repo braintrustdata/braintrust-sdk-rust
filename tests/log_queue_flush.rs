@@ -43,10 +43,7 @@ async fn flush_rows(rows: usize) -> (Vec<usize>, Duration) {
                 "token",
                 "org-id",
                 &exported,
-                SpanLog::builder()
-                    .output(json!({ "i": i }))
-                    .build()
-                    .expect("build"),
+                SpanLog::builder().output(json!({ "i": i })).build(),
             )
             .expect("update");
     }
@@ -135,10 +132,7 @@ async fn rate_limited_project_does_not_block_other_projects() {
                 "token",
                 "org-id",
                 &exported,
-                SpanLog::builder()
-                    .output(json!({ "i": i }))
-                    .build()
-                    .expect("build"),
+                SpanLog::builder().output(json!({ "i": i })).build(),
             )
             .expect("update");
     }

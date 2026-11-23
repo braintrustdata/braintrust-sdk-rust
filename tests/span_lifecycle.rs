@@ -45,8 +45,7 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
             .name("integration-span")
             .input(Value::String("input".into()))
             .output(Value::String("output".into()))
-            .build()
-            .expect("build"),
+            .build(),
     );
     span.flush().await.expect("flush");
     client.flush().await.expect("client flush");
@@ -106,8 +105,7 @@ async fn client_update_span_uses_exported_ids_for_project_logs() {
             &exported,
             SpanLog::builder()
                 .output(json!({"status": "updated"}))
-                .build()
-                .expect("build"),
+                .build(),
         )
         .expect("update");
     client.flush().await.expect("flush");
@@ -180,8 +178,7 @@ async fn client_update_span_with_credentials_works_without_priming_login_state()
             &exported,
             SpanLog::builder()
                 .output(json!({"status": "updated"}))
-                .build()
-                .expect("build"),
+                .build(),
         )
         .expect("update");
     client.flush().await.expect("flush");
@@ -220,7 +217,7 @@ async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
         .api_url(server.uri())
         .app_url(server.uri())
         .environment("ci", Some("test"))
-        .span_origin(SpanOrigin::new().name("client-origin"))
+        .span_origin(SpanOrigin::builder().name("client-origin").build())
         .build()
         .await
         .expect("client");
@@ -254,20 +251,13 @@ async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
                 .map(|context| Map::from_iter([("context".to_string(), context.clone())])),
         }
         .to_str();
-        let mut event = SpanLog::builder()
+        let event = SpanLog::builder()
             .skip_span_origin()
-            .span_origin(SpanOrigin::new().name("event-origin"))
-            .output(json!({"status": "updated"}));
-        if let Some(context) = context {
-            event = event.context(context.clone());
-        }
+            .span_origin(SpanOrigin::builder().name("event-origin").build())
+            .output(json!({"status": "updated"}))
+            .maybe_context(context.clone());
         client
-            .update_span_with_credentials(
-                "token",
-                "org-id",
-                &exported,
-                event.build().expect("build"),
-            )
+            .update_span_with_credentials("token", "org-id", &exported, event.build())
             .expect("update");
         client.flush().await.expect("flush");
     }
@@ -305,7 +295,7 @@ async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
         .api_url(server.uri())
         .app_url(server.uri())
         .environment("ci", Some("test"))
-        .span_origin(SpanOrigin::new().name("client-origin"))
+        .span_origin(SpanOrigin::builder().name("client-origin").build())
         .build()
         .await
         .expect("client");
@@ -319,23 +309,16 @@ async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
             .parent_info(ParentSpanInfo::ProjectLogs {
                 object_id: "proj-id".to_string(),
             })
-            .span_origin(SpanOrigin::new().name("builder-origin"))
+            .span_origin(SpanOrigin::builder().name("builder-origin").build())
             .build();
-        let mut event = SpanLog::builder()
-            .span_origin(SpanOrigin::new().name("event-origin"))
+        let event = SpanLog::builder()
+            .span_origin(SpanOrigin::builder().name("event-origin").build())
             .skip_span_origin()
-            .input(json!("input"));
-        if let Some(context) = context {
-            event = event.context(context.clone());
-        }
-        span.log(event.build().expect("build"));
+            .input(json!("input"))
+            .maybe_context(context.clone());
+        span.log(event.build());
         client.flush().await.expect("initial flush");
-        span.log(
-            SpanLog::builder()
-                .output(json!("output"))
-                .build()
-                .expect("build"),
-        );
+        span.log(SpanLog::builder().output(json!("output")).build());
         client.flush().await.expect("update flush");
         span.end();
         client.flush().await.expect("end flush");
@@ -403,8 +386,7 @@ async fn client_update_span_includes_exported_span_parents() {
             &exported,
             SpanLog::builder()
                 .output(json!({"status": "updated"}))
-                .build()
-                .expect("build"),
+                .build(),
         )
         .expect("update");
     client.flush().await.expect("flush");
@@ -463,8 +445,7 @@ async fn client_update_span_with_credentials_includes_exported_span_parents() {
             &exported,
             SpanLog::builder()
                 .output(json!({"status": "updated"}))
-                .build()
-                .expect("build"),
+                .build(),
         )
         .expect("update");
     client.flush().await.expect("flush");
@@ -556,8 +537,7 @@ async fn client_update_span_with_credentials_inherits_exported_propagated_event(
                     .metric("child_latency_ms", 42.0)
                     .tag("request")
                     .output(json!({ "status": output }))
-                    .build()
-                    .expect("build"),
+                    .build(),
             )
             .expect("update");
         client.flush().await.expect("flush");
@@ -672,8 +652,7 @@ async fn child_span_inherits_parent_propagated_event() {
             .metadata(Map::from_iter([("child".to_string(), json!(true))]))
             .tag("request")
             .output(json!({"status": "child"}))
-            .build()
-            .expect("build"),
+            .build(),
     );
     client.flush().await.expect("flush");
 
@@ -770,8 +749,7 @@ async fn client_update_span_resolves_project_name_from_exported_compute_metadata
             &exported,
             SpanLog::builder()
                 .output(json!({"status": "updated"}))
-                .build()
-                .expect("build"),
+                .build(),
         )
         .expect("update");
     client.flush().await.expect("flush");

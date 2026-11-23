@@ -710,6 +710,53 @@ async fn parity_base_url_query_and_fragment_do_not_replace_operation_paths() {
 }
 
 #[tokio::test]
+async fn organization_scope_covers_generated_and_sdk_requests_without_leaking_to_storage() {
+    let api = MockServer::start().await;
+    let storage = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/dataset"))
+        .and(header("authorization", "Bearer secret"))
+        .and(header("x-bt-org-name", "tenant"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"objects":[]})))
+        .expect(1)
+        .mount(&api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/project/register"))
+        .and(header("authorization", "Bearer secret"))
+        .and(header("x-bt-org-name", "tenant"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"project"}})))
+        .expect(1)
+        .mount(&api)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/object"))
+        .and(|r: &Request| {
+            !r.headers.contains_key("authorization") && !r.headers.contains_key("x-bt-org-name")
+        })
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&storage)
+        .await;
+    let client = Client::builder()
+        .api_key("secret")
+        .api_url(api.uri())
+        .app_url(api.uri())
+        .organization_scope("tenant")
+        .build()
+        .unwrap();
+    client.get_dataset_builder().send().await.unwrap();
+    client
+        .register_project(&braintrust_api_client::ProjectRegisterRequest::new(
+            "p".into(),
+        ))
+        .await
+        .unwrap();
+    let upload = Logs3OverflowUpload::new("PUT", format!("{}/object", storage.uri()), "key");
+    client.upload_logs3_overflow(&upload, "{}").await.unwrap();
+}
+
+#[tokio::test]
 async fn default_transport_preserves_redirects_as_one_attempt_results() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

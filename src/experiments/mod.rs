@@ -15,37 +15,25 @@
 //!     .build();
 //!
 //! let id = experiment.log(
-//!     ExperimentLog::builder()
+//!     SpanLog::builder()
 //!         .input(json!({"question": "What is 2+2?"}))
 //!         .output(json!({"answer": "4"}))
 //!         .expected(json!({"answer": "4"}))
 //!         .score("accuracy", 1.0)
-//!         .build()?
-//! ).await;
+//!         .build()
+//! ).await?;
 //!
 //! experiment.flush().await?;
 //! ```
 
-// Internal API module (not public)
-pub(crate) mod api;
-
 // Public modules
-mod builder;
-mod event_log;
 mod experiment;
 mod feedback;
 mod metadata;
-mod span_builder;
 mod summary;
 
 // Public re-exports
-pub use builder::{ExperimentBuilder, ExperimentBuilderError};
-pub use event_log::{ExperimentLog, ExperimentLogBuilder};
-pub use experiment::Experiment;
-pub use feedback::{Feedback, FeedbackBuilder, FeedbackBuilderError};
-pub use metadata::{
-    BaseExperimentInfo, ExportedExperiment, GitMetadataCollect, GitMetadataField,
-    GitMetadataSettings, ProjectMetadata, RepoInfo,
-};
-pub use span_builder::ExperimentSpanBuilder;
+pub use experiment::{Experiment, ExperimentBuilder};
+pub use feedback::{Feedback, FeedbackBuilder};
+pub use metadata::{BaseExperimentInfo, ExportedExperiment, ProjectMetadata, RepoInfo};
 pub use summary::{ExperimentSummary, MetricSummary, ScoreSummary};
