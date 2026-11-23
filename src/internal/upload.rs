@@ -40,6 +40,40 @@ impl UploadPolicy {
         }
     }
 }
+// The data plane's rate-limit window is 60 seconds, so a longer Retry-After is never useful.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// A failed request attempt, with the server's Retry-After hint when it sent one.
+struct Attempt {
+    error: BraintrustError,
+    retry_after: Option<Duration>,
+}
+
+async fn attempt<T>(
+    result: std::result::Result<T, crate::api::Error<serde_json::Value>>,
+) -> std::result::Result<T, Attempt> {
+    let retry_after = match &result {
+        Err(crate::api::Error::Api(response)) => response
+            .headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse().ok())
+            .map(Duration::from_secs),
+        _ => None,
+    };
+    api_result(result)
+        .await
+        .map_err(|error| Attempt { error, retry_after })
+}
+
+/// Wait at least as long as the server asked, without retrying once the budget is exhausted.
+fn retry_delay(attempt: &Attempt, backoff: Option<Duration>) -> Option<Duration> {
+    let backoff = backoff?;
+    Some(attempt.retry_after.map_or(backoff, |retry_after| {
+        retry_after.min(MAX_RETRY_AFTER).max(backoff)
+    }))
+}
+
 // Borrowing the iterator lets backon share retries across overflow stages and splits.
 struct RetryBudget {
     delays: ExponentialBackoff,
@@ -49,16 +83,20 @@ impl RetryBudget {
     async fn run<T, F, Fut>(&mut self, mut operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
+        Fut: Future<Output = std::result::Result<T, Attempt>>,
     {
         (|| {
             self.requests += 1;
             operation()
         })
         .retry(&mut self.delays)
-        .when(retryable)
-        .notify(|error, delay| warn!(%error, ?delay, "ingestion request failed, retrying"))
+        .when(|attempt| retryable(&attempt.error))
+        .adjust(retry_delay)
+        .notify(|attempt, delay| {
+            warn!(error = %attempt.error, ?delay, "ingestion request failed, retrying")
+        })
         .await
+        .map_err(|attempt| attempt.error)
     }
 }
 
@@ -150,7 +188,7 @@ impl UploadCoordinator {
             if batch.data.len() <= capabilities.max_request_size {
                 match budget
                     .run(|| async {
-                        api_result(self.logs.logs3_raw(batch.data.clone()).await)
+                        attempt(self.logs.logs3_raw(batch.data.clone()).await)
                             .await
                             .map(|_| ())
                     })
@@ -190,7 +228,7 @@ impl UploadCoordinator {
                 let mut request = Logs3OverflowRequest::new(batch.overflow_rows());
                 request.content_type = Some("application/json".into());
                 request.size_bytes = Some(batch.data.len());
-                api_result(
+                attempt(
                     self.logs
                         .logs3_overflow_with_org_name(&request, self.logs.organization_name())
                         .await,
@@ -201,7 +239,7 @@ impl UploadCoordinator {
             .await?;
         budget
             .run(|| async {
-                api_result(
+                attempt(
                     self.logs
                         .upload_logs3_overflow(&grant, batch.data.clone())
                         .await,
@@ -212,7 +250,7 @@ impl UploadCoordinator {
             .await?;
         budget
             .run(|| async {
-                api_result(self.logs.logs3(&serde_json::json!({"rows":grant.reference(), "api_version":LOGS_API_VERSION})).await).await.map(|_| ())
+                attempt(self.logs.logs3(&serde_json::json!({"rows":grant.reference(), "api_version":LOGS_API_VERSION})).await).await.map(|_| ())
             })
             .await
     }
@@ -496,5 +534,72 @@ mod tests {
             result,
             Err(BraintrustError::Api { status: 307, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_queue_upload_waits_for_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "3"))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        let result = coordinator(&server, UploadPolicy::Queue { retries: 2 })
+            .upload(
+                batch(),
+                Capabilities {
+                    max_request_size: usize::MAX,
+                    overflow: false,
+                },
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(result.requests_sent, 2);
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "retry should wait for Retry-After, waited {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn retry_after_never_shortens_backoff_and_is_capped() {
+        let rate_limited = |retry_after| Attempt {
+            error: BraintrustError::Api {
+                status: 429,
+                message: String::new(),
+            },
+            retry_after,
+        };
+        let backoff = Some(Duration::from_secs(2));
+        assert_eq!(
+            retry_delay(&rate_limited(Some(Duration::from_secs(20))), backoff),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            retry_delay(&rate_limited(Some(Duration::ZERO)), backoff),
+            backoff
+        );
+        assert_eq!(retry_delay(&rate_limited(None), backoff), backoff);
+        assert_eq!(
+            retry_delay(&rate_limited(Some(Duration::from_secs(3600))), backoff),
+            Some(MAX_RETRY_AFTER)
+        );
+        assert_eq!(
+            retry_delay(&rate_limited(Some(Duration::from_secs(20))), None),
+            None,
+            "an exhausted retry budget must stay exhausted"
+        );
     }
 }
