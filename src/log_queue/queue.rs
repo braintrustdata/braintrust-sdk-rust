@@ -12,7 +12,7 @@ use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{unbounded, Receiver, Sender, TrySendError};
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
 use std::borrow::Cow;
@@ -372,12 +372,12 @@ impl LogQueueCore {
             .await
     }
 
-    /// Internal flush implementation: drain → prepare → chunk → merge → batch → send.
+    /// Internal flush implementation: drain → prepare → merge → batch → send.
     ///
     /// Commands are drained atomically. Each command is prepared (project
-    /// registration, row building) before batching. Rows are then processed in
-    /// sequential chunks of `min(batch_max_items, flush_chunk_size)`.
-    /// Within each chunk, batches are sent concurrently.
+    /// registration, row building) before batching. Each credential group's spans
+    /// are merged by row key, then its spans and caller-built rows are batched and sent with at most
+    /// `max_concurrent_log_requests` requests in flight (matching the TypeScript SDK).
     async fn flush_internal(self: &Arc<Self>) -> std::result::Result<(), anyhow::Error> {
         let cmds = self.drain_all();
         if cmds.is_empty() {
@@ -457,15 +457,6 @@ impl LogQueueCore {
             };
         }
 
-        // Chunk size matches TypeScript SDK: max(1, min(batchMaxItems, flushChunkSize))
-        let chunk_size = std::cmp::max(
-            1,
-            std::cmp::min(
-                self.config.batch_max_items(),
-                self.config.flush_chunk_size(),
-            ),
-        );
-
         for ((credential, _org_id), group) in groups {
             let CredentialGroup {
                 org_name,
@@ -496,13 +487,13 @@ impl LogQueueCore {
             // server-advertised max request size. This mirrors the TypeScript SDK which uses
             // `maxRequestSize / 2` as the batching limit, where maxRequestSize comes from /version.
             let effective_batch_bytes = self.config.batch_max_bytes().min(max_request_size / 2);
-            // Process chunks sequentially (matches TypeScript SDK)
-            for chunk in spans.chunks(chunk_size).map(<[_]>::to_vec) {
+
+            if !spans.is_empty() {
                 let config = self.config.clone();
-                let count = chunk.len();
+                let count = spans.len();
                 let batches = tokio::task::spawn_blocking(move || {
                     let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
-                    for row in chunk {
+                    for row in spans {
                         let key = RowKey::from_row(&row);
                         if let Some(existing) = merged.get_mut(&key) {
                             if row.is_merge.unwrap_or(false) {
@@ -536,13 +527,11 @@ impl LogQueueCore {
             }
 
             // Caller-built rows are sent as given: no merging by row key.
-            let mut rows = rows.into_iter().peekable();
-            while rows.peek().is_some() {
-                let chunk: Vec<_> = rows.by_ref().take(chunk_size).collect();
+            if !rows.is_empty() {
                 let config = self.config.clone();
-                let count = chunk.len();
+                let count = rows.len();
                 let batches = tokio::task::spawn_blocking(move || {
-                    batch_and_serialize_maps(chunk, &config, effective_batch_bytes)
+                    batch_and_serialize_maps(rows, &config, effective_batch_bytes)
                 })
                 .await;
                 let batches = self.serialized_batches(batches, count, &mut first_error);
@@ -614,8 +603,9 @@ impl LogQueueCore {
         Vec::new()
     }
 
-    /// Send a chunk's batches concurrently (matches TypeScript SDK's Promise.all),
-    /// counting undelivered rows of failed batches as dropped. Returns the first error.
+    /// Send batches with at most `max_concurrent_log_requests` in flight (matching the
+    /// TypeScript SDK), counting undelivered rows of failed batches as dropped. Returns
+    /// the first error.
     #[allow(clippy::too_many_arguments)]
     async fn send_batches(
         &self,
@@ -647,7 +637,11 @@ impl LogQueueCore {
             result
         });
         let mut first_error = None;
-        for result in join_all(send_futures).await {
+        let results: Vec<_> = stream::iter(send_futures)
+            .buffer_unordered(self.config.max_concurrent_log_requests())
+            .collect()
+            .await;
+        for result in results {
             if let Err(e) = result {
                 warn!(error = %e, "batch send failed");
                 first_error.get_or_insert(e);
