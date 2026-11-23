@@ -1,8 +1,12 @@
 mod batching;
 mod config;
+mod dispatch;
+pub(crate) mod engine;
 mod http;
 mod merge;
-mod queue;
+pub(crate) mod observation;
+mod prepare;
+pub(crate) mod queue;
 mod row_key;
 
 // Public API exports

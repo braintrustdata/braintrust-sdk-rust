@@ -21,6 +21,7 @@ use super::{
 };
 
 /// A filter for selecting which evaluators to run, read from `BT_EVAL_FILTER_PARSED`.
+#[derive(Clone)]
 struct EvalFilter {
     path: Vec<String>,
     pattern: regex::Regex,
@@ -39,6 +40,7 @@ impl EvalFilter {
 }
 
 /// Configuration read from `BT_EVAL_*` environment variables.
+#[derive(Clone)]
 struct RunnerConfig {
     /// Output summaries as JSONL to stdout (`BT_EVAL_JSONL=1`)
     jsonl: bool,
@@ -207,14 +209,15 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 /// Ok(())
 /// # }
 /// ```
+#[derive(Clone)]
 pub struct BtEvalRunner {
     config: RunnerConfig,
     sse: Option<Arc<SseWriter>>,
     client: Option<Arc<BraintrustClient>>,
     /// Names registered in list mode, in order of registration.
-    registered_names: Vec<String>,
+    registered_names: Arc<Mutex<Vec<String>>>,
     /// Whether all evals that have run so far passed (no failures).
-    all_passed: bool,
+    all_passed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BtEvalRunner {
@@ -222,7 +225,11 @@ impl BtEvalRunner {
     ///
     /// In non-list mode, this creates a `BraintrustClient` from environment variables
     /// (e.g. `BRAINTRUST_API_KEY`). In list mode, no client is created.
-    pub async fn from_env() -> Result<Self> {
+    pub fn from_env() -> crate::Completion<Self, crate::BraintrustError> {
+        crate::service::submit(async move { Self::from_env_inner().await })
+    }
+
+    async fn from_env_inner() -> Result<Self> {
         let config = RunnerConfig::from_env();
         let sse = create_sse_writer();
 
@@ -237,8 +244,8 @@ impl BtEvalRunner {
             config,
             sse,
             client,
-            registered_names: Vec::new(),
-            all_passed: true,
+            registered_names: Default::default(),
+            all_passed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -253,8 +260,8 @@ impl BtEvalRunner {
             config,
             sse,
             client: Some(client),
-            registered_names: Vec::new(),
-            all_passed: true,
+            registered_names: Default::default(),
+            all_passed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -270,7 +277,7 @@ impl BtEvalRunner {
 
     /// Returns `true` if all evals that have run so far passed.
     pub fn all_passed(&self) -> bool {
-        self.all_passed
+        self.all_passed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn passes_filter(&self, name: &str) -> bool {
@@ -286,7 +293,21 @@ impl BtEvalRunner {
     /// - In **normal mode**: runs the evaluator and sends results via SSE if configured.
     ///
     /// If the eval name does not pass the configured filters, it is skipped silently.
-    pub async fn eval<I, O>(&mut self, project: &str, mut opts: EvalOpts<I, O>) -> Result<()>
+    pub fn eval<I, O>(
+        &mut self,
+        project: &str,
+        opts: EvalOpts<I, O>,
+    ) -> crate::Completion<(), crate::BraintrustError>
+    where
+        I: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
+        O: Serialize + DeserializeOwned + Send + Sync + PartialEq + Clone + 'static,
+    {
+        let mut runner = self.clone();
+        let project = project.to_owned();
+        crate::service::submit(async move { runner.eval_inner(&project, opts).await })
+    }
+
+    async fn eval_inner<I, O>(&mut self, project: &str, mut opts: EvalOpts<I, O>) -> Result<()>
     where
         I: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
         O: Serialize + DeserializeOwned + Send + Sync + PartialEq + Clone + 'static,
@@ -298,7 +319,7 @@ impl BtEvalRunner {
         }
 
         if self.config.list {
-            self.registered_names.push(name);
+            self.registered_names.lock().unwrap().push(name);
             return Ok(());
         }
 
@@ -332,7 +353,8 @@ impl BtEvalRunner {
                 }
 
                 if failed > 0 {
-                    self.all_passed = false;
+                    self.all_passed
+                        .store(false, std::sync::atomic::Ordering::Release);
                     if self.config.terminate_on_failure {
                         return Err(BraintrustError::Background(format!(
                             "Evaluator '{}' failed with {} error(s)",
@@ -342,7 +364,8 @@ impl BtEvalRunner {
                 }
             }
             Err(e) => {
-                self.all_passed = false;
+                self.all_passed
+                    .store(false, std::sync::atomic::Ordering::Release);
                 if let Some(sse) = &self.sse {
                     sse.send("error", &json!({ "message": e.to_string() }));
                 } else {
@@ -363,28 +386,39 @@ impl BtEvalRunner {
     /// The SSE connection (if any) is closed when this method returns.
     ///
     /// Returns `true` if all evals passed, `false` if any failed.
-    pub async fn finish(self) -> Result<bool> {
+    pub fn finish(self) -> crate::Completion<bool, crate::BraintrustError> {
+        crate::service::submit(async move { self.finish_inner().await })
+    }
+
+    async fn finish_inner(self) -> Result<bool> {
         if self.config.list {
-            for name in &self.registered_names {
+            for name in self.registered_names.lock().unwrap().iter() {
                 println!("{}", name);
             }
         }
         // SSE connection is closed when `self.sse` is dropped
-        Ok(self.all_passed)
+        Ok(self.all_passed.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Convenience method: run multiple evaluations whose results can be summarized.
     ///
     /// Returns `true` if all evals passed.
-    pub async fn run_all<F, Fut>(&mut self, evals: Vec<F>) -> Result<bool>
+    pub fn run_all<F, Fut>(
+        &mut self,
+        evals: Vec<F>,
+    ) -> crate::Completion<bool, crate::BraintrustError>
     where
-        F: FnOnce(&mut Self) -> Fut,
-        Fut: std::future::Future<Output = Result<()>>,
+        F: FnOnce(&mut Self) -> Fut + Send + 'static,
+        Fut: std::future::IntoFuture<Output = Result<()>> + Send + 'static,
+        Fut::IntoFuture: Send,
     {
-        for eval_fn in evals {
-            eval_fn(self).await?;
-        }
-        Ok(self.all_passed)
+        let mut runner = self.clone();
+        crate::service::submit(async move {
+            for evaluate in evals {
+                evaluate(&mut runner).await?;
+            }
+            Ok(runner.all_passed())
+        })
     }
 }
 

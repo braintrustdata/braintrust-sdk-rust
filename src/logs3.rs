@@ -19,7 +19,7 @@ pub struct Logs3UploadResult {
 pub struct Logs3BatchUploader {
     coordinator: UploadCoordinator,
     max_request_size_override: Option<usize>,
-    payload_limits: Option<Capabilities>,
+    payload_limits: std::sync::Arc<tokio::sync::Mutex<Option<Capabilities>>>,
 }
 
 impl Logs3BatchUploader {
@@ -59,6 +59,7 @@ impl Logs3BatchUploader {
         org_name: Option<String>,
         ca_bundle: Option<CaBundleConfig>,
     ) -> Result<Self> {
+        crate::service::global()?;
         let api_url = Url::parse(api_url.as_ref())
             .map_err(|e| BraintrustError::InvalidConfig(format!("invalid api_url: {e}")))?;
         let client = build_http_client(Duration::from_secs(30), ca_bundle.as_ref(), None)?;
@@ -72,16 +73,32 @@ impl Logs3BatchUploader {
         Ok(Self {
             coordinator: UploadCoordinator::new(api, UploadPolicy::Standalone),
             max_request_size_override: None,
-            payload_limits: None,
+            payload_limits: Default::default(),
         })
     }
 
     pub fn with_max_request_size_override(mut self, max_bytes: usize) -> Self {
         self.max_request_size_override = Some(max_bytes.max(1));
+        self.payload_limits = Default::default();
         self
     }
 
-    pub async fn upload_rows(
+    /// Upload destination groups independently under the shared HTTP request cap.
+    /// Returns the first error after all destination groups finish; other groups
+    /// may have succeeded. Counts are returned when every group succeeds.
+    pub fn upload_rows(
+        &self,
+        rows: &[Map<String, Value>],
+        batch_max_num_items: usize,
+    ) -> crate::Completion<Logs3UploadResult, BraintrustError> {
+        let mut uploader = self.clone();
+        let rows = rows.to_vec();
+        crate::service::submit(async move {
+            uploader.upload_rows_inner(&rows, batch_max_num_items).await
+        })
+    }
+
+    async fn upload_rows_inner(
         &mut self,
         rows: &[Map<String, Value>],
         batch_max_num_items: usize,
@@ -90,17 +107,19 @@ impl Logs3BatchUploader {
             return Ok(Logs3UploadResult::default());
         }
 
-        let limits = match self.payload_limits {
+        let mut cached = self.payload_limits.lock().await;
+        let limits = match *cached {
             Some(limits) => limits,
             None => {
                 let limits = self
                     .coordinator
                     .capabilities(DEFAULT_MAX_REQUEST_SIZE, self.max_request_size_override)
                     .await;
-                self.payload_limits = Some(limits);
+                *cached = Some(limits);
                 limits
             }
         };
+        drop(cached);
         let row_payloads = rows
             .iter()
             .map(EncodedRow::from_map)
@@ -108,20 +127,48 @@ impl Logs3BatchUploader {
             .map_err(|error| {
                 BraintrustError::InvalidConfig(format!("failed to serialize logs3 row: {error}"))
             })?;
-        let batches = EncodedBatch::partition(
+        let batches = EncodedBatch::partition_by_destination(
             row_payloads,
             batch_max_num_items.max(1),
             (limits.max_request_size / 2).max(1),
         );
 
-        let mut result = Logs3UploadResult::default();
+        let mut groups = indexmap::IndexMap::new();
         for batch in batches {
-            let batch_result = self.coordinator.upload(batch, limits).await?;
-            result.bytes_processed += batch_result.bytes_processed;
-            result.requests_sent += batch_result.requests_sent;
-            result.rows_uploaded += batch_result.rows_uploaded;
+            groups
+                .entry(batch.destination())
+                .or_insert_with(Vec::new)
+                .push(batch);
         }
-        Ok(result)
+        let results = futures::future::join_all(groups.into_values().map(|batches| {
+            let coordinator = self.coordinator.clone();
+            async move {
+                let mut result = Logs3UploadResult::default();
+                for batch in batches {
+                    let uploaded = coordinator.upload(batch, limits).await?;
+                    result.bytes_processed += uploaded.bytes_processed;
+                    result.requests_sent += uploaded.requests_sent;
+                    result.rows_uploaded += uploaded.rows_uploaded;
+                }
+                Ok::<_, BraintrustError>(result)
+            }
+        }))
+        .await;
+        let mut total = Logs3UploadResult::default();
+        let mut error = None;
+        for result in results {
+            match result {
+                Ok(uploaded) => {
+                    total.bytes_processed += uploaded.bytes_processed;
+                    total.requests_sent += uploaded.requests_sent;
+                    total.rows_uploaded += uploaded.rows_uploaded;
+                }
+                Err(failure) => {
+                    error.get_or_insert(failure);
+                }
+            }
+        }
+        error.map_or(Ok(total), Err)
     }
 }
 

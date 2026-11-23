@@ -367,6 +367,7 @@ pub struct DatasetBuilder<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher +
     submitter: Arc<S>,
     token: String,
     org_name: String,
+    org_id: String,
     project_name: Option<String>,
     dataset_name: Option<String>,
     description: Option<String>,
@@ -381,6 +382,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> C
             submitter: Arc::clone(&self.submitter),
             token: self.token.clone(),
             org_name: self.org_name.clone(),
+            org_id: self.org_id.clone(),
             project_name: self.project_name.clone(),
             dataset_name: self.dataset_name.clone(),
             description: self.description.clone(),
@@ -403,11 +405,17 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             submitter,
             token: token.into(),
             org_name: org_name.into(),
+            org_id: String::new(),
             project_name: None,
             dataset_name: None,
             description: None,
             metadata: None,
         }
+    }
+
+    pub(crate) fn org_id(mut self, org_id: String) -> Self {
+        self.org_id = org_id;
+        self
     }
 
     /// Set the project name (required).
@@ -455,11 +463,12 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             submitter: self.submitter,
             token: self.token,
             org_name: self.org_name,
+            org_id: self.org_id,
             project_name,
             dataset_name,
             description: self.description,
             metadata: self.metadata,
-            lazy_metadata: OnceCell::new(),
+            lazy_metadata: Arc::new(OnceCell::new()),
             pending_rows: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -477,12 +486,32 @@ pub struct Dataset<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + Datase
     submitter: Arc<S>,
     token: String,
     org_name: String,
+    org_id: String,
     project_name: String,
     dataset_name: String,
     description: Option<String>,
     metadata: Option<Map<String, Value>>,
-    lazy_metadata: OnceCell<std::result::Result<DatasetMetadata, String>>,
+    lazy_metadata: Arc<OnceCell<DatasetMetadata>>,
     pending_rows: Arc<Mutex<Vec<PendingDatasetRow>>>,
+}
+
+impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> Clone
+    for Dataset<S>
+{
+    fn clone(&self) -> Self {
+        Self {
+            submitter: self.submitter.clone(),
+            token: self.token.clone(),
+            org_name: self.org_name.clone(),
+            org_id: self.org_id.clone(),
+            project_name: self.project_name.clone(),
+            dataset_name: self.dataset_name.clone(),
+            description: self.description.clone(),
+            metadata: self.metadata.clone(),
+            lazy_metadata: self.lazy_metadata.clone(),
+            pending_rows: self.pending_rows.clone(),
+        }
+    }
 }
 
 impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> fmt::Debug
@@ -515,7 +544,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     /// Ensure the dataset is registered, returning cached metadata.
     async fn ensure_registered(&self) -> Result<&DatasetMetadata> {
         self.lazy_metadata
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 let mut request = DatasetRegisterRequest::new(
                     self.project_name.clone(),
                     self.org_name.clone(),
@@ -529,16 +558,19 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                         dataset_id: response.dataset.id,
                         project_id: response.project.id,
                     }),
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(e),
                 }
             })
             .await
-            .as_ref()
-            .map_err(|e| crate::error::BraintrustError::InvalidConfig(e.clone()))
     }
 
     /// Get the dataset ID (triggers registration if needed).
-    pub async fn dataset_id(&self) -> Result<String> {
+    pub fn dataset_id(&self) -> crate::Completion<String, crate::BraintrustError> {
+        let dataset = self.clone();
+        crate::service::submit(async move { dataset.dataset_id_inner().await })
+    }
+
+    async fn dataset_id_inner(&self) -> Result<String> {
         Ok(self.ensure_registered().await?.dataset_id.clone())
     }
 
@@ -555,7 +587,15 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     /// Insert a new record into the dataset.
     ///
     /// Returns the auto-generated record ID.
-    pub async fn insert(&self, record: DatasetInsert) -> String {
+    pub fn insert(
+        &self,
+        record: DatasetInsert,
+    ) -> crate::Completion<String, crate::BraintrustError> {
+        let dataset = self.clone();
+        crate::service::submit(async move { Ok(dataset.insert_inner(record).await) })
+    }
+
+    async fn insert_inner(&self, record: DatasetInsert) -> String {
         let id = Uuid::new_v4().to_string();
 
         let row = PendingDatasetRow {
@@ -575,7 +615,20 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     /// Update an existing record by ID (merge semantics).
     ///
     /// Unspecified fields are preserved.
-    pub async fn update(&self, id: &str, record: DatasetInsert) {
+    pub fn update(
+        &self,
+        id: &str,
+        record: DatasetInsert,
+    ) -> crate::Completion<(), crate::BraintrustError> {
+        let dataset = self.clone();
+        let id = id.to_owned();
+        crate::service::submit(async move {
+            dataset.update_inner(&id, record).await;
+            Ok(())
+        })
+    }
+
+    async fn update_inner(&self, id: &str, record: DatasetInsert) {
         let row = PendingDatasetRow {
             id: id.to_string(),
             input: record.input,
@@ -590,7 +643,16 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     }
 
     /// Delete a record by ID.
-    pub async fn delete(&self, id: &str) {
+    pub fn delete(&self, id: &str) -> crate::Completion<(), crate::BraintrustError> {
+        let dataset = self.clone();
+        let id = id.to_owned();
+        crate::service::submit(async move {
+            dataset.delete_inner(&id).await;
+            Ok(())
+        })
+    }
+
+    async fn delete_inner(&self, id: &str) {
         let row = PendingDatasetRow {
             id: id.to_string(),
             input: None,
@@ -607,7 +669,15 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     /// Fetch records with pagination.
     ///
     /// Returns an iterator that fetches records in batches.
-    pub async fn fetch(&self, batch_size: Option<usize>) -> Result<DatasetIterator<S>> {
+    pub fn fetch(
+        &self,
+        batch_size: Option<usize>,
+    ) -> crate::Completion<DatasetIterator<S>, crate::BraintrustError> {
+        let dataset = self.clone();
+        crate::service::submit(async move { dataset.fetch_inner(batch_size).await })
+    }
+
+    async fn fetch_inner(&self, batch_size: Option<usize>) -> Result<DatasetIterator<S>> {
         let metadata = self.ensure_registered().await?;
         Ok(DatasetIterator::new(
             Arc::clone(&self.submitter),
@@ -618,7 +688,12 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     }
 
     /// Get dataset summary statistics.
-    pub async fn summarize(&self) -> Result<DatasetSummary> {
+    pub fn summarize(&self) -> crate::Completion<DatasetSummary, crate::BraintrustError> {
+        let dataset = self.clone();
+        crate::service::submit(async move { dataset.summarize_inner().await })
+    }
+
+    async fn summarize_inner(&self) -> Result<DatasetSummary> {
         // Flush pending operations first
         self.flush().await?;
 
@@ -642,7 +717,12 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     }
 
     /// Flush all pending operations.
-    pub async fn flush(&self) -> Result<()> {
+    pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
+        let dataset = self.clone();
+        crate::service::submit(async move { dataset.flush_inner().await })
+    }
+
+    async fn flush_inner(&self) -> Result<()> {
         let metadata = self.ensure_registered().await?;
         let rows = {
             let mut pending = self.pending_rows.lock().await;
@@ -650,7 +730,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         };
 
         if rows.is_empty() {
-            return Ok(());
+            return self.submitter.flush().await.map(|_| ()).map_err(Into::into);
         }
 
         // Submit each row
@@ -665,7 +745,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                 span_id: row.id,
                 is_merge: row.is_merge,
                 span_components: None,
-                org_id: String::new(),
+                org_id: self.org_id.clone(),
                 org_name: Some(self.org_name.clone()),
                 project_name: Some(self.project_name.clone()),
                 input: row.input,
@@ -701,13 +781,13 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             };
 
             self.submitter.submit(
-                Credential::Token(self.token.clone()),
+                Credential::token_value(self.token.clone()),
                 payload,
                 Some(parent_info),
             );
         }
 
-        Ok(())
+        self.submitter.flush().await.map(|_| ()).map_err(Into::into)
     }
 }
 
@@ -718,6 +798,9 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 /// Iterator for fetching dataset records with pagination.
 #[allow(private_bounds)]
 pub struct DatasetIterator<S: DatasetFetcher> {
+    state: Arc<Mutex<DatasetIteratorState<S>>>,
+}
+struct DatasetIteratorState<S: DatasetFetcher> {
     fetcher: Arc<S>,
     token: String,
     dataset_id: String,
@@ -728,7 +811,7 @@ pub struct DatasetIterator<S: DatasetFetcher> {
 }
 
 #[allow(private_bounds)]
-impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
+impl<S: DatasetFetcher + 'static> DatasetIteratorState<S> {
     fn new(fetcher: Arc<S>, token: String, dataset_id: String, batch_size: usize) -> Self {
         Self {
             fetcher,
@@ -742,7 +825,7 @@ impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
     }
 
     /// Get the next record, fetching a new batch if needed.
-    pub async fn next(&mut self) -> Option<DatasetRecord> {
+    async fn next(&mut self) -> Option<DatasetRecord> {
         // Return buffered record if available
         if let Some(record) = self.buffer.pop_front() {
             return Some(record);
@@ -781,14 +864,33 @@ impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
             }
         }
     }
-
-    /// Collect all remaining records into a Vec.
-    pub async fn collect(mut self) -> Vec<DatasetRecord> {
-        let mut records = Vec::new();
-        while let Some(record) = self.next().await {
-            records.push(record);
+}
+#[allow(private_bounds)]
+impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
+    fn new(fetcher: Arc<S>, token: String, dataset_id: String, batch_size: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DatasetIteratorState::new(
+                fetcher, token, dataset_id, batch_size,
+            ))),
         }
-        records
+    }
+    /// Issue the next page or buffered-record operation immediately.
+    // This asynchronous cursor cannot implement the synchronous Iterator contract.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> crate::Completion<Option<DatasetRecord>, crate::BraintrustError> {
+        let state = self.state.clone();
+        crate::service::submit(async move { Ok(state.lock().await.next().await) })
+    }
+    /// Collect remaining records on the shared executor.
+    pub fn collect(self) -> crate::Completion<Vec<DatasetRecord>, crate::BraintrustError> {
+        crate::service::submit(async move {
+            let mut state = self.state.lock().await;
+            let mut records = Vec::new();
+            while let Some(row) = state.next().await {
+                records.push(row);
+            }
+            Ok(records)
+        })
     }
 }
 

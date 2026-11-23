@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 pub(crate) struct EncodedRow {
     data: Bytes,
     overflow: Logs3OverflowInputRow,
+    submissions: Vec<usize>,
 }
 
 impl EncodedRow {
@@ -21,7 +22,13 @@ impl EncodedRow {
         Ok(Self {
             data: data.into(),
             overflow,
+            submissions: Vec::new(),
         })
+    }
+
+    pub(crate) fn with_submissions(mut self, submissions: Vec<usize>) -> Self {
+        self.submissions = submissions;
+        self
     }
 
     pub fn from_map(row: &Map<String, Value>) -> Result<Self, serde_json::Error> {
@@ -112,6 +119,17 @@ impl EncodedBatch {
             .into_values()
             .flat_map(|rows| Self::partition(rows, max_items, max_bytes))
             .collect()
+    }
+
+    pub(crate) fn submissions(&self) -> Vec<Vec<usize>> {
+        self.rows
+            .iter()
+            .map(|row| row.submissions.clone())
+            .collect()
+    }
+
+    pub(crate) fn destination(&self) -> crate::destination::Destination {
+        crate::destination::Destination::row(&self.rows[0].overflow.object_ids)
     }
 
     pub fn overflow_rows(&self) -> Vec<Logs3OverflowInputRow> {

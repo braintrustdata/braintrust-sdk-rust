@@ -1,6 +1,7 @@
 mod completion;
 mod dataset;
 mod delivery;
+mod destination;
 mod error;
 pub mod eval;
 mod experiments;
@@ -11,6 +12,10 @@ mod json_merge;
 mod log_queue;
 mod logger;
 mod logs3;
+mod project;
+mod resolution;
+mod scheduler;
+mod service;
 mod span;
 mod span_components;
 mod stream;
@@ -60,3 +65,7 @@ pub use types::{
     CompletionTokensDetails, InvalidSpanObjectType, ParentSpanInfo, PromptTokensDetails,
     SpanObjectType, SpanType, Usage, UsageMetrics,
 };
+
+pub use service::{configure_service, ServiceConfig};
+
+pub use project::Project;

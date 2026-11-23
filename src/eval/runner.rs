@@ -42,6 +42,7 @@ pub struct EvalOpts<I, O> {
 }
 
 /// Async evaluator for running evaluations
+#[derive(Clone)]
 pub struct Evaluator<I, O> {
     client: Arc<BraintrustClient>,
     _phantom: PhantomData<(I, O)>,
@@ -69,7 +70,15 @@ where
     }
 
     /// Run the evaluation
-    pub async fn run(&self, mut opts: EvalOpts<I, O>) -> Result<EvalSummary<I, O>> {
+    pub fn run(
+        &self,
+        opts: EvalOpts<I, O>,
+    ) -> crate::Completion<EvalSummary<I, O>, crate::BraintrustError> {
+        let evaluator = self.clone();
+        crate::service::submit(async move { evaluator.run_inner(opts).await })
+    }
+
+    async fn run_inner(&self, mut opts: EvalOpts<I, O>) -> Result<EvalSummary<I, O>> {
         if !opts.quiet {
             println!("Running evaluation: {}", opts.name);
         }
@@ -346,10 +355,9 @@ where
     }
 }
 
-/// Sync evaluator (wraps async evaluator with Runtime::block_on)
+/// Synchronous evaluator using the shared SDK runtime.
 pub struct SyncEvaluator<I, O> {
     evaluator: Evaluator<I, O>,
-    runtime: tokio::runtime::Runtime,
 }
 
 impl<I, O> SyncEvaluator<I, O>
@@ -359,17 +367,22 @@ where
 {
     /// Create a new sync evaluator
     pub fn new(client: BraintrustClient) -> Result<Self> {
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| crate::BraintrustError::Background(e.to_string()))?;
         Ok(Self {
             evaluator: Evaluator::new(client),
-            runtime,
         })
     }
 
     /// Run the evaluation synchronously
     pub fn run(&self, opts: EvalOpts<I, O>) -> Result<EvalSummary<I, O>> {
-        self.runtime.block_on(self.evaluator.run(opts))
+        self.evaluator
+            .run(opts)
+            .blocking_wait()
+            .map_err(|error| match error {
+                crate::BlockingWaitError::Operation(error) => error,
+                crate::BlockingWaitError::InRuntime => {
+                    crate::BraintrustError::Background(error.to_string())
+                }
+            })
     }
 }
 

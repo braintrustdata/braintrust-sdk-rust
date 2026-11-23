@@ -1,0 +1,868 @@
+//! One intake and dispatcher for every facade. Observation and routing are independent.
+use super::{
+    observation::Observation,
+    queue::{Credential, LogQueueCore, SubmitCommand},
+};
+use crate::{destination::Destination, ServiceConfig};
+use crate::{
+    Completion, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushReport,
+    ShutdownError, ShutdownReport, WriteError,
+};
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
+use indexmap::IndexMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{oneshot, Notify};
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct OrgKey {
+    endpoint: String,
+    id: String,
+    name: Option<String>,
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct Key {
+    route: OrgKey,
+    policy: super::config::LogQueueConfig,
+    transport: u64,
+    app_url: String,
+    raw: bool,
+    credential: Credential,
+    org: String,
+    org_name: Option<String>,
+    destination: Destination,
+}
+struct Entry {
+    core: Arc<LogQueueCore>,
+    command: SubmitCommand,
+    sequence: u64,
+    bytes: usize,
+    ready: bool,
+}
+type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
+struct Record {
+    observer: Arc<Observation>,
+    bytes: usize,
+    route: OrgKey,
+    destination: Destination,
+    sender: Option<WriteSender>,
+}
+#[derive(Default)]
+struct Intake {
+    sequence: u64,
+    records: HashMap<u64, Record>,
+    rows: usize,
+    bytes: usize,
+    partitions: IndexMap<Key, VecDeque<Entry>>,
+    active: HashSet<Key>,
+    org_rows: HashMap<OrgKey, usize>,
+    destination_rows: HashMap<(OrgKey, Destination), usize>,
+}
+
+pub(crate) struct Engine {
+    config: ServiceConfig,
+    intake: Mutex<Intake>,
+    wake: Notify,
+    cancellations: Notify,
+    automatic: bool,
+}
+impl Engine {
+    pub fn new(config: ServiceConfig) -> Self {
+        Self {
+            config,
+            intake: Mutex::new(Intake::default()),
+            wake: Notify::new(),
+            cancellations: Notify::new(),
+            automatic: true,
+        }
+    }
+    #[cfg(test)]
+    fn manual(config: ServiceConfig) -> Self {
+        let mut engine = Self::new(config);
+        engine.automatic = false;
+        engine
+    }
+    pub fn submit(
+        &self,
+        core: Arc<LogQueueCore>,
+        command: SubmitCommand,
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        let (sender, mut completion) = Completion::pair();
+        let result = self.enqueue(core, [(command, Some(sender))]).pop().unwrap();
+        completion.record_issuance(result.map_err(WriteError::Admission));
+        completion
+    }
+    pub fn submit_many(
+        &self,
+        core: Arc<LogQueueCore>,
+        commands: impl IntoIterator<Item = SubmitCommand>,
+    ) {
+        self.enqueue(core, commands.into_iter().map(|command| (command, None)));
+    }
+    fn enqueue(
+        &self,
+        core: Arc<LogQueueCore>,
+        commands: impl IntoIterator<Item = (SubmitCommand, Option<WriteSender>)>,
+    ) -> Vec<Result<(), EnqueueError>> {
+        let prepared: Vec<_> = commands
+            .into_iter()
+            .map(|(command, sender)| {
+                let bytes = command.estimated_bytes();
+                let partition = command.partition();
+                (command, bytes, partition, sender)
+            })
+            .collect();
+        let mut rejected = Vec::new();
+        let mut results = Vec::new();
+        let mut intake = self.intake.lock().unwrap();
+        for (command, bytes, (credential, org, org_name, destination), sender) in prepared {
+            let (endpoint, org_name) = core.route(&org, org_name.as_deref());
+            let route = OrgKey {
+                endpoint,
+                id: org.clone(),
+                name: org.is_empty().then(|| org_name.clone()).flatten(),
+            };
+            let destination_key = (route.clone(), destination.clone());
+
+            let mut root = &core.observation;
+            while let Some(parent) = &root.parent {
+                root = parent;
+            }
+            let client_rows = root.len();
+            let closed = core.observation.closed();
+            if closed
+                || self.config.max_rows.is_some_and(|max| intake.rows >= max)
+                || self
+                    .config
+                    .max_bytes
+                    .is_some_and(|max| intake.bytes.saturating_add(bytes) > max)
+                || self
+                    .config
+                    .max_client_rows
+                    .is_some_and(|max| client_rows >= max)
+                || self
+                    .config
+                    .max_org_rows
+                    .is_some_and(|max| intake.org_rows.get(&route).copied().unwrap_or(0) >= max)
+                || self.config.max_destination_rows.is_some_and(|max| {
+                    intake
+                        .destination_rows
+                        .get(&destination_key)
+                        .copied()
+                        .unwrap_or(0)
+                        >= max
+                })
+                || client_rows >= core.config.queue_max_size()
+            {
+                let error = if closed {
+                    EnqueueError::Closed
+                } else {
+                    EnqueueError::Full
+                };
+                results.push(Err(error));
+                rejected.push((command, sender, error));
+                continue;
+            }
+            intake.sequence += 1;
+            let sequence = intake.sequence;
+            core.observation.accept(sequence);
+            core.retained(client_rows + 1);
+            *intake.org_rows.entry(route.clone()).or_default() += 1;
+            *intake.destination_rows.entry(destination_key).or_default() += 1;
+            let key = Key {
+                route,
+                policy: core.config.clone(),
+                transport: core.client.identity,
+                app_url: core.app_url.to_string(),
+                raw: command.is_raw(),
+                credential,
+                org,
+                org_name,
+                destination,
+            };
+            results.push(Ok(()));
+            intake.records.insert(
+                sequence,
+                Record {
+                    observer: core.observation.clone(),
+                    bytes,
+                    route: key.route.clone(),
+                    destination: key.destination.clone(),
+                    sender,
+                },
+            );
+            let ready = self.automatic;
+            intake.partitions.entry(key).or_default().push_back(Entry {
+                core: core.clone(),
+                command,
+                sequence,
+                bytes,
+                ready,
+            });
+            intake.rows += 1;
+            intake.bytes = intake.bytes.saturating_add(bytes);
+        }
+        drop(intake);
+        for (command, sender, error) in rejected {
+            core.rejected(command);
+            if let Some(sender) = sender {
+                let _ = sender.send(Err(error.into()));
+            }
+        }
+        if self.automatic {
+            self.wake.notify_one();
+        }
+        results
+    }
+    pub fn barrier(
+        &self,
+        scope: &Arc<Observation>,
+        checked: bool,
+    ) -> Completion<FlushReport, FlushError> {
+        let mut intake = self.intake.lock().unwrap();
+        let completion = scope.barrier(intake.sequence, checked, false);
+        for entries in intake.partitions.values_mut() {
+            for entry in entries {
+                if entry.core.observation.includes(scope) {
+                    entry.ready = true;
+                }
+            }
+        }
+        drop(intake);
+        self.wake.notify_one();
+        completion
+    }
+    pub fn activate(&self, scope: &Arc<Observation>) {
+        drop(self.barrier(scope, false));
+    }
+    fn retire(intake: &mut Intake, sequence: u64) -> Option<Record> {
+        let record = intake.records.remove(&sequence)?;
+        intake.rows -= 1;
+        intake.bytes = intake.bytes.saturating_sub(record.bytes);
+        if let Some(rows) = intake.org_rows.get_mut(&record.route) {
+            *rows -= 1;
+            if *rows == 0 {
+                intake.org_rows.remove(&record.route);
+            }
+        }
+        let key = (record.route.clone(), record.destination.clone());
+        if let Some(rows) = intake.destination_rows.get_mut(&key) {
+            *rows -= 1;
+            if *rows == 0 {
+                intake.destination_rows.remove(&key);
+            }
+        }
+        Some(record)
+    }
+    pub fn shutdown(
+        self: &Arc<Self>,
+        scope: &Arc<Observation>,
+        timeout: std::time::Duration,
+    ) -> Completion<ShutdownReport, ShutdownError> {
+        let (sender, mut completion) = Completion::pair();
+        let intake = self.intake.lock().unwrap();
+        {
+            let mut state = scope.state.lock().unwrap();
+            if state.shutdown_controls >= 1024 {
+                completion.record_issuance(Err(EnqueueError::Full.into()));
+                return completion;
+            }
+            state.shutdown_controls += 1;
+            state.closed = true;
+        }
+        let barrier = scope.barrier(intake.sequence, true, true);
+        drop(intake);
+        self.wake.notify_one();
+        let engine = self.clone();
+        let scope = scope.clone();
+        crate::service::global()
+            .expect("initialized service")
+            .handle
+            .spawn(async move {
+                let result = match tokio::time::timeout(timeout, barrier).await {
+                    Ok(result) => result
+                        .map(|report| ShutdownReport {
+                            delivered: report.delivered,
+                        })
+                        .map_err(ShutdownError::from),
+                    Err(_) => {
+                        engine.expire(&scope);
+                        Err(ExecutionError::TimedOut.into())
+                    }
+                };
+                scope.state.lock().unwrap().shutdown_controls -= 1;
+                let _ = sender.send(result);
+            });
+        completion
+    }
+    fn expire(&self, scope: &Arc<Observation>) {
+        let mut intake = self.intake.lock().unwrap();
+        scope.state.lock().unwrap().terminal = Some(ExecutionError::TimedOut);
+        let sequences: Vec<_> = intake
+            .records
+            .iter()
+            .filter(|(_, record)| record.observer.includes(scope))
+            .map(|(sequence, _)| *sequence)
+            .collect();
+        let error = WriteError::Execution(ExecutionError::TimedOut);
+        let mut signals = Vec::new();
+        let mut writes = Vec::new();
+        for sequence in &sequences {
+            if let Some(record) = Self::retire(&mut intake, *sequence) {
+                record
+                    .observer
+                    .retire(*sequence, Some(&error), &mut signals);
+                if let Some(sender) = record.sender {
+                    writes.push(sender);
+                }
+            }
+        }
+        let live: HashSet<_> = intake.records.keys().copied().collect();
+        let mut discarded = Vec::new();
+        for entries in intake.partitions.values_mut() {
+            let old = std::mem::take(entries);
+            for entry in old {
+                if live.contains(&entry.sequence) {
+                    entries.push_back(entry);
+                } else {
+                    discarded.push(entry);
+                }
+            }
+        }
+        intake.partitions.retain(|_, entries| !entries.is_empty());
+        drop(intake);
+        for (sender, result) in signals {
+            let _ = sender.send(result);
+        }
+        for sender in writes {
+            let _ = sender.send(Err(error.clone()));
+        }
+        drop(discarded);
+        self.cancellations.notify_waiters();
+        self.wake.notify_one();
+    }
+    fn take_jobs(&self) -> Vec<(Key, Vec<Entry>)> {
+        let mut intake = self.intake.lock().unwrap();
+        let mut by_org: IndexMap<String, VecDeque<(Key, Vec<Entry>)>> = IndexMap::new();
+        let keys: Vec<_> = intake.partitions.keys().cloned().collect();
+        for key in keys {
+            if intake.active.contains(&key) {
+                continue;
+            }
+            let entries = intake.partitions.get_mut(&key).unwrap();
+            // An unflushed checked scope must not sit ahead of another scope's barrier.
+            let mut ready = Vec::new();
+            let queued = std::mem::take(entries);
+            for entry in queued {
+                if entry.ready {
+                    ready.push(entry);
+                } else {
+                    entries.push_back(entry);
+                }
+            }
+            if !ready.is_empty() {
+                by_org
+                    .entry(key.org.clone())
+                    .or_default()
+                    .push_back((key, ready));
+            }
+        }
+        for queue in by_org.values() {
+            for (key, _) in queue {
+                intake.active.insert(key.clone());
+            }
+        }
+        intake.partitions.retain(|_, entries| !entries.is_empty());
+        let mut jobs = Vec::new();
+        while !by_org.is_empty() {
+            for queue in by_org.values_mut() {
+                if let Some(job) = queue.pop_front() {
+                    jobs.push(job);
+                }
+            }
+            by_org.retain(|_, queue| !queue.is_empty());
+        }
+        jobs
+    }
+    async fn process_job(self: Arc<Self>, key: Key, entries: Vec<Entry>) {
+        let engine = self;
+        let core = entries[0]
+            .core
+            .job(&key.route.endpoint, key.org_name.as_deref());
+        let mut commands = Vec::with_capacity(entries.len());
+        let mut tickets = Vec::with_capacity(entries.len());
+        for entry in entries {
+            commands.push(entry.command);
+            tickets.push((entry.sequence, entry.bytes, entry.core.observation.clone()));
+        }
+        // Permit covers preparation only; uploads acquire attempt permits separately.
+        let request_scope = crate::scheduler::Scope {
+            endpoint: core.endpoint(),
+            org: key.org.clone(),
+            destination: key.destination.clone(),
+        };
+        let work = std::panic::AssertUnwindSafe(
+            crate::scheduler::SCOPE.scope(request_scope, core.dispatch(commands)),
+        )
+        .catch_unwind();
+        let cancelled = async {
+            loop {
+                let wake = engine.cancellations.notified();
+                if tickets
+                    .iter()
+                    .all(|(seq, _, _)| !engine.intake.lock().unwrap().records.contains_key(seq))
+                {
+                    return;
+                }
+                wake.await;
+            }
+        };
+        let outcome = tokio::select! {outcome=work=>outcome,_=cancelled=>Ok(super::dispatch::Report::new(tickets.len()))};
+        let report = outcome.unwrap_or_else(|_| {
+            let mut report = super::dispatch::Report::new(tickets.len());
+            let error = anyhow::anyhow!("delivery partition panicked");
+            for i in 0..tickets.len() {
+                report.failed(vec![i], &error, true);
+            }
+            report
+        });
+        let mut intake = engine.intake.lock().unwrap();
+        intake.active.remove(&key);
+        for loss in report.losses {
+            let mut visited = HashSet::new();
+            for index in loss.submissions {
+                if intake.records.contains_key(&tickets[index].0) {
+                    tickets[index].2.record_loss(loss.preparation, &mut visited);
+                }
+            }
+        }
+        let mut signals = Vec::new();
+        let mut writes = Vec::new();
+        for ((sequence, _, _), error) in tickets.into_iter().zip(report.errors) {
+            if let Some(record) = Self::retire(&mut intake, sequence) {
+                let error = error.as_ref().map(|e| e.write_error());
+                record
+                    .observer
+                    .retire(sequence, error.as_ref(), &mut signals);
+                if let Some(sender) = record.sender {
+                    writes.push((sender, error.map_or(Ok(DeliveryReceipt::new()), Err)));
+                }
+            }
+        }
+        drop(intake);
+        for (sender, result) in signals {
+            let _ = sender.send(result);
+        }
+        for (sender, result) in writes {
+            let _ = sender.send(result);
+        }
+        engine.wake.notify_one();
+    }
+
+    pub async fn run(self: Arc<Self>) {
+        let mut active: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
+        loop {
+            for (key, entries) in self.take_jobs() {
+                active.push(self.clone().process_job(key, entries).boxed());
+            }
+            tokio::select! {
+                _ = self.wake.notified() => {},
+                _ = active.next(), if !active.is_empty() => {},
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log_queue::{LogQueue, LogQueueConfig};
+    use crate::LoginState;
+    fn queue() -> LogQueue {
+        LogQueue::new(
+            LogQueueConfig::builder().sync_flush(true).build(),
+            LoginState::new(),
+            crate::http::build_http_client(std::time::Duration::from_secs(1), None, None).unwrap(),
+            32,
+            "http://localhost".parse().unwrap(),
+            "http://localhost".parse().unwrap(),
+        )
+    }
+    #[test]
+    fn global_limits_include_buffered_scopes_and_reject_only_incoming_rows() {
+        let engine = Engine::manual(ServiceConfig::builder().max_rows(2).build());
+        let a = queue();
+        let b = queue();
+        engine.submit_many(
+            a.core.clone(),
+            [SubmitCommand::test_row("a1"), SubmitCommand::test_row("a2")],
+        );
+        engine.submit(b.core.clone(), SubmitCommand::test_row("b"));
+        assert_eq!(engine.intake.lock().unwrap().rows, 2);
+        assert_eq!(a.dropped_rows().queue_full, 0);
+        assert_eq!(b.dropped_rows().queue_full, 1);
+        assert_eq!(a.core.observation.len(), 2);
+        assert_eq!(b.core.observation.len(), 0);
+    }
+    #[test]
+    fn byte_limit_and_client_limit_are_independent() {
+        let engine = Engine::manual(ServiceConfig::builder().max_bytes(1).build());
+        let a = queue();
+        engine.submit(a.core.clone(), SubmitCommand::test_row("oversized"));
+        assert_eq!(engine.intake.lock().unwrap().bytes, 0);
+        assert_eq!(a.dropped_rows().queue_full, 1);
+        let engine = Engine::manual(ServiceConfig::builder().max_client_rows(1).build());
+        let child = a.child();
+        engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
+        engine.submit(child.core.clone(), SubmitCommand::test_row("child"));
+        let b = queue();
+        engine.submit(b.core.clone(), SubmitCommand::test_row("b"));
+        assert_eq!(child.dropped_rows().queue_full, 1);
+        assert_eq!(a.dropped_rows().queue_full, 2);
+        assert_eq!(b.dropped_rows().queue_full, 0);
+        assert_eq!(engine.intake.lock().unwrap().rows, 2);
+    }
+    #[test]
+    fn checked_barriers_activate_only_work_through_their_cutoff() {
+        let engine = Engine::manual(ServiceConfig::default());
+        let a = queue();
+        let b = queue();
+        engine.submit(a.core.clone(), SubmitCommand::test_row("covered"));
+        let barrier = engine.barrier(&a.core.observation, true);
+        engine.submit(a.core.clone(), SubmitCommand::test_row("later"));
+        engine.submit(b.core.clone(), SubmitCommand::test_row("unrelated"));
+        let jobs = engine.take_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].1.len(), 1);
+        assert_eq!(engine.intake.lock().unwrap().partitions.len(), 1);
+        drop(barrier);
+        a.core.observation.finish(jobs[0].1[0].sequence, None, 0, 0);
+        assert!(a.core.observation.state.lock().unwrap().waiters.is_empty());
+    }
+    #[test]
+    fn org_and_destination_budgets_are_shared_across_facades() {
+        let engine = Engine::manual(
+            ServiceConfig::builder()
+                .max_org_rows(2)
+                .max_destination_rows(1)
+                .build(),
+        );
+        let a = queue();
+        let b = queue();
+        engine.submit(
+            a.core.clone(),
+            SubmitCommand::test_scoped_row("a", "p", "org"),
+        );
+        engine.submit(
+            b.core.clone(),
+            SubmitCommand::test_scoped_row("same-project", "p", "org"),
+        );
+        engine.submit(
+            b.core.clone(),
+            SubmitCommand::test_scoped_row("other-project", "q", "org"),
+        );
+        engine.submit(
+            b.core.clone(),
+            SubmitCommand::test_scoped_row("over-org-budget", "r", "org"),
+        );
+        engine.submit(
+            b.core.clone(),
+            SubmitCommand::test_scoped_row("other-org", "p", "other"),
+        );
+        assert_eq!(b.dropped_rows().queue_full, 2);
+        assert_eq!(engine.intake.lock().unwrap().rows, 3);
+    }
+
+    #[test]
+    fn accepting_work_freezes_routing_before_later_login_discovery() {
+        let engine = Engine::manual(ServiceConfig::default());
+        let queue = queue();
+        engine.submit(queue.core.clone(), SubmitCommand::test_row("first"));
+        queue.core.login_state.set(
+            "token".into(),
+            "org".into(),
+            "name".into(),
+            "http://discovered.example".into(),
+            "http://localhost".into(),
+        );
+        engine.activate(&queue.core.observation);
+        let jobs = engine.take_jobs();
+        assert_eq!(jobs[0].0.route.endpoint, "http://localhost/");
+        let job = jobs[0].1[0]
+            .core
+            .job(&jobs[0].0.route.endpoint, jobs[0].0.org_name.as_deref());
+        assert_eq!(job.endpoint(), "http://localhost/");
+        assert_eq!(job.routing_org_name, None);
+    }
+    fn http_queue(server: &wiremock::MockServer, max_items: usize) -> LogQueue {
+        LogQueue::new(
+            LogQueueConfig::builder()
+                .sync_flush(true)
+                .checked_delivery(true)
+                .batch_max_items(max_items)
+                .build(),
+            LoginState::new(),
+            crate::http::build_http_client(std::time::Duration::from_secs(30), None, None).unwrap(),
+            32,
+            server.uri().parse().unwrap(),
+            server.uri().parse().unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn compatible_facades_share_uploads_with_independent_barriers() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let engine = Arc::new(Engine::manual(ServiceConfig::default()));
+        let a = http_queue(&server, 100);
+        let b = http_queue(&server, 100);
+        engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
+        engine.submit(b.core.clone(), SubmitCommand::test_row("b"));
+        let x = engine.barrier(&a.core.observation, true);
+        let y = engine.barrier(&b.core.observation, true);
+        let jobs = engine.take_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].1.len(), 2);
+        for (key, entries) in jobs {
+            engine.clone().process_job(key, entries).await;
+        }
+        x.await.unwrap();
+        y.await.unwrap();
+        let state = engine.intake.lock().unwrap();
+        assert_eq!((state.rows, state.bytes), (0, 0));
+        assert!(
+            state.org_rows.is_empty()
+                && state.destination_rows.is_empty()
+                && state.active.is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unflushed_compatible_scope_cannot_block_another_barrier() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let engine = Arc::new(Engine::manual(ServiceConfig::default()));
+        let blocked = http_queue(&server, 100);
+        let ready = http_queue(&server, 100);
+        engine.submit(blocked.core.clone(), SubmitCommand::test_row("not-flushed"));
+        engine.submit(ready.core.clone(), SubmitCommand::test_row("ready"));
+        let barrier = engine.barrier(&ready.core.observation, true);
+        let jobs = engine.take_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].1.len(), 1);
+        for (key, entries) in jobs {
+            engine.clone().process_job(key, entries).await;
+        }
+        barrier.await.unwrap();
+        assert_eq!(blocked.core.observation.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_split_failures_report_partial_delivery_to_each_owner() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, Request, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["rows"].as_array().unwrap().len() > 1 {
+                    ResponseTemplate::new(413)
+                } else if body["rows"][0]["id"] == "a" {
+                    ResponseTemplate::new(200).set_body_string("{}")
+                } else {
+                    ResponseTemplate::new(400)
+                }
+            })
+            .mount(&server)
+            .await;
+        let engine = Arc::new(Engine::manual(ServiceConfig::default()));
+        let a = http_queue(&server, 100);
+        let b = http_queue(&server, 100);
+        engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
+        engine.submit(b.core.clone(), SubmitCommand::test_row("b"));
+        let x = engine.barrier(&a.core.observation, true);
+        let y = engine.barrier(&b.core.observation, true);
+        for (key, entries) in engine.take_jobs() {
+            engine.clone().process_job(key, entries).await;
+        }
+        assert!(x.await.is_err());
+        assert!(y.await.is_err());
+        assert_eq!(a.dropped_rows().upload_failed, 0);
+        assert_eq!(b.dropped_rows().upload_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn failure_in_a_different_physical_batch_does_not_fail_a_successful_owner() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, Request, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["rows"][0]["id"] == "a" {
+                    ResponseTemplate::new(200).set_body_string("{}")
+                } else {
+                    ResponseTemplate::new(400)
+                }
+            })
+            .mount(&server)
+            .await;
+        let engine = Arc::new(Engine::manual(ServiceConfig::default()));
+        let a = http_queue(&server, 1);
+        let b = http_queue(&server, 1);
+        engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
+        engine.submit(b.core.clone(), SubmitCommand::test_row("b"));
+        let x = engine.barrier(&a.core.observation, true);
+        let y = engine.barrier(&b.core.observation, true);
+        for (key, entries) in engine.take_jobs() {
+            engine.clone().process_job(key, entries).await;
+        }
+        x.await.unwrap();
+        assert!(y.await.is_err());
+        assert_eq!(a.dropped_rows().upload_failed, 0);
+        assert_eq!(b.dropped_rows().upload_failed, 1);
+    }
+    #[tokio::test]
+    async fn merged_rows_complete_all_owners_and_count_ancestor_loss_once() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let engine = Arc::new(Engine::manual(ServiceConfig::default()));
+        let root = http_queue(&server, 100);
+        let a = root.child();
+        let b = root.child();
+        engine.submit(a.core.clone(), SubmitCommand::test_span(false));
+        engine.submit(b.core.clone(), SubmitCommand::test_span(true));
+        let x = engine.barrier(&a.core.observation, true);
+        let y = engine.barrier(&b.core.observation, true);
+        let z = engine.barrier(&root.core.observation, true);
+        let jobs = engine.take_jobs();
+        assert_eq!(jobs.len(), 1);
+        for (key, entries) in jobs {
+            engine.clone().process_job(key, entries).await;
+        }
+        assert!(x.await.is_err());
+        assert!(y.await.is_err());
+        assert!(z.await.is_err());
+        assert_eq!(a.dropped_rows().upload_failed, 1);
+        assert_eq!(b.dropped_rows().upload_failed, 1);
+        assert_eq!(root.dropped_rows().upload_failed, 1);
+    }
+    #[test]
+    fn racing_producers_share_one_bounded_admission_budget() {
+        let engine = Arc::new(Engine::manual(
+            ServiceConfig::builder().max_rows(17).build(),
+        ));
+        let queue = queue();
+        std::thread::scope(|threads| {
+            for _ in 0..8 {
+                let engine = engine.clone();
+                let core = queue.core.clone();
+                threads.spawn(move || {
+                    for _ in 0..100 {
+                        engine.submit(core.clone(), SubmitCommand::test_row("row"));
+                    }
+                });
+            }
+        });
+        assert_eq!(engine.intake.lock().unwrap().rows, 17);
+        assert_eq!(queue.core.observation.len(), 17);
+        assert_eq!(queue.dropped_rows().queue_full, 783);
+    }
+
+    #[tokio::test]
+    async fn completion_wakes_after_capacity_is_released_and_control_is_unlocked() {
+        use futures::task::{waker_ref, ArcWake};
+        use std::future::{Future, IntoFuture};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        struct Reenter {
+            engine: Arc<Engine>,
+            core: Arc<LogQueueCore>,
+            woke: AtomicBool,
+        }
+        impl ArcWake for Reenter {
+            fn wake_by_ref(this: &Arc<Self>) {
+                assert!(this.engine.intake.try_lock().is_ok());
+                assert!(this
+                    .engine
+                    .submit(this.core.clone(), SubmitCommand::test_row("next"))
+                    .submission()
+                    .is_ok());
+                this.woke.store(true, Ordering::SeqCst);
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let queue = http_queue(&server, 1);
+        let engine = Arc::new(Engine::manual(ServiceConfig::builder().max_rows(1).build()));
+        let write = engine.submit(queue.core.clone(), SubmitCommand::test_row("first"));
+        let rejected = engine.submit(queue.core.clone(), SubmitCommand::test_row("rejected"));
+        assert!(matches!(
+            rejected.submission(),
+            Err(WriteError::Admission(EnqueueError::Full))
+        ));
+        assert!(matches!(
+            rejected.await,
+            Err(WriteError::Admission(EnqueueError::Full))
+        ));
+        let signal = Arc::new(Reenter {
+            engine: engine.clone(),
+            core: queue.core.clone(),
+            woke: AtomicBool::new(false),
+        });
+        let waker = waker_ref(&signal);
+        let mut completion = Box::pin(write.into_future());
+        assert!(matches!(
+            completion.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+        let flush = engine.barrier(&queue.core.observation, true);
+        let (key, entries) = engine.take_jobs().pop().unwrap();
+        engine.clone().process_job(key, entries).await;
+        completion.await.unwrap();
+        assert!(signal.woke.load(Ordering::SeqCst));
+        assert_eq!(flush.await.unwrap().delivered(), 1);
+        assert_eq!(engine.intake.lock().unwrap().rows, 1);
+    }
+}

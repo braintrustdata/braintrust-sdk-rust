@@ -5,6 +5,19 @@ use reqwest::Client;
 
 use crate::error::{BraintrustError, Result};
 
+/// A reusable transport and a non-secret identity for authorization-sensitive caches.
+#[derive(Clone, Debug)]
+pub(crate) struct SharedHttp {
+    inner: Client,
+    pub identity: u64,
+}
+impl std::ops::Deref for SharedHttp {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        &self.inner
+    }
+}
+
 pub(crate) const CUSTOM_CA_BUNDLE_ENV: &str = "BRAINTRUST_CUSTOM_CA_BUNDLE";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
@@ -57,14 +70,47 @@ pub(crate) fn build_http_client(
     timeout: std::time::Duration,
     ca_bundle: Option<&CaBundleConfig>,
     user_agent: Option<&str>,
-) -> Result<Client> {
+) -> Result<SharedHttp> {
+    #[derive(PartialEq, Eq)]
+    struct Profile {
+        timeout: std::time::Duration,
+        pem: Option<Vec<u8>>,
+        user_agent: String,
+        proxy: Vec<Option<OsString>>,
+    }
+    type Pools = std::sync::Mutex<std::collections::VecDeque<(Profile, SharedHttp)>>;
+    static POOLS: std::sync::OnceLock<Pools> = std::sync::OnceLock::new();
+    let loaded = ca_bundle.map(CaBundleConfig::load_pem).transpose()?;
+    let profile = Profile {
+        timeout,
+        pem: loaded.as_ref().map(|(pem, _)| pem.clone()),
+        user_agent: user_agent.unwrap_or(USER_AGENT).to_owned(),
+        proxy: [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ]
+        .map(std::env::var_os)
+        .to_vec(),
+    };
+    let mut pools = POOLS.get_or_init(Default::default).lock().unwrap();
+    if let Some(index) = pools.iter().position(|(key, _)| key == &profile) {
+        let entry = pools.remove(index).unwrap();
+        let client = entry.1.clone();
+        pools.push_back(entry);
+        return Ok(client);
+    }
     let mut builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .user_agent(user_agent.unwrap_or(USER_AGENT));
 
-    if let Some(ca_bundle) = ca_bundle {
-        let (pem, source) = ca_bundle.load_pem()?;
+    if let Some((pem, source)) = loaded {
         let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|err| {
             BraintrustError::InvalidConfig(format!(
                 "failed to parse PEM certificates from CA bundle {}: {}",
@@ -82,9 +128,19 @@ pub(crate) fn build_http_client(
         }
     }
 
-    builder
+    let client = builder
         .build()
-        .map_err(|err| BraintrustError::InvalidConfig(err.to_string()))
+        .map_err(|err| BraintrustError::InvalidConfig(err.to_string()))?;
+    static NEXT_PROFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let client = SharedHttp {
+        inner: client,
+        identity: NEXT_PROFILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    };
+    if pools.len() >= 32 {
+        pools.pop_front();
+    }
+    pools.push_back((profile, client.clone()));
+    Ok(client)
 }
 
 /// Scope shared connection pools to one request's credentials and endpoints.

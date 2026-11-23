@@ -1,7 +1,4 @@
-use async_trait::async_trait;
 use futures::stream::Stream;
-
-use crate::Result;
 
 use super::types::Case;
 
@@ -10,14 +7,13 @@ use super::types::Case;
 /// This trait allows different dataset sources (in-memory vectors, API-backed datasets, etc.)
 /// to provide test cases to the evaluator. Follows the Go SDK pattern where Dataset is
 /// an interface/trait rather than a concrete type.
-#[async_trait]
 pub trait Dataset<I, O>: Send + Sync
 where
     I: Clone,
     O: Clone,
 {
     /// Get the next case from the dataset
-    async fn next(&mut self) -> Result<Option<Case<I, O>>>;
+    fn next(&mut self) -> crate::Completion<Option<Case<I, O>>, crate::BraintrustError>;
 
     /// Get the dataset ID (if backed by Braintrust API)
     fn id(&self) -> Option<String> {
@@ -50,20 +46,21 @@ where
     }
 }
 
-#[async_trait]
 impl<I, O> Dataset<I, O> for VecDataset<I, O>
 where
     I: Send + Sync + Clone,
     O: Send + Sync + Clone,
 {
-    async fn next(&mut self) -> Result<Option<Case<I, O>>> {
-        if self.index < self.cases.len() {
-            let case = self.cases[self.index].clone();
-            self.index += 1;
-            Ok(Some(case))
-        } else {
-            Ok(None)
-        }
+    fn next(&mut self) -> crate::Completion<Option<Case<I, O>>, crate::BraintrustError> {
+        crate::service::ready({
+            if self.index < self.cases.len() {
+                let case = self.cases[self.index].clone();
+                self.index += 1;
+                Ok(Some(case))
+            } else {
+                Ok(None)
+            }
+        })
     }
 }
 
@@ -90,15 +87,14 @@ where
     }
 }
 
-#[async_trait]
 impl<I, O, T> Dataset<I, O> for IterDataset<I, O, T>
 where
     T: Iterator<Item = Case<I, O>> + Send + Sync,
     I: Send + Sync + Clone,
     O: Send + Sync + Clone,
 {
-    async fn next(&mut self) -> Result<Option<Case<I, O>>> {
-        Ok(self.iter.next())
+    fn next(&mut self) -> crate::Completion<Option<Case<I, O>>, crate::BraintrustError> {
+        crate::service::ready(Ok(self.iter.next()))
     }
 }
 
@@ -109,7 +105,7 @@ where
     O: Clone,
     S: Stream<Item = Case<I, O>> + Send + Unpin,
 {
-    stream: S,
+    stream: std::sync::Arc<tokio::sync::Mutex<S>>,
 }
 
 impl<I, O, S> StreamDataset<I, O, S>
@@ -119,20 +115,24 @@ where
     S: Stream<Item = Case<I, O>> + Send + Unpin,
 {
     pub fn new(stream: S) -> Self {
-        Self { stream }
+        Self {
+            stream: std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
+        }
     }
 }
 
-#[async_trait]
 impl<I, O, S> Dataset<I, O> for StreamDataset<I, O, S>
 where
-    S: Stream<Item = Case<I, O>> + Send + Sync + Unpin,
+    S: Stream<Item = Case<I, O>> + Send + Sync + Unpin + 'static,
+    I: 'static,
+    O: 'static,
     I: Send + Sync + Clone,
     O: Send + Sync + Clone,
 {
-    async fn next(&mut self) -> Result<Option<Case<I, O>>> {
+    fn next(&mut self) -> crate::Completion<Option<Case<I, O>>, crate::BraintrustError> {
         use futures::stream::StreamExt;
-        Ok(self.stream.next().await)
+        let stream = self.stream.clone();
+        crate::service::submit(async move { Ok(stream.lock().await.next().await) })
     }
 }
 

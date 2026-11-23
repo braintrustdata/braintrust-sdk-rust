@@ -3,7 +3,6 @@ use super::config::LogQueueConfig;
 use crate::internal::upload::{Capabilities, UploadCoordinator, UploadPolicy};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
 use url::Url;
 
 /// Save payload bytes to a debug directory if configured.
@@ -24,28 +23,6 @@ pub(crate) fn save_payload_debug(
         tracing::debug!("Saved payload to {}", filename.display());
     }
     Ok(())
-}
-
-/// Compatibility adapter for the queue; protocol behavior lives in one coordinator.
-pub(crate) async fn fetch_version_info(
-    client: &reqwest::Client,
-    api_url: &Url,
-    token: &str,
-    org_name: Option<&str>,
-) -> (usize, bool) {
-    let fallback = crate::log_queue::config::DEFAULT_BATCH_MAX_BYTES * 2;
-    match crate::http::api_client(client, api_url.as_str(), api_url.as_str(), token, org_name) {
-        Ok(api) => {
-            let capabilities = UploadCoordinator::new(api, UploadPolicy::Queue { retries: 0 })
-                .capabilities(fallback, None)
-                .await;
-            (capabilities.max_request_size, capabilities.overflow)
-        }
-        Err(error) => {
-            warn!(%error, "invalid ingestion scope");
-            (fallback, false)
-        }
-    }
 }
 
 #[cfg(test)]

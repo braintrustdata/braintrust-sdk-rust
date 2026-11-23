@@ -1,0 +1,261 @@
+//! Preserve submission ownership through preparation, merging, batching, and split uploads.
+use super::batching::build_overflow_row_from_logs3row;
+use super::http::send_batch_counting;
+use super::merge::merge_row_into;
+use super::observation::DeliveryError;
+use super::queue::{LogQueueCore, QueuedItem, SubmitCommand};
+use super::row_key::RowKey;
+use crate::{
+    internal::ingest::{EncodedBatch, EncodedRow},
+    types::Logs3Row,
+    BraintrustError,
+};
+use futures::{stream, StreamExt};
+use indexmap::IndexMap;
+use std::sync::Arc;
+use url::Url;
+
+pub(super) struct Loss {
+    pub submissions: Vec<usize>,
+    pub preparation: bool,
+}
+pub(super) struct Report {
+    pub errors: Vec<Option<DeliveryError>>,
+    pub losses: Vec<Loss>,
+}
+impl Report {
+    pub fn new(count: usize) -> Self {
+        Self {
+            errors: vec![None; count],
+            losses: Vec::new(),
+        }
+    }
+    pub fn failed(&mut self, submissions: Vec<usize>, error: &anyhow::Error, preparation: bool) {
+        let error = DeliveryError::from_error(error);
+        for index in &submissions {
+            self.errors[*index] = Some(error.clone());
+        }
+        self.losses.push(Loss {
+            submissions,
+            preparation,
+        });
+    }
+}
+
+impl LogQueueCore {
+    async fn get_version_info(
+        &self,
+        api_url: &Url,
+        token: &str,
+        org_name: Option<&str>,
+        org_id: &str,
+    ) -> (usize, bool) {
+        let service = crate::service::global().expect("initialized service");
+        let key = crate::resolution::RouteKey {
+            transport: self.client.identity,
+            app_url: self.app_url.to_string(),
+            api_url: api_url.to_string(),
+            token: token.into(),
+            org_id: org_id.to_owned(),
+            org_name: org_name.map(str::to_owned),
+        };
+        let cell = service.capabilities.entry(key);
+        *cell
+            .get_or_try_init(|| async {
+                let api = crate::http::api_client(
+                    &self.client,
+                    api_url.as_str(),
+                    self.app_url.as_str(),
+                    token,
+                    org_name,
+                )?;
+                let _permit = service.attempts.acquire(1).await;
+                let version = crate::http::api_result(api.version().await)
+                    .await?
+                    .into_inner();
+                let bytes = version.logs3_payload_max_bytes.filter(|n| *n > 0);
+                Ok::<_, BraintrustError>((
+                    bytes.unwrap_or(super::config::DEFAULT_BATCH_MAX_BYTES * 2),
+                    bytes.is_some(),
+                ))
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error,"failed to fetch ingestion capabilities");
+                &(super::config::DEFAULT_BATCH_MAX_BYTES * 2, false)
+            })
+    }
+
+    /// The engine seals a compatible partition before assigning local submission indices.
+    pub(super) async fn dispatch(self: &Arc<Self>, commands: Vec<SubmitCommand>) -> Report {
+        let mut report = Report::new(commands.len());
+        if commands.is_empty() {
+            return report;
+        }
+        let (credential, org_id, org_name, _) = commands[0].partition();
+        let org_name = org_name.or_else(|| self.routing_org_name.clone());
+        let api_url = match Url::parse(&self.endpoint()) {
+            Ok(url) => url,
+            Err(error) => {
+                let error = anyhow::Error::from(error);
+                for i in 0..commands.len() {
+                    report.failed(vec![i], &error, false);
+                }
+                return report;
+            }
+        };
+        let service = crate::service::global().expect("initialized service");
+        let permit = service
+            .preparations
+            .acquire()
+            .await
+            .expect("service stays open");
+        let mut spans: IndexMap<RowKey, (Logs3Row, Vec<usize>)> = IndexMap::new();
+        let mut raw = Vec::new();
+        for (index, command) in commands.into_iter().enumerate() {
+            if index % 64 == 0 {
+                tokio::task::yield_now().await;
+            }
+            match command.item {
+                QueuedItem::Span {
+                    payload,
+                    parent_info,
+                } => {
+                    let result = tokio::time::timeout(
+                        service.config.preparation_timeout,
+                        self.prepare_span(&credential, payload, parent_info),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("destination preparation timed out"))
+                    .and_then(std::convert::identity);
+                    match result {
+                        Ok(row) => {
+                            let key = RowKey::from_row(&row);
+                            if let Some((existing, submissions)) = spans.get_mut(&key) {
+                                if row.is_merge.unwrap_or(false) {
+                                    merge_row_into(existing, row);
+                                } else {
+                                    *existing = row;
+                                }
+                                submissions.push(index);
+                            } else {
+                                spans.insert(key, (row, vec![index]));
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to prepare span, dropping");
+                            report.failed(vec![index], &error, true);
+                        }
+                    }
+                }
+                QueuedItem::Row { row, .. } => raw.push((index, row)),
+            }
+        }
+        drop(permit);
+        if spans.is_empty() && raw.is_empty() {
+            return report;
+        }
+        let permit = service
+            .preparations
+            .acquire()
+            .await
+            .expect("service stays open");
+        let token = credential.token().await;
+        drop(permit);
+        let token = match token {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(%error, "failed to get upload token, dropping rows");
+                for (_, submissions) in spans.into_values() {
+                    report.failed(submissions, &error, false);
+                }
+                for (index, _) in raw {
+                    report.failed(vec![index], &error, false);
+                }
+                return report;
+            }
+        };
+        let (max_request_size, overflow) = self
+            .get_version_info(&api_url, &token, org_name.as_deref(), &org_id)
+            .await;
+        let max_bytes = self.config.batch_max_bytes().min(max_request_size / 2);
+        let max_items = self.config.batch_max_items();
+        let encoded = tokio::task::spawn_blocking(move || {
+            let mut encoded = Vec::new();
+            let mut failures = Vec::new();
+            for (row, submissions) in spans.into_values() {
+                match EncodedRow::encode(&row, build_overflow_row_from_logs3row(&row)) {
+                    Ok(row) => encoded.push(row.with_submissions(submissions)),
+                    Err(error) => failures.push((submissions, anyhow::Error::from(error))),
+                }
+            }
+            for (index, row) in raw {
+                match EncodedRow::from_map(&row) {
+                    Ok(row) => encoded.push(row.with_submissions(vec![index])),
+                    Err(error) => failures.push((vec![index], anyhow::Error::from(error))),
+                }
+            }
+            (
+                EncodedBatch::partition_by_destination(encoded, max_items, max_bytes),
+                failures,
+            )
+        })
+        .await;
+        let (batches, failures) = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                let error = anyhow::Error::from(error);
+                for i in 0..report.errors.len() {
+                    if report.errors[i].is_none() {
+                        report.failed(vec![i], &error, true);
+                    }
+                }
+                return report;
+            }
+        };
+        for (submissions, error) in failures {
+            report.failed(submissions, &error, true);
+        }
+        let sends = batches.into_iter().map(|batch| {
+            let api_url = &api_url;
+            let token = token.as_ref();
+            let org_name = org_name.as_deref();
+            async move {
+                let submissions = batch.submissions();
+                let (delivered, result) = send_batch_counting(
+                    &self.client,
+                    api_url,
+                    token,
+                    org_name,
+                    batch,
+                    &self.config,
+                    max_request_size,
+                    overflow,
+                )
+                .await;
+                (submissions, delivered, result)
+            }
+        });
+        let mut sends = stream::iter(sends).buffer_unordered(usize::MAX);
+        while let Some((rows, delivered, result)) = sends.next().await {
+            if let Err(error) = result {
+                tracing::warn!(%error,"destination upload failed");
+                let failure = DeliveryError::from_error(&error);
+                // A split may have delivered a prefix. The whole logical batch fails
+                // its checked observers, but only undelivered rows count as lost.
+                for (position, submissions) in rows.into_iter().enumerate() {
+                    for index in &submissions {
+                        report.errors[*index] = Some(failure.clone());
+                    }
+                    if position >= delivered {
+                        report.losses.push(Loss {
+                            submissions,
+                            preparation: false,
+                        });
+                    }
+                }
+            }
+        }
+        report
+    }
+}

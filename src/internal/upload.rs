@@ -37,6 +37,7 @@ impl UploadPolicy {
         RetryBudget {
             delays,
             requests: 0,
+            bytes: 1,
         }
     }
 }
@@ -69,15 +70,22 @@ async fn attempt<T>(
 /// Wait at least as long as the server asked, without retrying once the budget is exhausted.
 fn retry_delay(attempt: &Attempt, backoff: Option<Duration>) -> Option<Duration> {
     let backoff = backoff?;
-    Some(attempt.retry_after.map_or(backoff, |retry_after| {
-        retry_after.min(MAX_RETRY_AFTER).max(backoff)
-    }))
+    let delay = attempt
+        .retry_after
+        .map_or(backoff, |hint| hint.min(MAX_RETRY_AFTER).max(backoff));
+    if matches!(attempt.error, BraintrustError::Api { status: 429, .. }) {
+        if let Ok(service) = crate::service::global() {
+            service.attempts.cool_down(delay);
+        }
+    }
+    Some(delay)
 }
 
 // Borrowing the iterator lets backon share retries across overflow stages and splits.
 struct RetryBudget {
     delays: ExponentialBackoff,
     requests: usize,
+    bytes: usize,
 }
 impl RetryBudget {
     async fn run<T, F, Fut>(&mut self, mut operation: F) -> Result<T>
@@ -87,7 +95,13 @@ impl RetryBudget {
     {
         (|| {
             self.requests += 1;
-            operation()
+            let operation = operation();
+            let bytes = self.bytes;
+            async move {
+                let service = crate::service::global().map_err(|error| Attempt { error, retry_after: None })?;
+                let _permit = service.attempts.acquire(bytes).await;
+                operation.await
+            }
         })
         .retry(&mut self.delays)
         .when(|attempt| retryable(&attempt.error))
@@ -168,9 +182,27 @@ impl UploadCoordinator {
         capabilities: Capabilities,
     ) -> (UploadResult, Result<()>) {
         let mut budget = self.policy.budget();
+        budget.bytes = batch.data.len().max(1);
         let mut result = UploadResult::default();
-        let outcome = self
-            .upload_into(batch, capabilities, &mut budget, &mut result)
+        let mut scope = crate::scheduler::SCOPE
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| crate::scheduler::Scope {
+                endpoint: self.logs.baseurl().to_owned(),
+                org: self
+                    .logs
+                    .organization()
+                    .map(|org| org.id.clone())
+                    .or_else(|| self.logs.organization_name().map(str::to_owned))
+                    .unwrap_or_default(),
+                destination: batch.destination(),
+            });
+        // Resolution may have replaced a project name with its canonical ID.
+        scope.destination = batch.destination();
+        let outcome = crate::scheduler::SCOPE
+            .scope(
+                scope,
+                self.upload_into(batch, capabilities, &mut budget, &mut result),
+            )
             .await;
         result.requests_sent = budget.requests;
         (result, outcome)

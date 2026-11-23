@@ -45,8 +45,24 @@ pub enum BlockingWaitError<E> {
 pub struct Completion<T, E> {
     issued: Result<(), E>,
     receiver: oneshot::Receiver<Result<T, E>>,
+    cancellation: Option<tokio::task::AbortHandle>,
 }
 impl<T, E> Completion<T, E> {
+    /// Return an already completed operation, useful for synchronous trait implementations.
+    pub fn ready(result: Result<T, E>) -> Self {
+        crate::service::ready(result)
+    }
+
+    /// Start owned asynchronous work on the shared SDK runtime immediately.
+    /// Dropping the returned completion does not cancel the operation.
+    pub fn spawn(operation: impl Future<Output = Result<T, E>> + Send + 'static) -> Self
+    where
+        T: Send + 'static,
+        E: From<ExecutionError> + Send + 'static,
+    {
+        crate::service::submit(operation)
+    }
+
     /// Borrow the immediate submission result without waiting for delivery.
     ///
     /// An accepted submission may still fail during delivery. Await this
@@ -57,15 +73,13 @@ impl<T, E> Completion<T, E> {
 
     /// Wait for the operation's final result from synchronous code.
     ///
-    /// Work already runs on the selected runtime; this only waits on its response.
+    /// Work already runs on the SDK runtime; this only waits on its response.
     /// Ready results can be read anywhere. Pending waits return
     /// [`BlockingWaitError::InRuntime`] whenever a Tokio runtime context is entered,
     /// including contexts where blocking might happen to work. Await instead there.
     /// Refusing a wait does not cancel accepted work.
     ///
-    /// Outside Tokio, the SDK-owned runtime progresses independently. An explicit
-    /// runtime must be kept alive and driven on another thread; its progress
-    /// cannot be inferred from its handle. This method does not drive that runtime.
+    /// Outside Tokio, the SDK-owned runtime progresses independently.
     pub fn blocking_wait(mut self) -> Result<T, BlockingWaitError<E>>
     where
         E: From<ExecutionError>,
@@ -96,9 +110,34 @@ impl<T, E> Completion<T, E> {
             Self {
                 issued: Ok(()),
                 receiver,
+                cancellation: None,
             },
         )
     }
+    pub(crate) fn set_cancellation(&mut self, handle: tokio::task::AbortHandle) {
+        self.cancellation = Some(handle);
+    }
+
+    /// Internal execution deadlines may cancel work; dropping a public observer never does.
+    pub(crate) fn cancel_on_drop(mut self) -> impl Future<Output = Result<T, E>>
+    where
+        E: From<ExecutionError>,
+    {
+        struct Cancel(Option<tokio::task::AbortHandle>);
+        impl Drop for Cancel {
+            fn drop(&mut self) {
+                if let Some(handle) = &self.0 {
+                    handle.abort();
+                }
+            }
+        }
+        let guard = Cancel(self.cancellation.take());
+        async move {
+            let _guard = guard;
+            self.await
+        }
+    }
+
     pub(crate) fn record_issuance(&mut self, result: Result<(), E>) {
         self.issued = result;
     }

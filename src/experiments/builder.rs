@@ -182,9 +182,9 @@ impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
             public: self.public,
             update: self.update,
             repo_info: self.repo_info,
-            lazy_metadata: OnceCell::new(),
-            last_start_time: AtomicU64::new(0),
-            called_start_span: AtomicBool::new(false),
+            lazy_metadata: Arc::new(OnceCell::new()),
+            last_start_time: Arc::new(AtomicU64::new(0)),
+            called_start_span: Arc::new(AtomicBool::new(false)),
             pending_flushes: Arc::new(Mutex::new(Vec::new())),
         })
     }

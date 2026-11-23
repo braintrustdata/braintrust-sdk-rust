@@ -47,7 +47,8 @@ async fn experiment_log_flushes_to_logs_endpoint() {
                 .score("accuracy", 1.0)
                 .build(),
         )
-        .await;
+        .await
+        .unwrap();
 
     experiment.flush().await.expect("flush");
     client.flush().await.expect("client flush");
@@ -124,7 +125,8 @@ async fn experiment_log_feedback_sends_merge_event() {
     // Log an event
     let id = experiment
         .log(ExperimentLog::builder().input(json!("test input")).build())
-        .await;
+        .await
+        .unwrap();
 
     // Log feedback on the event
     experiment
@@ -136,7 +138,8 @@ async fn experiment_log_feedback_sends_merge_event() {
                 .build()
                 .expect("build feedback"),
         )
-        .await;
+        .await
+        .unwrap();
 
     experiment.flush().await.expect("flush");
     client.flush().await.expect("client flush");
@@ -215,7 +218,8 @@ async fn experiment_summarize_returns_summary() {
     // Log an event first
     experiment
         .log(ExperimentLog::builder().input(json!("test")).build())
-        .await;
+        .await
+        .unwrap();
 
     let summary = experiment.summarize().await.expect("summarize");
 

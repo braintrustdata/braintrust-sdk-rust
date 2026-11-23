@@ -50,11 +50,11 @@ pub struct Experiment<S: SpanSubmitter> {
     pub(crate) public: Option<bool>,
     pub(crate) update: Option<bool>,
     pub(crate) repo_info: Option<RepoInfo>,
-    pub(crate) lazy_metadata: OnceCell<ExperimentMetadata>,
+    pub(crate) lazy_metadata: Arc<OnceCell<ExperimentMetadata>>,
     /// Last start time for sequential log() calls (stored as bits).
-    pub(crate) last_start_time: AtomicU64,
+    pub(crate) last_start_time: Arc<AtomicU64>,
     /// Whether start_span() has been called (prevents mixing with log()).
-    pub(crate) called_start_span: AtomicBool,
+    pub(crate) called_start_span: Arc<AtomicBool>,
     /// Pending span handles that need to be flushed.
     pub(crate) pending_flushes: Arc<Mutex<Vec<SpanHandle<S>>>>,
 }
@@ -74,9 +74,9 @@ impl<S: SpanSubmitter> Clone for Experiment<S> {
             repo_info: self.repo_info.clone(),
             metadata: self.metadata.clone(),
             public: self.public,
-            lazy_metadata: OnceCell::new(),
-            last_start_time: AtomicU64::new(self.last_start_time.load(Ordering::Acquire)),
-            called_start_span: AtomicBool::new(self.called_start_span.load(Ordering::Acquire)),
+            lazy_metadata: self.lazy_metadata.clone(),
+            last_start_time: self.last_start_time.clone(),
+            called_start_span: self.called_start_span.clone(),
             pending_flushes: Arc::clone(&self.pending_flushes),
         }
     }
@@ -99,7 +99,12 @@ impl<
     ///
     /// Panics if `start_span()` has already been called on this experiment,
     /// as mixing `log()` and `start_span()` is not supported.
-    pub async fn log(&self, event: ExperimentLog) -> String {
+    pub fn log(&self, event: ExperimentLog) -> crate::Completion<String, crate::BraintrustError> {
+        let experiment = self.clone();
+        crate::service::submit(async move { Ok(experiment.log_inner(event).await) })
+    }
+
+    async fn log_inner(&self, event: ExperimentLog) -> String {
         if self.called_start_span.load(Ordering::Acquire) {
             panic!(
                 "Cannot use log() after start_span() has been called. \
@@ -148,16 +153,36 @@ impl<
     ///
     /// Use this for more control over span lifecycle. Once called,
     /// you cannot use `log()` on this experiment.
-    pub async fn start_span(&self) -> ExperimentSpanBuilder<'_, S> {
+    pub fn start_span(
+        &self,
+    ) -> crate::Completion<ExperimentSpanBuilder<'static, S>, crate::BraintrustError> {
+        let experiment = self.clone();
+        crate::service::submit(async move { Ok(experiment.start_span_inner().await) })
+    }
+
+    async fn start_span_inner(&self) -> ExperimentSpanBuilder<'static, S> {
         self.called_start_span.store(true, Ordering::Release);
         let metadata = self.ensure_registered().await;
-        ExperimentSpanBuilder::new(self, metadata)
+        ExperimentSpanBuilder::new(self.clone(), metadata)
     }
 
     /// Log feedback on an existing span/record.
     ///
     /// Use this to add scores, comments, or other feedback after the initial log.
-    pub async fn log_feedback(&self, id: &str, feedback: Feedback) {
+    pub fn log_feedback(
+        &self,
+        id: &str,
+        feedback: Feedback,
+    ) -> crate::Completion<(), crate::BraintrustError> {
+        let experiment = self.clone();
+        let id = id.to_owned();
+        crate::service::submit(async move {
+            experiment.log_feedback_inner(&id, feedback).await;
+            Ok(())
+        })
+    }
+
+    async fn log_feedback_inner(&self, id: &str, feedback: Feedback) {
         let metadata = self.ensure_registered().await;
 
         // Create a merge payload for the existing span
@@ -207,7 +232,7 @@ impl<
         };
 
         self.submitter.submit(
-            Credential::Token(self.token.clone()),
+            Credential::token_value(self.token.clone()),
             payload,
             Some(parent_info),
         );
@@ -217,7 +242,12 @@ impl<
     ///
     /// This flushes pending data and fetches aggregated scores from the API.
     /// If a base experiment is configured, comparison data will be included.
-    pub async fn summarize(&self) -> Result<ExperimentSummary> {
+    pub fn summarize(&self) -> crate::Completion<ExperimentSummary, crate::BraintrustError> {
+        let experiment = self.clone();
+        crate::service::submit(async move { experiment.summarize_inner().await })
+    }
+
+    async fn summarize_inner(&self) -> Result<ExperimentSummary> {
         // Flush all pending data first
         self.flush().await?;
 
@@ -300,12 +330,18 @@ impl<
     }
 
     /// Flush all pending experiment data to Braintrust.
-    pub async fn flush(&self) -> Result<()> {
+    pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
+        let experiment = self.clone();
+        crate::service::submit(async move { experiment.flush_inner().await })
+    }
+
+    async fn flush_inner(&self) -> Result<()> {
         let mut pending = self.pending_flushes.lock().await;
         for span in pending.drain(..) {
-            span.flush().await?;
+            span.end();
         }
-        Ok(())
+        drop(pending);
+        self.submitter.flush().await.map(|_| ()).map_err(Into::into)
     }
 
     /// Get the experiment ID (after registration).
@@ -326,7 +362,12 @@ impl<
     }
 
     /// Get the project containing this experiment.
-    pub async fn project(&self) -> ProjectMetadata {
+    pub fn project(&self) -> crate::Completion<ProjectMetadata, crate::BraintrustError> {
+        let experiment = self.clone();
+        crate::service::submit(async move { Ok(experiment.project_inner().await) })
+    }
+
+    async fn project_inner(&self) -> ProjectMetadata {
         let metadata = self.ensure_registered().await;
         ProjectMetadata {
             id: metadata.project_id.clone(),
@@ -347,12 +388,22 @@ impl<
     ///     compute_result()
     /// }).await;
     /// ```
-    pub async fn traced<F, Fut, R>(&self, callback: F) -> R
+    pub fn traced<F, Fut, R>(&self, callback: F) -> crate::Completion<R, crate::BraintrustError>
+    where
+        F: FnOnce(SpanHandle<S>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let experiment = self.clone();
+        crate::service::submit(async move { Ok(experiment.traced_inner(callback).await) })
+    }
+
+    async fn traced_inner<F, Fut, R>(&self, callback: F) -> R
     where
         F: FnOnce(SpanHandle<S>) -> Fut,
         Fut: std::future::Future<Output = R>,
     {
-        let span = self.start_span().await.name("root").build();
+        let span = self.start_span_inner().await.name("root").build();
         let result = callback(span.clone()).await;
         // Flush span data - ignore errors since this is best-effort
         let _ = span.flush().await;
@@ -363,7 +414,20 @@ impl<
     ///
     /// This is useful for adding information to a span after it has been created,
     /// such as adding scores or metadata computed later.
-    pub async fn update_span(&self, id: &str, event: SpanLog) {
+    pub fn update_span(
+        &self,
+        id: &str,
+        event: SpanLog,
+    ) -> crate::Completion<(), crate::BraintrustError> {
+        let experiment = self.clone();
+        let id = id.to_owned();
+        crate::service::submit(async move {
+            experiment.update_span_inner(&id, event).await;
+            Ok(())
+        })
+    }
+
+    async fn update_span_inner(&self, id: &str, event: SpanLog) {
         let metadata = self.ensure_registered().await;
 
         let payload = SpanPayload {
@@ -397,7 +461,7 @@ impl<
         };
 
         self.submitter.submit(
-            Credential::Token(self.token.clone()),
+            Credential::token_value(self.token.clone()),
             payload,
             Some(parent_info),
         );
@@ -406,7 +470,14 @@ impl<
     /// Fetch the base experiment used for comparison.
     ///
     /// Returns `None` if no base experiment has been configured or detected.
-    pub async fn fetch_base_experiment(&self) -> Result<Option<BaseExperimentInfo>> {
+    pub fn fetch_base_experiment(
+        &self,
+    ) -> crate::Completion<Option<BaseExperimentInfo>, crate::BraintrustError> {
+        let experiment = self.clone();
+        crate::service::submit(async move { experiment.fetch_base_experiment_inner().await })
+    }
+
+    async fn fetch_base_experiment_inner(&self) -> Result<Option<BaseExperimentInfo>> {
         let metadata = self.ensure_registered().await;
         self.submitter
             .fetch_base_experiment(&self.token, &metadata.experiment_id)
@@ -417,7 +488,12 @@ impl<
     ///
     /// Use this to pass experiment context to another process or service,
     /// allowing spans created there to be linked to this experiment.
-    pub async fn export(&self) -> ExportedExperiment {
+    pub fn export(&self) -> crate::Completion<ExportedExperiment, crate::BraintrustError> {
+        let experiment = self.clone();
+        crate::service::submit(async move { Ok(experiment.export_inner().await) })
+    }
+
+    async fn export_inner(&self) -> ExportedExperiment {
         let metadata = self.ensure_registered().await;
         ExportedExperiment {
             object_type: "experiment".to_string(),
@@ -428,7 +504,7 @@ impl<
     /// Ensure the experiment is registered, returning cached metadata.
     pub(crate) async fn ensure_registered(&self) -> ExperimentMetadata {
         self.lazy_metadata
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 let mut request =
                     ExperimentRegisterRequest::new(self.project_name.clone(), self.org_id.clone());
                 request.experiment_name = self.experiment_name.clone();
@@ -450,32 +526,30 @@ impl<
                     value
                 });
 
-                match self
+                let response = self
                     .submitter
                     .register_experiment(&self.token, request)
-                    .await
-                {
-                    Ok(response) => ExperimentMetadata {
-                        project_id: response.project.id,
-                        experiment_id: response.experiment.id,
-                        experiment_name: response.experiment.name,
-                    },
-                    Err(e) => {
-                        // Log error but return placeholder to avoid blocking
-                        tracing::warn!(error = %e, "experiment registration failed");
-                        ExperimentMetadata {
-                            project_id: String::new(),
-                            experiment_id: Uuid::new_v4().to_string(),
-                            experiment_name: self
-                                .experiment_name
-                                .clone()
-                                .unwrap_or_else(|| "unnamed".to_string()),
-                        }
-                    }
-                }
+                    .await?;
+                Ok::<_, crate::BraintrustError>(ExperimentMetadata {
+                    project_id: response.project.id,
+                    experiment_id: response.experiment.id,
+                    experiment_name: response.experiment.name,
+                })
             })
             .await
-            .clone()
+            .cloned()
+            .unwrap_or_else(|error| {
+                // Preserve the existing best-effort result without caching a failed registration.
+                tracing::warn!(%error, "experiment registration failed");
+                ExperimentMetadata {
+                    project_id: String::new(),
+                    experiment_id: Uuid::new_v4().to_string(),
+                    experiment_name: self
+                        .experiment_name
+                        .clone()
+                        .unwrap_or_else(|| "unnamed".into()),
+                }
+            })
     }
 
     /// Create an internal span for log() calls.

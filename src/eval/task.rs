@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::marker::PhantomData;
 
@@ -9,17 +8,20 @@ use super::types::TaskHooks;
 /// Task trait for transforming inputs to outputs
 ///
 /// Tasks can be async functions, closures, or custom structs implementing this trait.
-/// Only async version is needed - SyncEvaluator uses this via Runtime::block_on().
-#[async_trait]
+/// Results can be awaited or observed with `blocking_wait()`.
 pub trait Task<I, O>: Send + Sync {
     /// Execute the task on the given input
-    async fn run(&self, input: &I, hooks: &TaskHooks<'_, I, O>) -> Result<O>;
+    fn run(
+        &self,
+        input: &I,
+        hooks: &TaskHooks<'_, I, O>,
+    ) -> crate::Completion<O, crate::BraintrustError>;
 }
 
 /// Wrapper for sync task functions
 ///
 /// This allows sync functions to be used as tasks in both async and sync evaluators.
-/// The function runs synchronously but is wrapped in an async trait implementation.
+/// The function runs synchronously and returns a ready completion.
 pub struct SyncFnTask<I, O, F>
 where
     F: Fn(&I, &TaskHooks<'_, I, O>) -> Result<O> + Send + Sync,
@@ -40,15 +42,18 @@ where
     }
 }
 
-#[async_trait]
 impl<I, O, F> Task<I, O> for SyncFnTask<I, O, F>
 where
     F: Fn(&I, &TaskHooks<'_, I, O>) -> Result<O> + Send + Sync,
     I: Send + Sync,
     O: Send + Sync,
 {
-    async fn run(&self, input: &I, hooks: &TaskHooks<'_, I, O>) -> Result<O> {
-        (self.func)(input, hooks)
+    fn run(
+        &self,
+        input: &I,
+        hooks: &TaskHooks<'_, I, O>,
+    ) -> crate::Completion<O, crate::BraintrustError> {
+        crate::service::ready((self.func)(input, hooks))
     }
 }
 
@@ -57,7 +62,7 @@ pub struct AsyncFnTask<I, O, F>
 where
     F: for<'a> Fn(&'a I, &'a TaskHooks<'a, I, O>) -> BoxFuture<'a, Result<O>> + Send + Sync,
 {
-    func: F,
+    func: std::sync::Arc<F>,
     _phantom: PhantomData<(I, O)>,
 }
 
@@ -67,21 +72,38 @@ where
 {
     pub fn new(func: F) -> Self {
         Self {
-            func,
+            func: std::sync::Arc::new(func),
             _phantom: PhantomData,
         }
     }
 }
 
-#[async_trait]
 impl<I, O, F> Task<I, O> for AsyncFnTask<I, O, F>
 where
-    F: for<'a> Fn(&'a I, &'a TaskHooks<'a, I, O>) -> BoxFuture<'a, Result<O>> + Send + Sync,
-    I: Send + Sync,
-    O: Send + Sync,
+    F: for<'a> Fn(&'a I, &'a TaskHooks<'a, I, O>) -> BoxFuture<'a, Result<O>>
+        + Send
+        + Sync
+        + 'static,
+    I: Clone + Send + Sync + 'static,
+    O: Clone + Send + Sync + 'static,
 {
-    async fn run(&self, input: &I, hooks: &TaskHooks<'_, I, O>) -> Result<O> {
-        (self.func)(input, hooks).await
+    fn run(
+        &self,
+        input: &I,
+        hooks: &TaskHooks<'_, I, O>,
+    ) -> crate::Completion<O, crate::BraintrustError> {
+        let func = self.func.clone();
+        let input = input.clone();
+        let span = hooks.span.clone();
+        let expected = hooks.expected.cloned();
+        let metadata = hooks.metadata.clone();
+        let tags = hooks.tags.clone();
+        crate::service::submit(async move {
+            let mut hooks = TaskHooks::new(&span, expected.as_ref());
+            hooks.metadata = metadata;
+            hooks.tags = tags;
+            func(&input, &hooks).await
+        })
     }
 }
 
@@ -106,15 +128,18 @@ where
     }
 }
 
-#[async_trait]
 impl<I, O, F> Task<I, O> for SimpleFnTask<I, O, F>
 where
     F: Fn(&I) -> Result<O> + Send + Sync,
     I: Send + Sync,
     O: Send + Sync,
 {
-    async fn run(&self, input: &I, _hooks: &TaskHooks<'_, I, O>) -> Result<O> {
-        (self.func)(input)
+    fn run(
+        &self,
+        input: &I,
+        _hooks: &TaskHooks<'_, I, O>,
+    ) -> crate::Completion<O, crate::BraintrustError> {
+        crate::service::ready((self.func)(input))
     }
 }
 
@@ -123,7 +148,7 @@ pub struct SimpleAsyncFnTask<I, O, F>
 where
     F: for<'a> Fn(&'a I) -> BoxFuture<'a, Result<O>> + Send + Sync,
 {
-    func: F,
+    func: std::sync::Arc<F>,
     _phantom: PhantomData<(I, O)>,
 }
 
@@ -133,21 +158,26 @@ where
 {
     pub fn new(func: F) -> Self {
         Self {
-            func,
+            func: std::sync::Arc::new(func),
             _phantom: PhantomData,
         }
     }
 }
 
-#[async_trait]
 impl<I, O, F> Task<I, O> for SimpleAsyncFnTask<I, O, F>
 where
-    F: for<'a> Fn(&'a I) -> BoxFuture<'a, Result<O>> + Send + Sync,
-    I: Send + Sync,
-    O: Send + Sync,
+    F: for<'a> Fn(&'a I) -> BoxFuture<'a, Result<O>> + Send + Sync + 'static,
+    I: Clone + Send + Sync + 'static,
+    O: Clone + Send + Sync + 'static,
 {
-    async fn run(&self, input: &I, _hooks: &TaskHooks<'_, I, O>) -> Result<O> {
-        (self.func)(input).await
+    fn run(
+        &self,
+        input: &I,
+        _hooks: &TaskHooks<'_, I, O>,
+    ) -> crate::Completion<O, crate::BraintrustError> {
+        let func = self.func.clone();
+        let input = input.clone();
+        crate::service::submit(async move { func(&input).await })
     }
 }
 
