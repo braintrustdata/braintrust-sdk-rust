@@ -373,7 +373,43 @@ impl BraintrustClientBuilder {
     ///
     /// If `blocking_login` is true, waits for login to complete.
     /// Otherwise, login happens in the background with retry logic.
-    pub async fn build(self) -> Result<BraintrustClient> {
+    pub async fn build(mut self) -> Result<BraintrustClient> {
+        let login = (!self.skip_login).then(|| {
+            (
+                self.api_key.take(),
+                self.org_name.take(),
+                self.blocking_login,
+            )
+        });
+        let client = self.construct()?;
+        if let Some((api_key, org_name, blocking_login)) = login {
+            let api_key = api_key.ok_or_else(|| {
+                BraintrustError::InvalidConfig(
+                    "API key required: set BRAINTRUST_API_KEY or call .api_key()".into(),
+                )
+            })?;
+            if blocking_login {
+                client.perform_login(&api_key, org_name.as_deref()).await?;
+            } else {
+                client.start_background_login(api_key, org_name);
+            }
+        }
+        Ok(client)
+    }
+
+    /// Build the client without logging in.
+    ///
+    /// Equivalent to `.skip_login(true).build()`, but synchronous, since only login
+    /// needs to wait. Upload with per-call credentials, such as
+    /// [`BraintrustClient::log_rows_with_credentials`] or
+    /// [`BraintrustClient::log_rows_with_token_provider`]. Must be called within a
+    /// Tokio runtime, which runs the client's background log worker.
+    pub fn build_without_login(mut self) -> Result<BraintrustClient> {
+        self.skip_login = true;
+        self.construct()
+    }
+
+    fn construct(self) -> Result<BraintrustClient> {
         let app_url_str = self.app_url.unwrap_or_else(|| DEFAULT_APP_URL.into());
         let explicit_api_url = self.api_url.is_some();
         let api_url_str = self.api_url.unwrap_or_else(|| DEFAULT_API_URL.into());
@@ -429,23 +465,6 @@ impl BraintrustClientBuilder {
                 span_origin: self.span_origin,
             }),
         };
-
-        // Perform login
-        if !self.skip_login {
-            let api_key = self.api_key.ok_or_else(|| {
-                BraintrustError::InvalidConfig(
-                    "API key required: set BRAINTRUST_API_KEY or call .api_key()".into(),
-                )
-            })?;
-
-            if self.blocking_login {
-                client
-                    .perform_login(&api_key, self.org_name.as_deref())
-                    .await?;
-            } else {
-                client.start_background_login(api_key, self.org_name);
-            }
-        }
 
         Ok(client)
     }
@@ -2001,6 +2020,44 @@ mod tests {
             uploaded[&("Bearer token-b".to_owned(), None)],
             as_values(rows_b)
         );
+    }
+
+    #[tokio::test]
+    async fn build_without_login_uploads_with_per_call_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .build_without_login()
+            .expect("client");
+
+        let row = serde_json::json!({"id": "row"})
+            .as_object()
+            .unwrap()
+            .clone();
+        client.log_rows_with_credentials("token", "org", None, [row]);
+        client.flush().await.expect("flush");
+
+        assert!(!client.is_logged_in().await);
+        let auths: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/logs3")
+            .map(|request| {
+                request.headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(auths, ["Bearer token"]);
     }
 
     #[tokio::test]
