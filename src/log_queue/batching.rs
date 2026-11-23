@@ -20,7 +20,7 @@ pub(crate) fn batch_and_serialize_rows(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(SerializedBatch::partition(
+    Ok(SerializedBatch::partition_by_destination(
         rows,
         config.batch_max_items(),
         batch_max_bytes,
@@ -42,7 +42,7 @@ pub(crate) fn batch_and_serialize_maps(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(SerializedBatch::partition(
+    Ok(SerializedBatch::partition_by_destination(
         rows,
         config.batch_max_items(),
         batch_max_bytes,

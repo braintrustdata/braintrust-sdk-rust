@@ -1,6 +1,7 @@
 //! Logs3 encoding and size-limited batching.
 use crate::types::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, LOGS_API_VERSION};
 use bytes::Bytes;
+use indexmap::IndexMap;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -92,6 +93,25 @@ impl EncodedBatch {
             batches.push(Self::encode(batch));
         }
         batches
+    }
+
+    /// Partition rows so each batch holds a single destination. The data plane
+    /// rejects a whole request when any project in it is rate limited, so mixing
+    /// destinations would let one throttled project drop another's rows.
+    pub fn partition_by_destination(
+        rows: Vec<EncodedRow>,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Vec<Self> {
+        let mut destinations: IndexMap<String, Vec<EncodedRow>> = IndexMap::new();
+        for row in rows {
+            let destination = serde_json::to_string(&row.overflow.object_ids).unwrap_or_default();
+            destinations.entry(destination).or_default().push(row);
+        }
+        destinations
+            .into_values()
+            .flat_map(|rows| Self::partition(rows, max_items, max_bytes))
+            .collect()
     }
 
     pub fn overflow_rows(&self) -> Vec<Logs3OverflowInputRow> {
@@ -186,5 +206,38 @@ mod tests {
                 serde_json::from_slice::<Value>(&row.data).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn partition_by_destination_keeps_each_batch_to_one_destination_in_order() {
+        let row = |id: &str, project: &str| {
+            EncodedRow::from_map(
+                json!({"id": id, "project_id": project, "log_id": "g"})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let input = vec![
+            row("a1", "a"),
+            row("b1", "b"),
+            row("a2", "a"),
+            row("a3", "a"),
+            row("b2", "b"),
+        ];
+        let batches = EncodedBatch::partition_by_destination(input, 2, usize::MAX);
+        let ids: Vec<Vec<String>> = batches
+            .iter()
+            .map(|batch| {
+                let value: Value = serde_json::from_slice(&batch.data).unwrap();
+                value["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["id"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(ids, [vec!["a1", "a2"], vec!["a3"], vec!["b1", "b2"]]);
     }
 }
