@@ -1,8 +1,8 @@
 use chrono::Utc;
 
-use super::batching::batch_and_serialize_rows;
+use super::batching::{batch_and_serialize_maps, batch_and_serialize_rows, SerializedBatch};
 use super::config::LogQueueConfig;
-use super::http::{fetch_version_info, save_payload_debug, send_batch_with_retry};
+use super::http::{fetch_version_info, save_payload_debug, send_batch_counting};
 use super::merge::merge_row_into;
 use super::row_key::RowKey;
 use super::worker::LogCommand;
@@ -14,6 +14,9 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::{unbounded, Receiver, Sender, TrySendError};
 use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
+use serde_json::{Map, Value};
+use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,14 +25,127 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use url::Url;
 
-/// A raw span payload queued for deferred preparation and flushing.
+/// Supplies the bearer token for queued uploads when they are sent.
+///
+/// The queue calls [`TokenProvider::token`] once per upload group each time it
+/// flushes, so cache tokens that are expensive to mint, and bound how long a call
+/// can take: a call that never returns stalls this client's uploads. When it
+/// returns an error, the rows waiting on it are dropped and counted in
+/// [`DroppedRows::upload_failed`].
+#[async_trait::async_trait]
+pub trait TokenProvider: Send + Sync {
+    /// Return the token for the next upload.
+    async fn token(&self) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// How a queued item authenticates its upload.
+#[derive(Clone)]
+enum Credential {
+    Token(String),
+    /// Fetched when the item is sent. Items share a credential only if they share
+    /// the provider `Arc`.
+    Provider(Arc<dyn TokenProvider>),
+}
+
+impl Credential {
+    async fn token(&self) -> std::result::Result<Cow<'_, str>, anyhow::Error> {
+        match self {
+            Self::Token(token) => Ok(Cow::Borrowed(token)),
+            Self::Provider(provider) => provider
+                .token()
+                .await
+                .map(Cow::Owned)
+                .map_err(|error| anyhow::anyhow!("token provider failed: {error}")),
+        }
+    }
+}
+
+impl PartialEq for Credential {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Token(a), Self::Token(b)) => a == b,
+            (Self::Provider(a), Self::Provider(b)) => {
+                std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Credential {}
+
+impl Hash for Credential {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Token(token) => token.hash(state),
+            Self::Provider(provider) => Arc::as_ptr(provider).cast::<()>().hash(state),
+        }
+    }
+}
+
+/// An item queued for deferred preparation and flushing, with the credential used
+/// to upload it.
 ///
 /// Fields are private — construction and destructuring happen only within this
 /// module. `worker.rs` never touches the fields directly.
 struct SubmitCommand {
-    token: String,
-    payload: SpanPayload,
-    parent_info: Option<ParentSpanInfo>,
+    credential: Credential,
+    item: QueuedItem,
+}
+
+// Spans are the common case; boxing them would add an allocation per span.
+#[allow(clippy::large_enum_variant)]
+enum QueuedItem {
+    /// A span payload, turned into a row at flush time.
+    Span {
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    },
+    /// A caller-built row, uploaded as given.
+    Row {
+        org_id: String,
+        org_name: Option<String>,
+        row: Map<String, Value>,
+    },
+}
+
+/// Cumulative counts of rows the log queue discarded instead of uploading.
+///
+/// Counts only grow over the life of the client, so callers can export them as
+/// monotonic counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DroppedRows {
+    /// Rejected because the queue was full or already closed.
+    pub queue_full: u64,
+    /// Discarded because the row could not be prepared or serialized for upload.
+    pub preparation_failed: u64,
+    /// Discarded after an upload failed and any retries were exhausted.
+    pub upload_failed: u64,
+}
+
+#[derive(Default)]
+struct DropCounters {
+    queue_full: AtomicU64,
+    preparation_failed: AtomicU64,
+    upload_failed: AtomicU64,
+}
+
+impl DropCounters {
+    fn snapshot(&self) -> DroppedRows {
+        DroppedRows {
+            queue_full: self.queue_full.load(Ordering::Relaxed),
+            preparation_failed: self.preparation_failed.load(Ordering::Relaxed),
+            upload_failed: self.upload_failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Rows bound for one upload credential (token or token provider, and org).
+struct CredentialGroup {
+    org_name: Option<String>,
+    spans: Vec<Logs3Row>,
+    rows: Vec<Map<String, Value>>,
 }
 
 struct CmdChannel {
@@ -81,6 +197,7 @@ pub(super) struct LogQueueCore {
     /// building) happens during `flush_internal`.
     channel: ArcSwap<CmdChannel>,
     dropped_count: AtomicUsize,
+    drops: DropCounters,
     last_drop_log_time: AtomicU64,
     queue_depth_warning_emitted: AtomicBool,
     config: LogQueueConfig,
@@ -115,6 +232,7 @@ impl LogQueueCore {
         Arc::new(Self {
             channel: ArcSwap::from_pointee(channel),
             dropped_count: AtomicUsize::new(0),
+            drops: DropCounters::default(),
             last_drop_log_time: AtomicU64::new(0),
             queue_depth_warning_emitted: AtomicBool::new(false),
             config,
@@ -141,6 +259,7 @@ impl LogQueueCore {
             self.config.enforce_queue_size_limit(),
         ) {
             self.dropped_count.fetch_add(1, Ordering::Relaxed);
+            self.drops.queue_full.fetch_add(1, Ordering::Relaxed);
             self.log_drop_warning();
             self.dump_dropped_row_if_configured(cmd);
             return;
@@ -152,6 +271,7 @@ impl LogQueueCore {
             Err(TrySendError::Disconnected(_)) => {
                 channel.queued_count.fetch_sub(1, Ordering::Relaxed);
                 self.dropped_count.fetch_add(1, Ordering::Relaxed);
+                self.drops.queue_full.fetch_add(1, Ordering::Relaxed);
                 self.log_drop_warning();
             }
         }
@@ -255,8 +375,8 @@ impl LogQueueCore {
     /// Internal flush implementation: drain → prepare → merge → batch → send.
     ///
     /// Commands are drained atomically. Each command is prepared (project
-    /// registration, row building) before batching. Each credential group's rows
-    /// are merged and batched together, then sent with at most
+    /// registration, row building) before batching. Each credential group's spans
+    /// are merged by row key, then its spans and caller-built rows are batched and sent with at most
     /// `max_concurrent_log_requests` requests in flight (matching the TypeScript SDK).
     async fn flush_internal(self: &Arc<Self>) -> std::result::Result<(), anyhow::Error> {
         let cmds = self.drain_all();
@@ -277,6 +397,9 @@ impl LogQueueCore {
             Ok(url) => url,
             Err(e) => {
                 warn!(error = %e, "Invalid API URL");
+                self.drops
+                    .upload_failed
+                    .fetch_add(cmds.len() as u64, Ordering::Relaxed);
                 return if self.config.checked_delivery() {
                     Err(e.into())
                 } else {
@@ -286,33 +409,43 @@ impl LogQueueCore {
         };
 
         // Prepare rows and bucket them by their upload credentials. The batch
-        // "destination" is (token, org_id): rows uploaded with different tokens or
-        // orgs must never be merged or batched into the same request under one
-        // token. `org_name` is carried alongside for the `x-bt-org-name` header.
-        type CredKey = (String, String);
-        let mut groups: IndexMap<CredKey, (Option<String>, Vec<Logs3Row>)> = IndexMap::new();
+        // "destination" is (credential, org_id): rows uploaded with different
+        // credentials or orgs must never be merged or batched into the same request
+        // under one token. `org_name` is carried alongside for the `x-bt-org-name`
+        // header.
+        let mut groups: IndexMap<(Credential, String), CredentialGroup> = IndexMap::new();
         for cmd in cmds {
-            let SubmitCommand {
-                token,
-                payload,
-                parent_info,
-            } = cmd;
-            match self.prepare_row(&token, payload, parent_info).await {
-                Ok(row) => {
-                    let key = (token, row.org_id.clone());
-                    let org_name = row.org_name.clone().or_else(|| self.login_state.org_name());
-                    groups
-                        .entry(key)
-                        .or_insert_with(|| (org_name, Vec::new()))
-                        .1
-                        .push(row);
-                }
-                Err(e) => {
-                    warn!(error = %e, "failed to prepare span, dropping");
-                    if first_error.is_none() {
-                        first_error = Some(e);
+            let SubmitCommand { credential, item } = cmd;
+            match item {
+                QueuedItem::Span {
+                    payload,
+                    parent_info,
+                } => match self.prepare_span(&credential, payload, parent_info).await {
+                    Ok(row) => {
+                        let org_id = row.org_id.clone();
+                        let org_name = row.org_name.clone();
+                        self.credential_group(&mut groups, credential, org_id, org_name)
+                            .spans
+                            .push(row);
                     }
-                }
+                    Err(e) => {
+                        warn!(error = %e, "failed to prepare span, dropping");
+                        self.drops
+                            .preparation_failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                },
+                QueuedItem::Row {
+                    org_id,
+                    org_name,
+                    row,
+                } => self
+                    .credential_group(&mut groups, credential, org_id, org_name)
+                    .rows
+                    .push(row),
             }
         }
 
@@ -324,84 +457,96 @@ impl LogQueueCore {
             };
         }
 
-        // Version info reflects a server-wide limit, so it is fetched once and
-        // reused across all credential groups (using any group's credentials).
-        let (probe_token, probe_org) = {
-            let ((token, _org_id), (org_name, _rows)) = groups.get_index(0).unwrap();
-            (token.clone(), org_name.clone())
-        };
-        let (max_request_size, can_use_overflow) = self
-            .get_version_info(&api_url, &probe_token, probe_org.as_deref())
-            .await;
-
-        // Effective batch byte limit: the smaller of the locally configured limit and half the
-        // server-advertised max request size. This mirrors the TypeScript SDK which uses
-        // `maxRequestSize / 2` as the batching limit, where maxRequestSize comes from /version.
-        let effective_batch_bytes = self.config.batch_max_bytes().min(max_request_size / 2);
-
-        let max_concurrent_requests = self.config.max_concurrent_log_requests();
-
-        for ((token, _org_id), (org_name, rows)) in groups {
-            let config = self.config.clone();
-            let batches = tokio::task::spawn_blocking(move || {
-                let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
-                for row in rows {
-                    let key = RowKey::from_row(&row);
-                    if let Some(existing) = merged.get_mut(&key) {
-                        if row.is_merge.unwrap_or(false) {
-                            merge_row_into(existing, row);
-                        } else {
-                            *existing = row;
-                        }
-                    } else {
-                        merged.insert(key, row);
-                    }
-                }
-
-                let rows: Vec<Logs3Row> = merged.into_values().collect();
-                batch_and_serialize_rows(rows, &config, effective_batch_bytes)
-            })
-            .await;
-            let batches = match batches {
-                Ok(Ok(batches)) => batches,
-                Ok(Err(error)) => {
-                    warn!(%error, "failed to serialize batch");
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                    vec![]
-                }
-                Err(error) => {
-                    warn!(%error, "serialization task panicked");
-                    if first_error.is_none() {
-                        first_error = Some(error.into());
-                    }
-                    vec![]
+        for ((credential, _org_id), group) in groups {
+            let CredentialGroup {
+                org_name,
+                spans,
+                rows,
+            } = group;
+            // Tokens from a provider are fetched now, so rows that waited in the
+            // queue still go out with a current token.
+            let token = match credential.token().await {
+                Ok(token) => token,
+                Err(e) => {
+                    warn!(error = %e, "failed to get upload token, dropping rows");
+                    self.drops
+                        .upload_failed
+                        .fetch_add((spans.len() + rows.len()) as u64, Ordering::Relaxed);
+                    first_error.get_or_insert(e);
+                    continue;
                 }
             };
 
-            // Each request uses THIS group's per-request token and org.
-            let results: Vec<_> = stream::iter(batches.into_iter().map(|batch| {
-                send_batch_with_retry(
-                    &self.client,
-                    &api_url,
-                    &token,
-                    org_name.as_deref(),
-                    batch,
-                    &self.config,
-                    max_request_size,
-                    can_use_overflow,
-                )
-            }))
-            .buffer_unordered(max_concurrent_requests)
-            .collect()
-            .await;
-            for result in results {
-                if let Err(e) = result {
-                    warn!(error = %e, "batch send failed");
-                    if first_error.is_none() {
-                        first_error = Some(e);
+            // Version info reflects a server-wide limit, so it is fetched once
+            // (with the first group's credentials) and cached.
+            let (max_request_size, can_use_overflow) = self
+                .get_version_info(&api_url, &token, org_name.as_deref())
+                .await;
+
+            // Effective batch byte limit: the smaller of the locally configured limit and half the
+            // server-advertised max request size. This mirrors the TypeScript SDK which uses
+            // `maxRequestSize / 2` as the batching limit, where maxRequestSize comes from /version.
+            let effective_batch_bytes = self.config.batch_max_bytes().min(max_request_size / 2);
+
+            if !spans.is_empty() {
+                let config = self.config.clone();
+                let count = spans.len();
+                let batches = tokio::task::spawn_blocking(move || {
+                    let mut merged: IndexMap<RowKey, Logs3Row> = IndexMap::new();
+                    for row in spans {
+                        let key = RowKey::from_row(&row);
+                        if let Some(existing) = merged.get_mut(&key) {
+                            if row.is_merge.unwrap_or(false) {
+                                merge_row_into(existing, row);
+                            } else {
+                                *existing = row;
+                            }
+                        } else {
+                            merged.insert(key, row);
+                        }
                     }
+
+                    let rows: Vec<Logs3Row> = merged.into_values().collect();
+                    batch_and_serialize_rows(rows, &config, effective_batch_bytes)
+                })
+                .await;
+                let batches = self.serialized_batches(batches, count, &mut first_error);
+                if let Err(e) = self
+                    .send_batches(
+                        &api_url,
+                        &token,
+                        org_name.as_deref(),
+                        batches,
+                        max_request_size,
+                        can_use_overflow,
+                    )
+                    .await
+                {
+                    first_error.get_or_insert(e);
+                }
+            }
+
+            // Caller-built rows are sent as given: no merging by row key.
+            if !rows.is_empty() {
+                let config = self.config.clone();
+                let count = rows.len();
+                let batches = tokio::task::spawn_blocking(move || {
+                    batch_and_serialize_maps(rows, &config, effective_batch_bytes)
+                })
+                .await;
+                let batches = self.serialized_batches(batches, count, &mut first_error);
+                if let Err(e) = self
+                    .send_batches(
+                        &api_url,
+                        &token,
+                        org_name.as_deref(),
+                        batches,
+                        max_request_size,
+                        can_use_overflow,
+                    )
+                    .await
+                {
+                    first_error.get_or_insert(e);
                 }
             }
         }
@@ -410,6 +555,110 @@ impl LogQueueCore {
         } else {
             Ok(())
         }
+    }
+
+    /// The upload group for a credential, created on first use. Rows without an
+    /// org name fall back to the shared login state's.
+    fn credential_group<'a>(
+        &self,
+        groups: &'a mut IndexMap<(Credential, String), CredentialGroup>,
+        credential: Credential,
+        org_id: String,
+        org_name: Option<String>,
+    ) -> &'a mut CredentialGroup {
+        groups
+            .entry((credential, org_id))
+            .or_insert_with(|| CredentialGroup {
+                org_name: org_name.or_else(|| self.login_state.org_name()),
+                spans: Vec::new(),
+                rows: Vec::new(),
+            })
+    }
+
+    /// Unwrap a chunk's serialization result, counting its rows as dropped on failure.
+    fn serialized_batches(
+        &self,
+        result: std::result::Result<
+            std::result::Result<Vec<SerializedBatch>, anyhow::Error>,
+            tokio::task::JoinError,
+        >,
+        count: usize,
+        first_error: &mut Option<anyhow::Error>,
+    ) -> Vec<SerializedBatch> {
+        let error = match result {
+            Ok(Ok(batches)) => return batches,
+            Ok(Err(error)) => {
+                warn!(%error, "failed to serialize batch");
+                error
+            }
+            Err(error) => {
+                warn!(%error, "serialization task panicked");
+                error.into()
+            }
+        };
+        self.drops
+            .preparation_failed
+            .fetch_add(count as u64, Ordering::Relaxed);
+        first_error.get_or_insert(error);
+        Vec::new()
+    }
+
+    /// Send batches with at most `max_concurrent_log_requests` in flight (matching the
+    /// TypeScript SDK), counting undelivered rows of failed batches as dropped. Returns
+    /// the first error.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_batches(
+        &self,
+        api_url: &Url,
+        token: &str,
+        org_name: Option<&str>,
+        batches: Vec<SerializedBatch>,
+        max_request_size: usize,
+        can_use_overflow: bool,
+    ) -> std::result::Result<(), anyhow::Error> {
+        let send_futures = batches.into_iter().map(|batch| async move {
+            let count = batch.len();
+            let (delivered, result) = send_batch_counting(
+                &self.client,
+                api_url,
+                token,
+                org_name,
+                batch,
+                &self.config,
+                max_request_size,
+                can_use_overflow,
+            )
+            .await;
+            if result.is_err() {
+                self.drops
+                    .upload_failed
+                    .fetch_add(count.saturating_sub(delivered) as u64, Ordering::Relaxed);
+            }
+            result
+        });
+        let mut first_error = None;
+        let results: Vec<_> = stream::iter(send_futures)
+            .buffer_unordered(self.config.max_concurrent_log_requests())
+            .collect()
+            .await;
+        for result in results {
+            if let Err(e) = result {
+                warn!(error = %e, "batch send failed");
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Prepare a span with its credential's token, which project registration uses.
+    async fn prepare_span(
+        &self,
+        credential: &Credential,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    ) -> std::result::Result<Logs3Row, anyhow::Error> {
+        let token = credential.token().await?;
+        self.prepare_row(&token, payload, parent_info).await
     }
 
     /// Prepare a `Logs3Row` from a submit command's token, payload, and parent info.
@@ -786,10 +1035,19 @@ impl LogQueueCore {
         };
         handle.spawn(async move {
             let SubmitCommand {
-                token: _,
-                payload,
-                parent_info,
+                credential: _,
+                item,
             } = cmd;
+            let (payload, parent_info) = match item {
+                QueuedItem::Span {
+                    payload,
+                    parent_info,
+                } => (payload, parent_info),
+                QueuedItem::Row { row, .. } => {
+                    write_dropped_row_debug(dirs, &row);
+                    return;
+                }
+            };
 
             let span_components = payload.span_components.clone();
 
@@ -888,22 +1146,27 @@ impl LogQueueCore {
                 audit_source: Some("api".to_string()),
             };
 
-            let payload_bytes = match serde_json::to_vec(&serde_json::json!({
-                "rows": [row],
-                "api_version": crate::types::LOGS_API_VERSION,
-            })) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, "failed to serialize dropped row for debug dump");
-                    return;
-                }
-            };
-            for dir in dirs {
-                if let Err(e) = save_payload_debug(&payload_bytes, Some(dir), "dropped") {
-                    warn!(error = %e, "failed to write dropped row to debug dir");
-                }
-            }
+            write_dropped_row_debug(dirs, &row);
         });
+    }
+}
+
+/// Write a dropped row to each debug directory as a one-row logs3 payload.
+fn write_dropped_row_debug(dirs: Vec<std::path::PathBuf>, row: &impl serde::Serialize) {
+    let payload_bytes = match serde_json::to_vec(&serde_json::json!({
+        "rows": [row],
+        "api_version": crate::types::LOGS_API_VERSION,
+    })) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "failed to serialize dropped row for debug dump");
+            return;
+        }
+    };
+    for dir in dirs {
+        if let Err(e) = save_payload_debug(&payload_bytes, Some(dir), "dropped") {
+            warn!(error = %e, "failed to write dropped row to debug dir");
+        }
     }
 }
 
@@ -984,15 +1247,71 @@ impl LogQueue {
         parent_info: Option<ParentSpanInfo>,
     ) {
         self.core.push(SubmitCommand {
-            token: token.into(),
-            payload,
-            parent_info,
+            credential: Credential::Token(token.into()),
+            item: QueuedItem::Span {
+                payload,
+                parent_info,
+            },
         });
-        // Signal the worker to flush. try_send is non-blocking and best-effort:
-        // if the channel is full the worker already has a flush pending.
+        self.signal_flush();
+    }
+
+    /// Submit caller-built rows, uploaded as given with `token` and `org_id`.
+    ///
+    /// Each row takes one queue slot, so a full queue drops the rows that don't fit.
+    pub(crate) fn submit_rows(
+        &self,
+        token: &str,
+        org_id: &str,
+        org_name: Option<&str>,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+    ) {
+        self.submit_rows_with(Credential::Token(token.to_owned()), org_id, org_name, rows);
+    }
+
+    /// Submit caller-built rows whose token is fetched from `provider` when they
+    /// are sent.
+    pub(crate) fn submit_rows_with_provider(
+        &self,
+        provider: Arc<dyn TokenProvider>,
+        org_id: &str,
+        org_name: Option<&str>,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+    ) {
+        self.submit_rows_with(Credential::Provider(provider), org_id, org_name, rows);
+    }
+
+    fn submit_rows_with(
+        &self,
+        credential: Credential,
+        org_id: &str,
+        org_name: Option<&str>,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+    ) {
+        for row in rows {
+            self.core.push(SubmitCommand {
+                credential: credential.clone(),
+                item: QueuedItem::Row {
+                    org_id: org_id.to_owned(),
+                    org_name: org_name.map(str::to_owned),
+                    row,
+                },
+            });
+        }
+        self.signal_flush();
+    }
+
+    /// Signal the worker to flush. try_send is non-blocking and best-effort:
+    /// if the channel is full the worker already has a flush pending.
+    fn signal_flush(&self) {
         if !self.core.config.sync_flush() {
             let _ = self.worker_sender.try_send(LogCommand::TriggerFlush);
         }
+    }
+
+    /// Cumulative counts of rows this queue has discarded.
+    pub(crate) fn dropped_rows(&self) -> DroppedRows {
+        self.core.drops.snapshot()
     }
 
     /// Flush all pending data through the worker, waiting for completion.
@@ -1085,30 +1404,32 @@ mod tests {
 
     fn make_test_cmd(id: &str) -> SubmitCommand {
         SubmitCommand {
-            token: "test-token".to_string(),
-            payload: SpanPayload {
-                row_id: id.to_string(),
-                span_id: id.to_string(),
-                is_merge: false,
-                span_components: None,
-                org_id: "org".to_string(),
-                org_name: Some("test-org".to_string()),
-                project_name: None,
-                input: None,
-                output: None,
-                expected: None,
-                error: None,
-                scores: None,
-                metadata: None,
-                metrics: None,
-                tags: None,
-                context: None,
-                span_attributes: None,
-                extra: std::collections::HashMap::new(),
+            credential: Credential::Token("test-token".to_string()),
+            item: QueuedItem::Span {
+                payload: SpanPayload {
+                    row_id: id.to_string(),
+                    span_id: id.to_string(),
+                    is_merge: false,
+                    span_components: None,
+                    org_id: "org".to_string(),
+                    org_name: Some("test-org".to_string()),
+                    project_name: None,
+                    input: None,
+                    output: None,
+                    expected: None,
+                    error: None,
+                    scores: None,
+                    metadata: None,
+                    metrics: None,
+                    tags: None,
+                    context: None,
+                    span_attributes: None,
+                    extra: std::collections::HashMap::new(),
+                },
+                parent_info: Some(ParentSpanInfo::Experiment {
+                    object_id: "exp-test".to_string(),
+                }),
             },
-            parent_info: Some(ParentSpanInfo::Experiment {
-                object_id: "exp-test".to_string(),
-            }),
         }
     }
 
@@ -1213,6 +1534,18 @@ mod tests {
         // The throttled warning fires immediately on the first drop (last_drop_log_time
         // starts at 0, which is well beyond the throttle window), resetting the counter.
         assert_eq!(queue.core.dropped_count(), 0);
+        // The public count is cumulative and unaffected by the warning reset.
+        assert_eq!(queue.dropped_rows().queue_full, 1);
+
+        let row = || {
+            serde_json::json!({"id": "row"})
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        queue.submit_rows("token", "org", None, [row(), row()]);
+        assert_eq!(queue.core.len(), 2);
+        assert_eq!(queue.dropped_rows().queue_full, 3);
     }
 
     #[tokio::test]

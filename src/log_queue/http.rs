@@ -48,6 +48,7 @@ pub(crate) async fn fetch_version_info(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_batch_with_retry(
     client: &reqwest::Client,
@@ -59,31 +60,65 @@ pub(crate) async fn send_batch_with_retry(
     max_request_size: usize,
     can_use_overflow: bool,
 ) -> Result<(), anyhow::Error> {
+    send_batch_counting(
+        client,
+        api_url,
+        token,
+        org_name,
+        batch,
+        config,
+        max_request_size,
+        can_use_overflow,
+    )
+    .await
+    .1
+}
+
+/// Like [`send_batch_with_retry`], also returning how many of the batch's rows
+/// were delivered, which can be nonzero when a split part fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_batch_counting(
+    client: &reqwest::Client,
+    api_url: &Url,
+    token: &str,
+    org_name: Option<&str>,
+    batch: SerializedBatch,
+    config: &LogQueueConfig,
+    max_request_size: usize,
+    can_use_overflow: bool,
+) -> (usize, Result<(), anyhow::Error>) {
     save_payload_debug(&batch.data, config.all_publish_payloads_dir(), "all").ok();
     let data = batch.data.clone();
-    let result = async {
-        let api =
-            crate::http::api_client(client, api_url.as_str(), api_url.as_str(), token, org_name)?;
-        UploadCoordinator::new(
-            api,
-            UploadPolicy::Queue {
-                retries: config.num_retries(),
-            },
-        )
-        .upload(
-            batch,
-            Capabilities {
-                max_request_size,
-                overflow: can_use_overflow,
-            },
-        )
-        .await
-    }
-    .await;
+    let (delivered, result) = match crate::http::api_client(
+        client,
+        api_url.as_str(),
+        api_url.as_str(),
+        token,
+        org_name,
+    ) {
+        Ok(api) => {
+            let (result, outcome) = UploadCoordinator::new(
+                api,
+                UploadPolicy::Queue {
+                    retries: config.num_retries(),
+                },
+            )
+            .upload_counting(
+                batch,
+                Capabilities {
+                    max_request_size,
+                    overflow: can_use_overflow,
+                },
+            )
+            .await;
+            (result.rows_uploaded, outcome)
+        }
+        Err(error) => (0, Err(error)),
+    };
     if result.is_err() {
         save_payload_debug(&data, config.failed_publish_payloads_dir(), "failed").ok();
     }
-    result.map(|_| ()).map_err(Into::into)
+    (delivered, result.map_err(Into::into))
 }
 
 #[cfg(test)]

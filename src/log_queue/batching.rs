@@ -27,6 +27,28 @@ pub(crate) fn batch_and_serialize_rows(
     ))
 }
 
+/// Encode caller-built rows as given, then partition using the complete request size.
+pub(crate) fn batch_and_serialize_maps(
+    rows: Vec<serde_json::Map<String, serde_json::Value>>,
+    config: &LogQueueConfig,
+    batch_max_bytes: usize,
+) -> Result<Vec<SerializedBatch>, anyhow::Error> {
+    let rows = rows
+        .iter()
+        .map(|row| {
+            EncodedRow::from_map(row).map_err(|error| {
+                warn!(%error, "failed to serialize row");
+                error
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SerializedBatch::partition(
+        rows,
+        config.batch_max_items(),
+        batch_max_bytes,
+    ))
+}
+
 /// Build overflow metadata directly from a Logs3Row struct.
 ///
 /// Extracts object IDs from the destination and object_delete flag without

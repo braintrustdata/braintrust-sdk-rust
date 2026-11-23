@@ -8,4 +8,4 @@ pub(crate) mod worker;
 
 // Public API exports
 pub use config::LogQueueConfig;
-pub use queue::LogQueue;
+pub use queue::{DroppedRows, LogQueue, TokenProvider};

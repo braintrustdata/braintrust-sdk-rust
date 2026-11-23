@@ -31,7 +31,7 @@ pub use experiments::{
     GitMetadataSettings, MetricSummary, ProjectMetadata, RepoInfo, ScoreSummary,
 };
 pub use extractors::{extract_anthropic_usage, extract_openai_usage};
-pub use log_queue::LogQueueConfig;
+pub use log_queue::{DroppedRows, LogQueueConfig, TokenProvider};
 pub use logger::{
     BraintrustClient, BraintrustClientBuilder, LoginState, OrgInfo, DEFAULT_API_URL,
     DEFAULT_APP_URL,
