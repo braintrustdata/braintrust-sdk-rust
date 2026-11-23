@@ -84,15 +84,12 @@ async fn delivery_survives_the_constructing_runtime() {
 
 /// A credential gate stays open after release, including subsequent upload attempts.
 struct Gate(tokio::sync::watch::Receiver<bool>);
+#[async_trait::async_trait]
 impl TokenProvider for Gate {
-    fn token(
-        &self,
-    ) -> braintrust_sdk_rust::Completion<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let mut ready = self.0.clone();
-        braintrust_sdk_rust::Completion::spawn(async move {
-            ready.wait_for(|ready| *ready).await?;
-            Ok("token".into())
-        })
+        ready.wait_for(|ready| *ready).await?;
+        Ok("token".into())
     }
 }
 
@@ -335,15 +332,12 @@ async fn org_selection_uses_discovered_endpoints_without_retargeting_existing_wo
 }
 
 struct Blocked(Arc<tokio::sync::Notify>);
+#[async_trait::async_trait]
 impl TokenProvider for Blocked {
-    fn token(
-        &self,
-    ) -> braintrust_sdk_rust::Completion<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let release = self.0.clone();
-        braintrust_sdk_rust::Completion::spawn(async move {
-            release.notified().await;
-            Err("unavailable".into())
-        })
+        release.notified().await;
+        Err("unavailable".into())
     }
 }
 #[tokio::test]
@@ -449,10 +443,9 @@ async fn dataset_registration_retries_failure_and_clones_share_success() {
 }
 
 struct Panicking;
+#[async_trait::async_trait]
 impl TokenProvider for Panicking {
-    fn token(
-        &self,
-    ) -> braintrust_sdk_rust::Completion<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         panic!("test provider panic")
     }
 }

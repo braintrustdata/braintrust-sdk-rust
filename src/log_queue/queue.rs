@@ -22,9 +22,10 @@ use url::Url;
 /// runtime and are bounded by [`crate::ServiceConfig::preparation_timeout`]. When it
 /// returns an error, the rows waiting on it are dropped and counted in
 /// [`DroppedRows::upload_failed`].
+#[async_trait::async_trait]
 pub trait TokenProvider: Send + Sync {
     /// Return the token for the next upload.
-    fn token(&self) -> crate::Completion<String, Box<dyn std::error::Error + Send + Sync>>;
+    async fn token(&self) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// How a queued item authenticates its upload.
@@ -69,7 +70,7 @@ impl Credential {
             Self::Token(token) => Ok(Cow::Borrowed(token.as_ref())),
             Self::Provider(provider) => tokio::time::timeout(
                 crate::service::global()?.config.preparation_timeout,
-                provider.token().cancel_on_drop(),
+                provider.token(),
             )
             .await
             .map_err(|_| anyhow::anyhow!("token provider timed out"))?

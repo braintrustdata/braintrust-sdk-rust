@@ -1,7 +1,5 @@
 //! Each configuration scenario gets a new process and therefore a new singleton.
-use braintrust_sdk_rust::{
-    configure_service, BraintrustClient, Completion, ServiceConfig, TokenProvider,
-};
+use braintrust_sdk_rust::{configure_service, BraintrustClient, ServiceConfig, TokenProvider};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -112,8 +110,7 @@ async fn configuration_child() {
     );
     clients[0].flush().await.unwrap();
     assert_eq!(clients[0].dropped_rows().queue_full, 1);
-    // A credential execution deadline cancels the provider task itself, even though
-    // simply dropping an ordinary completion observer leaves its operation running.
+    // A credential execution deadline drops the stalled provider future.
     struct Cancelled(Option<tokio::sync::oneshot::Sender<()>>);
     impl Drop for Cancelled {
         fn drop(&mut self) {
@@ -123,13 +120,11 @@ async fn configuration_child() {
         }
     }
     struct Stalled(Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+    #[async_trait::async_trait]
     impl TokenProvider for Stalled {
-        fn token(&self) -> Completion<String, Box<dyn std::error::Error + Send + Sync>> {
-            let cancelled = Cancelled(self.0.lock().unwrap().take());
-            Completion::spawn(async move {
-                let _cancelled = cancelled;
-                std::future::pending().await
-            })
+        async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            let _cancelled = Cancelled(self.0.lock().unwrap().take());
+            std::future::pending().await
         }
     }
     let (cancelled, observed) = tokio::sync::oneshot::channel();

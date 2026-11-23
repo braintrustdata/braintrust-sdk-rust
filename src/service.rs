@@ -160,21 +160,13 @@ where
     let (sender, mut completion) = crate::Completion::pair();
     match global() {
         Ok(service) => {
-            let task = service.handle.spawn(async move {
+            service.handle.spawn(async move {
                 let _ = sender.send(operation.await);
             });
-            completion.set_cancellation(task.abort_handle());
         }
         Err(_) => {
             completion.record_issuance(Err(crate::ExecutionError::WorkerLost.into()));
         }
     }
-    completion
-}
-
-/// Complete an operation that finishes during issuance.
-pub(crate) fn ready<T, E>(result: std::result::Result<T, E>) -> crate::Completion<T, E> {
-    let (sender, completion) = crate::Completion::pair();
-    let _ = sender.send(result);
     completion
 }

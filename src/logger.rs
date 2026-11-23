@@ -2270,10 +2270,13 @@ mod tests {
             token: std::sync::Mutex<String>,
             calls: std::sync::atomic::AtomicUsize,
         }
+        #[async_trait::async_trait]
         impl TokenProvider for Rotating {
-            fn token(&self) -> crate::Completion<String, Box<dyn std::error::Error + Send + Sync>> {
+            async fn token(
+                &self,
+            ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                crate::Completion::ready(Ok(self.token.lock().unwrap().clone()))
+                Ok(self.token.lock().unwrap().clone())
             }
         }
         let provider = |token: &str| {
@@ -2355,19 +2358,19 @@ mod tests {
             gate: tokio::sync::Semaphore,
         }
         struct Rotating(Arc<State>);
+        #[async_trait::async_trait]
         impl TokenProvider for Rotating {
-            fn token(&self) -> crate::Completion<String, Box<dyn std::error::Error + Send + Sync>> {
-                let state = self.0.clone();
-                crate::service::submit(async move {
-                    drop(state.gate.acquire().await?);
-                    state.calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(if state.rotated.load(Ordering::SeqCst) {
-                        "refreshed"
-                    } else {
-                        "expired"
-                    }
-                    .into())
-                })
+            async fn token(
+                &self,
+            ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                drop(self.0.gate.acquire().await?);
+                self.0.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(if self.0.rotated.load(Ordering::SeqCst) {
+                    "refreshed"
+                } else {
+                    "expired"
+                }
+                .into())
             }
         }
 
@@ -2434,9 +2437,12 @@ mod tests {
     #[tokio::test]
     async fn token_provider_errors_drop_the_rows_waiting_on_them() {
         struct Unavailable;
+        #[async_trait::async_trait]
         impl TokenProvider for Unavailable {
-            fn token(&self) -> crate::Completion<String, Box<dyn std::error::Error + Send + Sync>> {
-                crate::Completion::ready(Err("credential unavailable".into()))
+            async fn token(
+                &self,
+            ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                Err("credential unavailable".into())
             }
         }
         let server = MockServer::start().await;

@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::marker::PhantomData;
 
 use crate::Result;
@@ -7,16 +8,14 @@ use super::types::{Score, ScorerArgs, Scores};
 /// Scorer trait for evaluating task outputs
 ///
 /// Scorers compare the task output against expected values and produce numeric scores.
-/// Results can be awaited or observed with `blocking_wait()`.
+/// The evaluator awaits this callback, including when its own completion is observed synchronously.
+#[async_trait]
 pub trait Scorer<I, O>: Send + Sync {
     /// Name of this scorer (used in results)
     fn name(&self) -> &str;
 
     /// Score the output
-    fn score(
-        &self,
-        args: ScorerArgs<'_, I, O>,
-    ) -> crate::Completion<Scores, crate::BraintrustError>;
+    async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores>;
 }
 
 /// Wrapper for sync scoring functions
@@ -44,6 +43,7 @@ where
     }
 }
 
+#[async_trait]
 impl<I, O, F> Scorer<I, O> for SyncFnScorer<I, O, F>
 where
     F: Fn(ScorerArgs<'_, I, O>) -> Result<Scores> + Send + Sync,
@@ -54,11 +54,8 @@ where
         &self.name
     }
 
-    fn score(
-        &self,
-        args: ScorerArgs<'_, I, O>,
-    ) -> crate::Completion<Scores, crate::BraintrustError> {
-        crate::service::ready((self.func)(args))
+    async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
+        (self.func)(args)
     }
 }
 
@@ -85,6 +82,7 @@ impl Default for ExactMatch {
     }
 }
 
+#[async_trait]
 impl<I, O> Scorer<I, O> for ExactMatch
 where
     O: PartialEq + Send + Sync,
@@ -94,19 +92,14 @@ where
         &self.name
     }
 
-    fn score(
-        &self,
-        args: ScorerArgs<'_, I, O>,
-    ) -> crate::Completion<Scores, crate::BraintrustError> {
-        crate::service::ready({
-            let score = match args.expected {
-                Some(expected) if expected == args.output => 1.0,
-                Some(_) => 0.0,
-                None => 0.0, // No expected value means we can't score
-            };
+    async fn score(&self, args: ScorerArgs<'_, I, O>) -> Result<Scores> {
+        let score = match args.expected {
+            Some(expected) if expected == args.output => 1.0,
+            Some(_) => 0.0,
+            None => 0.0, // No expected value means we can't score
+        };
 
-            Ok(vec![Score::new(self.name.clone(), score)])
-        })
+        Ok(vec![Score::new(self.name.clone(), score)])
     }
 }
 
@@ -179,6 +172,7 @@ impl Default for LevenshteinScorer {
     }
 }
 
+#[async_trait]
 impl<I> Scorer<I, String> for LevenshteinScorer
 where
     I: Send + Sync,
@@ -187,31 +181,26 @@ where
         &self.name
     }
 
-    fn score(
-        &self,
-        args: ScorerArgs<'_, I, String>,
-    ) -> crate::Completion<Scores, crate::BraintrustError> {
-        crate::service::ready({
-            let expected = match args.expected {
-                Some(e) => e,
-                None => return crate::service::ready(Ok(vec![Score::new(self.name.clone(), 0.0)])),
-            };
+    async fn score(&self, args: ScorerArgs<'_, I, String>) -> Result<Scores> {
+        let expected = match args.expected {
+            Some(e) => e,
+            None => return Ok(vec![Score::new(self.name.clone(), 0.0)]),
+        };
 
-            let distance = Self::levenshtein_distance(args.output, expected);
+        let distance = Self::levenshtein_distance(args.output, expected);
 
-            let score = if self.normalize {
-                let max_len = std::cmp::max(args.output.chars().count(), expected.chars().count());
-                if max_len == 0 {
-                    1.0
-                } else {
-                    1.0 - (distance as f64 / max_len as f64)
-                }
+        let score = if self.normalize {
+            let max_len = std::cmp::max(args.output.chars().count(), expected.chars().count());
+            if max_len == 0 {
+                1.0
             } else {
-                distance as f64
-            };
+                1.0 - (distance as f64 / max_len as f64)
+            }
+        } else {
+            distance as f64
+        };
 
-            Ok(vec![Score::new(self.name.clone(), score)])
-        })
+        Ok(vec![Score::new(self.name.clone(), score)])
     }
 }
 
@@ -252,6 +241,7 @@ impl Default for NumericDiffScorer {
     }
 }
 
+#[async_trait]
 impl<I> Scorer<I, f64> for NumericDiffScorer
 where
     I: Send + Sync,
@@ -260,26 +250,21 @@ where
         &self.name
     }
 
-    fn score(
-        &self,
-        args: ScorerArgs<'_, I, f64>,
-    ) -> crate::Completion<Scores, crate::BraintrustError> {
-        crate::service::ready({
-            let expected = match args.expected {
-                Some(e) => e,
-                None => return crate::service::ready(Ok(vec![Score::new(self.name.clone(), 0.0)])),
-            };
+    async fn score(&self, args: ScorerArgs<'_, I, f64>) -> Result<Scores> {
+        let expected = match args.expected {
+            Some(e) => e,
+            None => return Ok(vec![Score::new(self.name.clone(), 0.0)]),
+        };
 
-            let score = if self.absolute {
-                (args.output - expected).abs()
-            } else if *expected != 0.0 {
-                ((args.output - expected) / expected).abs()
-            } else {
-                args.output.abs()
-            };
+        let score = if self.absolute {
+            (args.output - expected).abs()
+        } else if *expected != 0.0 {
+            ((args.output - expected) / expected).abs()
+        } else {
+            args.output.abs()
+        };
 
-            Ok(vec![Score::new(self.name.clone(), score)])
-        })
+        Ok(vec![Score::new(self.name.clone(), score)])
     }
 }
 

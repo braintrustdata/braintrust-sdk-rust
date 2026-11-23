@@ -156,7 +156,7 @@ configure_service(ServiceConfig::builder()
 # Ok::<(), braintrust_sdk_rust::BraintrustError>(())
 ```
 
-High-level SDK operations return eager `Completion` values: calling the method starts the operation, `.await` observes it in async code, and `.blocking_wait()` observes it in synchronous code. Dropping a completion leaves accepted work running. Pending blocking waits are refused inside Tokio runtime contexts. The standalone `braintrust-api-client` crate retains its async, one-attempt transport interface. Custom task, scorer, dataset, and credential-provider implementations can return `Completion::ready(result)` or `Completion::spawn(async move { ... })`.
+SDK-issued operations return eager `Completion` values: calling the method starts the operation, `.await` observes it in async code, and `.blocking_wait()` observes it in synchronous code. Dropping a completion leaves accepted work running. Pending blocking waits are refused inside Tokio runtime contexts. The standalone `braintrust-api-client` crate retains its async, one-attempt transport interface. The `Task`, `Scorer`, evaluation `Dataset`, and `TokenProvider` extension traits retain their existing async contracts, including support for borrowed inputs and implementations.
 
 ```rust,no_run
 use braintrust_sdk_rust::BraintrustClient;

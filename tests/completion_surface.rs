@@ -1,9 +1,6 @@
 use braintrust_sdk_rust::{
-    eval::{
-        Case, Dataset, ExactMatch, Scorer, ScorerArgs, SimpleAsyncFnTask, Task, TaskHooks,
-        VecDataset,
-    },
-    BraintrustClient, Completion, DatasetInsert, Logs3BatchUploader, ParentSpanInfo,
+    eval::{Case, Dataset, Scorer, ScorerArgs, SimpleAsyncFnTask, Task, TaskHooks},
+    BraintrustClient, DatasetInsert, Logs3BatchUploader, ParentSpanInfo,
 };
 use serde_json::json;
 use wiremock::{
@@ -28,6 +25,7 @@ async fn high_level_operations_work_from_a_plain_sync_thread() {
             json!({"project":{"id":"p","name":"p"}, "experiment":{"id":"e","name":"e"}}),
         ),
         ("/logs3", json!({})),
+        ("/api/project/register", json!({"project":{"id":"p"}})),
         ("/btql", json!({"data":[{"id":"record","input":"hello"}]})),
     ] {
         Mock::given(method("POST"))
@@ -41,6 +39,7 @@ async fn high_level_operations_work_from_a_plain_sync_thread() {
         std::thread::spawn(move || {
             let client = BraintrustClient::builder()
                 .api_key("key")
+                .default_project("p")
                 .app_url(&endpoint)
                 .api_url(&endpoint)
                 .blocking_login(true)
@@ -118,6 +117,32 @@ async fn high_level_operations_work_from_a_plain_sync_thread() {
                 )
                 .blocking_wait()
                 .unwrap();
+            let summary = braintrust_sdk_rust::eval::Evaluator::new(client.clone())
+                .run(
+                    braintrust_sdk_rust::eval::EvalOpts::builder()
+                        .name("async-task-from-sync-code".into())
+                        .dataset(
+                            vec![Case {
+                                input: "hello".to_owned(),
+                                expected: Some("HELLO".to_owned()),
+                                ..Default::default()
+                            }]
+                            .into(),
+                        )
+                        .task(Box::new(SimpleAsyncFnTask::new(|input: &String| {
+                            Box::pin(async move {
+                                tokio::task::yield_now().await;
+                                Ok(input.to_uppercase())
+                            })
+                        })))
+                        .scorers(vec![Box::new(braintrust_sdk_rust::eval::ExactMatch::new())])
+                        .quiet(true)
+                        .build(),
+                )
+                .blocking_wait()
+                .unwrap();
+            assert_eq!(summary.successful_cases, 1);
+            assert_eq!(summary.results[0].output.as_deref(), Some("HELLO"));
             client.flush().blocking_wait().unwrap();
         })
         .join()
@@ -127,45 +152,104 @@ async fn high_level_operations_work_from_a_plain_sync_thread() {
     .unwrap();
 }
 
-#[test]
-fn evaluation_traits_support_sync_observation_and_owned_async_callbacks() {
-    let client = BraintrustClient::builder().build_without_login().unwrap();
-    let span = client.span_builder_with_credentials("key", "org").build();
-    let expected = "HELLO".to_owned();
-    let hooks = TaskHooks::new(&span, Some(&expected));
-    let task =
-        SimpleAsyncFnTask::new(|input: &String| Box::pin(async move { Ok(input.to_uppercase()) }));
-    let input = "hello".to_owned();
-    let output = task.run(&input, &hooks).blocking_wait().unwrap();
-    assert_eq!(output, "HELLO");
-    let scores = ExactMatch::new()
-        .score(ScorerArgs {
-            input: &input,
-            output: &output,
-            expected: Some(&output),
-            metadata: None,
-        })
-        .blocking_wait()
-        .unwrap();
-    assert_eq!(scores[0].score, 1.0);
-    let mut dataset = VecDataset::new(vec![Case {
-        input,
-        expected: Some(output),
-        ..Default::default()
-    }]);
-    assert!(dataset.next().blocking_wait().unwrap().is_some());
-    assert!(dataset.next().blocking_wait().unwrap().is_none());
+// These implementations intentionally use the pre-existing #[async_trait] signatures.
+// Non-Clone values and borrowed state catch accidental ownership restrictions.
+struct Input(String);
+struct Output(String);
+struct BorrowedTask<'a>(&'a str);
+
+#[async_trait::async_trait]
+impl Task<Input, Output> for BorrowedTask<'_> {
+    async fn run(
+        &self,
+        input: &Input,
+        hooks: &TaskHooks<'_, Input, Output>,
+    ) -> braintrust_sdk_rust::Result<Output> {
+        tokio::task::yield_now().await;
+        hooks.add_tag(self.0);
+        Ok(Output(format!("{}{}", input.0, self.0)))
+    }
+}
+
+struct BorrowedScorer<'a>(&'a str);
+#[async_trait::async_trait]
+impl Scorer<Input, Output> for BorrowedScorer<'_> {
+    fn name(&self) -> &str {
+        self.0
+    }
+    async fn score(
+        &self,
+        args: ScorerArgs<'_, Input, Output>,
+    ) -> braintrust_sdk_rust::Result<braintrust_sdk_rust::eval::Scores> {
+        tokio::task::yield_now().await;
+        Ok(vec![braintrust_sdk_rust::eval::Score::new(
+            self.0,
+            f64::from(args.output.0.starts_with(&args.input.0)),
+        )])
+    }
+}
+
+struct BorrowedDataset<'a>(Option<&'a str>);
+#[async_trait::async_trait]
+impl<'a> Dataset<&'a str, &'a str> for BorrowedDataset<'a> {
+    async fn next(&mut self) -> braintrust_sdk_rust::Result<Option<Case<&'a str, &'a str>>> {
+        tokio::task::yield_now().await;
+        Ok(self.0.take().map(|input| Case {
+            input,
+            expected: Some(input),
+            ..Default::default()
+        }))
+    }
+}
+
+struct BorrowedProvider<'a>(&'a str);
+#[async_trait::async_trait]
+impl braintrust_sdk_rust::TokenProvider for BorrowedProvider<'_> {
+    async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        tokio::task::yield_now().await;
+        Ok(self.0.to_owned())
+    }
 }
 
 #[tokio::test]
-async fn dropping_a_completion_does_not_cancel_its_operation() {
-    let (sent, received) = tokio::sync::oneshot::channel();
-    drop(
-        Completion::<(), braintrust_sdk_rust::BraintrustError>::spawn(async move {
+async fn extension_traits_preserve_borrowed_async_implementations() {
+    use braintrust_sdk_rust::TokenProvider;
+    let client = BraintrustClient::builder().build_without_login().unwrap();
+    let span = client.span_builder_with_credentials("key", "org").build();
+    let hooks = TaskHooks::new(&span, None);
+    let input = Input("hello".to_owned());
+    let suffix = "!".to_owned();
+    let task = BorrowedTask(&suffix);
+    let task: &dyn Task<Input, Output> = &task;
+    let output = task.run(&input, &hooks).await.unwrap();
+    assert_eq!(output.0, "hello!");
+    assert_eq!(hooks.get_tags().unwrap(), ["!"]);
+    let task = SimpleAsyncFnTask::new(|input: &Input| {
+        let suffix = suffix.clone();
+        Box::pin(async move {
             tokio::task::yield_now().await;
-            sent.send(()).unwrap();
-            Ok(())
-        }),
-    );
-    received.await.unwrap();
+            Ok(Output(format!("{}{}", input.0, suffix)))
+        })
+    });
+    assert_eq!(task.run(&input, &hooks).await.unwrap().0, "hello!");
+    let scorer_name = "borrowed".to_owned();
+    let scorer = BorrowedScorer(&scorer_name);
+    let scorer: &dyn Scorer<Input, Output> = &scorer;
+    let scores = scorer
+        .score(ScorerArgs {
+            input: &input,
+            output: &output,
+            expected: None,
+            metadata: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(scores[0].name, "borrowed");
+    assert_eq!(scores[0].score, 1.0);
+    let text = "case".to_owned();
+    let mut dataset = BorrowedDataset(Some(&text));
+    assert_eq!(dataset.next().await.unwrap().unwrap().input, "case");
+    assert!(dataset.next().await.unwrap().is_none());
+    let provider = BorrowedProvider(&text);
+    assert_eq!(provider.token().await.unwrap(), "case");
 }
