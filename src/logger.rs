@@ -941,13 +941,7 @@ impl BraintrustClient {
             ));
         }
         let state = self.wait_for_login_state().await?;
-        let api_key = state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_id = state
-            .org_id()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        self.log_rows_with_credentials(&api_key, &org_id, state.org_name().as_deref(), rows);
+        self.inner.queue.submit_rows(state.scope()?, rows);
         Ok(())
     }
 
@@ -971,7 +965,10 @@ impl BraintrustClient {
         org_name: Option<&str>,
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
-        self.inner.queue.submit_rows(self.explicit_scope(token.into(), org_id.into(), org_name.map(str::to_owned)), rows);
+        self.inner.queue.submit_rows(
+            self.explicit_scope(token.into(), org_id.into(), org_name.map(str::to_owned)),
+            rows,
+        );
     }
 
     /// Queue caller-built rows for upload to `/logs3`, fetching the token from
@@ -989,9 +986,11 @@ impl BraintrustClient {
         org_name: Option<&str>,
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
-        self.inner
-            .queue
-            .submit_rows_with_provider(provider, self.explicit_scope(String::new(), org_id.into(), org_name.map(str::to_owned)), rows);
+        self.inner.queue.submit_rows_with_provider(
+            provider,
+            self.explicit_scope(String::new(), org_id.into(), org_name.map(str::to_owned)),
+            rows,
+        );
     }
 
     /// Cumulative counts of rows this client discarded instead of uploading.

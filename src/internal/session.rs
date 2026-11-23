@@ -31,7 +31,9 @@ impl CredentialScope {
         }))
     }
     pub fn with_token(self, token: String) -> Self {
-        if self.token() == token { return self; }
+        if self.token() == token {
+            return self;
+        }
         let mut identity = (*self.0).clone();
         identity.token = token;
         Self(Arc::new(identity))

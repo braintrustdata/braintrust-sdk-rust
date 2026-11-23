@@ -58,8 +58,7 @@ async fn explicit_handles_keep_their_routes_after_shared_login_state_is_populate
 }
 
 #[tokio::test]
-async fn logged_in_resources_capture_the_org_route_while_explicit_resources_keep_configured_routes()
-{
+async fn explicit_api_url_is_preserved_for_logged_in_and_explicit_resources() {
     let control = MockServer::start().await;
     let configured = MockServer::start().await;
     let org_data = MockServer::start().await;
@@ -77,11 +76,11 @@ async fn logged_in_resources_capture_the_org_route_while_explicit_resources_keep
         .expect(2)
         .mount(&control)
         .await;
-    for server in [&configured, &org_data] {
+    for server in [&configured] {
         Mock::given(method("POST"))
             .and(path("/logs3"))
             .respond_with(ResponseTemplate::new(204))
-            .expect(1)
+            .expect(2)
             .mount(server)
             .await;
         Mock::given(method("POST"))
@@ -89,12 +88,12 @@ async fn logged_in_resources_capture_the_org_route_while_explicit_resources_keep
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"record"}]})),
             )
-            .expect(1)
+            .expect(2)
             .mount(server)
             .await;
         Mock::given(method("GET")).and(path("/dataset-summary"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"project_name":"p","project_id":"project","dataset_name":"d","dataset_id":"dataset"})))
-            .expect(1).mount(server).await;
+            .expect(2).mount(server).await;
     }
     let client = BraintrustClient::builder()
         .api_key("session")
@@ -131,14 +130,15 @@ async fn logged_in_resources_capture_the_org_route_while_explicit_resources_keep
         );
         dataset.summarize().await.unwrap();
     }
-    for (server, token, org) in [
-        (&configured, "explicit", "explicit-tenant"),
-        (&org_data, "session", "tenant"),
-    ] {
-        for request in server.received_requests().await.unwrap() {
-            assert!(header("authorization", format!("Bearer {token}").as_str()).matches(&request));
-            assert!(header("x-bt-org-name", org).matches(&request));
-        }
+    assert!(org_data.received_requests().await.unwrap().is_empty());
+    for request in configured.received_requests().await.unwrap() {
+        let org = if header("authorization", "Bearer explicit").matches(&request) {
+            "explicit-tenant"
+        } else {
+            assert!(header("authorization", "Bearer session").matches(&request));
+            "tenant"
+        };
+        assert!(header("x-bt-org-name", org).matches(&request));
     }
 }
 
@@ -201,7 +201,7 @@ async fn organization_headers_partition_registration_capabilities_and_uploads() 
 }
 
 #[tokio::test]
-async fn mixed_trace_scopes_keep_separate_routes_and_project_cache_entries() {
+async fn matching_logged_in_and_explicit_scopes_share_project_and_capability_caches() {
     let control = MockServer::start().await;
     let configured = MockServer::start().await;
     let selected = MockServer::start().await;
@@ -218,10 +218,10 @@ async fn mixed_trace_scopes_keep_separate_routes_and_project_cache_entries() {
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"shared-project"}})),
         )
-        .expect(2)
+        .expect(1)
         .mount(&control)
         .await;
-    for server in [&selected, &configured] {
+    for server in [&configured] {
         Mock::given(method("GET"))
             .and(path("/version"))
             .and(header("authorization", "Bearer shared"))
@@ -245,7 +245,7 @@ async fn mixed_trace_scopes_keep_separate_routes_and_project_cache_entries() {
         .build()
         .await
         .unwrap();
-    // Identical credentials and selectors still have separate data routes.
+    // Explicit API URLs remain authoritative after login, so these scopes match.
     let logged = client
         .span_builder()
         .await
@@ -264,7 +264,7 @@ async fn mixed_trace_scopes_keep_separate_routes_and_project_cache_entries() {
         a.await.unwrap();
         b.await.unwrap();
     }
-    for server in [&selected, &configured] {
+    for server in [&configured] {
         for request in server
             .received_requests()
             .await
@@ -273,11 +273,12 @@ async fn mixed_trace_scopes_keep_separate_routes_and_project_cache_entries() {
             .filter(|r| r.url.path() == "/logs3")
         {
             let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-            assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+            assert_eq!(body["rows"].as_array().unwrap().len(), 2);
             assert_eq!(body["rows"][0]["project_id"], "shared-project");
             assert!(header("x-bt-org-name", "tenant").matches(request));
         }
     }
+    assert!(selected.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -431,4 +432,80 @@ async fn resource_builders_defer_credential_validation_until_use() {
         ));
         assert!(server.received_requests().await.unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn logged_in_raw_rows_use_the_discovered_route() {
+    let control = MockServer::start().await;
+    let data = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"org_info":[{"id":"org","name":"tenant","api_url":data.uri()}]}),
+            ),
+        )
+        .expect(1)
+        .mount(&control)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(header("authorization", "Bearer session"))
+        .and(header("x-bt-org-name", "tenant"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&data)
+        .await;
+    let client = BraintrustClient::builder()
+        .api_key("session")
+        .app_url(control.uri())
+        .blocking_login(true)
+        .build()
+        .await
+        .unwrap();
+    client
+        .log_rows([json!({"id":"raw"}).as_object().unwrap().clone()])
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn one_token_provider_keeps_raw_row_organization_scopes_separate() {
+    struct Provider;
+    #[async_trait::async_trait]
+    impl braintrust_sdk_rust::TokenProvider for Provider {
+        async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Ok("token".into())
+        }
+    }
+    let server = MockServer::start().await;
+    for org in ["tenant-a", "tenant-b"] {
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .and(header("authorization", "Bearer token"))
+            .and(header("x-bt-org-name", org))
+            .and(wiremock::matchers::body_json(
+                json!({"rows":[{"id":org}],"api_version":2}),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let client = BraintrustClient::builder()
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build_without_login()
+        .unwrap();
+    let provider = std::sync::Arc::new(Provider);
+    for org in ["tenant-a", "tenant-b"] {
+        client.log_rows_with_token_provider(
+            provider.clone(),
+            "same-org-id",
+            Some(org),
+            [json!({"id":org}).as_object().unwrap().clone()],
+        );
+    }
+    client.flush().await.unwrap();
 }

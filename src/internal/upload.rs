@@ -49,7 +49,7 @@ struct Attempt {
     retry_after: Option<Duration>,
 }
 
-async fn attempt<T>(
+fn attempt<T>(
     result: std::result::Result<T, crate::api::Error<serde_json::Value>>,
 ) -> std::result::Result<T, Attempt> {
     let retry_after = match &result {
@@ -61,9 +61,7 @@ async fn attempt<T>(
             .map(Duration::from_secs),
         _ => None,
     };
-    api_result(result)
-        .await
-        .map_err(|error| Attempt { error, retry_after })
+    api_result(result).map_err(|error| Attempt { error, retry_after })
 }
 
 /// Wait at least as long as the server asked, without retrying once the budget is exhausted.
@@ -185,9 +183,7 @@ impl UploadCoordinator {
             if batch.data.len() <= capabilities.max_request_size {
                 match budget
                     .run(|| async {
-                        attempt(self.logs.logs3_raw(batch.data.clone()).await)
-                            .await
-                            .map(|_| ())
+                        attempt(self.logs.logs3_raw(batch.data.clone()).await).map(|_| ())
                     })
                     .await
                 {
@@ -245,7 +241,7 @@ impl UploadCoordinator {
             .await?;
         budget
             .run(|| async {
-                attempt(self.logs.logs3(&serde_json::json!({"rows":grant.reference(), "api_version":LOGS_API_VERSION})).await).await.map(|_| ())
+                attempt(self.logs.logs3(&serde_json::json!({"rows":grant.reference(), "api_version":LOGS_API_VERSION})).await).map(|_| ())
             })
             .await
     }

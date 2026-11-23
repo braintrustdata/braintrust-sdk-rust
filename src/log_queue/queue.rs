@@ -22,9 +22,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use url::Url;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
+use url::Url;
 
 use crate::api::ProjectRegisterRequest;
 
@@ -61,7 +61,10 @@ enum Credential {
 }
 
 impl Credential {
-    async fn token<'a>(&'a self, scope: &'a CredentialScope) -> std::result::Result<Cow<'a, str>, anyhow::Error> {
+    async fn token<'a>(
+        &'a self,
+        scope: &'a CredentialScope,
+    ) -> std::result::Result<Cow<'a, str>, anyhow::Error> {
         match self {
             Self::Token => Ok(Cow::Borrowed(scope.token())),
             Self::Provider(provider) => provider
@@ -116,9 +119,7 @@ enum QueuedItem {
         parent_info: Option<ParentSpanInfo>,
     },
     /// A caller-built row, uploaded as given.
-    Row {
-        row: Map<String, Value>,
-    },
+    Row { row: Map<String, Value> },
 }
 
 /// Cumulative counts of rows the log queue discarded instead of uploading.
@@ -212,7 +213,11 @@ impl SpanBatchProcessor {
         // Uploads and caches are isolated by the full immutable scope and token provider.
         let mut groups: IndexMap<(CredentialScope, Credential), CredentialGroup> = IndexMap::new();
         for cmd in cmds {
-            let SubmitCommand { scope, credential, item } = cmd;
+            let SubmitCommand {
+                scope,
+                credential,
+                item,
+            } = cmd;
             match item {
                 QueuedItem::Span {
                     payload,
@@ -245,10 +250,7 @@ impl SpanBatchProcessor {
         }
 
         for ((scope, credential), group) in groups {
-            let CredentialGroup {
-                spans,
-                rows,
-            } = group;
+            let CredentialGroup { spans, rows } = group;
             // Tokens from a provider are fetched now, so rows that waited in the
             // queue still go out with a current token.
             let token = match credential.token(&scope).await {
@@ -341,9 +343,12 @@ impl SpanBatchProcessor {
         scope: CredentialScope,
         credential: Credential,
     ) -> &'a mut CredentialGroup {
-        groups.entry((scope, credential)).or_insert_with(|| CredentialGroup {
-            spans: Vec::new(), rows: Vec::new(),
-        })
+        groups
+            .entry((scope, credential))
+            .or_insert_with(|| CredentialGroup {
+                spans: Vec::new(),
+                rows: Vec::new(),
+            })
     }
 
     /// Unwrap a chunk's serialization result, counting its rows as dropped on failure.
@@ -864,8 +869,7 @@ impl LogQueue {
             last_drop_log_time: AtomicU64::new(0),
             config: config.clone(),
         });
-        let processor =
-            SpanBatchProcessor::new(config, drops, client);
+        let processor = SpanBatchProcessor::new(config, drops, client);
         let writes = WriteService::new(
             capacity,
             tokio::runtime::Handle::current(),
@@ -913,15 +917,33 @@ impl LogQueue {
     }
 
     /// Submit each raw row into the same bounded delivery queue as spans.
-    pub(crate) fn submit_rows(&self, scope: CredentialScope, rows: impl IntoIterator<Item = Map<String, Value>>) {
+    pub(crate) fn submit_rows(
+        &self,
+        scope: CredentialScope,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+    ) {
         self.submit_rows_with(scope, Credential::Token, rows);
     }
-    pub(crate) fn submit_rows_with_provider(&self, provider: Arc<dyn TokenProvider>, scope: CredentialScope, rows: impl IntoIterator<Item = Map<String, Value>>) {
+    pub(crate) fn submit_rows_with_provider(
+        &self,
+        provider: Arc<dyn TokenProvider>,
+        scope: CredentialScope,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+    ) {
         self.submit_rows_with(scope, Credential::Provider(provider), rows);
     }
-    fn submit_rows_with(&self, scope: CredentialScope, credential: Credential, rows: impl IntoIterator<Item = Map<String, Value>>) {
+    fn submit_rows_with(
+        &self,
+        scope: CredentialScope,
+        credential: Credential,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+    ) {
         for row in rows {
-            self.enqueue(SubmitCommand { scope: scope.clone(), credential: credential.clone(), item: QueuedItem::Row { row } });
+            self.enqueue(SubmitCommand {
+                scope: scope.clone(),
+                credential: credential.clone(),
+                item: QueuedItem::Row { row },
+            });
         }
     }
 
