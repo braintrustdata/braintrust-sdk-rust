@@ -21,24 +21,25 @@ struct OrgKey {
     name: Option<String>,
 }
 
+/// One delivery partition. Each has at most one job in flight, so a destination
+/// that is retrying or cooling down never delays another partition's uploads.
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct Key {
     route: OrgKey,
+    /// The organization name sent with requests, even when `route.id` is known.
+    org_name: Option<String>,
+    destination: Destination,
+    credential: Credential,
     policy: super::config::LogQueueConfig,
     transport: u64,
     app_url: String,
     raw: bool,
-    credential: Credential,
-    org: String,
-    org_name: Option<String>,
-    destination: Destination,
 }
 struct Entry {
     core: Arc<LogQueueCore>,
     command: SubmitCommand,
     sequence: u64,
     bytes: usize,
-    ready: bool,
 }
 type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
 struct Record {
@@ -65,7 +66,6 @@ pub(crate) struct Engine {
     intake: Mutex<Intake>,
     wake: Notify,
     cancellations: Notify,
-    automatic: bool,
 }
 impl Engine {
     pub fn new(config: ServiceConfig) -> Self {
@@ -74,14 +74,7 @@ impl Engine {
             intake: Mutex::new(Intake::default()),
             wake: Notify::new(),
             cancellations: Notify::new(),
-            automatic: true,
         }
-    }
-    #[cfg(test)]
-    fn manual(config: ServiceConfig) -> Self {
-        let mut engine = Self::new(config);
-        engine.automatic = false;
-        engine
     }
     pub fn submit(
         &self,
@@ -172,14 +165,13 @@ impl Engine {
             *intake.destination_rows.entry(destination_key).or_default() += 1;
             let key = Key {
                 route,
+                org_name,
+                destination,
+                credential,
                 policy: core.config.clone(),
                 transport: core.client.identity,
                 app_url: core.app_url.to_string(),
                 raw: command.is_raw(),
-                credential,
-                org,
-                org_name,
-                destination,
             };
             results.push(Ok(()));
             intake.records.insert(
@@ -192,13 +184,11 @@ impl Engine {
                     sender,
                 },
             );
-            let ready = self.automatic;
             intake.partitions.entry(key).or_default().push_back(Entry {
                 core: core.clone(),
                 command,
                 sequence,
                 bytes,
-                ready,
             });
             intake.rows += 1;
             intake.bytes = intake.bytes.saturating_add(bytes);
@@ -210,31 +200,17 @@ impl Engine {
                 let _ = sender.send(Err(error.into()));
             }
         }
-        if self.automatic {
-            self.wake.notify_one();
-        }
+        self.wake.notify_one();
         results
     }
+    /// Delivery is continuous, so a barrier only observes work accepted before it.
     pub fn barrier(
         &self,
         scope: &Arc<Observation>,
         checked: bool,
     ) -> Completion<FlushReport, FlushError> {
-        let mut intake = self.intake.lock().unwrap();
-        let completion = scope.barrier(intake.sequence, checked, false);
-        for entries in intake.partitions.values_mut() {
-            for entry in entries {
-                if entry.core.observation.includes(scope) {
-                    entry.ready = true;
-                }
-            }
-        }
-        drop(intake);
-        self.wake.notify_one();
-        completion
-    }
-    pub fn activate(&self, scope: &Arc<Observation>) {
-        drop(self.barrier(scope, false));
+        let intake = self.intake.lock().unwrap();
+        scope.barrier(intake.sequence, checked, false)
     }
     fn retire(intake: &mut Intake, sequence: u64) -> Option<Record> {
         let record = intake.records.remove(&sequence)?;
@@ -342,47 +318,22 @@ impl Engine {
         self.cancellations.notify_waiters();
         self.wake.notify_one();
     }
+    /// Start one job per idle partition. Request fairness across organizations
+    /// and destinations is the scheduler's responsibility, not job order.
     fn take_jobs(&self) -> Vec<(Key, Vec<Entry>)> {
         let mut intake = self.intake.lock().unwrap();
-        let mut by_org: IndexMap<String, VecDeque<(Key, Vec<Entry>)>> = IndexMap::new();
-        let keys: Vec<_> = intake.partitions.keys().cloned().collect();
-        for key in keys {
-            if intake.active.contains(&key) {
-                continue;
-            }
-            let entries = intake.partitions.get_mut(&key).unwrap();
-            // An unflushed checked scope must not sit ahead of another scope's barrier.
-            let mut ready = Vec::new();
-            let queued = std::mem::take(entries);
-            for entry in queued {
-                if entry.ready {
-                    ready.push(entry);
-                } else {
-                    entries.push_back(entry);
-                }
-            }
-            if !ready.is_empty() {
-                by_org
-                    .entry(key.org.clone())
-                    .or_default()
-                    .push_back((key, ready));
-            }
-        }
-        for queue in by_org.values() {
-            for (key, _) in queue {
-                intake.active.insert(key.clone());
-            }
-        }
-        intake.partitions.retain(|_, entries| !entries.is_empty());
+        let Intake {
+            partitions, active, ..
+        } = &mut *intake;
         let mut jobs = Vec::new();
-        while !by_org.is_empty() {
-            for queue in by_org.values_mut() {
-                if let Some(job) = queue.pop_front() {
-                    jobs.push(job);
-                }
+        partitions.retain(|key, entries| {
+            if active.contains(key) {
+                return true;
             }
-            by_org.retain(|_, queue| !queue.is_empty());
-        }
+            active.insert(key.clone());
+            jobs.push((key.clone(), Vec::from(std::mem::take(entries))));
+            false
+        });
         jobs
     }
     async fn process_job(self: Arc<Self>, key: Key, entries: Vec<Entry>) {
@@ -399,7 +350,7 @@ impl Engine {
         // Permit covers preparation only; uploads acquire attempt permits separately.
         let request_scope = crate::scheduler::Scope {
             endpoint: core.endpoint(),
-            org: key.org.clone(),
+            org: key.route.id.clone(),
             destination: key.destination.clone(),
         };
         let work = std::panic::AssertUnwindSafe(
@@ -409,11 +360,14 @@ impl Engine {
         let cancelled = async {
             loop {
                 let wake = engine.cancellations.notified();
-                if tickets
-                    .iter()
-                    .all(|(seq, _, _)| !engine.intake.lock().unwrap().records.contains_key(seq))
                 {
-                    return;
+                    let intake = engine.intake.lock().unwrap();
+                    if tickets
+                        .iter()
+                        .all(|(seq, _, _)| !intake.records.contains_key(seq))
+                    {
+                        return;
+                    }
                 }
                 wake.await;
             }
@@ -491,7 +445,7 @@ mod tests {
     }
     #[test]
     fn global_limits_include_buffered_scopes_and_reject_only_incoming_rows() {
-        let engine = Engine::manual(ServiceConfig::builder().max_rows(2).build());
+        let engine = Engine::new(ServiceConfig::builder().max_rows(2).build());
         let a = queue();
         let b = queue();
         engine.submit_many(
@@ -507,12 +461,12 @@ mod tests {
     }
     #[test]
     fn byte_limit_and_client_limit_are_independent() {
-        let engine = Engine::manual(ServiceConfig::builder().max_bytes(1).build());
+        let engine = Engine::new(ServiceConfig::builder().max_bytes(1).build());
         let a = queue();
         engine.submit(a.core.clone(), SubmitCommand::test_row("oversized"));
         assert_eq!(engine.intake.lock().unwrap().bytes, 0);
         assert_eq!(a.dropped_rows().queue_full, 1);
-        let engine = Engine::manual(ServiceConfig::builder().max_client_rows(1).build());
+        let engine = Engine::new(ServiceConfig::builder().max_client_rows(1).build());
         let child = a.child();
         engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
         engine.submit(child.core.clone(), SubmitCommand::test_row("child"));
@@ -523,9 +477,9 @@ mod tests {
         assert_eq!(b.dropped_rows().queue_full, 0);
         assert_eq!(engine.intake.lock().unwrap().rows, 2);
     }
-    #[test]
-    fn checked_barriers_activate_only_work_through_their_cutoff() {
-        let engine = Engine::manual(ServiceConfig::default());
+    #[tokio::test]
+    async fn barriers_cover_only_work_accepted_before_them() {
+        let engine = Engine::new(ServiceConfig::default());
         let a = queue();
         let b = queue();
         engine.submit(a.core.clone(), SubmitCommand::test_row("covered"));
@@ -534,15 +488,15 @@ mod tests {
         engine.submit(b.core.clone(), SubmitCommand::test_row("unrelated"));
         let jobs = engine.take_jobs();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].1.len(), 1);
-        assert_eq!(engine.intake.lock().unwrap().partitions.len(), 1);
-        drop(barrier);
+        assert_eq!(jobs[0].1.len(), 3);
+        assert!(engine.take_jobs().is_empty(), "the partition is in flight");
         a.core.observation.finish(jobs[0].1[0].sequence, None, 0, 0);
-        assert!(a.core.observation.state.lock().unwrap().waiters.is_empty());
+        assert_eq!(barrier.await.unwrap().delivered(), 1);
+        assert_eq!(a.core.observation.len(), 1);
     }
     #[test]
     fn org_and_destination_budgets_are_shared_across_facades() {
-        let engine = Engine::manual(
+        let engine = Engine::new(
             ServiceConfig::builder()
                 .max_org_rows(2)
                 .max_destination_rows(1)
@@ -576,7 +530,7 @@ mod tests {
 
     #[test]
     fn accepting_work_freezes_routing_before_later_login_discovery() {
-        let engine = Engine::manual(ServiceConfig::default());
+        let engine = Engine::new(ServiceConfig::default());
         let queue = queue();
         engine.submit(queue.core.clone(), SubmitCommand::test_row("first"));
         queue.core.login_state.set(
@@ -586,7 +540,6 @@ mod tests {
             "http://discovered.example".into(),
             "http://localhost".into(),
         );
-        engine.activate(&queue.core.observation);
         let jobs = engine.take_jobs();
         assert_eq!(jobs[0].0.route.endpoint, "http://localhost/");
         let job = jobs[0].1[0]
@@ -623,7 +576,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::manual(ServiceConfig::default()));
+        let engine = Arc::new(Engine::new(ServiceConfig::default()));
         let a = http_queue(&server, 100);
         let b = http_queue(&server, 100);
         engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
@@ -648,34 +601,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unflushed_compatible_scope_cannot_block_another_barrier() {
-        use wiremock::{
-            matchers::{method, path},
-            Mock, MockServer, ResponseTemplate,
-        };
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/logs3"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-            .mount(&server)
-            .await;
-        let engine = Arc::new(Engine::manual(ServiceConfig::default()));
-        let blocked = http_queue(&server, 100);
-        let ready = http_queue(&server, 100);
-        engine.submit(blocked.core.clone(), SubmitCommand::test_row("not-flushed"));
-        engine.submit(ready.core.clone(), SubmitCommand::test_row("ready"));
-        let barrier = engine.barrier(&ready.core.observation, true);
-        let jobs = engine.take_jobs();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].1.len(), 1);
-        for (key, entries) in jobs {
-            engine.clone().process_job(key, entries).await;
-        }
-        barrier.await.unwrap();
-        assert_eq!(blocked.core.observation.len(), 1);
-    }
-
-    #[tokio::test]
     async fn shared_split_failures_report_partial_delivery_to_each_owner() {
         use wiremock::{
             matchers::{method, path},
@@ -696,7 +621,7 @@ mod tests {
             })
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::manual(ServiceConfig::default()));
+        let engine = Arc::new(Engine::new(ServiceConfig::default()));
         let a = http_queue(&server, 100);
         let b = http_queue(&server, 100);
         engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
@@ -731,7 +656,7 @@ mod tests {
             })
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::manual(ServiceConfig::default()));
+        let engine = Arc::new(Engine::new(ServiceConfig::default()));
         let a = http_queue(&server, 1);
         let b = http_queue(&server, 1);
         engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
@@ -759,7 +684,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::manual(ServiceConfig::default()));
+        let engine = Arc::new(Engine::new(ServiceConfig::default()));
         let root = http_queue(&server, 100);
         let a = root.child();
         let b = root.child();
@@ -780,11 +705,82 @@ mod tests {
         assert_eq!(b.dropped_rows().upload_failed, 1);
         assert_eq!(root.dropped_rows().upload_failed, 1);
     }
+    #[tokio::test]
+    async fn a_failed_project_registration_is_attempted_once_per_job() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/project/register"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let queue = http_queue(&server, 100);
+        for i in 0..20 {
+            engine.submit(
+                queue.core.clone(),
+                SubmitCommand::test_named_span(&format!("row-{i}"), "forbidden"),
+            );
+        }
+        let flush = engine.barrier(&queue.core.observation, true);
+        let jobs = engine.take_jobs();
+        assert_eq!(jobs.len(), 1);
+        for (key, entries) in jobs {
+            engine.clone().process_job(key, entries).await;
+        }
+        assert!(flush.await.is_err());
+        assert_eq!(queue.dropped_rows().preparation_failed, 20);
+    }
+
+    #[tokio::test]
+    async fn transient_project_registration_failures_are_retried() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/project/register"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/project/register"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"project":{"id":"resolved"}})),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let queue = http_queue(&server, 100);
+        engine.submit(
+            queue.core.clone(),
+            SubmitCommand::test_named_span("row", "flaky-project"),
+        );
+        let flush = engine.barrier(&queue.core.observation, true);
+        for (key, entries) in engine.take_jobs() {
+            engine.clone().process_job(key, entries).await;
+        }
+        assert_eq!(flush.await.unwrap().delivered(), 1);
+    }
+
     #[test]
     fn racing_producers_share_one_bounded_admission_budget() {
-        let engine = Arc::new(Engine::manual(
-            ServiceConfig::builder().max_rows(17).build(),
-        ));
+        let engine = Arc::new(Engine::new(ServiceConfig::builder().max_rows(17).build()));
         let queue = queue();
         std::thread::scope(|threads| {
             for _ in 0..8 {
@@ -835,7 +831,7 @@ mod tests {
             .mount(&server)
             .await;
         let queue = http_queue(&server, 1);
-        let engine = Arc::new(Engine::manual(ServiceConfig::builder().max_rows(1).build()));
+        let engine = Arc::new(Engine::new(ServiceConfig::builder().max_rows(1).build()));
         let write = engine.submit(queue.core.clone(), SubmitCommand::test_row("first"));
         let rejected = engine.submit(queue.core.clone(), SubmitCommand::test_row("rejected"));
         assert!(matches!(

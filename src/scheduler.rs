@@ -58,7 +58,15 @@ impl Scheduler {
             let mut cooldowns = self.cooldowns.lock().unwrap();
             cooldowns.retain(|_, until| *until > tokio::time::Instant::now());
             if cooldowns.len() >= 256 && !cooldowns.contains_key(&scope) {
-                return;
+                // Dropping the new pause would let a throttled destination retry
+                // immediately; forget the pause closest to expiring instead.
+                if let Some(soonest) = cooldowns
+                    .iter()
+                    .min_by_key(|(_, until)| **until)
+                    .map(|(key, _)| key.clone())
+                {
+                    cooldowns.remove(&soonest);
+                }
             }
             let until = tokio::time::Instant::now() + delay;
             cooldowns
@@ -194,6 +202,23 @@ mod tests {
         drop(scheduler.acquire(1).await);
         assert_eq!(scheduler.state.lock().unwrap().active, 0);
         assert!(scheduler.state.lock().unwrap().orgs.is_empty());
+    }
+    #[tokio::test]
+    async fn a_full_cooldown_table_still_pauses_newly_throttled_destinations() {
+        let scheduler = Scheduler::new(1);
+        for i in 0..256 {
+            SCOPE.sync_scope(scope("org", &format!("p{i}")), || {
+                scheduler.cool_down(Duration::from_secs(60 + i))
+            });
+        }
+        let throttled = scope("org", "new");
+        SCOPE.sync_scope(throttled.clone(), || {
+            scheduler.cool_down(Duration::from_secs(30))
+        });
+        assert!(scheduler.deadline(Some(&throttled)).is_some());
+        // The pause closest to expiring made room.
+        assert!(scheduler.deadline(Some(&scope("org", "p0"))).is_none());
+        assert_eq!(scheduler.cooldowns.lock().unwrap().len(), 256);
     }
     #[tokio::test]
     async fn byte_deficits_allow_small_destinations_to_progress_before_large_requests() {

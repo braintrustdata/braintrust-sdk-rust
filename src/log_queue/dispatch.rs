@@ -69,8 +69,8 @@ impl LogQueueCore {
                     token,
                     org_name,
                 )?;
-                let _permit = service.attempts.acquire(1).await;
-                let version = crate::http::api_result(api.version().await)
+                let policy = crate::internal::upload::UploadPolicy::Queue { retries: 0 };
+                let version = crate::internal::upload::scheduled(policy, || api.version())
                     .await?
                     .into_inner();
                 let bytes = version.logs3_payload_max_bytes.filter(|n| *n > 0);
@@ -110,6 +110,18 @@ impl LogQueueCore {
             .acquire()
             .await
             .expect("service stays open");
+        // One token serves the whole job: preparation, registration, and uploads.
+        let token = match credential.token().await {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(%error, "failed to get upload token, dropping rows");
+                for i in 0..commands.len() {
+                    report.failed(vec![i], &error, false);
+                }
+                return report;
+            }
+        };
+        let mut failures = super::prepare::ProjectFailures::new();
         let mut spans: IndexMap<RowKey, (Logs3Row, Vec<usize>)> = IndexMap::new();
         let mut raw = Vec::new();
         for (index, command) in commands.into_iter().enumerate() {
@@ -121,13 +133,9 @@ impl LogQueueCore {
                     payload,
                     parent_info,
                 } => {
-                    let result = tokio::time::timeout(
-                        service.config.preparation_timeout,
-                        self.prepare_span(&credential, payload, parent_info),
-                    )
-                    .await
-                    .map_err(|_| anyhow::anyhow!("destination preparation timed out"))
-                    .and_then(std::convert::identity);
+                    let result = self
+                        .prepare_span(&token, payload, parent_info, &mut failures)
+                        .await;
                     match result {
                         Ok(row) => {
                             let key = RowKey::from_row(&row);
@@ -155,26 +163,6 @@ impl LogQueueCore {
         if spans.is_empty() && raw.is_empty() {
             return report;
         }
-        let permit = service
-            .preparations
-            .acquire()
-            .await
-            .expect("service stays open");
-        let token = credential.token().await;
-        drop(permit);
-        let token = match token {
-            Ok(token) => token,
-            Err(error) => {
-                tracing::warn!(%error, "failed to get upload token, dropping rows");
-                for (_, submissions) in spans.into_values() {
-                    report.failed(submissions, &error, false);
-                }
-                for (index, _) in raw {
-                    report.failed(vec![index], &error, false);
-                }
-                return report;
-            }
-        };
         let (max_request_size, overflow) = self
             .get_version_info(&api_url, &token, org_name.as_deref(), &org_id)
             .await;

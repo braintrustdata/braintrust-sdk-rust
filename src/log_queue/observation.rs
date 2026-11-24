@@ -11,19 +11,24 @@ use tokio::sync::oneshot;
 pub(crate) struct DeliveryError {
     shared: Arc<crate::DeliveryError>,
 }
+/// Copy an error for another owner, keeping API status codes inspectable.
+pub(crate) fn duplicate_error(error: &anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<BraintrustError>() {
+        Some(BraintrustError::Api { status, message }) => {
+            anyhow::Error::from(BraintrustError::Api {
+                status: *status,
+                message: message.clone(),
+            })
+        }
+        _ => anyhow::anyhow!(error.to_string()),
+    }
+}
 impl DeliveryError {
     pub(crate) fn from_error(error: &anyhow::Error) -> Self {
-        let source = match error.downcast_ref::<BraintrustError>() {
-            Some(BraintrustError::Api { status, message }) => {
-                anyhow::Error::from(BraintrustError::Api {
-                    status: *status,
-                    message: message.clone(),
-                })
-            }
-            _ => anyhow::anyhow!(error.to_string()),
-        };
         Self {
-            shared: Arc::new(crate::DeliveryError { source }),
+            shared: Arc::new(crate::DeliveryError {
+                source: duplicate_error(error),
+            }),
         }
     }
     pub fn write_error(&self) -> WriteError {

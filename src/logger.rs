@@ -325,8 +325,8 @@ impl BraintrustClientBuilder {
     }
 
     /// Legacy worker command capacity, retained for source compatibility.
-    /// The shared service coalesces wakeups. Use `with_queue_max_size` and
-    /// `with_queue_max_size` to limit retained rows.
+    /// The shared service coalesces wakeups. Use `with_queue_max_size` or
+    /// [`crate::ServiceConfig`] to limit retained rows.
     pub fn queue_size(mut self, size: usize) -> Self {
         self.queue_size = size;
         self
@@ -1192,13 +1192,13 @@ impl BraintrustClient {
 
     async fn experiment_builder_inner(&self) -> Result<ExperimentBuilder<Self>> {
         let state = self.wait_for_login().await?;
-        let mut builder = self
-            .experiment_builder_with_credentials(state.api_key().unwrap(), state.org_id().unwrap());
+        let (Some(api_key), Some(org_id)) = (state.api_key(), state.org_id()) else {
+            return Err(BraintrustError::InvalidConfig("Not logged in".into()));
+        };
+        // The credentials builder already applies this facade's default project.
+        let mut builder = self.experiment_builder_with_credentials(api_key, org_id);
         if let Some(name) = state.org_name() {
             builder = builder.org_name(name);
-        }
-        if let Some(project) = &self.inner.default_project {
-            builder = builder.project_name(project);
         }
         Ok(builder)
     }
@@ -2417,7 +2417,7 @@ mod tests {
             .into_iter()
             .filter(|request| request.url.path() == "/logs3")
             .collect();
-        assert!(state.calls.load(Ordering::SeqCst) >= uploads.len());
+        assert_eq!(state.calls.load(Ordering::SeqCst), uploads.len());
         let mut ids: Vec<String> = uploads
             .iter()
             .flat_map(|request| {

@@ -1,31 +1,26 @@
 //! Resolve resource destinations without borrowing global login state from another facade.
-use super::queue::{Credential, LogQueueCore};
+use super::queue::LogQueueCore;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use chrono::Utc;
+use std::collections::HashMap;
 use url::Url;
 
-impl LogQueueCore {
-    /// Prepare a span with its credential's token, which project registration uses.
-    pub(super) async fn prepare_span(
-        &self,
-        credential: &Credential,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) -> std::result::Result<Logs3Row, anyhow::Error> {
-        let token = credential.token().await?;
-        self.prepare_row(&token, payload, parent_info).await
-    }
+/// Project names that failed to resolve during one delivery job. Later spans for
+/// the same name fail with the same error instead of repeating the request.
+pub(super) type ProjectFailures = HashMap<String, anyhow::Error>;
 
-    /// Prepare a `Logs3Row` from a submit command's token, payload, and parent info.
+impl LogQueueCore {
+    /// Prepare a `Logs3Row` from the job's token, payload, and parent info.
     ///
     /// Resolves the destination (including calling the project registration API
     /// if needed) and builds the complete row for the flush pipeline.
-    async fn prepare_row(
+    pub(super) async fn prepare_span(
         &self,
         token: &str,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
+        failures: &mut ProjectFailures,
     ) -> std::result::Result<Logs3Row, anyhow::Error> {
         let SpanPayload {
             row_id,
@@ -55,6 +50,7 @@ impl LogQueueCore {
                     &org_id,
                     org_name.as_deref(),
                     &span_components,
+                    failures,
                 )
                 .await?;
             let root_span_id = span_components
@@ -93,7 +89,7 @@ impl LogQueueCore {
         let project_id = if parent_info.is_none() {
             if let Some(ref pn) = project_name {
                 Some(
-                    self.ensure_project_id(token, &org_id, org_name.as_deref(), pn)
+                    self.ensure_project_id(token, &org_id, org_name.as_deref(), pn, failures)
                         .await?,
                 )
             } else {
@@ -123,7 +119,7 @@ impl LogQueueCore {
             ),
             Some(ParentSpanInfo::ProjectName { project_name }) => {
                 let proj_id = self
-                    .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name)
+                    .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name, failures)
                     .await?;
                 (span_id.clone(), None, LogDestination::project_logs(proj_id))
             }
@@ -166,6 +162,7 @@ impl LogQueueCore {
                                         &org_id,
                                         org_name.as_deref(),
                                         &project_name,
+                                        failures,
                                     )
                                     .await?;
                                 LogDestination::project_logs(project_id)
@@ -221,6 +218,7 @@ impl LogQueueCore {
         org_id: &str,
         org_name: Option<&str>,
         span_components: &crate::span_components::SpanComponents,
+        failures: &mut ProjectFailures,
     ) -> std::result::Result<LogDestination, anyhow::Error> {
         match span_components.object_type {
             SpanObjectType::Experiment => span_components
@@ -234,7 +232,7 @@ impl LogQueueCore {
                 }
                 Some(ProjectLogsIdentifier::ProjectName(project_name)) => {
                     let project_id = self
-                        .ensure_project_id(token, org_id, org_name, &project_name)
+                        .ensure_project_id(token, org_id, org_name, &project_name, failures)
                         .await?;
                     Ok(LogDestination::project_logs(project_id))
                 }
@@ -261,7 +259,11 @@ impl LogQueueCore {
         org_id: &str,
         org_name: Option<&str>,
         project_name: &str,
+        failures: &mut ProjectFailures,
     ) -> std::result::Result<String, anyhow::Error> {
+        if let Some(error) = failures.get(project_name) {
+            return Err(super::observation::duplicate_error(error));
+        }
         let app_url_key = self
             .login_state
             .app_url()
@@ -278,34 +280,50 @@ impl LogQueueCore {
             project: project_name.into(),
         };
         let entry = crate::service::global()?.projects.entry(key);
-        entry
-            .get_or_try_init(|| async {
-                // Prefer the login-state control-plane URL (logged-in path), falling back
-                // to the client-configured URL for per-request-credential callers.
-                let app_url = match self.login_state.app_url() {
-                    Some(app_url_str) => Url::parse(&app_url_str)
-                        .map_err(|e| anyhow::anyhow!("invalid app URL: {e}"))?,
-                    None => self.app_url.clone(),
-                };
-                let mut request = crate::api::ProjectRegisterRequest::new(project_name.to_owned());
-                request.org_id = (!org_id.is_empty()).then(|| org_id.to_owned());
-                request.org_name = org_name.map(str::to_owned);
+        let timeout = crate::service::global()?.config.preparation_timeout;
+        let resolve = entry.get_or_try_init(|| async {
+            // Prefer the login-state control-plane URL (logged-in path), falling back
+            // to the client-configured URL for per-request-credential callers.
+            let app_url = match self.login_state.app_url() {
+                Some(app_url_str) => {
+                    Url::parse(&app_url_str).map_err(|e| anyhow::anyhow!("invalid app URL: {e}"))?
+                }
+                None => self.app_url.clone(),
+            };
+            let mut request = crate::api::ProjectRegisterRequest::new(project_name.to_owned());
+            request.org_id = (!org_id.is_empty()).then(|| org_id.to_owned());
+            request.org_name = org_name.map(str::to_owned);
 
-                let client = crate::http::api_client(
-                    &self.client,
-                    self.api_url.as_str(),
-                    app_url.as_str(),
-                    token,
-                    org_name,
-                )?;
-                let register_response =
-                    crate::http::api_result(client.register_project(&request).await)
-                        .await?
-                        .into_inner();
+            let client = crate::http::api_client(
+                &self.client,
+                self.api_url.as_str(),
+                app_url.as_str(),
+                token,
+                org_name,
+            )?;
+            // Registration shares the upload scheduler, so it waits out 429
+            // cooldowns, counts against request concurrency, and retries
+            // transient failures instead of dropping the span on the first one.
+            let policy = crate::internal::upload::UploadPolicy::Queue {
+                retries: self.config.num_retries(),
+            };
+            let register_response =
+                crate::internal::upload::scheduled(policy, || client.register_project(&request))
+                    .await?
+                    .into_inner();
 
-                Ok::<_, anyhow::Error>(register_response.project.id)
-            })
-            .await
-            .cloned()
+            Ok::<_, anyhow::Error>(register_response.project.id)
+        });
+        let result = match tokio::time::timeout(timeout, resolve).await {
+            Ok(result) => result.cloned(),
+            Err(_) => Err(anyhow::anyhow!("project registration timed out")),
+        };
+        if let Err(error) = &result {
+            failures.insert(
+                project_name.to_owned(),
+                super::observation::duplicate_error(error),
+            );
+        }
+        result
     }
 }

@@ -68,17 +68,33 @@ async fn attempt<T>(
 }
 
 /// Wait at least as long as the server asked, without retrying once the budget is exhausted.
+/// Every 429 pauses its scope, even when this request has no retries left, so
+/// other requests for the same destination do not repeat the rejected attempt.
 fn retry_delay(attempt: &Attempt, backoff: Option<Duration>) -> Option<Duration> {
-    let backoff = backoff?;
-    let delay = attempt
-        .retry_after
-        .map_or(backoff, |hint| hint.min(MAX_RETRY_AFTER).max(backoff));
+    let hint = attempt.retry_after.map(|hint| hint.min(MAX_RETRY_AFTER));
+    let delay = backoff.map(|backoff| hint.map_or(backoff, |hint| hint.max(backoff)));
     if matches!(attempt.error, BraintrustError::Api { status: 429, .. }) {
-        if let Ok(service) = crate::service::global() {
-            service.attempts.cool_down(delay);
+        if let (Ok(service), Some(pause)) = (crate::service::global(), delay.or(hint)) {
+            service.attempts.cool_down(pause);
         }
     }
-    Some(delay)
+    delay
+}
+
+/// Issue a non-upload request through the shared scheduler, honoring cooldowns,
+/// the request concurrency limit, and the given retry policy.
+pub(crate) async fn scheduled<T, F, Fut>(policy: UploadPolicy, mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<T, crate::api::Error<serde_json::Value>>>,
+{
+    policy
+        .budget()
+        .run(|| {
+            let request = operation();
+            async move { attempt(request.await).await }
+        })
+        .await
 }
 
 // Borrowing the iterator lets backon share retries across overflow stages and splits.

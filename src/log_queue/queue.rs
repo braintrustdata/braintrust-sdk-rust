@@ -475,6 +475,21 @@ impl SubmitCommand {
             },
         }
     }
+    #[cfg(test)]
+    pub(crate) fn test_named_span(row_id: &str, project_name: &str) -> Self {
+        let mut command = Self::test_span(false);
+        if let QueuedItem::Span {
+            payload,
+            parent_info,
+        } = &mut command.item
+        {
+            payload.row_id = row_id.into();
+            payload.span_id = row_id.into();
+            payload.project_name = Some(project_name.into());
+            *parent_info = None;
+        }
+        command
+    }
     pub(crate) fn partition(
         &self,
     ) -> (
@@ -668,17 +683,9 @@ impl LogQueue {
             .engine
             .shutdown(&self.core.observation, timeout)
     }
+    /// Delivery starts as soon as work is accepted; this only verifies the service.
     pub async fn trigger_flush_command(&self) -> Result<()> {
-        crate::service::global()?.activate(&self.core.observation);
+        crate::service::global()?;
         Ok(())
-    }
-}
-
-impl Drop for LogQueue {
-    fn drop(&mut self) {
-        // Never block a destructor or shut down machinery shared by other clients.
-        if let Ok(service) = crate::service::global() {
-            service.activate(&self.core.observation);
-        }
     }
 }
