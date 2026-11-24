@@ -2,6 +2,64 @@ use super::build_api_client;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::*;
+    use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn sends_client_identity_on_each_request() {
+        let agents = Arc::new(Mutex::new(Vec::new()));
+        let captured = agents.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = HttpServer::new(move || {
+            let captured = captured.clone();
+            App::new().route(
+                "/mcp",
+                web::post().to(move |req: HttpRequest, body: web::Json<Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push(
+                            req.headers()
+                                .get("user-agent")
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .to_owned(),
+                        );
+                        let result = match body["method"].as_str().unwrap() {
+                            "initialize" => json!({"protocolVersion": "2025-03-26"}),
+                            "notifications/initialized" => {
+                                return HttpResponse::Accepted().finish();
+                            }
+                            "tools/call" => json!({"content": []}),
+                            _ => panic!("unexpected request"),
+                        };
+                        HttpResponse::Ok()
+                            .json(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+                    }
+                }),
+            )
+        })
+        .workers(1)
+        .listen(listener)
+        .unwrap()
+        .run();
+        let handle = server.handle();
+        tokio::spawn(server);
+        let mut client = McpSession::new(&endpoint, "test-key", "bt", "1.2.3").unwrap();
+        client.initialize().await.unwrap();
+        client
+            .call_tool("send_feedback", json!({"feedback":"test"}))
+            .await
+            .unwrap();
+        assert_eq!(*agents.lock().unwrap(), vec!["bt/1.2.3"; 3]);
+        handle.stop(false).await;
+    }
+}
 const PROTOCOL_VERSION: &str = "2025-03-26";
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[non_exhaustive]
@@ -62,6 +120,7 @@ pub struct ToolResult {
 }
 pub struct McpSession {
     http: crate::Client,
+    user_agent: reqwest::header::HeaderValue,
     session_id: Option<String>,
     protocol_version: Option<String>,
     next_id: u64,
@@ -83,6 +142,10 @@ impl McpSession {
                 api_key,
                 std::time::Duration::from_secs(60),
             )?,
+            user_agent: reqwest::header::HeaderValue::from_str(&format!(
+                "{client_name}/{client_version}"
+            ))
+            .context("invalid MCP client name or version for User-Agent")?,
             session_id: None,
             protocol_version: None,
             next_id: 1,
@@ -197,6 +260,7 @@ impl McpSession {
         let mut request = self
             .http
             .api_request(reqwest::Method::POST, "")
+            .header(reqwest::header::USER_AGENT, self.user_agent.clone())
             .header(
                 reqwest::header::ACCEPT,
                 "application/json, text/event-stream",
