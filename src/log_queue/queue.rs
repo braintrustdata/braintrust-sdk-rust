@@ -1,6 +1,5 @@
 use super::config::LogQueueConfig;
 use super::http::save_payload_debug;
-use super::token_map::TokenMap;
 use crate::error::Result;
 use crate::logger::LoginState;
 use crate::span_components::ProjectLogsIdentifier;
@@ -48,8 +47,7 @@ impl std::fmt::Debug for Credential {
 
 impl Credential {
     pub(crate) fn token_value(token: String) -> Self {
-        static TOKENS: TokenMap = TokenMap::new();
-        Self::Token(TOKENS.get_or_insert(token))
+        Self::Token(Arc::from(token))
     }
 
     pub(crate) async fn token(&self) -> std::result::Result<Cow<'_, str>, anyhow::Error> {
