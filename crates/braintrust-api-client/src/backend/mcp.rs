@@ -120,7 +120,6 @@ pub struct ToolResult {
 }
 pub struct McpSession {
     http: crate::Client,
-    user_agent: reqwest::header::HeaderValue,
     session_id: Option<String>,
     protocol_version: Option<String>,
     next_id: u64,
@@ -142,10 +141,6 @@ impl McpSession {
                 api_key,
                 std::time::Duration::from_secs(60),
             )?,
-            user_agent: reqwest::header::HeaderValue::from_str(&format!(
-                "{client_name}/{client_version}"
-            ))
-            .context("invalid MCP client name or version for User-Agent")?,
             session_id: None,
             protocol_version: None,
             next_id: 1,
@@ -260,7 +255,10 @@ impl McpSession {
         let mut request = self
             .http
             .api_request(reqwest::Method::POST, "")
-            .header(reqwest::header::USER_AGENT, self.user_agent.clone())
+            .header(
+                reqwest::header::USER_AGENT,
+                format!("{}/{}", self.client_name, self.client_version),
+            )
             .header(
                 reqwest::header::ACCEPT,
                 "application/json, text/event-stream",
