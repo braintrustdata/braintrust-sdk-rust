@@ -2,6 +2,7 @@ mod completion;
 mod dataset;
 mod delivery;
 mod error;
+#[cfg(unix)]
 pub mod eval;
 mod experiments;
 mod extractors;
