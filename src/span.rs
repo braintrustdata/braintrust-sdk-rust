@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::log_queue::Credential;
 use crate::span_components::SpanComponents;
 use crate::types::{
     ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload, SpanType,
@@ -252,7 +253,12 @@ pub(crate) trait SpanSubmitter: Send + Sync {
     /// Submit a span payload for queuing (fire-and-forget).
     /// The payload is queued internally and processed by a background worker.
     /// Dropping is handled internally if the queue is full.
-    fn submit(&self, token: String, payload: SpanPayload, parent_info: Option<ParentSpanInfo>);
+    fn submit(
+        &self,
+        credential: Credential,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    );
 
     /// Flush all queued span data through to the server.
     async fn flush(&self) -> Result<()>;
@@ -265,7 +271,7 @@ pub(crate) trait SpanSubmitter: Send + Sync {
 #[allow(private_bounds)]
 pub struct SpanBuilder<S: SpanSubmitter> {
     submitter: Arc<S>,
-    token: String,
+    credential: Credential,
     org_id: String,
     org_name: Option<String>,
     project_name: Option<String>,
@@ -284,7 +290,7 @@ impl<S: SpanSubmitter> Clone for SpanBuilder<S> {
     fn clone(&self) -> Self {
         Self {
             submitter: Arc::clone(&self.submitter),
-            token: self.token.clone(),
+            credential: self.credential.clone(),
             org_id: self.org_id.clone(),
             org_name: self.org_name.clone(),
             project_name: self.project_name.clone(),
@@ -376,9 +382,17 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
         token: impl Into<String>,
         org_id: impl Into<String>,
     ) -> Self {
+        Self::new_with_credential(submitter, Credential::Token(token.into()), org_id)
+    }
+
+    pub(crate) fn new_with_credential(
+        submitter: Arc<S>,
+        credential: Credential,
+        org_id: impl Into<String>,
+    ) -> Self {
         Self {
             submitter,
-            token: token.into(),
+            credential,
             org_id: org_id.into(),
             org_name: None,
             project_name: None,
@@ -518,7 +532,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
 
         SpanHandle {
             submitter: Arc::clone(&self.submitter),
-            token: self.token,
+            credential: self.credential,
             parent_info: self.parent_info,
             row_id: row_id.clone(),
             inner: Arc::new(Mutex::new(SpanData {
@@ -544,7 +558,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
 #[allow(private_bounds)]
 pub struct SpanHandle<S: SpanSubmitter> {
     submitter: Arc<S>,
-    token: String,
+    credential: Credential,
     parent_info: Option<ParentSpanInfo>,
     /// Stable identifier set at creation, accessible without locking.
     row_id: String,
@@ -555,7 +569,7 @@ impl<S: SpanSubmitter> Clone for SpanHandle<S> {
     fn clone(&self) -> Self {
         Self {
             submitter: Arc::clone(&self.submitter),
-            token: self.token.clone(),
+            credential: self.credential.clone(),
             parent_info: self.parent_info.clone(),
             row_id: self.row_id.clone(),
             inner: Arc::clone(&self.inner),
@@ -584,7 +598,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, self.parent_info.clone());
+            .submit(self.credential.clone(), payload, self.parent_info.clone());
     }
 
     /// Flush all queued span data through to Braintrust.
@@ -622,7 +636,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         };
 
         self.submitter
-            .submit(self.token.clone(), payload, self.parent_info.clone());
+            .submit(self.credential.clone(), payload, self.parent_info.clone());
         end_time
     }
 

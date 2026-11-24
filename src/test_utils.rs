@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::error::Result;
+use crate::log_queue::Credential;
 use crate::span::{SpanBuilder, SpanHandle};
 use crate::types::{ParentSpanInfo, SpanPayload};
 
@@ -58,7 +59,15 @@ impl MockBraintrustClient {
 
 #[async_trait]
 impl SpanSubmitter for MockBraintrustClient {
-    fn submit(&self, token: String, payload: SpanPayload, parent_info: Option<ParentSpanInfo>) {
+    fn submit(
+        &self,
+        credential: Credential,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    ) {
+        let Credential::Token(token) = credential else {
+            panic!("expected a static test credential");
+        };
         self.collector.push(CapturedSpan {
             token,
             payload,

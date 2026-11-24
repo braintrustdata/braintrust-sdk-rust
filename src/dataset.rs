@@ -37,6 +37,7 @@ use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::log_queue::Credential;
 use crate::span::SpanSubmitter;
 use crate::types::{ParentSpanInfo, SpanPayload};
 
@@ -699,8 +700,11 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                 object_id: metadata.dataset_id.clone(),
             };
 
-            self.submitter
-                .submit(self.token.clone(), payload, Some(parent_info));
+            self.submitter.submit(
+                Credential::Token(self.token.clone()),
+                payload,
+                Some(parent_info),
+            );
         }
 
         Ok(())

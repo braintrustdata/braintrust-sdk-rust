@@ -28,7 +28,8 @@ use url::Url;
 /// Supplies the bearer token for queued uploads when they are sent.
 ///
 /// The queue calls [`TokenProvider::token`] once per upload group each time it
-/// flushes, so cache tokens that are expensive to mint, and bound how long a call
+/// flushes. Resolving an uncached project name can also request a token.
+/// Cache tokens that are expensive to mint, and bound how long a call
 /// can take: a call that never returns stalls this client's uploads. When it
 /// returns an error, the rows waiting on it are dropped and counted in
 /// [`DroppedRows::upload_failed`].
@@ -40,11 +41,20 @@ pub trait TokenProvider: Send + Sync {
 
 /// How a queued item authenticates its upload.
 #[derive(Clone)]
-enum Credential {
+pub(crate) enum Credential {
     Token(String),
     /// Fetched when the item is sent. Items share a credential only if they share
     /// the provider `Arc`.
     Provider(Arc<dyn TokenProvider>),
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Token(_) => "Token([redacted])",
+            Self::Provider(_) => "TokenProvider",
+        })
+    }
 }
 
 impl Credential {
@@ -420,7 +430,7 @@ impl LogQueueCore {
                 QueuedItem::Span {
                     payload,
                     parent_info,
-                } => match self.prepare_span(&credential, payload, parent_info).await {
+                } => match self.prepare_row(&credential, payload, parent_info).await {
                     Ok(row) => {
                         let org_id = row.org_id.clone();
                         let org_name = row.org_name.clone();
@@ -650,24 +660,13 @@ impl LogQueueCore {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// Prepare a span with its credential's token, which project registration uses.
-    async fn prepare_span(
-        &self,
-        credential: &Credential,
-        payload: SpanPayload,
-        parent_info: Option<ParentSpanInfo>,
-    ) -> std::result::Result<Logs3Row, anyhow::Error> {
-        let token = credential.token().await?;
-        self.prepare_row(&token, payload, parent_info).await
-    }
-
     /// Prepare a `Logs3Row` from a submit command's token, payload, and parent info.
     ///
     /// Resolves the destination (including calling the project registration API
     /// if needed) and builds the complete row for the flush pipeline.
     async fn prepare_row(
         &self,
-        token: &str,
+        credential: &Credential,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> std::result::Result<Logs3Row, anyhow::Error> {
@@ -695,7 +694,7 @@ impl LogQueueCore {
         if let Some(span_components) = span_components {
             let destination = self
                 .destination_from_span_components(
-                    token,
+                    credential,
                     &org_id,
                     org_name.as_deref(),
                     &span_components,
@@ -736,7 +735,7 @@ impl LogQueueCore {
 
         let project_id = if let Some(ref pn) = project_name {
             Some(
-                self.ensure_project_id(token, &org_id, org_name.as_deref(), pn)
+                self.ensure_project_id(credential, &org_id, org_name.as_deref(), pn)
                     .await?,
             )
         } else {
@@ -763,7 +762,7 @@ impl LogQueueCore {
             ),
             Some(ParentSpanInfo::ProjectName { project_name }) => {
                 let proj_id = self
-                    .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name)
+                    .ensure_project_id(credential, &org_id, org_name.as_deref(), &project_name)
                     .await?;
                 (span_id.clone(), None, LogDestination::project_logs(proj_id))
             }
@@ -802,7 +801,7 @@ impl LogQueueCore {
                             Some(ProjectLogsIdentifier::ProjectName(project_name)) => {
                                 let project_id = self
                                     .ensure_project_id(
-                                        token,
+                                        credential,
                                         &org_id,
                                         org_name.as_deref(),
                                         &project_name,
@@ -857,7 +856,7 @@ impl LogQueueCore {
 
     async fn destination_from_span_components(
         &self,
-        token: &str,
+        credential: &Credential,
         org_id: &str,
         org_name: Option<&str>,
         span_components: &crate::span_components::SpanComponents,
@@ -874,7 +873,7 @@ impl LogQueueCore {
                 }
                 Some(ProjectLogsIdentifier::ProjectName(project_name)) => {
                     let project_id = self
-                        .ensure_project_id(token, org_id, org_name, &project_name)
+                        .ensure_project_id(credential, org_id, org_name, &project_name)
                         .await?;
                     Ok(LogDestination::project_logs(project_id))
                 }
@@ -897,7 +896,7 @@ impl LogQueueCore {
     /// doesn't need to be passed separately.
     async fn ensure_project_id(
         &self,
-        token: &str,
+        credential: &Credential,
         org_id: &str,
         org_name: Option<&str>,
         project_name: &str,
@@ -922,11 +921,12 @@ impl LogQueueCore {
         request.org_id = (!org_id.is_empty()).then(|| org_id.to_owned());
         request.org_name = org_name.map(str::to_owned);
 
+        let token = credential.token().await?;
         let client = crate::http::api_client(
             &self.client,
             self.api_url.as_str(),
             app_url.as_str(),
-            token,
+            &token,
             org_name,
         )?;
         let register_response = crate::http::api_result(client.register_project(&request).await)
@@ -1240,14 +1240,14 @@ impl LogQueue {
     /// handles drop counting, throttled warnings, and optional debug dumps
     /// uniformly. Row preparation (project registration, destination resolution)
     /// is deferred to flush time.
-    pub fn submit(
+    pub(crate) fn submit(
         &self,
-        token: impl Into<String>,
+        credential: Credential,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) {
         self.core.push(SubmitCommand {
-            credential: Credential::Token(token.into()),
+            credential,
             item: QueuedItem::Span {
                 payload,
                 parent_info,

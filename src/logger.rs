@@ -19,7 +19,7 @@ use crate::experiments::api::{
 };
 use crate::experiments::{BaseExperimentInfo, ExperimentBuilder};
 use crate::http::{api_client, api_result, build_http_client, CaBundleConfig};
-use crate::log_queue::{DroppedRows, LogQueue, LogQueueConfig, TokenProvider};
+use crate::log_queue::{Credential, DroppedRows, LogQueue, LogQueueConfig, TokenProvider};
 use crate::span::{merge_span_origin_context, SpanOrigin, SpanOriginEnvironment, SpanSubmitter};
 use crate::span_components::SpanComponents;
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType, SpanPayload};
@@ -623,11 +623,29 @@ impl BraintrustClient {
         token: impl Into<String>,
         org_id: impl Into<String>,
     ) -> crate::span::SpanBuilder<Self> {
-        let token = token.into();
-        let org_id = org_id.into();
+        self.span_builder_for(Credential::Token(token.into()), org_id)
+    }
 
+    /// Create a span builder that resolves its credential when spans are uploaded.
+    ///
+    /// Reuse the same provider for spans with the same authorization scope to
+    /// batch their uploads. See [`TokenProvider`] for lookup timing.
+    pub fn span_builder_with_token_provider(
+        &self,
+        provider: Arc<dyn TokenProvider>,
+        org_id: impl Into<String>,
+    ) -> crate::span::SpanBuilder<Self> {
+        self.span_builder_for(Credential::Provider(provider), org_id)
+    }
+
+    fn span_builder_for(
+        &self,
+        credential: Credential,
+        org_id: impl Into<String>,
+    ) -> crate::span::SpanBuilder<Self> {
         let submitter = Arc::new(self.clone());
-        let mut builder = crate::span::SpanBuilder::new(submitter, token, org_id);
+        let mut builder =
+            crate::span::SpanBuilder::new_with_credential(submitter, credential, org_id);
         if let Some(environment) = &self.inner.environment {
             builder = builder.span_origin_environment(environment.clone());
         }
@@ -778,7 +796,7 @@ impl BraintrustClient {
             extra: event_data.extra,
         };
 
-        self.submit_payload(token, payload, None);
+        self.submit_payload(Credential::Token(token), payload, None);
         Ok(())
     }
 
@@ -936,13 +954,13 @@ impl BraintrustClient {
     /// Errors are logged as warnings but not propagated to callers.
     /// Submit a span payload synchronously (fire-and-forget).
     /// The payload is queued internally and processed by a background worker.
-    pub(crate) fn submit_payload(
+    fn submit_payload(
         &self,
-        token: impl Into<String>,
+        credential: Credential,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) {
-        self.inner.queue.submit(token, payload, parent_info)
+        self.inner.queue.submit(credential, payload, parent_info)
     }
 
     /// Queue caller-built rows for upload to `/logs3` using the logged-in credentials.
@@ -1067,8 +1085,13 @@ impl Drop for BraintrustClient {
 
 #[async_trait::async_trait]
 impl SpanSubmitter for BraintrustClient {
-    fn submit(&self, token: String, payload: SpanPayload, parent_info: Option<ParentSpanInfo>) {
-        self.submit_payload(token, payload, parent_info)
+    fn submit(
+        &self,
+        credential: Credential,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+    ) {
+        self.submit_payload(credential, payload, parent_info)
     }
 
     async fn flush(&self) -> Result<()> {
@@ -2140,6 +2163,78 @@ mod tests {
                 ("Bearer other".to_owned(), vec!["c".to_owned()]),
             ])
         );
+    }
+
+    // A batch of spans resolves its shared credential after the writes are queued.
+    #[tokio::test]
+    async fn span_builder_with_token_provider_resolves_once_at_upload() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Rotating {
+            rotated: AtomicBool,
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl TokenProvider for Rotating {
+            async fn token(
+                &self,
+            ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(if self.rotated.load(Ordering::SeqCst) {
+                    "refreshed"
+                } else {
+                    "expired"
+                }
+                .into())
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer refreshed",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .api_url(server.uri())
+            .build_without_login()
+            .unwrap();
+        let provider = Arc::new(Rotating::default());
+        let builder = client
+            .span_builder_with_token_provider(provider.clone(), "org")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "project".into(),
+            });
+        for id in ["first", "second"] {
+            let span = builder.clone().row_id(id).build();
+            span.log(crate::SpanLog::builder().name(id).build().unwrap());
+        }
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        provider.rotated.store(true, Ordering::SeqCst);
+        client.flush().await.unwrap();
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let uploaded = server.received_requests().await.unwrap();
+        let batch = uploaded
+            .iter()
+            .find(|request| request.url.path() == "/logs3")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&batch.body).unwrap();
+        let ids: Vec<_> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["first", "second"]);
     }
 
     #[tokio::test]

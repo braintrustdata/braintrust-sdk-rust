@@ -21,6 +21,7 @@ use crate::experiments::metadata::{
 };
 use crate::experiments::span_builder::ExperimentSpanBuilder;
 use crate::experiments::summary::{ExperimentSummary, MetricSummary, ScoreSummary};
+use crate::log_queue::Credential;
 use crate::span::{SpanBuilder, SpanHandle, SpanLog, SpanSubmitter};
 use crate::types::{ParentSpanInfo, SpanAttributes, SpanPayload, SpanType};
 
@@ -205,8 +206,11 @@ impl<
             object_id: metadata.experiment_id.clone(),
         };
 
-        self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info));
+        self.submitter.submit(
+            Credential::Token(self.token.clone()),
+            payload,
+            Some(parent_info),
+        );
     }
 
     /// Get a summary of the experiment's performance.
@@ -392,8 +396,11 @@ impl<
             object_id: metadata.experiment_id.clone(),
         };
 
-        self.submitter
-            .submit(self.token.clone(), payload, Some(parent_info));
+        self.submitter.submit(
+            Credential::Token(self.token.clone()),
+            payload,
+            Some(parent_info),
+        );
     }
 
     /// Fetch the base experiment used for comparison.
