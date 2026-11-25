@@ -1,11 +1,11 @@
 use super::config::LogQueueConfig;
 use super::http::save_payload_debug;
+use super::token_map::TokenMap;
 use crate::error::Result;
 use crate::logger::LoginState;
 use crate::span_components::ProjectLogsIdentifier;
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use chrono::Utc;
-use indexmap::IndexMap;
 use serde_json::{Map, Value};
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
@@ -48,21 +48,8 @@ impl std::fmt::Debug for Credential {
 
 impl Credential {
     pub(crate) fn token_value(token: String) -> Self {
-        // Intern only live credentials. Keys are reclaimed and the registry is bounded.
-        static TOKENS: std::sync::OnceLock<
-            std::sync::Mutex<IndexMap<String, std::sync::Weak<str>>>,
-        > = std::sync::OnceLock::new();
-        let mut tokens = TOKENS.get_or_init(Default::default).lock().unwrap();
-        if let Some(existing) = tokens.get(&token).and_then(std::sync::Weak::upgrade) {
-            return Self::Token(existing);
-        }
-        tokens.retain(|_, value| value.strong_count() > 0);
-        if tokens.len() >= 256 {
-            tokens.shift_remove_index(0);
-        }
-        let value: Arc<str> = Arc::from(token.as_str());
-        tokens.insert(token, Arc::downgrade(&value));
-        Self::Token(value)
+        static TOKENS: TokenMap = TokenMap::new();
+        Self::Token(TOKENS.get_or_insert(token))
     }
 
     pub(crate) async fn token(&self) -> std::result::Result<Cow<'_, str>, anyhow::Error> {

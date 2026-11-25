@@ -8,6 +8,7 @@ pub(crate) mod observation;
 mod prepare;
 pub(crate) mod queue;
 mod row_key;
+mod token_map;
 
 // Public API exports
 pub use config::LogQueueConfig;
