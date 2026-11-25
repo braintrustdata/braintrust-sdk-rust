@@ -1,5 +1,5 @@
 use braintrust_api_client::{
-    backend::{BackendClient, extensions::*},
+    backend::{BackendClient, HttpError, extensions::*},
     types,
 };
 use serde_json::json;
@@ -331,6 +331,101 @@ async fn interrupted_success_body_remains_a_retryable_network_error() {
     assert_eq!(*reasons.lock().unwrap(), [RetryReason::Network]);
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     server.abort();
+}
+
+#[tokio::test]
+async fn attachment_lookup_decodes_metadata_and_upload_status() {
+    let server = MockServer::start().await;
+    let client = client(&server);
+    let download_url = "https://storage.example/download?signature=download";
+    let embed_url = "https://storage.example/embed?signature=embed";
+
+    for (key, status, content_length, expected_status) in [
+        (
+            "complete/key",
+            json!({"upload_status": "done"}),
+            Some(512),
+            AttachmentUploadStatus::Done,
+        ),
+        (
+            "in-progress/key",
+            json!({"upload_status": "uploading"}),
+            None,
+            AttachmentUploadStatus::Uploading,
+        ),
+        (
+            "failed/key",
+            json!({"upload_status": "error", "error_message": "upload failed"}),
+            None,
+            AttachmentUploadStatus::Error {
+                error_message: Some("upload failed".into()),
+            },
+        ),
+        (
+            "failed-without-message/key",
+            json!({"upload_status": "error"}),
+            None,
+            AttachmentUploadStatus::Error {
+                error_message: None,
+            },
+        ),
+    ] {
+        let mut response = json!({
+            "status": status,
+            "downloadUrl": download_url,
+            "embedUrl": embed_url,
+        });
+        if let Some(length) = content_length {
+            response["contentLength"] = json!(length);
+        }
+        Mock::given(method("GET"))
+            .and(path("/attachment"))
+            .and(header("authorization", "Bearer test-key"))
+            .and(query_param("key", key))
+            .and(query_param("filename", "report + notes.pdf"))
+            .and(query_param("content_type", "application/pdf"))
+            .and(query_param("org_id", "org"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let metadata = client
+            .get_attachment(&AttachmentRequest::new(
+                key.into(),
+                "report + notes.pdf".into(),
+                "application/pdf".into(),
+                "org".into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(metadata.status, expected_status);
+        assert_eq!(metadata.content_length, content_length);
+        assert_eq!(metadata.download_url, download_url);
+        assert_eq!(metadata.embed_url, embed_url);
+    }
+}
+
+#[tokio::test]
+async fn missing_attachment_preserves_http_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/attachment"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .get_attachment(&AttachmentRequest::new(
+            "missing".into(),
+            "file.bin".into(),
+            "application/octet-stream".into(),
+            "org".into(),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.downcast_ref::<HttpError>().unwrap().status, 404);
 }
 
 #[tokio::test]
