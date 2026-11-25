@@ -39,7 +39,9 @@ impl UploadPolicy {
             delays,
             requests: 0,
             bytes: 1,
-            pause: Pause::Destination,
+            // The 429 does not say whether a project or org limit was hit, so
+            // pause the whole org rather than let sibling destinations repeat it.
+            pause: Pause::Org,
         }
     }
 }
@@ -71,7 +73,7 @@ async fn attempt<T>(
 
 /// Wait at least as long as the server asked, without retrying once the budget is exhausted.
 /// Every 429 pauses its scope, even when this request has no retries left, so
-/// other requests for the same destination do not repeat the rejected attempt.
+/// other requests sharing the limit do not repeat the rejected attempt.
 fn retry_delay(attempt: &Attempt, backoff: Option<Duration>, pause: Pause) -> Option<Duration> {
     let hint = attempt.retry_after.map(|hint| hint.min(MAX_RETRY_AFTER));
     let delay = backoff.map(|backoff| hint.map_or(backoff, |hint| hint.max(backoff)));
@@ -658,6 +660,40 @@ mod tests {
             elapsed >= Duration::from_secs(3),
             "retry should wait for Retry-After, waited {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_upload_429_pauses_the_whole_org_but_not_other_orgs() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let org = Scope::new(server.uri(), "throttled-org");
+        let outcome = SCOPE
+            .scope(
+                org.clone(),
+                coordinator(&server, UploadPolicy::Queue { retries: 0 }).upload(
+                    batch(),
+                    Capabilities {
+                        max_request_size: usize::MAX,
+                        overflow: false,
+                    },
+                ),
+            )
+            .await;
+        assert!(outcome.is_err());
+        let sibling = crate::destination::Destination::row(
+            serde_json::json!({"project_id":"sibling"})
+                .as_object()
+                .unwrap(),
+        );
+        let scheduler = &crate::service::global().unwrap().attempts;
+        assert!(scheduler.paused(&org.clone().with_destination(sibling.clone())));
+        assert!(scheduler.paused(&org));
+        assert!(!scheduler.paused(&Scope::new(server.uri(), "other-org").with_destination(sibling)));
     }
 
     #[test]

@@ -44,7 +44,9 @@ tokio::task_local! { pub(crate) static SCOPE: Scope; }
 /// How widely a 429 pauses later requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Pause {
-    /// Only requests for the same destination wait.
+    /// Only requests for the same destination wait. Unused until 429s report
+    /// whether a project or an org limit was exceeded.
+    #[cfg_attr(not(test), allow(dead_code))]
     Destination,
     /// Every request for the same endpoint and org waits.
     Org,
@@ -95,6 +97,10 @@ impl Scheduler {
             .then(|| cooldowns.get(&scope.org_wide()).copied())
             .flatten();
         own.max(org)
+    }
+    #[cfg(test)]
+    pub fn paused(&self, scope: &Scope) -> bool {
+        self.deadline(Some(scope)).is_some()
     }
     pub fn cool_down(&self, delay: Duration, pause: Pause) {
         if let Ok(scope) = SCOPE.try_with(Clone::clone) {
