@@ -268,15 +268,11 @@ impl LogQueueCore {
             .login_state
             .app_url()
             .unwrap_or_else(|| self.app_url.to_string());
+        let org = crate::resolution::OrgIdentity::new(org_id, org_name, token);
+        let scope = crate::scheduler::Scope::new(app_url_key.clone(), org.scope_key());
         let key = crate::resolution::ProjectKey {
-            route: crate::resolution::RouteKey {
-                transport: self.client.identity,
-                app_url: app_url_key,
-                api_url: self.endpoint(),
-                token: token.into(),
-                org_id: org_id.into(),
-                org_name: org_name.map(str::to_owned),
-            },
+            app_url: app_url_key,
+            org,
             project: project_name.into(),
         };
         let entry = crate::service::global()?.projects.entry(key);
@@ -304,13 +300,15 @@ impl LogQueueCore {
             // Registration shares the upload scheduler, so it waits out 429
             // cooldowns, counts against request concurrency, and retries
             // transient failures instead of dropping the span on the first one.
-            let policy = crate::internal::upload::UploadPolicy::Queue {
+            let policy = crate::internal::upload::RequestPolicy {
                 retries: self.config.num_retries(),
+                pause: crate::scheduler::Pause::Org,
             };
-            let register_response =
-                crate::internal::upload::scheduled(policy, || client.register_project(&request))
-                    .await?
-                    .into_inner();
+            let register_response = crate::internal::upload::scheduled(scope, policy, || {
+                client.register_project(&request)
+            })
+            .await?
+            .into_inner();
 
             Ok::<_, anyhow::Error>(register_response.project.id)
         });

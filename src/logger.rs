@@ -892,6 +892,28 @@ impl BraintrustClient {
         )
     }
 
+    /// The scheduler scope for a request made with `token` to the control plane
+    /// (`app_url`) or the data plane. Separate planes have separate rate limits.
+    fn request_scope(
+        &self,
+        client: &crate::api::Client,
+        token: &str,
+        control_plane: bool,
+    ) -> crate::scheduler::Scope {
+        let same_auth = self.inner.login_state.api_key().as_deref() == Some(token);
+        let org_id = same_auth
+            .then(|| self.inner.login_state.org_id())
+            .flatten()
+            .unwrap_or_default();
+        let org = crate::resolution::OrgIdentity::new(&org_id, client.organization_name(), token);
+        let endpoint = if control_plane {
+            client.app_url()
+        } else {
+            client.baseurl()
+        };
+        crate::scheduler::Scope::new(endpoint, org.scope_key())
+    }
+
     /// Log in and discover the selected organization's API endpoint.
     async fn perform_login(&self, api_key: &str, org_name: Option<&str>) -> Result<()> {
         let mut builder = crate::api::Client::builder()
@@ -905,11 +927,13 @@ impl BraintrustClient {
         if let Some(org_name) = org_name {
             builder = builder.org_name(org_name);
         }
-        let result = crate::service::global()?
-            .handle
-            .spawn(async move { builder.build_with_login().await })
-            .await
-            .map_err(|e| BraintrustError::Background(e.to_string()))?;
+        let org = crate::resolution::OrgIdentity::new("", org_name, api_key);
+        let scope = crate::scheduler::Scope::new(self.inner.app_url.as_str(), org.scope_key());
+        let result = crate::service::execute(crate::internal::upload::admitted(
+            scope,
+            builder.build_with_login(),
+        ))
+        .await?;
         let client = match result {
             Ok(client) => client,
             Err(crate::api::ClientInitError::Login(error)) => {
@@ -1263,10 +1287,14 @@ impl ExperimentRegistrar for BraintrustClient {
         request: ExperimentRegisterRequest,
     ) -> Result<ExperimentRegisterResponse> {
         let client = self.request_client(token)?;
+        let scope = self.request_scope(&client, token, true);
         crate::service::execute(async move {
-            Ok(api_result(client.register_experiment(&request).await)
-                .await?
-                .into_inner())
+            let response = crate::internal::upload::scheduled(
+                scope,
+                crate::internal::upload::RequestPolicy::ONCE,
+                || client.register_experiment(&request),
+            );
+            Ok(response.await?.into_inner())
         })
         .await
     }
@@ -1280,9 +1308,15 @@ impl BaseExperimentFetcher for BraintrustClient {
         experiment_id: &str,
     ) -> Result<Option<BaseExperimentInfo>> {
         let client = self.request_client(token)?;
+        let scope = self.request_scope(&client, token, true);
         let experiment_id = experiment_id.to_owned();
         let response = crate::service::execute(async move {
-            api_result(client.base_experiment(&experiment_id).await).await
+            crate::internal::upload::scheduled(
+                scope,
+                crate::internal::upload::RequestPolicy::ONCE,
+                || client.base_experiment(&experiment_id),
+            )
+            .await
         })
         .await;
         let base_response: BaseExperimentResponse = match response {
@@ -1308,13 +1342,14 @@ impl ExperimentComparisonFetcher for BraintrustClient {
         base_experiment_id: Option<&str>,
     ) -> Result<ExperimentComparisonResponse> {
         let client = self.request_client(token)?;
+        let scope = self.request_scope(&client, token, false);
         let experiment_id = experiment_id.to_owned();
         let base_experiment_id = base_experiment_id.map(str::to_owned);
         let response = crate::service::execute(async move {
-            api_result(
-                client
-                    .experiment_comparison(&experiment_id, base_experiment_id.as_deref())
-                    .await,
+            crate::internal::upload::scheduled(
+                scope,
+                crate::internal::upload::RequestPolicy::ONCE,
+                || client.experiment_comparison(&experiment_id, base_experiment_id.as_deref()),
             )
             .await
         })
@@ -1331,10 +1366,14 @@ impl DatasetRegistrar for BraintrustClient {
         request: DatasetRegisterRequest,
     ) -> Result<DatasetRegisterResponse> {
         let client = self.request_client(token)?;
+        let scope = self.request_scope(&client, token, true);
         crate::service::execute(async move {
-            Ok(api_result(client.register_dataset(&request).await)
-                .await?
-                .into_inner())
+            let response = crate::internal::upload::scheduled(
+                scope,
+                crate::internal::upload::RequestPolicy::ONCE,
+                || client.register_dataset(&request),
+            );
+            Ok(response.await?.into_inner())
         })
         .await
     }
@@ -1344,12 +1383,14 @@ impl DatasetRegistrar for BraintrustClient {
 impl DatasetFetcher for BraintrustClient {
     async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse> {
         let client = self.request_client(token)?;
+        let scope = self.request_scope(&client, token, false);
         crate::service::execute(async move {
-            Ok(
-                api_result(client.btql_json_as::<_, BTQLResponse>(&query).await)
-                    .await?
-                    .into_inner(),
-            )
+            let response = crate::internal::upload::scheduled(
+                scope,
+                crate::internal::upload::RequestPolicy::ONCE,
+                || client.btql_json_as::<_, BTQLResponse>(&query),
+            );
+            Ok(response.await?.into_inner())
         })
         .await
     }
@@ -1363,9 +1404,15 @@ impl DatasetSummarizer for BraintrustClient {
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse> {
         let client = self.request_client(token)?;
+        let scope = self.request_scope(&client, token, false);
         let dataset_id = dataset_id.to_owned();
         let response = crate::service::execute(async move {
-            api_result(client.dataset_summary(&dataset_id).await).await
+            crate::internal::upload::scheduled(
+                scope,
+                crate::internal::upload::RequestPolicy::ONCE,
+                || client.dataset_summary(&dataset_id),
+            )
+            .await
         })
         .await?;
         Ok(response.into_inner())
@@ -2266,15 +2313,18 @@ mod tests {
 
     #[tokio::test]
     async fn log_rows_with_token_provider_fetches_the_token_when_sending() {
+        // Delivery starts immediately, so the gate holds sends until the token rotates.
         struct Rotating {
             token: std::sync::Mutex<String>,
             calls: std::sync::atomic::AtomicUsize,
+            gate: tokio::sync::Semaphore,
         }
         #[async_trait::async_trait]
         impl TokenProvider for Rotating {
             async fn token(
                 &self,
             ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                drop(self.gate.acquire().await?);
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(self.token.lock().unwrap().clone())
             }
@@ -2283,6 +2333,7 @@ mod tests {
             Arc::new(Rotating {
                 token: std::sync::Mutex::new(token.to_owned()),
                 calls: Default::default(),
+                gate: tokio::sync::Semaphore::new(0),
             })
         };
 
@@ -2304,11 +2355,18 @@ mod tests {
         let row = |id: &str| serde_json::json!({ "id": id }).as_object().unwrap().clone();
         let rotating = provider("first");
         let other = provider("other");
-        client.log_rows_with_token_provider(rotating.clone(), "org", Some("org-name"), [row("a")]);
-        client.log_rows_with_token_provider(rotating.clone(), "org", Some("org-name"), [row("b")]);
+        // One call is admitted atomically, so its rows share a job and a token fetch.
+        client.log_rows_with_token_provider(
+            rotating.clone(),
+            "org",
+            Some("org-name"),
+            [row("a"), row("b")],
+        );
         client.log_rows_with_token_provider(other.clone(), "org", Some("org-name"), [row("c")]);
         assert_eq!(rotating.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         *rotating.token.lock().unwrap() = "rotated".to_owned();
+        rotating.gate.add_permits(1);
+        other.gate.add_permits(1);
         client.flush().await.expect("flush");
 
         assert_eq!(client.dropped_rows(), DroppedRows::default());

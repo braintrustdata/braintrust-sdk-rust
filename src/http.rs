@@ -5,7 +5,7 @@ use reqwest::Client;
 
 use crate::error::{BraintrustError, Result};
 
-/// A reusable transport and a non-secret identity for authorization-sensitive caches.
+/// A reusable transport and an identity, so only rows sharing a transport share a request.
 #[derive(Clone, Debug)]
 pub(crate) struct SharedHttp {
     inner: Client,

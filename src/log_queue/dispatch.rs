@@ -51,14 +51,16 @@ impl LogQueueCore {
         org_id: &str,
     ) -> (usize, bool) {
         let service = crate::service::global().expect("initialized service");
-        let key = crate::resolution::RouteKey {
-            transport: self.client.identity,
-            app_url: self.app_url.to_string(),
+        let key = crate::resolution::CapabilityKey {
             api_url: api_url.to_string(),
-            token: token.into(),
-            org_id: org_id.to_owned(),
-            org_name: org_name.map(str::to_owned),
         };
+        // Capabilities are not tied to the job's destination.
+        let scope = crate::scheduler::Scope::current_org().unwrap_or_else(|| {
+            crate::scheduler::Scope::new(
+                api_url.as_str(),
+                crate::resolution::OrgIdentity::new(org_id, org_name, token).scope_key(),
+            )
+        });
         let cell = service.capabilities.entry(key);
         *cell
             .get_or_try_init(|| async {
@@ -69,10 +71,13 @@ impl LogQueueCore {
                     token,
                     org_name,
                 )?;
-                let policy = crate::internal::upload::UploadPolicy::Queue { retries: 0 };
-                let version = crate::internal::upload::scheduled(policy, || api.version())
-                    .await?
-                    .into_inner();
+                let version = crate::internal::upload::scheduled(
+                    scope,
+                    crate::internal::upload::RequestPolicy::ONCE,
+                    || api.version(),
+                )
+                .await?
+                .into_inner();
                 let bytes = version.logs3_payload_max_bytes.filter(|n| *n > 0);
                 Ok::<_, BraintrustError>((
                     bytes.unwrap_or(super::config::DEFAULT_BATCH_MAX_BYTES * 2),

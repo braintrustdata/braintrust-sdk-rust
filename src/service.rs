@@ -82,7 +82,7 @@ pub(crate) struct Service {
     pub preparations: Arc<tokio::sync::Semaphore>,
     pub config: ServiceConfig,
     pub projects: crate::resolution::Cache<crate::resolution::ProjectKey, String>,
-    pub capabilities: crate::resolution::Cache<crate::resolution::RouteKey, (usize, bool)>,
+    pub capabilities: crate::resolution::Cache<crate::resolution::CapabilityKey, (usize, bool)>,
 }
 impl std::ops::Deref for Service {
     type Target = crate::log_queue::engine::Engine;

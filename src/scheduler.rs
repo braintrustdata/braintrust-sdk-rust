@@ -6,13 +6,49 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+/// Who a request counts against. Every SDK request runs inside one, so permits
+/// rotate fairly and a 429 pauses only the requests sharing its limit.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct Scope {
     pub endpoint: String,
+    /// The org ID, or a stand-in for the credential's org when it is unknown.
     pub org: String,
-    pub destination: Destination,
+    /// `None` for requests that are not tied to one destination.
+    pub destination: Option<Destination>,
+}
+impl Scope {
+    pub fn new(endpoint: impl Into<String>, org: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            org: org.into(),
+            destination: None,
+        }
+    }
+    pub fn with_destination(mut self, destination: Destination) -> Self {
+        self.destination = Some(destination);
+        self
+    }
+    /// The enclosing scope without its destination, for org-level requests.
+    pub fn current_org() -> Option<Self> {
+        SCOPE.try_with(Self::org_wide).ok()
+    }
+    fn org_wide(&self) -> Self {
+        Self {
+            destination: None,
+            ..self.clone()
+        }
+    }
 }
 tokio::task_local! { pub(crate) static SCOPE: Scope; }
+
+/// How widely a 429 pauses later requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pause {
+    /// Only requests for the same destination wait.
+    Destination,
+    /// Every request for the same endpoint and org waits.
+    Org,
+}
 
 struct Request {
     bytes: usize,
@@ -49,12 +85,23 @@ impl Scheduler {
         })
     }
     fn deadline(&self, scope: Option<&Scope>) -> Option<tokio::time::Instant> {
+        let scope = scope?;
         let mut cooldowns = self.cooldowns.lock().unwrap();
         cooldowns.retain(|_, until| *until > tokio::time::Instant::now());
-        scope.and_then(|key| cooldowns.get(key).copied())
+        let own = cooldowns.get(scope).copied();
+        let org = scope
+            .destination
+            .is_some()
+            .then(|| cooldowns.get(&scope.org_wide()).copied())
+            .flatten();
+        own.max(org)
     }
-    pub fn cool_down(&self, delay: Duration) {
+    pub fn cool_down(&self, delay: Duration, pause: Pause) {
         if let Ok(scope) = SCOPE.try_with(Clone::clone) {
+            let scope = match pause {
+                Pause::Destination => scope,
+                Pause::Org => scope.org_wide(),
+            };
             let mut cooldowns = self.cooldowns.lock().unwrap();
             cooldowns.retain(|_, until| *until > tokio::time::Instant::now());
             if cooldowns.len() >= 256 && !cooldowns.contains_key(&scope) {
@@ -86,7 +133,7 @@ impl Scheduler {
             {
                 let mut state = self.state.lock().unwrap();
                 let org = scope.as_ref().map(|s| (s.endpoint.clone(), s.org.clone()));
-                let destination = scope.as_ref().map(|s| s.destination.clone());
+                let destination = scope.as_ref().and_then(|s| s.destination.clone());
                 state
                     .orgs
                     .entry(org)
@@ -161,15 +208,11 @@ impl Drop for Permit {
 mod tests {
     use super::*;
     fn scope(org: &str, destination: &str) -> Scope {
-        Scope {
-            endpoint: "https://example.com".into(),
-            org: org.into(),
-            destination: Destination::row(
-                serde_json::json!({"project_id":destination})
-                    .as_object()
-                    .unwrap(),
-            ),
-        }
+        Scope::new("https://example.com", org).with_destination(Destination::row(
+            serde_json::json!({"project_id":destination})
+                .as_object()
+                .unwrap(),
+        ))
     }
     #[tokio::test]
     async fn permits_rotate_orgs_and_destinations_and_cancelled_waits_release_capacity() {
@@ -208,17 +251,38 @@ mod tests {
         let scheduler = Scheduler::new(1);
         for i in 0..256 {
             SCOPE.sync_scope(scope("org", &format!("p{i}")), || {
-                scheduler.cool_down(Duration::from_secs(60 + i))
+                scheduler.cool_down(Duration::from_secs(60 + i), Pause::Destination)
             });
         }
         let throttled = scope("org", "new");
         SCOPE.sync_scope(throttled.clone(), || {
-            scheduler.cool_down(Duration::from_secs(30))
+            scheduler.cool_down(Duration::from_secs(30), Pause::Destination)
         });
         assert!(scheduler.deadline(Some(&throttled)).is_some());
         // The pause closest to expiring made room.
         assert!(scheduler.deadline(Some(&scope("org", "p0"))).is_none());
         assert_eq!(scheduler.cooldowns.lock().unwrap().len(), 256);
+    }
+    #[tokio::test]
+    async fn pauses_apply_to_their_destination_or_to_the_whole_org() {
+        let scheduler = Scheduler::new(1);
+        let a = scope("org", "a");
+        let b = scope("org", "b");
+        let other_org = scope("other", "a");
+        SCOPE.sync_scope(a.clone(), || {
+            scheduler.cool_down(Duration::from_secs(30), Pause::Destination)
+        });
+        assert!(scheduler.deadline(Some(&a)).is_some());
+        assert!(scheduler.deadline(Some(&b)).is_none());
+        SCOPE.sync_scope(b.clone(), || {
+            scheduler.cool_down(Duration::from_secs(30), Pause::Org)
+        });
+        assert!(scheduler.deadline(Some(&b)).is_some());
+        assert!(scheduler.deadline(Some(&scope("org", "c"))).is_some());
+        assert!(scheduler
+            .deadline(Some(&Scope::new("https://example.com", "org")))
+            .is_some());
+        assert!(scheduler.deadline(Some(&other_org)).is_none());
     }
     #[tokio::test]
     async fn byte_deficits_allow_small_destinations_to_progress_before_large_requests() {

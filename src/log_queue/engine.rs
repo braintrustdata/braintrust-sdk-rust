@@ -348,11 +348,16 @@ impl Engine {
             tickets.push((entry.sequence, entry.bytes, entry.core.observation.clone()));
         }
         // Permit covers preparation only; uploads acquire attempt permits separately.
-        let request_scope = crate::scheduler::Scope {
-            endpoint: core.endpoint(),
-            org: key.route.id.clone(),
-            destination: key.destination.clone(),
-        };
+        let request_scope = crate::scheduler::Scope::new(
+            core.endpoint(),
+            crate::resolution::OrgIdentity::new(
+                &key.route.id,
+                key.org_name.as_deref(),
+                &key.credential.stand_in(),
+            )
+            .scope_key(),
+        )
+        .with_destination(key.destination.clone());
         let work = std::panic::AssertUnwindSafe(
             crate::scheduler::SCOPE.scope(request_scope, core.dispatch(commands)),
         )
@@ -734,6 +739,42 @@ mod tests {
         }
         assert!(flush.await.is_err());
         assert_eq!(queue.dropped_rows().preparation_failed, 20);
+    }
+
+    #[tokio::test]
+    async fn rotated_tokens_in_one_org_reuse_the_project_registration() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/project/register"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"project":{"id":"resolved"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let queue = http_queue(&server, 100);
+        for token in ["first-token", "rotated-token"] {
+            let mut command = SubmitCommand::test_named_span(token, "rotation-project");
+            command.credential = Credential::token_value(token.into());
+            engine.submit(queue.core.clone(), command);
+            let flush = engine.barrier(&queue.core.observation, true);
+            for (key, entries) in engine.take_jobs() {
+                engine.clone().process_job(key, entries).await;
+            }
+            flush.await.unwrap();
+        }
     }
 
     #[tokio::test]

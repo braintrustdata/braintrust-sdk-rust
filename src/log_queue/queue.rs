@@ -50,6 +50,15 @@ impl Credential {
         Self::Token(Arc::from(token))
     }
 
+    /// Identifies the credential when no organization is known. Providers are
+    /// identified by instance, matching how they partition work.
+    pub(crate) fn stand_in(&self) -> String {
+        match self {
+            Self::Token(token) => token.to_string(),
+            Self::Provider(provider) => format!("provider:{:p}", Arc::as_ptr(provider)),
+        }
+    }
+
     pub(crate) async fn token(&self) -> std::result::Result<Cow<'_, str>, anyhow::Error> {
         match self {
             Self::Token(token) => Ok(Cow::Borrowed(token.as_ref())),
