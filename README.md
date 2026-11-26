@@ -115,33 +115,35 @@ let anthropic_response = json!({
 let usage = extract_anthropic_usage(&anthropic_response);
 ```
 
-## Shared delivery service
+## Organizations and projects
 
-Every client, project handle and bulk uploader in a process shares one delivery service: one intake with a queue per organization, one request scheduler, and shared caches and HTTP connection pools. Creating another client or project handle does not create another queue or worker. Each organization's queue retries independently, and a 429 pauses only that organization's requests. A handle's flush waits for its own accepted work, and its parent client's flush includes work submitted through derived handles.
+Use `project(name)` to log to a specific project. To work in another organization
+that your API key can access, call `with_organization(name)` and select a project
+from that client.
 
 ```rust,no_run
 # use braintrust_sdk_rust::BraintrustClient;
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let client = BraintrustClient::builder().api_key("your-key").build().await?;
-let traces = client.project("gateway-traces");
-let evaluations = client.project("evaluation-traces");
-let span = traces.span_builder().await?.build();
-span.end();
-traces.flush().await?;
-client.flush().await?;
-
-// Selection succeeds only if these credentials can access the organization.
-// Existing handles keep their original organization and endpoint.
 let other_org = client.with_organization("another-org").await?;
+let evaluations = other_org.project("evaluations");
+
+let span = evaluations.span_builder().await?.build();
+span.end();
+evaluations.flush().await?;
 # Ok(())
 # }
 ```
 
-For different credentials, construct another client normally, or use the per-call credential methods of a client built with `build_without_login()`.
+A project handle's `flush()` waits for writes through that handle. Flushing its
+client also covers writes through the client's project handles.
 
-SDK work runs on the application's Tokio runtime: each piece of work on the runtime current where it was started. The SDK starts its own single-threaded runtime only for work started outside any runtime, such as from synchronous code. `ServiceConfig::runtime` can select a specific runtime or always use the SDK's own. A current-thread runtime only makes progress while it is driven, so keep driving it until the work it started has finished. If a runtime shuts down with work unfinished, that work's rows upload from the SDK's runtime instead.
+## Service configuration
 
-Process-wide limits, including the number of concurrent requests (`max_concurrent_requests`, default 8, or `BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS`), cover every client's uploads and API calls. Process-wide and per-organization admission limits are optional. Configure them before constructing the first client or bulk uploader; conflicting later configuration returns an error. Per-client queue limits always apply.
+Call `configure_service` before creating your first SDK client or bulk uploader.
+Use `ServiceConfig` to set process-wide request concurrency, limit how many
+pending rows the SDK holds across all clients or per organization, or select
+the Tokio runtime for SDK work.
 
 ```rust,no_run
 use braintrust_sdk_rust::{configure_service, ServiceConfig};
@@ -149,24 +151,10 @@ use braintrust_sdk_rust::{configure_service, ServiceConfig};
 configure_service(ServiceConfig::builder()
     .max_concurrent_requests(8)
     .max_rows(100_000)
-    .max_bytes(64 * 1024 * 1024)
+    .max_org_rows(10_000)
     .build())?;
 # Ok::<(), braintrust_sdk_rust::BraintrustError>(())
 ```
-
-SDK operations return eager `Completion` values: calling the method starts the operation, `.await` observes it in async code, and `.blocking_wait()` observes it in synchronous code. Dropping a completion leaves the operation running. You can discard routine logging completions for best-effort delivery. Calls such as `build()`, `flush()`, and `upload_rows()` warn if you ignore their completion, so you can catch a missed result or delivery error. Pending blocking waits are refused inside Tokio runtime contexts. If an operation panics, the panic resumes in whoever awaits or waits on it. Evaluations and `Experiment::traced` run user code, so they stay plain async functions that run in the caller's task; use `SyncEvaluator` from synchronous code. The standalone `braintrust-api-client` crate retains its async, one-attempt transport interface.
-
-```rust,no_run
-use braintrust_sdk_rust::BraintrustClient;
-
-let client = BraintrustClient::builder().api_key("your-key").build().blocking_wait()?;
-let span = client.project("gateway-traces").span_builder().blocking_wait()?.build();
-span.log(Default::default()).blocking_wait()?;
-client.flush().blocking_wait()?;
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-Delivery runs automatically with bounded admission. Write completions report admission and delivery failures, and flush completions report failures for work pending at their cutoff. Terminal failures do not poison subsequent flushes. `dropped_rows()` reports losses for the handle and its derived handles. Call `flush()` or `shutdown(timeout)` and observe its completion before exiting when delivery matters. Shutdown closes only the selected handle and its descendants; other clients and sibling projects continue using the shared service.
 
 ## License
 
