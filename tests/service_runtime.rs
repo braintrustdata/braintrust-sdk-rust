@@ -58,6 +58,14 @@ fn work_from_one_runtime_survives_another_stopping() {
     run_child("caller_operation_child");
 }
 #[test]
+fn an_idle_runtime_does_not_hold_up_another_runtimes_uploads() {
+    run_child("idle_runtime_child");
+}
+#[test]
+fn an_idle_runtimes_connections_are_not_reused_elsewhere() {
+    run_child("idle_connection_child");
+}
+#[test]
 fn a_background_login_interrupted_by_its_runtime_stopping_resumes() {
     run_child("interrupted_login_child");
 }
@@ -407,4 +415,51 @@ fn caller_operation_child() {
         assert_eq!(other.flush().await.unwrap().delivered(), 1);
     });
     assert_eq!(*provider.threads.lock().unwrap(), ["second-runtime"]);
+}
+
+#[test]
+#[ignore = "executed in an isolated subprocess"]
+fn idle_runtime_child() {
+    let fixture = Fixture::new();
+    let healthy = named_runtime("healthy-runtime");
+    // Two clients whose rows share an org, credential and connection profile.
+    let idle_client = healthy.block_on(async { fixture.client() });
+    let client = healthy.block_on(async { fixture.client() });
+    let provider = Arc::new(Recorder::default());
+    // A current-thread runtime that is kept alive but no longer driven.
+    let idle = Builder::new_current_thread().enable_all().build().unwrap();
+    idle.block_on(async { fixture.log(&idle_client, &provider, &["idle"]) });
+    let report = healthy.block_on(async {
+        fixture.log(&client, &provider, &["healthy"]);
+        tokio::time::timeout(Duration::from_secs(5), client.flush()).await
+    });
+    assert_eq!(report.unwrap().unwrap().delivered(), 1);
+    assert_eq!(fixture.uploaded_ids(), ["healthy"]);
+    // The idle runtime's row uploads once that runtime runs again.
+    idle.block_on(async { idle_client.flush().await.unwrap() });
+    assert_eq!(fixture.uploaded_ids(), ["healthy", "idle"]);
+}
+
+#[test]
+#[ignore = "executed in an isolated subprocess"]
+fn idle_connection_child() {
+    let fixture = Fixture::new();
+    let provider = Arc::new(Recorder::default());
+    // Leaves a pooled keep-alive connection that only `idle` can drive.
+    let idle = Builder::new_current_thread().enable_all().build().unwrap();
+    idle.block_on(async {
+        let client = fixture.client();
+        fixture.log(&client, &provider, &["a"]);
+        client.flush().await.unwrap();
+    });
+    let client = fixture.client();
+    fixture.log(&client, &provider, &["b"]);
+    let started = std::time::Instant::now();
+    let report = client
+        .flush()
+        .blocking_wait_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(report.delivered(), 1);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    drop(idle);
 }

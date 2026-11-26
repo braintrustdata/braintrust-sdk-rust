@@ -2,19 +2,65 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use reqwest::Client;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::runtime::Id as RuntimeId;
 
 use crate::error::{BraintrustError, Result};
 
-/// A reusable transport and an identity, so only rows sharing a transport share a request.
+/// A reusable transport profile and its identity, so only rows sharing a
+/// profile share a request.
 #[derive(Clone, Debug)]
 pub(crate) struct SharedHttp {
-    inner: Client,
+    settings: Arc<Settings>,
     pub identity: u64,
 }
-impl std::ops::Deref for SharedHttp {
-    type Target = Client;
-    fn deref(&self) -> &Client {
-        &self.inner
+#[derive(Debug)]
+struct Settings {
+    timeout: std::time::Duration,
+    user_agent: String,
+    certificates: Vec<reqwest::Certificate>,
+}
+impl Settings {
+    fn build(&self) -> Result<Client> {
+        let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(self.timeout)
+            .user_agent(&self.user_agent);
+        for certificate in &self.certificates {
+            builder = builder.add_root_certificate(certificate.clone());
+        }
+        builder
+            .build()
+            .map_err(|err| BraintrustError::InvalidConfig(err.to_string()))
+    }
+}
+/// Connection pools by profile and runtime. hyper drives each connection from
+/// the runtime that opened it, so a pool shared across runtimes would let an
+/// idle runtime stall other runtimes' requests.
+type Pools = HashMap<(u64, Option<RuntimeId>), Client>;
+static RUNTIME_POOLS: Mutex<Option<Pools>> = Mutex::new(None);
+impl SharedHttp {
+    /// This profile's connection pool for the current runtime.
+    pub fn client(&self) -> Client {
+        let runtime = tokio::runtime::Handle::try_current().ok().map(|h| h.id());
+        let mut pools = RUNTIME_POOLS.lock().unwrap();
+        let pools = pools.get_or_insert_with(HashMap::new);
+        pools
+            .entry((self.identity, runtime))
+            .or_insert_with(|| {
+                // The same settings built successfully when the profile was created.
+                self.settings
+                    .build()
+                    .expect("validated HTTP client settings")
+            })
+            .clone()
+    }
+}
+/// Drop the connection pools of a runtime that shut down.
+pub(crate) fn forget_runtime(runtime: RuntimeId) {
+    if let Some(pools) = RUNTIME_POOLS.lock().unwrap().as_mut() {
+        pools.retain(|(_, pool_runtime), _| *pool_runtime != Some(runtime));
     }
 }
 
@@ -105,11 +151,7 @@ pub(crate) fn build_http_client(
         pools.push_back(entry);
         return Ok(client);
     }
-    let mut builder = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(timeout)
-        .user_agent(user_agent.unwrap_or(USER_AGENT));
-
+    let mut certificates = Vec::new();
     if let Some((pem, source)) = loaded {
         let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|err| {
             BraintrustError::InvalidConfig(format!(
@@ -123,17 +165,17 @@ pub(crate) fn build_http_client(
                 source
             )));
         }
-        for cert in certs {
-            builder = builder.add_root_certificate(cert);
-        }
+        certificates = certs;
     }
-
-    let client = builder
-        .build()
-        .map_err(|err| BraintrustError::InvalidConfig(err.to_string()))?;
+    let settings = Settings {
+        timeout,
+        user_agent: user_agent.unwrap_or(USER_AGENT).to_owned(),
+        certificates,
+    };
+    settings.build()?;
     static NEXT_PROFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let client = SharedHttp {
-        inner: client,
+        settings: Arc::new(settings),
         identity: NEXT_PROFILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     };
     if pools.len() >= 32 {
@@ -411,7 +453,7 @@ cb0bfZ7fHHs=
         let default_client =
             build_http_client(Duration::from_secs(1), None, None).expect("default client");
         let api = api_client(
-            &default_client,
+            &default_client.client(),
             &url,
             crate::api::DEFAULT_APP_URL,
             "test-key",
@@ -431,7 +473,7 @@ cb0bfZ7fHHs=
         let custom_ca_client = build_http_client(Duration::from_secs(10), Some(&config), None)
             .expect("custom CA client");
         let api = api_client(
-            &custom_ca_client,
+            &custom_ca_client.client(),
             &url,
             crate::api::DEFAULT_APP_URL,
             "test-key",
@@ -460,7 +502,14 @@ cb0bfZ7fHHs=
         // Long enough for a TLS handshake while the rest of the suite runs.
         let client = build_http_client(Duration::from_secs(10), Some(&config), None)
             .expect("custom CA client");
-        let api = api_client(&client, &url, crate::api::DEFAULT_APP_URL, "test-key", None).unwrap();
+        let api = api_client(
+            &client.client(),
+            &url,
+            crate::api::DEFAULT_APP_URL,
+            "test-key",
+            None,
+        )
+        .unwrap();
         let response = api
             .btql(&serde_json::json!({"query":"select 1"}))
             .await

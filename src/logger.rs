@@ -884,7 +884,7 @@ impl BraintrustClient {
             .then(|| self.inner.login_state.org_name())
             .flatten();
         api_client(
-            &self.inner.http_client,
+            &self.inner.http_client.client(),
             &api_url,
             &app_url,
             token,
@@ -919,8 +919,8 @@ impl BraintrustClient {
         let mut builder = crate::api::Client::builder()
             .api_key(api_key)
             .app_url(self.inner.app_url.as_str())
-            .http_client((*self.inner.http_client).clone())
-            .upload_http_client((*self.inner.http_client).clone());
+            .http_client(self.inner.http_client.client())
+            .upload_http_client(self.inner.http_client.client());
         if self.inner.explicit_api_url {
             builder = builder.api_url(self.inner.api_url.as_str());
         }

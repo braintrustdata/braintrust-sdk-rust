@@ -1,6 +1,6 @@
 //! Process-wide executor and resources; facades never own a runtime.
 use crate::{BraintrustError, Result};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -38,37 +38,29 @@ pub struct ServiceConfig {
 
 /// Where the SDK runs its work.
 ///
-/// Every client shares one delivery service: one intake, set of partitions,
-/// request scheduler, connection pool and set of caches for the process. This
-/// selects the runtimes that poll its work: each operation a client method
-/// starts, such as an API call, and each upload job. The SDK's own thread is
-/// only a fallback for work started outside any runtime, such as from
+/// Every client shares one delivery service: one intake, request scheduler,
+/// set of budgets and set of caches for the process, with a queue per org.
+/// This selects the runtimes that poll its work. Queues and connection pools
+/// are kept per runtime, so each runtime polls only the work it started, and a
+/// runtime that is alive but idle holds up nothing else. The SDK's own thread
+/// is only a fallback for work started outside any runtime, such as from
 /// synchronous code.
 ///
 /// The runtime must have I/O and timers enabled. A current-thread runtime only
 /// makes progress while its owner drives it, so keep driving it (for example,
 /// by awaiting from inside it) until the work it started has finished.
 ///
-/// If a runtime shuts down with SDK work unfinished, that work's rows go back in
-/// the queue and upload from another runtime, and the stopped runtime is never
-/// selected again. Rows from a request that got a response are never sent
-/// again, but the server may have received the request that was in flight, so
-/// its rows can arrive twice; Logs3 writes by row ID, so a repeat overwrites the
-/// same row. Operations still running on a stopped runtime fail with
-/// [`crate::ExecutionError::WorkerLost`].
+/// If a runtime shuts down with SDK work unfinished, its queued rows upload
+/// from the SDK's thread instead. Rows from a request that got a response are
+/// never sent again, but the server may have received the request that was in
+/// flight, so its rows can arrive twice; Logs3 writes by row ID, so a repeat
+/// overwrites the same row. Operations still running on a stopped runtime fail
+/// with [`crate::ExecutionError::WorkerLost`].
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub enum ServiceRuntime {
-    /// The default: share the application's runtimes.
-    ///
-    /// Each operation runs on the runtime current where it is started. Each
-    /// upload job runs on the runtime current when its rows were submitted, or
-    /// on another submitter's if that one has stopped. Work started outside any
-    /// runtime runs on the SDK's thread.
-    ///
-    /// Work depends only on the runtime that started it, so runtimes that end
-    /// while others keep using the SDK, like one per `#[tokio::test]`, stop
-    /// only their own work.
+    /// The default: share the application's runtimes. Work runs on the runtime
+    /// current where it is started, or on the SDK's thread outside any runtime.
     #[default]
     Current,
     /// Everything runs on the SDK's own single-threaded runtime on a dedicated thread.
@@ -129,14 +121,28 @@ pub fn configure_service(config: ServiceConfig) -> Result<()> {
 }
 
 pub(crate) struct Service {
-    /// Runtimes that shut down while running SDK work; never selected again.
-    stopped: Mutex<HashSet<RuntimeId>>,
+    /// Application runtimes running SDK work. Each has a sentinel task that
+    /// removes it when the runtime shuts down.
+    lanes: Mutex<HashMap<RuntimeId, Handle>>,
     pub engine: Arc<crate::log_queue::engine::Engine>,
     pub attempts: Arc<crate::scheduler::Scheduler>,
     pub preparations: Arc<tokio::sync::Semaphore>,
     pub config: ServiceConfig,
     pub projects: crate::resolution::Cache<crate::resolution::ProjectKey, String>,
     pub capabilities: crate::resolution::Cache<crate::resolution::CapabilityKey, (usize, bool)>,
+}
+/// The runtime that polls a piece of SDK work: an application runtime, or
+/// `None` for the SDK's own thread. Queues and connection pools are kept per
+/// lane, so a runtime that is alive but idle only holds up its own work.
+pub(crate) type Lane = Option<RuntimeId>;
+/// A task parked on each lane's runtime; dropped when that runtime shuts down.
+struct Sentinel(RuntimeId);
+impl Drop for Sentinel {
+    fn drop(&mut self) {
+        if let Some(service) = started() {
+            service.lane_stopped(self.0);
+        }
+    }
 }
 impl std::ops::Deref for Service {
     type Target = crate::log_queue::engine::Engine;
@@ -145,56 +151,61 @@ impl std::ops::Deref for Service {
     }
 }
 impl Service {
-    /// Spawn an operation a caller started: on the caller's runtime with
-    /// [`ServiceRuntime::Current`], so it ends only with that runtime, or on the
-    /// SDK's thread for callers outside any runtime.
+    /// The lane for work started here: the configured runtime, else (with
+    /// [`ServiceRuntime::Current`]) the current one, else the SDK's thread.
+    pub fn current_lane(&self) -> Lane {
+        let handle = match &self.config.runtime {
+            ServiceRuntime::Dedicated => return None,
+            ServiceRuntime::Handle(handle) => handle.clone(),
+            ServiceRuntime::Current => Handle::try_current().ok()?,
+        };
+        if is_dedicated(&handle) {
+            return None;
+        }
+        let id = handle.id();
+        if self
+            .lanes
+            .lock()
+            .unwrap()
+            .insert(id, handle.clone())
+            .is_some()
+        {
+            return Some(id);
+        }
+        // Spawned without holding the lock: on a runtime that has shut down,
+        // the sentinel is dropped at once and removes the lane again.
+        handle.spawn(async move {
+            let _sentinel = Sentinel(id);
+            std::future::pending::<()>().await
+        });
+        self.lanes.lock().unwrap().contains_key(&id).then_some(id)
+    }
+    /// The runtime for `lane`, or the SDK's thread once that runtime has stopped.
+    pub fn lane_handle(&self, lane: Lane) -> Option<Handle> {
+        lane.and_then(|id| self.lanes.lock().unwrap().get(&id).cloned())
+            .or_else(|| dedicated().ok())
+    }
+    /// Forget a runtime that shut down: its unfinished work moves to the SDK's thread.
+    pub fn lane_stopped(&self, lane: RuntimeId) {
+        if self.lanes.lock().unwrap().remove(&lane).is_some() {
+            crate::http::forget_runtime(lane);
+            tracing::debug!(runtime = %lane, "SDK runtime stopped; moving its work to the SDK's thread");
+        }
+    }
+    /// Spawn an operation a caller started on the caller's lane, so it ends
+    /// only with that runtime.
     pub fn spawn_operation<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let caller = Handle::try_current().ok();
-        match self.select(caller.as_slice().iter()) {
-            Some(handle) => handle.spawn(future),
-            // Only when the SDK's thread cannot start; the caller's runtime
-            // is then the one place left to run.
-            None => caller
-                .unwrap_or_else(|| panic!("no Tokio runtime is available for SDK work"))
-                .spawn(future),
-        }
-    }
-    /// The runtime for an upload job: the latest submitter's that still runs.
-    pub fn job_runtime<'a>(&self, submitters: impl Iterator<Item = &'a Handle>) -> Option<Handle> {
-        self.select(submitters)
-    }
-    /// The configured runtime, else the first live application runtime among
-    /// `candidates`, else the SDK's own thread.
-    fn select<'a>(&self, mut candidates: impl Iterator<Item = &'a Handle>) -> Option<Handle> {
-        let stopped = self.stopped.lock().unwrap();
-        let live = |handle: &Handle| !stopped.contains(&handle.id());
-        match &self.config.runtime {
-            ServiceRuntime::Handle(handle) if live(handle) => return Some(handle.clone()),
-            ServiceRuntime::Dedicated => return dedicated().ok(),
-            ServiceRuntime::Handle(_) | ServiceRuntime::Current => {}
-        }
-        candidates
-            .find(|handle| live(handle))
-            .cloned()
-            .or_else(|| dedicated().ok())
-    }
-    /// Record that `runtime` dropped unfinished SDK work, which only its
-    /// shutdown does.
-    pub fn runtime_stopped(&self, runtime: RuntimeId) {
-        if !is_dedicated_id(runtime) && self.stopped.lock().unwrap().insert(runtime) {
-            if matches!(&self.config.runtime, ServiceRuntime::Handle(h) if h.id() == runtime) {
-                tracing::warn!("configured SDK runtime shut down; falling back to another runtime");
-            }
-            tracing::debug!(%runtime, "SDK runtime stopped; moving its work to another runtime");
-        }
+        self.lane_handle(self.current_lane())
+            .unwrap_or_else(|| panic!("no Tokio runtime is available for SDK work"))
+            .spawn(future)
     }
 }
-fn is_dedicated_id(runtime: RuntimeId) -> bool {
-    matches!(DEDICATED.get(), Some(Ok(dedicated)) if dedicated.id() == runtime)
+fn is_dedicated(handle: &Handle) -> bool {
+    matches!(DEDICATED.get(), Some(Ok(dedicated)) if dedicated.id() == handle.id())
 }
 static DEDICATED: OnceLock<std::result::Result<Handle, String>> = OnceLock::new();
 /// The SDK-owned runtime: one thread, started on first use and never stopped.
@@ -240,7 +251,7 @@ pub(crate) fn global() -> Result<&'static Service> {
             let engine = Arc::new(crate::log_queue::engine::Engine::new(config.clone()));
             let cache_capacity = config.max_cached_resolutions;
             Ok(Service {
-                stopped: Mutex::new(HashSet::new()),
+                lanes: Mutex::new(HashMap::new()),
                 engine,
                 attempts: crate::scheduler::Scheduler::new(config.max_concurrent_requests),
                 preparations: Arc::new(tokio::sync::Semaphore::new(

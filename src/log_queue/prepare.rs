@@ -291,7 +291,7 @@ impl LogQueueCore {
             request.org_name = org_name.map(str::to_owned);
 
             let client = crate::http::api_client(
-                &self.client,
+                &self.client.client(),
                 self.api_url.as_str(),
                 app_url.as_str(),
                 token,

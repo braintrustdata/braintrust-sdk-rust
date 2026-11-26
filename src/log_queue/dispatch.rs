@@ -85,7 +85,7 @@ impl LogQueueCore {
         *cell
             .get_or_try_init(|| async {
                 let api = crate::http::api_client(
-                    &self.client,
+                    &self.client.client(),
                     api_url.as_str(),
                     self.app_url.as_str(),
                     token,
@@ -264,7 +264,7 @@ impl LogQueueCore {
             async move {
                 let submissions = batch.submissions();
                 let result = send_batch_counting(
-                    &self.client,
+                    &self.client.client(),
                     api_url,
                     token,
                     org_name,

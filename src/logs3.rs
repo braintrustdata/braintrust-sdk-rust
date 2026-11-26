@@ -17,7 +17,10 @@ pub struct Logs3UploadResult {
 
 #[derive(Debug, Clone)]
 pub struct Logs3BatchUploader {
-    coordinator: UploadCoordinator,
+    http: crate::http::SharedHttp,
+    api_url: Url,
+    api_key: String,
+    org_name: Option<String>,
     max_request_size_override: Option<usize>,
     payload_limits: std::sync::Arc<tokio::sync::Mutex<Option<Capabilities>>>,
 }
@@ -62,19 +65,30 @@ impl Logs3BatchUploader {
         crate::service::global()?;
         let api_url = Url::parse(api_url.as_ref())
             .map_err(|e| BraintrustError::InvalidConfig(format!("invalid api_url: {e}")))?;
-        let client = build_http_client(Duration::from_secs(30), ca_bundle.as_ref(), None)?;
-        let api = api_client(
-            &client,
-            api_url.as_str(),
-            api_url.as_str(),
-            &api_key.into(),
-            org_name.as_deref(),
-        )?;
-        Ok(Self {
-            coordinator: UploadCoordinator::new(api, UploadPolicy::Standalone),
+        let http = build_http_client(Duration::from_secs(30), ca_bundle.as_ref(), None)?;
+        let uploader = Self {
+            http,
+            api_url,
+            api_key: api_key.into(),
+            org_name,
             max_request_size_override: None,
             payload_limits: Default::default(),
-        })
+        };
+        // Report invalid credentials or URLs here rather than at upload time.
+        uploader.coordinator()?;
+        Ok(uploader)
+    }
+
+    /// A coordinator using the connection pool of the runtime uploading.
+    fn coordinator(&self) -> Result<UploadCoordinator> {
+        let api = api_client(
+            &self.http.client(),
+            self.api_url.as_str(),
+            self.api_url.as_str(),
+            &self.api_key,
+            self.org_name.as_deref(),
+        )?;
+        Ok(UploadCoordinator::new(api, UploadPolicy::Standalone))
     }
 
     pub fn with_max_request_size_override(mut self, max_bytes: usize) -> Self {
@@ -97,12 +111,12 @@ impl Logs3BatchUploader {
                 return Ok(Logs3UploadResult::default());
             }
 
+            let coordinator = uploader.coordinator()?;
             let mut cached = uploader.payload_limits.lock().await;
             let limits = match *cached {
                 Some(limits) => limits,
                 None => {
-                    let limits = uploader
-                        .coordinator
+                    let limits = coordinator
                         .capabilities(DEFAULT_MAX_REQUEST_SIZE, uploader.max_request_size_override)
                         .await;
                     *cached = Some(limits);
@@ -126,7 +140,7 @@ impl Logs3BatchUploader {
             );
             let mut result = Logs3UploadResult::default();
             for batch in batches {
-                let uploaded = uploader.coordinator.upload(batch, limits).await?;
+                let uploaded = coordinator.upload(batch, limits).await?;
                 result.bytes_processed += uploaded.bytes_processed;
                 result.requests_sent += uploaded.requests_sent;
                 result.rows_uploaded += uploaded.rows_uploaded;
