@@ -447,6 +447,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_send_batch_with_retry_408() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(408))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let config = LogQueueConfig::builder().num_retries(1).build();
+        let result = send_batch_with_retry(
+            &reqwest::Client::new(),
+            &Url::parse(&server.uri()).unwrap(),
+            "token",
+            None,
+            make_batch(),
+            &config,
+            usize::MAX,
+            false,
+        )
+        .await;
+        assert!(result.is_ok(), "a request timeout should be retried");
+    }
+
+    #[tokio::test]
     async fn test_send_batch_with_retry_429() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 

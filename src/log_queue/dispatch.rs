@@ -140,22 +140,39 @@ impl LogQueueCore {
             }
         };
         let service = crate::service::global().expect("initialized service");
+        // One token serves the whole job: preparation, registration, and uploads.
+        // A provider can fail transiently, so it is retried like an upload; the
+        // wait between attempts holds no preparation permit.
+        let mut delays = crate::internal::upload::queue_delays(self.config.num_retries());
+        let token = loop {
+            let fetched = {
+                let _permit = service
+                    .preparations
+                    .acquire()
+                    .await
+                    .expect("service stays open");
+                credential.token().await
+            };
+            match (fetched, delays.next()) {
+                (Ok(token), _) => break token,
+                (Err(error), Some(delay)) => {
+                    tracing::warn!(%error, ?delay, "failed to get upload token, retrying");
+                    tokio::time::sleep(delay).await;
+                }
+                (Err(error), None) => {
+                    tracing::warn!(%error, "failed to get upload token, dropping rows");
+                    for i in 0..commands.len() {
+                        report.failed(vec![i], &error, false);
+                    }
+                    return;
+                }
+            }
+        };
         let permit = service
             .preparations
             .acquire()
             .await
             .expect("service stays open");
-        // One token serves the whole job: preparation, registration, and uploads.
-        let token = match credential.token().await {
-            Ok(token) => token,
-            Err(error) => {
-                tracing::warn!(%error, "failed to get upload token, dropping rows");
-                for i in 0..commands.len() {
-                    report.failed(vec![i], &error, false);
-                }
-                return;
-            }
-        };
         let mut failures = super::prepare::ProjectFailures::new();
         let mut spans: IndexMap<RowKey, (Logs3Row, Vec<usize>)> = IndexMap::new();
         let mut raw = Vec::new();
