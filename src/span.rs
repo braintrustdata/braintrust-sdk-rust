@@ -607,6 +607,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     /// This does not create a new queued span update. Call [`SpanHandle::log`] or
     /// [`SpanHandle::end`] first to submit changes, then call `flush()` when you need
     /// to ensure the background queue has been processed.
+    #[must_use = "await or call blocking_wait to observe delivery"]
     pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         self.submitter.flush()
     }

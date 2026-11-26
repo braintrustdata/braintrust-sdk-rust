@@ -200,6 +200,7 @@ impl<
     ///
     /// Use this for more control over span lifecycle. Once called,
     /// you cannot use `log()` on this experiment.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn start_span(
         &self,
     ) -> crate::Completion<ExperimentSpanBuilder<'static, S>, crate::BraintrustError> {
@@ -290,6 +291,7 @@ impl<
     ///
     /// This flushes pending data and fetches aggregated scores from the API.
     /// If a base experiment is configured, comparison data will be included.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn summarize(&self) -> crate::Completion<ExperimentSummary, crate::BraintrustError> {
         let experiment = self.clone();
         crate::service::submit(async move {
@@ -376,6 +378,7 @@ impl<
     }
 
     /// Flush this experiment's writes started before this call to Braintrust.
+    #[must_use = "await or call blocking_wait to observe delivery"]
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let experiment = self.clone();
         let cutoff = self.writes.cutoff();
@@ -408,6 +411,7 @@ impl<
     }
 
     /// Get the project containing this experiment.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn project(&self) -> crate::Completion<ProjectMetadata, crate::BraintrustError> {
         let experiment = self.clone();
         crate::service::submit(async move {
@@ -505,6 +509,7 @@ impl<
     /// Fetch the base experiment used for comparison.
     ///
     /// Returns `None` if no base experiment has been configured or detected.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn fetch_base_experiment(
         &self,
     ) -> crate::Completion<Option<BaseExperimentInfo>, crate::BraintrustError> {
@@ -522,6 +527,7 @@ impl<
     ///
     /// Use this to pass experiment context to another process or service,
     /// allowing spans created there to be linked to this experiment.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn export(&self) -> crate::Completion<ExportedExperiment, crate::BraintrustError> {
         let experiment = self.clone();
         crate::service::submit(async move {

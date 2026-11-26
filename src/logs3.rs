@@ -99,6 +99,7 @@ impl Logs3BatchUploader {
 
     /// Upload rows in batches, stopping at the first failure. Earlier batches
     /// may have been delivered.
+    #[must_use = "await or call blocking_wait to check whether the upload succeeded"]
     pub fn upload_rows(
         &self,
         rows: &[Map<String, Value>],

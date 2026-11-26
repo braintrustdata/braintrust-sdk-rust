@@ -16,6 +16,7 @@ impl Project {
         &self.name
     }
     /// Wait for this handle's accepted project work, excluding sibling projects.
+    #[must_use = "await or call blocking_wait to observe delivery"]
     pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         self.client.flush()
     }

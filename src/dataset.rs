@@ -565,6 +565,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     }
 
     /// Get the dataset ID (triggers registration if needed).
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn dataset_id(&self) -> crate::Completion<String, crate::BraintrustError> {
         let dataset = self.clone();
         crate::service::submit(
@@ -640,6 +641,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     /// Fetch records with pagination.
     ///
     /// Returns an iterator that fetches records in batches.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn fetch(
         &self,
         batch_size: Option<usize>,
@@ -657,6 +659,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     }
 
     /// Get dataset summary statistics.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn summarize(&self) -> crate::Completion<DatasetSummary, crate::BraintrustError> {
         let dataset = self.clone();
         crate::service::submit(async move {
@@ -684,6 +687,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     }
 
     /// Flush this dataset's writes made before this call.
+    #[must_use = "await or call blocking_wait to observe delivery"]
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let dataset = self.clone();
         let rows = std::mem::take(&mut *self.pending_rows.lock().unwrap());
@@ -849,11 +853,13 @@ impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
     /// Issue the next page or buffered-record operation immediately.
     // This asynchronous cursor cannot implement the synchronous Iterator contract.
     #[allow(clippy::should_implement_trait)]
+    #[must_use = "await or call blocking_wait to read the record"]
     pub fn next(&mut self) -> crate::Completion<Option<DatasetRecord>, crate::BraintrustError> {
         let state = self.state.clone();
         crate::service::submit(async move { Ok(state.lock().await.next().await) })
     }
     /// Collect remaining records on the shared executor.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn collect(self) -> crate::Completion<Vec<DatasetRecord>, crate::BraintrustError> {
         crate::service::submit(async move {
             let mut state = self.state.lock().await;

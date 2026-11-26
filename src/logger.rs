@@ -374,6 +374,7 @@ impl BraintrustClientBuilder {
     ///
     /// If `blocking_login` is true, waits for login to complete.
     /// Otherwise, login happens in the background with retry logic.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn build(mut self) -> crate::Completion<BraintrustClient, BraintrustError> {
         crate::service::submit(async move {
             let login = (!self.skip_login).then(|| {
@@ -554,6 +555,7 @@ impl BraintrustClient {
     /// Wait for login to complete (useful if using background login).
     ///
     /// Returns the login state once available, or an error if login times out.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn wait_for_login(&self) -> crate::Completion<LoginState, BraintrustError> {
         let client = self.clone();
         crate::service::submit(async move {
@@ -591,6 +593,7 @@ impl BraintrustClient {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn span_builder(
         &self,
     ) -> crate::Completion<crate::span::SpanBuilder<Self>, BraintrustError> {
@@ -629,6 +632,7 @@ impl BraintrustClient {
     /// Create a dataset builder using the logged-in state.
     ///
     /// This waits for login to complete if it hasn't already.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn dataset_builder(&self) -> crate::Completion<DatasetBuilder<Self>, BraintrustError> {
         let client = self.clone();
         crate::service::submit(async move {
@@ -1207,6 +1211,7 @@ impl BraintrustClient {
 
     /// Return a facade for an organization permitted by these credentials.
     /// Existing handles and accepted work retain their organization and endpoints.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn with_organization(
         &self,
         name: impl Into<String>,
@@ -1233,6 +1238,7 @@ impl BraintrustClient {
     }
 
     /// Create an experiment builder using this facade's authentication and project defaults.
+    #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn experiment_builder(
         &self,
     ) -> crate::Completion<ExperimentBuilder<Self>, BraintrustError> {
@@ -1269,6 +1275,7 @@ impl BraintrustClient {
 
     /// Capture a cutoff immediately and observe delivery of the covered batch.
     /// New writes belong to later work; completed failures are never replayed.
+    #[must_use = "await or call blocking_wait to observe delivery"]
     pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         self.inner.queue.flush()
     }
