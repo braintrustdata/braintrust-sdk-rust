@@ -379,9 +379,7 @@ where
             .blocking_wait()
             .map_err(|error| match error {
                 crate::BlockingWaitError::Operation(error) => error,
-                crate::BlockingWaitError::InRuntime => {
-                    crate::BraintrustError::Background(error.to_string())
-                }
+                error => crate::BraintrustError::Background(error.to_string()),
             })
     }
 }
