@@ -423,7 +423,8 @@ cb0bfZ7fHHs=
             .expect("generate unrelated test certificate");
         let bundle = format!("{}{certificate_pem}", unrelated_certificate.cert.pem());
         let config = CaBundleConfig::from_pem(bundle, "test bundle");
-        let custom_ca_client = build_http_client(Duration::from_secs(1), Some(&config), None)
+        // Long enough for a TLS handshake while the rest of the suite runs.
+        let custom_ca_client = build_http_client(Duration::from_secs(10), Some(&config), None)
             .expect("custom CA client");
         let api = api_client(
             &custom_ca_client,
@@ -452,7 +453,8 @@ cb0bfZ7fHHs=
         std::env::set_var(CUSTOM_CA_BUNDLE_ENV, certificate_pem);
 
         let config = CaBundleConfig::from_environment().expect("environment CA bundle");
-        let client = build_http_client(Duration::from_secs(1), Some(&config), None)
+        // Long enough for a TLS handshake while the rest of the suite runs.
+        let client = build_http_client(Duration::from_secs(10), Some(&config), None)
             .expect("custom CA client");
         let api = api_client(&client, &url, crate::api::DEFAULT_APP_URL, "test-key", None).unwrap();
         let response = api
