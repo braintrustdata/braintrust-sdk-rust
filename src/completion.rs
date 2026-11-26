@@ -69,8 +69,6 @@ pub struct Completion<T, E> {
     /// Where a panicking operation leaves its payload, to re-raise for the waiter.
     panic: Option<PanicSlot>,
 }
-/// Compatibility name for the future returned by converting a completion.
-pub type CompletionFuture<T, E> = Completion<T, E>;
 
 pub(crate) type PanicSlot = Arc<Mutex<Option<Box<dyn Any + Send>>>>;
 /// The error for a sender dropped without a result: the operation's panic,
