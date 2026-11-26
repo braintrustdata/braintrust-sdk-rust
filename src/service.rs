@@ -2,10 +2,9 @@
 use crate::{BraintrustError, Result};
 use std::collections::HashSet;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, Id as RuntimeId};
 
 /// Process-wide SDK limits. Configure before constructing the first SDK facade.
 /// Additional process, organization, and destination budgets are opt-in.
@@ -42,33 +41,37 @@ pub struct ServiceConfig {
 
 /// Where the SDK runs its work.
 ///
-/// Every client shares one delivery service: one intake, scheduler and set of
-/// upload jobs for the process. This selects the runtime that hosts it, and the
-/// runtime that runs each operation a client method starts, such as an API
-/// call or a flush.
+/// Every client shares one delivery service: one intake, set of partitions,
+/// request scheduler, connection pool and set of caches for the process. This
+/// selects the runtimes that poll its work: each operation a client method
+/// starts, such as an API call, and each upload job. The SDK's own thread is
+/// only a fallback for work started outside any runtime, such as from
+/// synchronous code.
 ///
 /// The runtime must have I/O and timers enabled. A current-thread runtime only
-/// makes progress while some thread drives it, so [`ServiceRuntime::Current`]
-/// never selects one; pass it as [`ServiceRuntime::Handle`] to use it anyway.
+/// makes progress while its owner drives it, so keep driving it (for example,
+/// by awaiting from inside it) until the work it started has finished.
 ///
-/// If the runtime hosting delivery shuts down, delivery restarts straight away
-/// on the SDK's own thread, and a stopped runtime is never selected again.
-/// Rows whose upload was interrupted go back in the queue. Rows from a request
-/// that got a response are never sent again, but the server may have received
-/// the request that was in flight, so its rows can arrive twice; Logs3 writes
-/// by row ID, so a repeat overwrites the same row. Operations still running on
-/// a stopped runtime fail with [`crate::ExecutionError::WorkerLost`].
+/// If a runtime shuts down with SDK work unfinished, that work's rows go back in
+/// the queue and upload from another runtime, and the stopped runtime is never
+/// selected again. Rows from a request that got a response are never sent
+/// again, but the server may have received the request that was in flight, so
+/// its rows can arrive twice; Logs3 writes by row ID, so a repeat overwrites the
+/// same row. Operations still running on a stopped runtime fail with
+/// [`crate::ExecutionError::WorkerLost`].
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub enum ServiceRuntime {
-    /// The default. Operations run on the runtime current where they are
-    /// started. Delivery runs on the runtime current when the first client is
-    /// built. Either uses the SDK's own thread when there is no current runtime,
-    /// or it is a current-thread runtime.
+    /// The default: share the application's runtimes.
     ///
-    /// Each operation depends only on its caller's runtime, so runtimes that
-    /// end while others keep using the SDK, like one per `#[tokio::test]`,
-    /// stop only their own operations.
+    /// Each operation runs on the runtime current where it is started. Each
+    /// upload job runs on the runtime current when its rows were submitted, or
+    /// on another submitter's if that one has stopped. Work started outside any
+    /// runtime runs on the SDK's thread.
+    ///
+    /// Work depends only on the runtime that started it, so runtimes that end
+    /// while others keep using the SDK, like one per `#[tokio::test]`, stop
+    /// only their own work.
     #[default]
     Current,
     /// Everything runs on the SDK's own single-threaded runtime on a dedicated thread.
@@ -129,40 +132,14 @@ pub fn configure_service(config: ServiceConfig) -> Result<()> {
 }
 
 pub(crate) struct Service {
-    executor: Mutex<Executor>,
+    /// Runtimes that shut down while running SDK work; never selected again.
+    stopped: Mutex<HashSet<RuntimeId>>,
     pub engine: Arc<crate::log_queue::engine::Engine>,
     pub attempts: Arc<crate::scheduler::Scheduler>,
     pub preparations: Arc<tokio::sync::Semaphore>,
     pub config: ServiceConfig,
     pub projects: crate::resolution::Cache<crate::resolution::ProjectKey, String>,
     pub capabilities: crate::resolution::Cache<crate::resolution::CapabilityKey, (usize, bool)>,
-}
-/// The runtime currently hosting the delivery loop.
-struct Executor {
-    handle: Handle,
-    /// Cleared when the delivery loop is dropped, normally by its runtime shutting down.
-    running: Arc<AtomicBool>,
-    /// Runtimes that shut down while hosting the service; never selected again.
-    stopped: HashSet<tokio::runtime::Id>,
-}
-/// Dropped with the delivery loop. Restarts delivery straight away, because
-/// callers may only be awaiting rows that are now back in the queue.
-struct Running(Arc<AtomicBool>);
-impl Drop for Running {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-        // A loop dropped while this thread is starting one is retried there.
-        if !STARTING.get() {
-            if let Some(Ok(service)) = SERVICE.get() {
-                service.handle();
-            }
-        }
-    }
-}
-thread_local! {
-    /// Set while this thread starts a delivery loop. Spawning onto a runtime
-    /// that is shutting down drops the loop at once, on this thread.
-    static STARTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 impl std::ops::Deref for Service {
     type Target = crate::log_queue::engine::Engine;
@@ -171,97 +148,60 @@ impl std::ops::Deref for Service {
     }
 }
 impl Service {
-    /// The runtime hosting SDK work, restarting the service on another one if
-    /// the previous runtime shut down.
-    pub fn handle(&self) -> Handle {
-        let mut executor = self.executor.lock().unwrap();
-        while !executor.running.load(Ordering::Acquire) {
-            let stopped = executor.handle.id();
-            tracing::warn!(runtime = %stopped, "SDK runtime stopped; restarting delivery on another runtime");
-            executor.stopped.insert(stopped);
-            let stopped = std::mem::take(&mut executor.stopped);
-            match Executor::start(&self.config.runtime, &self.engine, stopped) {
-                Ok(started) => *executor = started,
-                Err((error, stopped)) => {
-                    executor.stopped = stopped;
-                    tracing::error!(%error, "failed to restart SDK delivery");
-                    break;
-                }
-            }
-        }
-        executor.handle.clone()
-    }
-    /// Spawn shared delivery work on the runtime hosting the service.
-    pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.handle().spawn(future)
-    }
-    /// Spawn an operation a caller started. With [`ServiceRuntime::Current`] it
-    /// runs on the caller's runtime, so it ends only with that runtime.
+    /// Spawn an operation a caller started: on the caller's runtime with
+    /// [`ServiceRuntime::Current`], so it ends only with that runtime, or on the
+    /// SDK's thread for callers outside any runtime.
     pub fn spawn_operation<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let handle = self.handle();
-        if self.config.runtime == ServiceRuntime::Current {
-            let caller = current_runtime(&self.executor.lock().unwrap().stopped);
-            if let Some(caller) = caller {
-                return caller.spawn(future);
-            }
+        let caller = Handle::try_current().ok();
+        match self.select(caller.as_slice().iter()) {
+            Some(handle) => handle.spawn(future),
+            // Only when the SDK's thread cannot start; the caller's runtime
+            // is then the one place left to run.
+            None => caller
+                .unwrap_or_else(|| panic!("no Tokio runtime is available for SDK work"))
+                .spawn(future),
         }
-        handle.spawn(future)
     }
-}
-impl Executor {
-    fn start(
-        runtime: &ServiceRuntime,
-        engine: &Arc<crate::log_queue::engine::Engine>,
-        stopped: HashSet<tokio::runtime::Id>,
-    ) -> std::result::Result<Self, (String, HashSet<tokio::runtime::Id>)> {
-        let current = || current_runtime(&stopped);
-        let handle = match runtime {
-            ServiceRuntime::Handle(handle) if !stopped.contains(&handle.id()) => Ok(handle.clone()),
-            ServiceRuntime::Handle(_) => {
+    /// The runtime for an upload job: the latest submitter's that still runs.
+    pub fn job_runtime<'a>(&self, submitters: impl Iterator<Item = &'a Handle>) -> Option<Handle> {
+        self.select(submitters)
+    }
+    /// The configured runtime, else the first live application runtime among
+    /// `candidates`, else the SDK's own thread.
+    fn select<'a>(&self, mut candidates: impl Iterator<Item = &'a Handle>) -> Option<Handle> {
+        let stopped = self.stopped.lock().unwrap();
+        let live = |handle: &Handle| !stopped.contains(&handle.id());
+        match &self.config.runtime {
+            ServiceRuntime::Handle(handle) if live(handle) => return Some(handle.clone()),
+            ServiceRuntime::Dedicated => return dedicated().ok(),
+            ServiceRuntime::Handle(_) | ServiceRuntime::Current => {}
+        }
+        candidates
+            .find(|handle| live(handle))
+            .cloned()
+            .or_else(|| dedicated().ok())
+    }
+    /// Record that `runtime` dropped unfinished SDK work, which only its
+    /// shutdown does.
+    pub fn runtime_stopped(&self, runtime: RuntimeId) {
+        if !is_dedicated_id(runtime) && self.stopped.lock().unwrap().insert(runtime) {
+            if matches!(&self.config.runtime, ServiceRuntime::Handle(h) if h.id() == runtime) {
                 tracing::warn!("configured SDK runtime shut down; falling back to another runtime");
-                current().map(Ok).unwrap_or_else(dedicated)
             }
-            ServiceRuntime::Current => current().map(Ok).unwrap_or_else(dedicated),
-            ServiceRuntime::Dedicated => dedicated(),
-        };
-        let handle = match handle {
-            Ok(handle) => handle,
-            Err(error) => return Err((error, stopped)),
-        };
-        let running = Arc::new(AtomicBool::new(true));
-        let guard = Running(running.clone());
-        let worker = engine.clone();
-        let starting = STARTING.replace(true);
-        handle.spawn(async move {
-            let _guard = guard;
-            worker.run().await
-        });
-        STARTING.set(starting);
-        Ok(Self {
-            handle,
-            running,
-            stopped,
-        })
+            tracing::debug!(%runtime, "SDK runtime stopped; moving its work to another runtime");
+        }
     }
 }
-/// The current runtime, if work can rely on it without driving it.
-fn current_runtime(stopped: &HashSet<tokio::runtime::Id>) -> Option<Handle> {
-    Handle::try_current().ok().filter(|handle| {
-        handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-            && !stopped.contains(&handle.id())
-    })
+fn is_dedicated_id(runtime: RuntimeId) -> bool {
+    matches!(DEDICATED.get(), Some(Ok(dedicated)) if dedicated.id() == runtime)
 }
+static DEDICATED: OnceLock<std::result::Result<Handle, String>> = OnceLock::new();
 /// The SDK-owned runtime: one thread, started on first use and never stopped.
 fn dedicated() -> std::result::Result<Handle, String> {
-    static DEDICATED: OnceLock<std::result::Result<Handle, String>> = OnceLock::new();
     DEDICATED
         .get_or_init(|| {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -287,6 +227,10 @@ fn dedicated() -> std::result::Result<Handle, String> {
         })
         .clone()
 }
+/// The service, if it has been started, without starting it.
+pub(crate) fn started() -> Option<&'static Service> {
+    SERVICE.get()?.as_ref().ok()
+}
 pub(crate) fn global() -> Result<&'static Service> {
     let service = SERVICE
         .get_or_init(|| {
@@ -297,11 +241,9 @@ pub(crate) fn global() -> Result<&'static Service> {
                     .clone()
             };
             let engine = Arc::new(crate::log_queue::engine::Engine::new(config.clone()));
-            let executor = Executor::start(&config.runtime, &engine, HashSet::new())
-                .map_err(|(error, _)| error)?;
             let cache_capacity = config.max_cached_resolutions;
             Ok(Service {
-                executor: Mutex::new(executor),
+                stopped: Mutex::new(HashSet::new()),
                 engine,
                 attempts: crate::scheduler::Scheduler::new(config.max_concurrent_requests),
                 preparations: Arc::new(tokio::sync::Semaphore::new(
@@ -314,9 +256,8 @@ pub(crate) fn global() -> Result<&'static Service> {
         })
         .as_ref()
         .map_err(|error| BraintrustError::Background(error.clone()))?;
-    // Restart delivery promptly when its runtime has gone, even for calls that
-    // only enqueue work.
-    service.handle();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| service.engine.start_jobs());
     Ok(service)
 }
 

@@ -9,10 +9,11 @@ use crate::{
     Completion, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushReport,
     ShutdownError, ShutdownReport, WriteError,
 };
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::FutureExt;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use tokio::runtime::{Handle, Id as RuntimeId};
 use tokio::sync::{oneshot, Notify};
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -40,6 +41,8 @@ struct Entry {
     core: Arc<LogQueueCore>,
     command: SubmitCommand,
     sequence: u64,
+    /// The runtime current when the row was submitted.
+    runtime: Option<Handle>,
 }
 type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
 struct Record {
@@ -64,16 +67,55 @@ struct Intake {
 pub(crate) struct Engine {
     config: ServiceConfig,
     intake: Mutex<Intake>,
-    wake: Notify,
     cancellations: Notify,
+    /// Set by the service, which runs jobs; standalone engines in tests start none.
+    this: OnceLock<Weak<Engine>>,
 }
 impl Engine {
     pub fn new(config: ServiceConfig) -> Self {
         Self {
             config,
             intake: Mutex::new(Intake::default()),
-            wake: Notify::new(),
             cancellations: Notify::new(),
+            this: OnceLock::new(),
+        }
+    }
+    /// Start jobs from now on, as rows arrive and earlier jobs finish.
+    pub fn start_jobs(self: &Arc<Self>) {
+        let _ = self.this.set(Arc::downgrade(self));
+        self.schedule();
+    }
+    /// Start a job for each idle partition with rows. Each job runs on the
+    /// application runtime that submitted its rows, so one runtime ending only
+    /// interrupts uploads it started; see [`crate::ServiceRuntime`].
+    fn schedule(&self) {
+        let Some(engine) = self.this.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let Some(service) = crate::service::started() else {
+            return;
+        };
+        for (key, entries) in self.take_jobs() {
+            let submitters = entries
+                .iter()
+                .rev()
+                .filter_map(|entry| entry.runtime.as_ref());
+            let Some(runtime) = service.job_runtime(submitters) else {
+                tracing::error!("no runtime can run SDK delivery");
+                self.requeue(&key, entries);
+                continue;
+            };
+            let id = runtime.id();
+            runtime.spawn(engine.clone().process_job(key, entries, id));
+        }
+    }
+    /// Put a job's entries back at the front of their partition.
+    fn requeue(&self, key: &Key, entries: Vec<Entry>) {
+        let mut intake = self.intake.lock().unwrap_or_else(PoisonError::into_inner);
+        intake.active.remove(key);
+        let queue = intake.partitions.entry(key.clone()).or_default();
+        for entry in entries.into_iter().rev() {
+            queue.push_front(entry);
         }
     }
     pub fn submit(
@@ -98,6 +140,7 @@ impl Engine {
         core: Arc<LogQueueCore>,
         commands: impl IntoIterator<Item = (SubmitCommand, Option<WriteSender>)>,
     ) -> Vec<Result<(), EnqueueError>> {
+        let runtime = tokio::runtime::Handle::try_current().ok();
         let prepared: Vec<_> = commands
             .into_iter()
             .map(|(command, sender)| {
@@ -188,6 +231,7 @@ impl Engine {
                 core: core.clone(),
                 command,
                 sequence,
+                runtime: runtime.clone(),
             });
             intake.rows += 1;
             intake.bytes = intake.bytes.saturating_add(bytes);
@@ -199,7 +243,7 @@ impl Engine {
                 let _ = sender.send(Err(error.into()));
             }
         }
-        self.wake.notify_one();
+        self.schedule();
         results
     }
     /// Delivery is continuous, so a barrier only observes work accepted before it.
@@ -248,7 +292,7 @@ impl Engine {
         }
         let barrier = scope.barrier(intake.sequence, true, true);
         drop(intake);
-        self.wake.notify_one();
+        self.schedule();
         let engine = self.clone();
         let scope = scope.clone();
         crate::service::global()
@@ -314,7 +358,7 @@ impl Engine {
         }
         drop(discarded);
         self.cancellations.notify_waiters();
-        self.wake.notify_one();
+        self.schedule();
     }
     /// Start one job per idle partition. Request fairness across organizations
     /// and destinations is the scheduler's responsibility, not job order.
@@ -334,14 +378,28 @@ impl Engine {
         });
         jobs
     }
-    async fn process_job(self: Arc<Self>, key: Key, entries: Vec<Entry>) {
-        let count = entries.len();
-        let mut job = Job {
+    /// The job exists before the future is first polled, so a runtime that
+    /// drops the task unpolled still requeues its rows.
+    fn process_job(
+        self: Arc<Self>,
+        key: Key,
+        entries: Vec<Entry>,
+        runtime: RuntimeId,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let job = Job {
+            report: Report::new(entries.len()),
             engine: self,
             key,
             entries,
-            report: Report::new(count),
+            runtime,
         };
+        job.run()
+    }
+}
+impl Job {
+    async fn run(mut self) {
+        let job = &mut self;
+        let count = job.entries.len();
         let core = job.entries[0]
             .core
             .job(&job.key.route.endpoint, job.key.org_name.as_deref());
@@ -394,18 +452,6 @@ impl Engine {
         // without reaching this point requeues whatever is still unsettled.
         job.report.settle(0..count);
     }
-    pub async fn run(self: Arc<Self>) {
-        let mut active: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
-        loop {
-            for (key, entries) in self.take_jobs() {
-                active.push(self.clone().process_job(key, entries).boxed());
-            }
-            tokio::select! {
-                _ = self.wake.notified() => {},
-                _ = active.next(), if !active.is_empty() => {},
-            }
-        }
-    }
 }
 
 /// A job keeps its rows until each has an outcome. If the job is dropped first,
@@ -415,12 +461,20 @@ struct Job {
     key: Key,
     entries: Vec<Entry>,
     report: Report,
+    /// The runtime running this job. Only its shutdown drops an unfinished job.
+    runtime: RuntimeId,
 }
 impl Drop for Job {
     fn drop(&mut self) {
         let entries = std::mem::take(&mut self.entries);
         let mut report = std::mem::replace(&mut self.report, Report::new(0));
         report.settle_delivered();
+        if report.settled.iter().any(|settled| !settled) {
+            // Keep later jobs off the runtime that is shutting down.
+            if let Some(service) = crate::service::started() {
+                service.runtime_stopped(self.runtime);
+            }
+        }
         let engine = &self.engine;
         let mut intake = engine.intake.lock().unwrap_or_else(PoisonError::into_inner);
         intake.active.remove(&self.key);
@@ -476,7 +530,7 @@ impl Drop for Job {
         for (sender, result) in writes {
             let _ = sender.send(result);
         }
-        engine.wake.notify_one();
+        engine.schedule();
     }
 }
 
@@ -568,11 +622,15 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         ));
         // As when the job's runtime shuts down mid-upload.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         drop(Job {
             engine: engine.clone(),
             key,
             entries,
             report,
+            runtime: runtime.handle().id(),
         });
         assert_eq!(a.core.observation.len(), 3, "only the settled row retired");
         let jobs = engine.take_jobs();
@@ -673,7 +731,10 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].1.len(), 2);
         for (key, entries) in jobs {
-            engine.clone().process_job(key, entries).await;
+            engine
+                .clone()
+                .process_job(key, entries, Handle::current().id())
+                .await;
         }
         x.await.unwrap();
         y.await.unwrap();
@@ -715,7 +776,10 @@ mod tests {
         let x = engine.barrier(&a.core.observation, true);
         let y = engine.barrier(&b.core.observation, true);
         for (key, entries) in engine.take_jobs() {
-            engine.clone().process_job(key, entries).await;
+            engine
+                .clone()
+                .process_job(key, entries, Handle::current().id())
+                .await;
         }
         assert!(x.await.is_err());
         assert!(y.await.is_err());
@@ -750,7 +814,10 @@ mod tests {
         let x = engine.barrier(&a.core.observation, true);
         let y = engine.barrier(&b.core.observation, true);
         for (key, entries) in engine.take_jobs() {
-            engine.clone().process_job(key, entries).await;
+            engine
+                .clone()
+                .process_job(key, entries, Handle::current().id())
+                .await;
         }
         x.await.unwrap();
         assert!(y.await.is_err());
@@ -782,7 +849,10 @@ mod tests {
         let jobs = engine.take_jobs();
         assert_eq!(jobs.len(), 1);
         for (key, entries) in jobs {
-            engine.clone().process_job(key, entries).await;
+            engine
+                .clone()
+                .process_job(key, entries, Handle::current().id())
+                .await;
         }
         assert!(x.await.is_err());
         assert!(y.await.is_err());
@@ -816,7 +886,10 @@ mod tests {
         let jobs = engine.take_jobs();
         assert_eq!(jobs.len(), 1);
         for (key, entries) in jobs {
-            engine.clone().process_job(key, entries).await;
+            engine
+                .clone()
+                .process_job(key, entries, Handle::current().id())
+                .await;
         }
         assert!(flush.await.is_err());
         assert_eq!(queue.dropped_rows().preparation_failed, 20);
@@ -852,7 +925,10 @@ mod tests {
             engine.submit(queue.core.clone(), command);
             let flush = engine.barrier(&queue.core.observation, true);
             for (key, entries) in engine.take_jobs() {
-                engine.clone().process_job(key, entries).await;
+                engine
+                    .clone()
+                    .process_job(key, entries, Handle::current().id())
+                    .await;
             }
             flush.await.unwrap();
         }
@@ -895,7 +971,10 @@ mod tests {
         );
         let flush = engine.barrier(&queue.core.observation, true);
         for (key, entries) in engine.take_jobs() {
-            engine.clone().process_job(key, entries).await;
+            engine
+                .clone()
+                .process_job(key, entries, Handle::current().id())
+                .await;
         }
         assert_eq!(flush.await.unwrap().delivered(), 1);
     }
@@ -977,7 +1056,10 @@ mod tests {
         ));
         let flush = engine.barrier(&queue.core.observation, true);
         let (key, entries) = engine.take_jobs().pop().unwrap();
-        engine.clone().process_job(key, entries).await;
+        engine
+            .clone()
+            .process_job(key, entries, Handle::current().id())
+            .await;
         completion.await.unwrap();
         assert!(signal.woke.load(Ordering::SeqCst));
         assert_eq!(flush.await.unwrap().delivered(), 1);

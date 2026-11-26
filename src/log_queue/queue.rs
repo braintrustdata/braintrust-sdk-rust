@@ -293,7 +293,7 @@ impl LogQueueCore {
             return;
         }
         let service = crate::service::global().expect("initialized service");
-        service.spawn(async move {
+        service.spawn_operation(async move {
             let SubmitCommand {
                 credential: _,
                 item,

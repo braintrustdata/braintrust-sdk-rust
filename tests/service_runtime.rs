@@ -34,8 +34,12 @@ fn work_runs_on_the_sdk_thread_outside_a_runtime() {
     run_child("no_runtime_child");
 }
 #[test]
-fn delivery_does_not_rely_on_a_current_thread_runtime() {
+fn work_shares_a_current_thread_runtime() {
     run_child("current_thread_runtime_child");
+}
+#[test]
+fn uploads_run_on_the_runtime_that_submitted_their_rows() {
+    run_child("submitter_runtime_child");
 }
 #[test]
 fn work_runs_on_a_configured_runtime() {
@@ -50,7 +54,7 @@ fn rows_with_a_confirmed_upload_are_not_sent_again_after_the_runtime_stops() {
     run_child("interrupted_upload_child");
 }
 #[test]
-fn operations_survive_the_delivery_runtime_stopping() {
+fn work_from_one_runtime_survives_another_stopping() {
     run_child("caller_operation_child");
 }
 #[test]
@@ -175,7 +179,7 @@ fn current_runtime_child() {
     let app = named_runtime("app-runtime");
     let client = app.block_on(async { fixture.client() });
     let provider = Arc::new(Recorder::default());
-    fixture.log(&client, &provider, &["a"]);
+    app.block_on(async { fixture.log(&client, &provider, &["a"]) });
     // Waiting from outside any runtime, while `app` keeps running.
     assert_eq!(client.flush().blocking_wait().unwrap().delivered(), 1);
     assert_eq!(*provider.threads.lock().unwrap(), ["app-runtime"]);
@@ -221,7 +225,7 @@ fn stopped_runtime_child() {
     let provider = Arc::new(Recorder::default());
     let (stalled, entered) = mpsc::channel();
     *provider.stall.lock().unwrap() = Some(stalled);
-    fixture.log(&client, &provider, &["a", "b"]);
+    app.block_on(async { fixture.log(&client, &provider, &["a", "b"]) });
     // The job holding both rows is mid-flight when its runtime stops.
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     app.shutdown_timeout(Duration::from_secs(5));
@@ -273,13 +277,39 @@ fn interrupted_login_child() {
 #[ignore = "executed in an isolated subprocess"]
 fn current_thread_runtime_child() {
     let fixture = Fixture::new();
-    // Like `#[tokio::test]`: it only runs while its test drives it.
+    // Like `#[tokio::main(flavor = "current_thread")]` or `#[tokio::test]`.
     let app = Builder::new_current_thread().enable_all().build().unwrap();
-    let client = app.block_on(async { fixture.client() });
+    let provider = Arc::new(Recorder::default());
+    let report = app.block_on(async {
+        let client = fixture.client();
+        fixture.log(&client, &provider, &["a"]);
+        client.flush().await
+    });
+    assert_eq!(report.unwrap().delivered(), 1);
+    let this_thread = std::thread::current().name().unwrap().to_owned();
+    assert_eq!(*provider.threads.lock().unwrap(), [this_thread]);
+}
+
+#[test]
+#[ignore = "executed in an isolated subprocess"]
+fn submitter_runtime_child() {
+    let fixture = Fixture::new();
+    // Rows submitted outside any runtime upload on the SDK's thread.
+    let client = fixture.client();
     let provider = Arc::new(Recorder::default());
     fixture.log(&client, &provider, &["a"]);
     assert_eq!(client.flush().blocking_wait().unwrap().delivered(), 1);
-    assert_eq!(*provider.threads.lock().unwrap(), ["braintrust-delivery"]);
+    // Rows submitted from an application runtime upload there.
+    let app = named_runtime("app-runtime");
+    app.block_on(async {
+        fixture.log(&client, &provider, &["b"]);
+        assert_eq!(client.flush().await.unwrap().delivered(), 1);
+    });
+    assert_eq!(
+        *provider.threads.lock().unwrap(),
+        ["braintrust-delivery", "app-runtime"]
+    );
+    assert_eq!(fixture.uploaded_ids(), ["a", "b"]);
 }
 
 #[test]
@@ -314,7 +344,7 @@ fn interrupted_upload_child() {
     let app = named_runtime("app-runtime");
     let client = app.block_on(async { fixture.client() });
     let provider = Arc::new(Recorder::default());
-    fixture.log(&client, &provider, &["a", "b"]);
+    app.block_on(async { fixture.log(&client, &provider, &["a", "b"]) });
     // The rejected pair, then a, then b.
     fixture.wait_for(|fixture| fixture.uploaded_ids() == ["a", "a", "b", "b"]);
     app.shutdown_timeout(Duration::from_secs(5));
@@ -338,13 +368,18 @@ fn caller_operation_child() {
             )
             .mount(&fixture.server),
     );
-    // The first client makes `host` the delivery runtime.
-    let host = named_runtime("host-runtime");
-    host.block_on(async { fixture.client() });
-    // Another runtime, like a concurrent test, starts an operation.
-    let caller = named_runtime("caller-runtime");
+    // Like two concurrent tests: `first` has an upload in flight, while
+    // `second` waits for a login, when `first` ends.
+    let first = named_runtime("first-runtime");
+    let client = first.block_on(async { fixture.client() });
+    let provider = Arc::new(Recorder::default());
+    let (stalled, entered) = mpsc::channel();
+    *provider.stall.lock().unwrap() = Some(stalled);
+    first.block_on(async { fixture.log(&client, &provider, &["a"]) });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second = named_runtime("second-runtime");
     let uri = fixture.server.uri();
-    let login = caller.spawn(async move {
+    let login = second.spawn(async move {
         BraintrustClient::builder()
             .api_key("key")
             .api_url(&uri)
@@ -354,8 +389,22 @@ fn caller_operation_child() {
             .await
     });
     fixture.wait_for(|fixture| fixture.logins() == 1);
-    host.shutdown_timeout(Duration::from_secs(5));
-    let client = caller.block_on(login).unwrap().unwrap();
-    assert!(client.is_logged_in());
+    first.shutdown_timeout(Duration::from_secs(5));
+    let other = second.block_on(login).unwrap().unwrap();
+    assert!(other.is_logged_in());
     assert_eq!(fixture.logins(), 1, "the login was never interrupted");
+    // The interrupted upload moved to the SDK's thread.
+    client.flush().blocking_wait().unwrap();
+    assert_eq!(fixture.uploaded_ids(), ["a"]);
+    assert_eq!(
+        *provider.threads.lock().unwrap(),
+        ["first-runtime", "braintrust-delivery"]
+    );
+    // Uploads from the runtime still running stay there.
+    let provider = Arc::new(Recorder::default());
+    second.block_on(async {
+        fixture.log(&other, &provider, &["b"]);
+        assert_eq!(other.flush().await.unwrap().delivered(), 1);
+    });
+    assert_eq!(*provider.threads.lock().unwrap(), ["second-runtime"]);
 }
