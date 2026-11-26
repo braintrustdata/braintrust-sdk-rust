@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::error::Result;
 use crate::log_queue::Credential;
 use crate::span::{SpanBuilder, SpanHandle};
 use crate::types::{ParentSpanInfo, SpanPayload};
@@ -82,11 +81,6 @@ impl SpanSubmitter for MockBraintrustClient {
         let (sender, completion) = crate::Completion::pair();
         let _ = sender.send(Ok(crate::FlushReport::default()));
         completion
-    }
-
-    async fn trigger_flush(&self) -> Result<()> {
-        // Mock: no-op for tests
-        Ok(())
     }
 }
 

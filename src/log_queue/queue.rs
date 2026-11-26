@@ -1,6 +1,5 @@
 use super::config::LogQueueConfig;
 use super::http::save_payload_debug;
-use crate::error::Result;
 use crate::logger::LoginState;
 use crate::span_components::ProjectLogsIdentifier;
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
@@ -671,10 +670,5 @@ impl LogQueue {
             .expect("initialized service")
             .engine
             .shutdown(&self.core.observation, timeout)
-    }
-    /// Delivery starts as soon as work is accepted; this only verifies the service.
-    pub async fn trigger_flush_command(&self) -> Result<()> {
-        crate::service::global()?;
-        Ok(())
     }
 }

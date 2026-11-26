@@ -115,13 +115,9 @@ let anthropic_response = json!({
 let usage = extract_anthropic_usage(&anthropic_response);
 ```
 
-## License
+## Shared delivery service
 
-This project is licensed under the [Apache License, Version 2.0](LICENSE).
-
-### Sharing clients across projects and organizations
-
-SDK clients and project handles share one background delivery service and compatible HTTP connection pools. Creating another project handle does not create another queue or worker. Each handle retains its own routing context; a project's flush waits for its accepted work, and its parent client's flush includes work submitted through derived project handles.
+Every client, project handle and bulk uploader in a process shares one delivery service: one intake with a queue per organization, one request scheduler, and shared caches and HTTP connection pools. Creating another client or project handle does not create another queue or worker. Each organization's queue retries independently, and a 429 pauses only that organization's requests. A handle's flush waits for its own accepted work, and its parent client's flush includes work submitted through derived handles.
 
 ```rust,no_run
 # use braintrust_sdk_rust::BraintrustClient;
@@ -141,9 +137,11 @@ let other_org = client.with_organization("another-org").await?;
 # }
 ```
 
-For different credentials, construct another client normally. `build_without_login()` also works without a caller Tokio runtime; its per-call credential methods route uploads through the same shared service. Token providers execute on the SDK runtime, so their implementations must not depend on a caller runtime remaining alive.
+For different credentials, construct another client normally, or use the per-call credential methods of a client built with `build_without_login()`.
 
-Process-wide and per-org admission limits are optional. Configure them before constructing the first client or bulk uploader; conflicting later configuration returns an error. Per-client queue limits always apply, and retries remain counted against retained work while releasing active HTTP request capacity.
+SDK work runs on the application's Tokio runtime: each piece of work on the runtime current where it was started. The SDK starts its own single-threaded runtime only for work started outside any runtime, such as from synchronous code. `ServiceConfig::runtime` can select a specific runtime or always use the SDK's own. A current-thread runtime only makes progress while it is driven, so keep driving it until the work it started has finished. If a runtime shuts down with work unfinished, that work's rows upload from the SDK's runtime instead.
+
+Process-wide limits, including the number of concurrent requests (`max_concurrent_requests`, default 8, or `BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS`), cover every client's uploads and API calls. Process-wide and per-organization admission limits are optional. Configure them before constructing the first client or bulk uploader; conflicting later configuration returns an error. Per-client queue limits always apply.
 
 ```rust,no_run
 use braintrust_sdk_rust::{configure_service, ServiceConfig};
@@ -156,7 +154,7 @@ configure_service(ServiceConfig::builder()
 # Ok::<(), braintrust_sdk_rust::BraintrustError>(())
 ```
 
-SDK-issued operations return eager `Completion` values: calling the method starts the operation, `.await` observes it in async code, and `.blocking_wait()` observes it in synchronous code. Dropping a completion leaves accepted work running. Pending blocking waits are refused inside Tokio runtime contexts. The standalone `braintrust-api-client` crate retains its async, one-attempt transport interface. The `Task`, `Scorer`, evaluation `Dataset`, and `TokenProvider` extension traits retain their existing async contracts, including support for borrowed inputs and implementations.
+SDK operations return eager `Completion` values: calling the method starts the operation, `.await` observes it in async code, and `.blocking_wait()` observes it in synchronous code. Dropping a completion leaves the operation running. Pending blocking waits are refused inside Tokio runtime contexts. If an operation panics, the panic resumes in whoever awaits or waits on it. Evaluations and `Experiment::traced` run user code, so they stay plain async functions that run in the caller's task; use `SyncEvaluator` from synchronous code. The standalone `braintrust-api-client` crate retains its async, one-attempt transport interface.
 
 ```rust,no_run
 use braintrust_sdk_rust::BraintrustClient;
@@ -169,3 +167,7 @@ client.flush().blocking_wait()?;
 ```
 
 Delivery runs automatically with bounded admission. Write completions report admission and delivery failures, and flush completions report failures for work pending at their cutoff. Terminal failures do not poison subsequent flushes. `dropped_rows()` reports losses for the handle and its derived handles. Call `flush()` or `shutdown(timeout)` and observe its completion before exiting when delivery matters. Shutdown closes only the selected handle and its descendants; other clients and sibling projects continue using the shared service.
+
+## License
+
+This project is licensed under the [Apache License, Version 2.0](LICENSE).

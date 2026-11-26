@@ -11,8 +11,10 @@ use tokio::runtime::{Handle, Id as RuntimeId};
 /// Per-client retained work remains bounded by its configured queue capacity.
 #[derive(Clone, Debug, PartialEq, Eq, bon::Builder)]
 pub struct ServiceConfig {
-    /// Maximum simultaneous ingestion HTTP attempts, including overflow uploads.
-    #[builder(default = 8)]
+    /// Maximum simultaneous SDK HTTP requests across every client, including
+    /// uploads and API calls. Defaults to `BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS`
+    /// when set to a positive number, otherwise 8.
+    #[builder(default = default_max_concurrent_requests())]
     pub max_concurrent_requests: usize,
     /// Maximum retained rows across all clients, including in-flight work.
     pub max_rows: Option<usize>,
@@ -77,16 +79,15 @@ impl PartialEq for ServiceRuntime {
 impl Eq for ServiceRuntime {}
 impl Default for ServiceConfig {
     fn default() -> Self {
-        Self::builder()
-            .max_concurrent_requests(
-                std::env::var("BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(8),
-            )
-            .build()
+        Self::builder().build()
     }
+}
+fn default_max_concurrent_requests() -> usize {
+    std::env::var("BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(8)
 }
 static CONFIG: Mutex<Option<ServiceConfig>> = Mutex::new(None);
 static SERVICE: OnceLock<std::result::Result<Service, String>> = OnceLock::new();

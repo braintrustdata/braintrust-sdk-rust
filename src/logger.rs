@@ -970,9 +970,6 @@ impl BraintrustClient {
     /// dropped with its runtime stays pending, so the next wait restarts it.
     fn resume_background_login(&self) {
         let login = &self.inner.background_login;
-        let Some((api_key, org_name)) = login.pending.lock().unwrap().clone() else {
-            return;
-        };
         if login
             .running
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -980,6 +977,11 @@ impl BraintrustClient {
             return;
         }
         let running = LoginRunning(login.clone());
+        // Read only once running: a login that finished cleared `pending`
+        // before it stopped running, so this cannot start a stale second one.
+        let Some((api_key, org_name)) = login.pending.lock().unwrap().clone() else {
+            return;
+        };
         let client = self.clone();
         crate::service::global().expect("initialized service").spawn_operation(async move {
             let _running = running;
@@ -1258,8 +1260,10 @@ impl BraintrustClient {
         self.inner.queue.dropped_rows()
     }
 
-    /// Stop accepting writes, drain accepted work and stop the delivery worker.
-    /// A timeout fails remaining completions and discards active SDK state.
+    /// Stop accepting writes through this facade and its derived handles, and
+    /// wait for their accepted work to be delivered. Other clients sharing the
+    /// service are unaffected. A timeout fails the remaining completions and
+    /// discards their rows.
     pub fn shutdown(
         &self,
         timeout: std::time::Duration,
@@ -1273,11 +1277,11 @@ impl BraintrustClient {
         self.inner.queue.flush()
     }
 
-    /// Trigger a non-blocking background flush.
-    /// Does not wait for completion - useful for streaming writes.
+    /// Kept for compatibility: delivery is continuous, so accepted rows are
+    /// already on their way and there is nothing to trigger. Use
+    /// [`Self::flush`] to wait for delivery.
     pub fn trigger_flush(&self) -> crate::Completion<(), BraintrustError> {
-        let client = self.clone();
-        crate::service::submit(async move { client.inner.queue.trigger_flush_command().await })
+        crate::Completion::finished(Ok(()))
     }
 }
 
@@ -1294,10 +1298,6 @@ impl SpanSubmitter for BraintrustClient {
 
     fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         BraintrustClient::flush(self)
-    }
-
-    async fn trigger_flush(&self) -> Result<()> {
-        BraintrustClient::trigger_flush(self).await
     }
 }
 
