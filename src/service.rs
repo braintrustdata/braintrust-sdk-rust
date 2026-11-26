@@ -1,5 +1,5 @@
 //! Process-wide executor and resources; facades never own a runtime.
-use crate::{BraintrustError, Result};
+use crate::{operation::dedicated, BraintrustError, Result};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -186,34 +186,6 @@ impl Service {
             .spawn(future)
     }
 }
-static DEDICATED: OnceLock<std::result::Result<Handle, String>> = OnceLock::new();
-/// The SDK-owned runtime: one thread, started on first use and never stopped.
-fn dedicated() -> std::result::Result<Handle, String> {
-    DEDICATED
-        .get_or_init(|| {
-            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            std::thread::Builder::new()
-                .name("braintrust-delivery".into())
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .max_blocking_threads(4)
-                        .build();
-                    match runtime {
-                        Ok(runtime) => {
-                            let _ = sender.send(Ok(runtime.handle().clone()));
-                            runtime.block_on(std::future::pending::<()>());
-                        }
-                        Err(error) => {
-                            let _ = sender.send(Err(error.to_string()));
-                        }
-                    }
-                })
-                .map_err(|e| e.to_string())?;
-            receiver.recv().map_err(|e| e.to_string())?
-        })
-        .clone()
-}
 /// The service, if it has been started, without starting it.
 pub(crate) fn started() -> Option<&'static Service> {
     SERVICE.get()?.as_ref().ok()
@@ -243,35 +215,4 @@ pub(crate) fn global() -> Result<&'static Service> {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| service.engine.start_jobs());
     Ok(service)
-}
-
-/// Issue an owned operation immediately, independently of whether its completion is observed.
-pub(crate) fn submit<T, E>(
-    operation: impl Future<Output = std::result::Result<T, E>> + Send + 'static,
-) -> crate::Completion<T, E>
-where
-    T: Send + 'static,
-    E: From<crate::ExecutionError> + Send + 'static,
-{
-    let (sender, mut completion) = crate::Completion::pair();
-    match global() {
-        Ok(service) => {
-            let panic = completion.panic_slot();
-            service.spawn_operation(async move {
-                use futures::FutureExt;
-                match std::panic::AssertUnwindSafe(operation).catch_unwind().await {
-                    Ok(result) => {
-                        let _ = sender.send(result);
-                    }
-                    // Dropping the sender after storing the payload lets the
-                    // waiter re-raise the panic instead of seeing WorkerLost.
-                    Err(payload) => *panic.lock().unwrap() = Some(payload),
-                }
-            });
-        }
-        Err(_) => {
-            completion.record_issuance(Err(crate::ExecutionError::WorkerLost.into()));
-        }
-    }
-    completion
 }

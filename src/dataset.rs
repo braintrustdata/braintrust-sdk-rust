@@ -581,9 +581,9 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn dataset_id(&self) -> crate::Completion<String, crate::BraintrustError> {
         let dataset = self.clone();
-        crate::service::submit(
-            async move { Ok(dataset.ensure_registered().await?.dataset_id.clone()) },
-        )
+        crate::operation::submit(async move {
+            Ok(dataset.ensure_registered().await?.dataset_id.clone())
+        })
     }
 
     /// Get the dataset name.
@@ -660,7 +660,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         batch_size: Option<usize>,
     ) -> crate::Completion<DatasetIterator<S>, crate::BraintrustError> {
         let dataset = self.clone();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let metadata = dataset.ensure_registered().await?;
             Ok(DatasetIterator::new(
                 Arc::clone(&dataset.submitter),
@@ -675,7 +675,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn summarize(&self) -> crate::Completion<DatasetSummary, crate::BraintrustError> {
         let dataset = self.clone();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             // Flush pending operations first
             dataset.flush().await?;
 
@@ -704,7 +704,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let dataset = self.clone();
         let cutoff = self.pending_rows.lock().unwrap().next;
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let metadata = dataset.ensure_registered().await?;
             let flush = {
                 let mut pending = dataset.pending_rows.lock().unwrap();
@@ -860,12 +860,12 @@ impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
     #[must_use = "await or call blocking_wait to read the record"]
     pub fn next(&mut self) -> crate::Completion<Option<DatasetRecord>, crate::BraintrustError> {
         let state = self.state.clone();
-        crate::service::submit(async move { Ok(state.lock().await.next().await) })
+        crate::operation::submit(async move { Ok(state.lock().await.next().await) })
     }
     /// Collect remaining records on the shared executor.
     #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn collect(self) -> crate::Completion<Vec<DatasetRecord>, crate::BraintrustError> {
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let mut state = self.state.lock().await;
             let mut records = Vec::new();
             while let Some(row) = state.next().await {

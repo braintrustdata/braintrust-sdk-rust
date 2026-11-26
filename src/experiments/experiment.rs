@@ -155,7 +155,7 @@ impl<
         }
         let experiment = self.clone();
         let write = self.writes.start();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let _write = write;
 
             // Get or create experiment registration
@@ -206,7 +206,7 @@ impl<
     ) -> crate::Completion<ExperimentSpanBuilder<'static, S>, crate::BraintrustError> {
         self.called_start_span.store(true, Ordering::Release);
         let experiment = self.clone();
-        crate::service::submit(async move { Ok(experiment.registered_span_builder().await) })
+        crate::operation::submit(async move { Ok(experiment.registered_span_builder().await) })
     }
 
     /// Register the experiment and switch it to explicit spans.
@@ -227,7 +227,7 @@ impl<
         let experiment = self.clone();
         let id = id.to_owned();
         let write = self.writes.start();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let _write = write;
             let metadata = experiment.ensure_registered().await;
 
@@ -294,7 +294,7 @@ impl<
     #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn summarize(&self) -> crate::Completion<ExperimentSummary, crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             // Flush all pending data first
             experiment.flush().await?;
 
@@ -382,7 +382,7 @@ impl<
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let experiment = self.clone();
         let cutoff = self.writes.cutoff();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             experiment.writes.wait(cutoff).await;
             experiment
                 .submitter
@@ -414,7 +414,7 @@ impl<
     #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn project(&self) -> crate::Completion<ProjectMetadata, crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let metadata = experiment.ensure_registered().await;
             Ok(ProjectMetadata {
                 id: metadata.project_id.clone(),
@@ -462,7 +462,7 @@ impl<
         let experiment = self.clone();
         let id = id.to_owned();
         let write = self.writes.start();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let _write = write;
             let metadata = experiment.ensure_registered().await;
 
@@ -514,7 +514,7 @@ impl<
         &self,
     ) -> crate::Completion<Option<BaseExperimentInfo>, crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let metadata = experiment.ensure_registered().await;
             experiment
                 .submitter
@@ -530,7 +530,7 @@ impl<
     #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn export(&self) -> crate::Completion<ExportedExperiment, crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let metadata = experiment.ensure_registered().await;
             Ok(ExportedExperiment {
                 object_type: "experiment".to_string(),

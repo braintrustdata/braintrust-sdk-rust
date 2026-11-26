@@ -343,14 +343,14 @@ mod tests {
     }
     #[tokio::test]
     async fn an_operations_panic_reaches_whoever_awaits_it() {
-        let completion = crate::service::submit::<(), ExecutionError>(async { panic!("boom") });
+        let completion = crate::operation::submit::<(), ExecutionError>(async { panic!("boom") });
         let caught = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(completion));
         let payload = caught.await.unwrap_err();
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
     }
     #[test]
     fn an_operations_panic_reaches_a_blocking_waiter() {
-        let completion = crate::service::submit::<(), ExecutionError>(async { panic!("boom") });
+        let completion = crate::operation::submit::<(), ExecutionError>(async { panic!("boom") });
         let payload =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| completion.blocking_wait()))
                 .unwrap_err();

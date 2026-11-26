@@ -376,7 +376,7 @@ impl BraintrustClientBuilder {
     /// Otherwise, login happens in the background with retry logic.
     #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn build(mut self) -> crate::Completion<BraintrustClient, BraintrustError> {
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let login = (!self.skip_login).then(|| {
                 (
                     self.api_key.take(),
@@ -557,7 +557,7 @@ impl BraintrustClient {
     #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn wait_for_login(&self) -> crate::Completion<LoginState, BraintrustError> {
         let client = self.clone();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             if client.inner.settings.login_skipped {
                 return Err(BraintrustError::InvalidConfig(
                     "wait_for_login() not available when skip_login is enabled".into(),
@@ -597,7 +597,7 @@ impl BraintrustClient {
         &self,
     ) -> crate::Completion<crate::span::SpanBuilder<Self>, BraintrustError> {
         let client = self.clone();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             if client.inner.settings.login_skipped {
                 return Err(BraintrustError::InvalidConfig(
                 "span_builder() requires login; use span_builder_with_credentials() when skip_login is enabled".into(),
@@ -634,7 +634,7 @@ impl BraintrustClient {
     #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn dataset_builder(&self) -> crate::Completion<DatasetBuilder<Self>, BraintrustError> {
         let client = self.clone();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let state = client.wait_for_login_state().await?;
             let api_key = state
                 .api_key()
@@ -707,7 +707,7 @@ impl BraintrustClient {
     ) -> crate::Completion<(), BraintrustError> {
         let client = self.clone();
         let exported = exported.to_owned();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let login_state = if client.inner.login_state.is_logged_in() {
                 client.inner.login_state.clone()
             } else if client.inner.settings.login_skipped {
@@ -1104,7 +1104,7 @@ impl BraintrustClient {
     ) -> crate::Completion<(), BraintrustError> {
         let client = self.clone();
         let rows: Vec<_> = rows.into_iter().collect();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             if client.inner.settings.login_skipped {
                 return Err(BraintrustError::InvalidConfig(
                 "log_rows() requires login; use log_rows_with_credentials() when skip_login is enabled".into(),
@@ -1214,7 +1214,7 @@ impl BraintrustClient {
     ) -> crate::Completion<Self, BraintrustError> {
         let client = self.clone();
         let name = name.into();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let state = client.wait_for_login().await?;
             let state_key = state
                 .api_key()
@@ -1239,7 +1239,7 @@ impl BraintrustClient {
         &self,
     ) -> crate::Completion<ExperimentBuilder<Self>, BraintrustError> {
         let client = self.clone();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let state = client.wait_for_login().await?;
             let (Some(api_key), Some(org_id)) = (state.api_key(), state.org_id()) else {
                 return Err(BraintrustError::InvalidConfig("Not logged in".into()));
@@ -1311,7 +1311,7 @@ impl ExperimentRegistrar for BraintrustClient {
         // registration request still uses the shared SDK runtime.
         let handle = self.clone();
         let token = token.to_owned();
-        crate::service::submit(async move {
+        crate::operation::submit(async move {
             let client = handle.request_client(&token)?;
             let scope = handle.request_scope(&client, &token, true);
             let response = crate::internal::upload::scheduled(scope, 0, || {

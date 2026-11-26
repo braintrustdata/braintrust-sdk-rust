@@ -114,7 +114,7 @@ impl Logs3BatchUploader {
             crate::resolution::OrgIdentity::new("", self.org_name.as_deref(), &self.api_key)
                 .scope_key(),
         );
-        crate::service::submit(crate::scheduler::SCOPE.scope(scope, async move {
+        crate::operation::submit(crate::scheduler::SCOPE.scope(scope, async move {
             if rows.is_empty() {
                 return Ok(Logs3UploadResult::default());
             }

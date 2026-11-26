@@ -11,6 +11,7 @@ mod json_merge;
 mod log_queue;
 mod logger;
 mod logs3;
+mod operation;
 mod project;
 mod resolution;
 mod scheduler;
