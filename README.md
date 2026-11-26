@@ -154,7 +154,7 @@ configure_service(ServiceConfig::builder()
 # Ok::<(), braintrust_sdk_rust::BraintrustError>(())
 ```
 
-SDK operations return eager `Completion` values: calling the method starts the operation, `.await` observes it in async code, and `.blocking_wait()` observes it in synchronous code. Dropping a completion leaves the operation running. Pending blocking waits are refused inside Tokio runtime contexts. If an operation panics, the panic resumes in whoever awaits or waits on it. Evaluations and `Experiment::traced` run user code, so they stay plain async functions that run in the caller's task; use `SyncEvaluator` from synchronous code. The standalone `braintrust-api-client` crate retains its async, one-attempt transport interface.
+SDK operations return eager `Completion` values: calling the method starts the operation, `.await` observes it in async code, and `.blocking_wait()` observes it in synchronous code. Dropping a completion leaves the operation running. You can discard routine logging completions for best-effort delivery. Calls such as `build()`, `flush()`, and `upload_rows()` warn if you ignore their completion, so you can catch a missed result or delivery error. Pending blocking waits are refused inside Tokio runtime contexts. If an operation panics, the panic resumes in whoever awaits or waits on it. Evaluations and `Experiment::traced` run user code, so they stay plain async functions that run in the caller's task; use `SyncEvaluator` from synchronous code. The standalone `braintrust-api-client` crate retains its async, one-attempt transport interface.
 
 ```rust,no_run
 use braintrust_sdk_rust::BraintrustClient;

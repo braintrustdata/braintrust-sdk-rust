@@ -33,6 +33,13 @@ pub enum BlockingWaitError<E> {
 /// returns that error, or the accepted operation's result. Dropping this token does
 /// not cancel accepted work.
 ///
+/// For best-effort logging, you can ignore the completion from
+/// [`crate::SpanHandle::log`]. Await it or call [`Self::blocking_wait`] if you
+/// need to confirm delivery. Methods such as [`crate::BraintrustClientBuilder::build`]
+/// and [`crate::BraintrustClient::flush`] warn when you discard their completion.
+/// Use `let _ = …` to discard one deliberately.
+///
+///
 /// `Completion` is an [`Unpin`] [`Future`], so it can also be awaited through
 /// `&mut` (for example with `tokio::time::timeout(duration, &mut completion)`)
 /// and passed to combinators like `futures::future::join_all`. Once the result
