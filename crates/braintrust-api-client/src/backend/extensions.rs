@@ -273,6 +273,33 @@ pub struct AttachmentUploadMetadata {
     pub headers: HashMap<String, String>,
 }
 
+/// Metadata for a Braintrust-hosted attachment.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct AttachmentMetadata {
+    /// Signed URL for downloading the attachment.
+    pub download_url: String,
+    /// Signed URL for displaying the attachment inline.
+    pub embed_url: String,
+    /// Size of the stored object in bytes, if present.
+    pub content_length: Option<u64>,
+    pub status: AttachmentUploadStatus,
+}
+
+/// Upload status reported by an attachment lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "upload_status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AttachmentUploadStatus {
+    Uploading,
+    Done,
+    Error {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FunctionPage {
@@ -778,6 +805,13 @@ impl BackendClient {
     ) -> Result<AttachmentUploadMetadata> {
         self.post("/attachment", request).await
     }
+
+    /// Look up a Braintrust-hosted attachment by key without downloading it.
+    pub async fn get_attachment(&self, request: &AttachmentRequest) -> Result<AttachmentMetadata> {
+        let query = serde_urlencoded::to_string(request)?;
+        self.get(&format!("/attachment?{query}")).await
+    }
+
     /// Upload bytes using an attachment slot, then mark the attachment ready.
     /// Object storage receives only slot headers, never API credentials.
     pub async fn upload_attachment(

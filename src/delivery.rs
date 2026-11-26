@@ -17,7 +17,7 @@ pub enum ExecutionError {
     WorkerLost,
     #[error("delivery shutdown timed out")]
     TimedOut,
-    /// A [`crate::Completion`] was polled again after returning its result.
+    /// A completion was polled again after returning its result.
     #[error("the completion's result was already taken")]
     AlreadyTaken,
 }
