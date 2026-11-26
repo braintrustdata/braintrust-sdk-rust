@@ -205,7 +205,7 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 ///         .build(),
 /// ).await?;
 ///
-/// let _passed = runner.finish();
+/// let _passed = runner.finish().await?;
 /// Ok(())
 /// # }
 /// ```
@@ -218,6 +218,46 @@ pub struct BtEvalRunner {
     registered_names: Arc<Mutex<Vec<String>>>,
     /// Whether all evals that have run so far passed (no failures).
     all_passed: Arc<std::sync::atomic::AtomicBool>,
+    /// Evals started from this runner or its clones that have not finished.
+    running: Arc<RunningEvals>,
+}
+
+/// Counts running evals, so [`BtEvalRunner::finish`] can report on all of them.
+#[derive(Default)]
+struct RunningEvals {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+impl RunningEvals {
+    fn start(self: &Arc<Self>) -> RunningEval {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        RunningEval(self.clone())
+    }
+    async fn wait_idle(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+/// Held by a running eval; dropped when it finishes, however it ends.
+struct RunningEval(Arc<RunningEvals>);
+impl Drop for RunningEval {
+    fn drop(&mut self) {
+        if self
+            .0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
 }
 
 impl BtEvalRunner {
@@ -243,6 +283,7 @@ impl BtEvalRunner {
                 client,
                 registered_names: Default::default(),
                 all_passed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                running: Default::default(),
             })
         })
     }
@@ -260,6 +301,7 @@ impl BtEvalRunner {
             client: Some(client),
             registered_names: Default::default(),
             all_passed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            running: Default::default(),
         }
     }
 
@@ -273,7 +315,8 @@ impl BtEvalRunner {
         self.config.no_send_logs
     }
 
-    /// Returns `true` if all evals that have run so far passed.
+    /// Returns `true` if all evals that have finished so far passed. Evals still
+    /// running are not included; [`Self::finish`] waits for them.
     pub fn all_passed(&self) -> bool {
         self.all_passed.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -302,7 +345,10 @@ impl BtEvalRunner {
     {
         let runner = self.clone();
         let project = project.to_owned();
+        // Counted now, so a `finish` called before this eval runs still waits for it.
+        let running = self.running.start();
         crate::service::submit(async move {
+            let _running = running;
             let name = opts.name.clone();
 
             if !runner.passes_filter(&name) {
@@ -319,9 +365,14 @@ impl BtEvalRunner {
                 opts.project_name = Some(project.to_string());
             }
 
-            let client = runner.client.clone().ok_or_else(|| {
-                BraintrustError::Background("BtEvalRunner has no client".to_string())
-            })?;
+            let Some(client) = runner.client.clone() else {
+                runner
+                    .all_passed
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Err(BraintrustError::Background(
+                    "BtEvalRunner has no client".to_string(),
+                ));
+            };
 
             let evaluator = Evaluator::<I, O>::from_arc(client);
 
@@ -373,20 +424,26 @@ impl BtEvalRunner {
         })
     }
 
-    /// Finish the runner session.
+    /// Finish the runner session, once every eval started from this runner or
+    /// its clones has finished, including evals whose completions were dropped.
     ///
     /// In list mode, prints all registered eval names to stdout (one per line).
-    /// The SSE connection (if any) is closed when this method returns.
+    /// The SSE connection (if any) is closed when the last running eval and this
+    /// runner have released it.
     ///
-    /// Returns `true` if all evals passed, `false` if any failed.
-    pub fn finish(self) -> bool {
-        if self.config.list {
-            for name in self.registered_names.lock().unwrap().iter() {
-                println!("{}", name);
+    /// Resolves to `true` if all evals passed, `false` if any failed. `bt eval`
+    /// uses it for the process's exit status.
+    pub fn finish(self) -> crate::Completion<bool, crate::BraintrustError> {
+        crate::service::submit(async move {
+            self.running.wait_idle().await;
+            if self.config.list {
+                for name in self.registered_names.lock().unwrap().iter() {
+                    println!("{}", name);
+                }
             }
-        }
-        // SSE connection is closed when `self.sse` is dropped
-        self.all_passed.load(std::sync::atomic::Ordering::Acquire)
+            // SSE connection is closed when the last `self.sse` is dropped
+            Ok(self.all_passed.load(std::sync::atomic::Ordering::Acquire))
+        })
     }
 
     /// Convenience method: run multiple evaluations whose results can be summarized.
@@ -427,6 +484,65 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::eval::{Case, SimpleFnTask};
+
+    fn test_runner(list: bool) -> BtEvalRunner {
+        BtEvalRunner {
+            config: RunnerConfig {
+                jsonl: false,
+                list,
+                terminate_on_failure: false,
+                filters: Vec::new(),
+                no_send_logs: true,
+            },
+            sse: None,
+            client: None,
+            registered_names: Default::default(),
+            all_passed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            running: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_waits_for_evals_whose_completions_were_dropped() {
+        let runner = test_runner(false);
+        let held = runner.running.start();
+        let finish = runner.finish();
+        tokio::pin!(finish);
+        assert!(futures::poll!(finish.as_mut()).is_pending());
+        drop(held);
+        assert!(finish.await.unwrap());
+
+        let mut runner = test_runner(false);
+        let opts = EvalOpts::<String, String>::builder()
+            .name("dropped".to_string())
+            .dataset(Vec::<Case<String, String>>::new().into())
+            .task(Box::new(SimpleFnTask::new(|input: &String| {
+                Ok(input.clone())
+            })))
+            .scorers(Vec::new())
+            .build();
+        // Started and ignored; without a client it fails.
+        drop(runner.eval("project", opts));
+        assert!(!runner.finish().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn finish_lists_names_registered_by_evals_still_running() {
+        let mut runner = test_runner(true);
+        let observer = runner.registered_names.clone();
+        let opts = EvalOpts::<String, String>::builder()
+            .name("listed".to_string())
+            .dataset(Vec::<Case<String, String>>::new().into())
+            .task(Box::new(SimpleFnTask::new(|input: &String| {
+                Ok(input.clone())
+            })))
+            .scorers(Vec::new())
+            .build();
+        drop(runner.eval("project", opts));
+        assert!(runner.finish().await.unwrap());
+        assert_eq!(*observer.lock().unwrap(), ["listed"]);
+    }
 
     // Serialize tests that mutate BT_EVAL_FILTER_PARSED to avoid race conditions.
     static FILTER_ENV_MUTEX: Mutex<()> = Mutex::new(());
