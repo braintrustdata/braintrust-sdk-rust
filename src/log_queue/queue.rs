@@ -660,7 +660,7 @@ impl LogQueue {
     pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         crate::service::global()
             .expect("initialized service")
-            .barrier(&self.core.observation, true)
+            .barrier(&self.core.observation)
     }
     pub fn shutdown(
         &self,

@@ -20,8 +20,6 @@ pub struct ServiceConfig {
     pub max_rows: Option<usize>,
     /// Maximum estimated retained payload bytes across all clients.
     pub max_bytes: Option<usize>,
-    /// Maximum retained rows for one client and its derived handles.
-    pub max_client_rows: Option<usize>,
     /// Maximum retained rows for one organization across client facades.
     pub max_org_rows: Option<usize>,
     /// Maximum entries in each shared project and server-capability cache.
@@ -259,17 +257,6 @@ pub(crate) fn global() -> Result<&'static Service> {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| service.engine.start_jobs());
     Ok(service)
-}
-
-/// Execute on the service runtime, so connection lifetimes never depend on callers.
-pub(crate) async fn execute<T: Send + 'static>(
-    operation: impl Future<Output = Result<T>> + Send + 'static,
-) -> Result<T> {
-    match global()?.spawn_operation(operation).await {
-        Ok(result) => result,
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(error) => Err(BraintrustError::Background(error.to_string())),
-    }
 }
 
 /// Issue an owned operation immediately, independently of whether its completion is observed.

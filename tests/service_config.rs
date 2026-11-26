@@ -30,7 +30,6 @@ async fn configuration_child() {
         .max_concurrent_requests(2)
         .max_rows(6)
         .max_org_rows(6)
-        .max_client_rows(2)
         .build();
     configure_service(config.clone()).unwrap();
     let server = MockServer::start().await;

@@ -929,11 +929,7 @@ impl BraintrustClient {
         }
         let org = crate::resolution::OrgIdentity::new("", org_name, api_key);
         let scope = crate::scheduler::Scope::new(self.inner.app_url.as_str(), org.scope_key());
-        let result = crate::service::execute(crate::internal::upload::admitted(
-            scope,
-            builder.build_with_login(),
-        ))
-        .await?;
+        let result = crate::internal::upload::admitted(scope, builder.build_with_login()).await?;
         let client = match result {
             Ok(client) => client,
             Err(crate::api::ClientInitError::Login(error)) => {
@@ -1310,13 +1306,9 @@ impl ExperimentRegistrar for BraintrustClient {
     ) -> Result<ExperimentRegisterResponse> {
         let client = self.request_client(token)?;
         let scope = self.request_scope(&client, token, true);
-        crate::service::execute(async move {
-            let response = crate::internal::upload::scheduled(scope, 0, || {
-                client.register_experiment(&request)
-            });
-            Ok(response.await?.into_inner())
-        })
-        .await
+        let response =
+            crate::internal::upload::scheduled(scope, 0, || client.register_experiment(&request));
+        Ok(response.await?.into_inner())
     }
 }
 
@@ -1329,12 +1321,9 @@ impl BaseExperimentFetcher for BraintrustClient {
     ) -> Result<Option<BaseExperimentInfo>> {
         let client = self.request_client(token)?;
         let scope = self.request_scope(&client, token, true);
-        let experiment_id = experiment_id.to_owned();
-        let response = crate::service::execute(async move {
-            crate::internal::upload::scheduled(scope, 0, || client.base_experiment(&experiment_id))
-                .await
-        })
-        .await;
+        let response =
+            crate::internal::upload::scheduled(scope, 0, || client.base_experiment(experiment_id))
+                .await;
         let base_response: BaseExperimentResponse = match response {
             Ok(response) => response.into_inner(),
             Err(BraintrustError::Api { status: 400, .. }) => return Ok(None),
@@ -1359,13 +1348,8 @@ impl ExperimentComparisonFetcher for BraintrustClient {
     ) -> Result<ExperimentComparisonResponse> {
         let client = self.request_client(token)?;
         let scope = self.request_scope(&client, token, false);
-        let experiment_id = experiment_id.to_owned();
-        let base_experiment_id = base_experiment_id.map(str::to_owned);
-        let response = crate::service::execute(async move {
-            crate::internal::upload::scheduled(scope, 0, || {
-                client.experiment_comparison(&experiment_id, base_experiment_id.as_deref())
-            })
-            .await
+        let response = crate::internal::upload::scheduled(scope, 0, || {
+            client.experiment_comparison(experiment_id, base_experiment_id)
         })
         .await?;
         Ok(response.into_inner())
@@ -1381,12 +1365,9 @@ impl DatasetRegistrar for BraintrustClient {
     ) -> Result<DatasetRegisterResponse> {
         let client = self.request_client(token)?;
         let scope = self.request_scope(&client, token, true);
-        crate::service::execute(async move {
-            let response =
-                crate::internal::upload::scheduled(scope, 0, || client.register_dataset(&request));
-            Ok(response.await?.into_inner())
-        })
-        .await
+        let response =
+            crate::internal::upload::scheduled(scope, 0, || client.register_dataset(&request));
+        Ok(response.await?.into_inner())
     }
 }
 
@@ -1395,13 +1376,10 @@ impl DatasetFetcher for BraintrustClient {
     async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse> {
         let client = self.request_client(token)?;
         let scope = self.request_scope(&client, token, false);
-        crate::service::execute(async move {
-            let response = crate::internal::upload::scheduled(scope, 0, || {
-                client.btql_json_as::<_, BTQLResponse>(&query)
-            });
-            Ok(response.await?.into_inner())
-        })
-        .await
+        let response = crate::internal::upload::scheduled(scope, 0, || {
+            client.btql_json_as::<_, BTQLResponse>(&query)
+        });
+        Ok(response.await?.into_inner())
     }
 }
 
@@ -1414,12 +1392,9 @@ impl DatasetSummarizer for BraintrustClient {
     ) -> Result<DatasetSummaryResponse> {
         let client = self.request_client(token)?;
         let scope = self.request_scope(&client, token, false);
-        let dataset_id = dataset_id.to_owned();
-        let response = crate::service::execute(async move {
-            crate::internal::upload::scheduled(scope, 0, || client.dataset_summary(&dataset_id))
-                .await
-        })
-        .await?;
+        let response =
+            crate::internal::upload::scheduled(scope, 0, || client.dataset_summary(dataset_id))
+                .await?;
         Ok(response.into_inner())
     }
 }

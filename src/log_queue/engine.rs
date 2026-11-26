@@ -170,10 +170,6 @@ impl Engine {
                     .is_some_and(|max| intake.bytes.saturating_add(bytes) > max)
                 || self
                     .config
-                    .max_client_rows
-                    .is_some_and(|max| client_rows >= max)
-                || self
-                    .config
                     .max_org_rows
                     .is_some_and(|max| intake.org_rows.get(&route).copied().unwrap_or(0) >= max)
                 || client_rows >= core.config.queue_max_size()
@@ -231,13 +227,9 @@ impl Engine {
         results
     }
     /// Delivery is continuous, so a barrier only observes work accepted before it.
-    pub fn barrier(
-        &self,
-        scope: &Arc<Observation>,
-        checked: bool,
-    ) -> Completion<FlushReport, FlushError> {
+    pub fn barrier(&self, scope: &Arc<Observation>) -> Completion<FlushReport, FlushError> {
         let intake = self.intake.lock().unwrap();
-        scope.barrier(intake.sequence, checked, false)
+        scope.barrier(intake.sequence, false)
     }
     fn retire(intake: &mut Intake, sequence: u64) -> Option<Record> {
         let record = intake.records.remove(&sequence)?;
@@ -256,18 +248,10 @@ impl Engine {
         scope: &Arc<Observation>,
         timeout: std::time::Duration,
     ) -> Completion<ShutdownReport, ShutdownError> {
-        let (sender, mut completion) = Completion::pair();
+        let (sender, completion) = Completion::pair();
         let intake = self.intake.lock().unwrap();
-        {
-            let mut state = scope.state.lock().unwrap();
-            if state.shutdown_controls >= 1024 {
-                completion.record_issuance(Err(EnqueueError::Full.into()));
-                return completion;
-            }
-            state.shutdown_controls += 1;
-            state.closed = true;
-        }
-        let barrier = scope.barrier(intake.sequence, true, true);
+        scope.state.lock().unwrap().closed = true;
+        let barrier = scope.barrier(intake.sequence, true);
         drop(intake);
         self.schedule();
         let engine = self.clone();
@@ -286,7 +270,6 @@ impl Engine {
                         Err(ExecutionError::TimedOut.into())
                     }
                 };
-                scope.state.lock().unwrap().shutdown_controls -= 1;
                 let _ = sender.send(result);
             });
         completion
@@ -532,22 +515,12 @@ mod tests {
         assert_eq!(b.core.observation.len(), 0);
     }
     #[test]
-    fn byte_limit_and_client_limit_are_independent() {
+    fn the_byte_limit_rejects_rows_that_would_exceed_it() {
         let engine = Engine::new(ServiceConfig::builder().max_bytes(1).build());
         let a = queue();
         engine.submit(a.core.clone(), SubmitCommand::test_row("oversized"));
         assert_eq!(engine.intake.lock().unwrap().bytes, 0);
         assert_eq!(a.dropped_rows().queue_full, 1);
-        let engine = Engine::new(ServiceConfig::builder().max_client_rows(1).build());
-        let child = a.child();
-        engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
-        engine.submit(child.core.clone(), SubmitCommand::test_row("child"));
-        let b = queue();
-        engine.submit(b.core.clone(), SubmitCommand::test_row("b"));
-        assert_eq!(child.dropped_rows().queue_full, 1);
-        assert_eq!(a.dropped_rows().queue_full, 2);
-        assert_eq!(b.dropped_rows().queue_full, 0);
-        assert_eq!(engine.intake.lock().unwrap().rows, 2);
     }
     #[tokio::test]
     async fn barriers_cover_only_work_accepted_before_them() {
@@ -555,7 +528,7 @@ mod tests {
         let a = queue();
         let b = queue();
         engine.submit(a.core.clone(), SubmitCommand::test_row("covered"));
-        let barrier = engine.barrier(&a.core.observation, true);
+        let barrier = engine.barrier(&a.core.observation);
         engine.submit(a.core.clone(), SubmitCommand::test_row("later"));
         engine.submit(b.core.clone(), SubmitCommand::test_row("unrelated"));
         let jobs = engine.take_jobs();
@@ -682,8 +655,8 @@ mod tests {
         let b = http_queue(&server, 100);
         engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
         engine.submit(b.core.clone(), SubmitCommand::test_row("b"));
-        let x = engine.barrier(&a.core.observation, true);
-        let y = engine.barrier(&b.core.observation, true);
+        let x = engine.barrier(&a.core.observation);
+        let y = engine.barrier(&b.core.observation);
         let jobs = engine.take_jobs();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].1.len(), 2);
@@ -723,8 +696,8 @@ mod tests {
         let b = http_queue(&server, 100);
         engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
         engine.submit(b.core.clone(), SubmitCommand::test_row("b"));
-        let x = engine.barrier(&a.core.observation, true);
-        let y = engine.barrier(&b.core.observation, true);
+        let x = engine.barrier(&a.core.observation);
+        let y = engine.barrier(&b.core.observation);
         for (key, entries) in engine.take_jobs() {
             engine.clone().process_job(key, entries).await;
         }
@@ -758,8 +731,8 @@ mod tests {
         let b = http_queue(&server, 1);
         engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
         engine.submit(b.core.clone(), SubmitCommand::test_row("b"));
-        let x = engine.barrier(&a.core.observation, true);
-        let y = engine.barrier(&b.core.observation, true);
+        let x = engine.barrier(&a.core.observation);
+        let y = engine.barrier(&b.core.observation);
         for (key, entries) in engine.take_jobs() {
             engine.clone().process_job(key, entries).await;
         }
@@ -787,9 +760,9 @@ mod tests {
         let b = root.child();
         engine.submit(a.core.clone(), SubmitCommand::test_span(false));
         engine.submit(b.core.clone(), SubmitCommand::test_span(true));
-        let x = engine.barrier(&a.core.observation, true);
-        let y = engine.barrier(&b.core.observation, true);
-        let z = engine.barrier(&root.core.observation, true);
+        let x = engine.barrier(&a.core.observation);
+        let y = engine.barrier(&b.core.observation);
+        let z = engine.barrier(&root.core.observation);
         let jobs = engine.take_jobs();
         assert_eq!(jobs.len(), 1);
         for (key, entries) in jobs {
@@ -823,7 +796,7 @@ mod tests {
                 SubmitCommand::test_named_span(&format!("row-{i}"), "forbidden"),
             );
         }
-        let flush = engine.barrier(&queue.core.observation, true);
+        let flush = engine.barrier(&queue.core.observation);
         let jobs = engine.take_jobs();
         assert_eq!(jobs.len(), 1);
         for (key, entries) in jobs {
@@ -861,7 +834,7 @@ mod tests {
             let mut command = SubmitCommand::test_named_span(token, "rotation-project");
             command.credential = Credential::token_value(token.into());
             engine.submit(queue.core.clone(), command);
-            let flush = engine.barrier(&queue.core.observation, true);
+            let flush = engine.barrier(&queue.core.observation);
             for (key, entries) in engine.take_jobs() {
                 engine.clone().process_job(key, entries).await;
             }
@@ -904,7 +877,7 @@ mod tests {
             queue.core.clone(),
             SubmitCommand::test_named_span("row", "flaky-project"),
         );
-        let flush = engine.barrier(&queue.core.observation, true);
+        let flush = engine.barrier(&queue.core.observation);
         for (key, entries) in engine.take_jobs() {
             engine.clone().process_job(key, entries).await;
         }
@@ -986,7 +959,7 @@ mod tests {
             completion.as_mut().poll(&mut Context::from_waker(&waker)),
             Poll::Pending
         ));
-        let flush = engine.barrier(&queue.core.observation, true);
+        let flush = engine.barrier(&queue.core.observation);
         let (key, entries) = engine.take_jobs().pop().unwrap();
         engine.clone().process_job(key, entries).await;
         completion.await.unwrap();

@@ -41,7 +41,6 @@ pub(crate) type Notification = (
 );
 pub(crate) struct Waiter {
     pub cutoff: u64,
-    pub checked: bool,
     pub delivered: u64,
     pub failed: u64,
     pub error: Option<WriteError>,
@@ -53,7 +52,6 @@ pub(crate) struct State {
     pub waiters: Vec<Waiter>,
     pub drops: DroppedRows,
     pub closed: bool,
-    pub shutdown_controls: usize,
     pub terminal: Option<ExecutionError>,
 }
 pub(crate) struct Observation {
@@ -128,7 +126,7 @@ impl Observation {
             if sequence <= waiter.cutoff {
                 if let Some(error) = error {
                     waiter.failed += 1;
-                    if waiter.checked && waiter.error.is_none() {
+                    if waiter.error.is_none() {
                         waiter.error = Some(error.clone());
                     }
                 } else {
@@ -184,12 +182,7 @@ impl Observation {
     pub fn len(&self) -> usize {
         self.state.lock().unwrap().pending.len()
     }
-    pub fn barrier(
-        &self,
-        cutoff: u64,
-        checked: bool,
-        allow_closed: bool,
-    ) -> Completion<FlushReport, FlushError> {
+    pub fn barrier(&self, cutoff: u64, allow_closed: bool) -> Completion<FlushReport, FlushError> {
         let (sender, mut completion) = Completion::pair();
         let terminal = self.terminal();
         let closed = self.closed();
@@ -206,7 +199,6 @@ impl Observation {
         } else {
             state.waiters.push(Waiter {
                 cutoff,
-                checked,
                 delivered: 0,
                 failed: 0,
                 error: None,
