@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use wiremock::{
-    matchers::{method, path},
+    matchers::{body_string_contains, method, path},
     Mock, MockServer, ResponseTemplate,
 };
 
@@ -44,6 +44,10 @@ fn work_runs_on_a_configured_runtime() {
 #[test]
 fn rows_in_flight_when_the_runtime_stops_are_delivered_on_another() {
     run_child("stopped_runtime_child");
+}
+#[test]
+fn rows_with_a_confirmed_upload_are_not_sent_again_after_the_runtime_stops() {
+    run_child("interrupted_upload_child");
 }
 #[test]
 fn operations_survive_the_delivery_runtime_stopping() {
@@ -276,6 +280,48 @@ fn current_thread_runtime_child() {
     fixture.log(&client, &provider, &["a"]);
     assert_eq!(client.flush().blocking_wait().unwrap().delivered(), 1);
     assert_eq!(*provider.threads.lock().unwrap(), ["braintrust-delivery"]);
+}
+
+#[test]
+#[ignore = "executed in an isolated subprocess"]
+fn interrupted_upload_child() {
+    let fixture = Fixture::new();
+    // Rows a and b form one batch. The server rejects it as too large, so the
+    // SDK splits it: a's request succeeds, and b's is still waiting for its
+    // response when the runtime stops.
+    fixture.server_runtime.block_on(async {
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .and(body_string_contains(r#""id":"a""#))
+            .and(body_string_contains(r#""id":"b""#))
+            .respond_with(ResponseTemplate::new(413))
+            .with_priority(1)
+            .mount(&fixture.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .and(body_string_contains(r#""id":"b""#))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{}")
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .up_to_n_times(1)
+            .with_priority(2)
+            .mount(&fixture.server)
+            .await;
+    });
+    let app = named_runtime("app-runtime");
+    let client = app.block_on(async { fixture.client() });
+    let provider = Arc::new(Recorder::default());
+    fixture.log(&client, &provider, &["a", "b"]);
+    // The rejected pair, then a, then b.
+    fixture.wait_for(|fixture| fixture.uploaded_ids() == ["a", "a", "b", "b"]);
+    app.shutdown_timeout(Duration::from_secs(5));
+    let report = client.flush().blocking_wait().unwrap();
+    assert_eq!(report.delivered(), 1, "only b was still outstanding");
+    // Besides the rejected pair: a once, and b again because its outcome was unknown.
+    assert_eq!(fixture.uploaded_ids(), ["a", "a", "b", "b", "b"]);
 }
 
 #[test]

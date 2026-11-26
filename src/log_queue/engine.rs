@@ -419,7 +419,8 @@ struct Job {
 impl Drop for Job {
     fn drop(&mut self) {
         let entries = std::mem::take(&mut self.entries);
-        let report = std::mem::replace(&mut self.report, Report::new(0));
+        let mut report = std::mem::replace(&mut self.report, Report::new(0));
+        report.settle_delivered();
         let engine = &self.engine;
         let mut intake = engine.intake.lock().unwrap_or_else(PoisonError::into_inner);
         intake.active.remove(&self.key);
@@ -560,7 +561,12 @@ mod tests {
         let (key, entries) = engine.take_jobs().pop().unwrap();
         engine.submit(a.core.clone(), SubmitCommand::test_row("later"));
         let mut report = Report::new(entries.len());
-        report.settle([0]);
+        // Rows 0 and 1 went in one upload; the request holding row 0 succeeded
+        // before the job was dropped, while row 1's was still in flight.
+        report.uploads.push((
+            vec![vec![0], vec![1]],
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        ));
         // As when the job's runtime shuts down mid-upload.
         drop(Job {
             engine: engine.clone(),

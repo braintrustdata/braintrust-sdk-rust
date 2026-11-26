@@ -12,6 +12,7 @@ use crate::{
 };
 use futures::{stream, StreamExt};
 use indexmap::IndexMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use url::Url;
 
@@ -25,6 +26,9 @@ pub(super) struct Report {
     pub errors: Vec<Option<DeliveryError>>,
     pub losses: Vec<Loss>,
     pub settled: Vec<bool>,
+    /// Batches being uploaded: each row's submissions in batch order, and how
+    /// many leading rows have been delivered so far.
+    pub uploads: Vec<(Vec<Vec<usize>>, Arc<AtomicUsize>)>,
 }
 impl Report {
     pub fn new(count: usize) -> Self {
@@ -32,6 +36,17 @@ impl Report {
             errors: vec![None; count],
             losses: Vec::new(),
             settled: vec![false; count],
+            uploads: Vec::new(),
+        }
+    }
+    /// Settle rows whose request already succeeded, so a job dropped mid-upload
+    /// does not send them again.
+    pub fn settle_delivered(&mut self) {
+        for (rows, delivered) in std::mem::take(&mut self.uploads) {
+            let delivered = delivered.load(Ordering::Acquire);
+            for submissions in rows.into_iter().take(delivered) {
+                self.settle(submissions);
+            }
         }
     }
     pub fn settle(&mut self, submissions: impl IntoIterator<Item = usize>) {
@@ -224,13 +239,23 @@ impl LogQueueCore {
         for (submissions, error) in failures {
             report.failed(submissions, &error, true);
         }
-        let sends = batches.into_iter().map(|batch| {
+        let batches: Vec<_> = batches
+            .into_iter()
+            .map(|batch| {
+                let delivered = Arc::new(AtomicUsize::new(0));
+                report
+                    .uploads
+                    .push((batch.submissions(), delivered.clone()));
+                (batch, delivered)
+            })
+            .collect();
+        let sends = batches.into_iter().map(|(batch, delivered)| {
             let api_url = &api_url;
             let token = token.as_ref();
             let org_name = org_name.as_deref();
             async move {
                 let submissions = batch.submissions();
-                let (delivered, result) = send_batch_counting(
+                let result = send_batch_counting(
                     &self.client,
                     api_url,
                     token,
@@ -239,9 +264,10 @@ impl LogQueueCore {
                     &self.config,
                     max_request_size,
                     overflow,
+                    &delivered,
                 )
                 .await;
-                (submissions, delivered, result)
+                (submissions, delivered.load(Ordering::Acquire), result)
             }
         });
         let mut sends = stream::iter(sends).buffer_unordered(usize::MAX);
