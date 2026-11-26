@@ -1,3 +1,5 @@
+mod support;
+
 use braintrust_sdk_rust::{BraintrustClient, SpanComponents, SpanLog, SpanObjectType};
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -7,6 +9,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const LOGS3_DELAY: Duration = Duration::from_millis(500);
 
 async fn flush_rows(rows: usize) -> (Vec<usize>, Duration) {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/logs3"))
@@ -92,6 +95,7 @@ async fn flush_sends_full_batches_with_bounded_concurrency() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rate_limited_project_does_not_block_other_projects() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/logs3"))

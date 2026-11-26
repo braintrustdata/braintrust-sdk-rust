@@ -1,3 +1,5 @@
+mod support;
+
 use braintrust_sdk_rust::{BraintrustClient, TokenProvider};
 use serde_json::{json, Map, Value};
 use std::future::IntoFuture;
@@ -15,6 +17,7 @@ fn row(id: &str, project: &str) -> Map<String, Value> {
         .clone()
 }
 fn client(server: &MockServer) -> BraintrustClient {
+    support::use_dedicated_runtime();
     BraintrustClient::builder()
         .app_url(server.uri())
         .api_url(server.uri())
@@ -32,6 +35,7 @@ async fn accept(server: &MockServer) {
 
 #[tokio::test]
 async fn construction_and_submission_need_no_caller_runtime() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
     accept(&server).await;
     let endpoint = server.uri();
@@ -57,6 +61,7 @@ async fn construction_and_submission_need_no_caller_runtime() {
 
 #[tokio::test]
 async fn delivery_survives_the_constructing_runtime() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
     accept(&server).await;
     let endpoint = server.uri();
@@ -211,6 +216,7 @@ async fn terminal_failure_is_scoped_and_does_not_poison_later_flushes() {
 
 #[tokio::test]
 async fn retry_sleep_releases_capacity_for_healthy_orgs() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
     let healthy_at = Arc::new(Mutex::new(None));
     Mock::given(method("POST"))
@@ -290,6 +296,7 @@ async fn a_flush_excludes_submissions_after_its_cutoff() {
 
 #[tokio::test]
 async fn org_selection_uses_discovered_endpoints_without_retargeting_existing_work() {
+    support::use_dedicated_runtime();
     let app = MockServer::start().await;
     let a = MockServer::start().await;
     let b = MockServer::start().await;
@@ -391,6 +398,7 @@ async fn concurrent_clients_share_project_resolution_without_sharing_delivery_re
 
 #[tokio::test]
 async fn dataset_registration_retries_failure_and_clones_share_success() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/apikey/login"))

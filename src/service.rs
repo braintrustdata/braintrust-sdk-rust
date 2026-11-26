@@ -1,7 +1,7 @@
 //! Process-wide executor and resources; facades never own a runtime.
 use crate::{BraintrustError, Result};
-use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::runtime::{Handle, Id as RuntimeId};
@@ -35,29 +35,16 @@ pub struct ServiceConfig {
 
 /// Where the SDK runs its work.
 ///
-/// Every client shares one delivery service: one intake, request scheduler,
-/// set of budgets and set of caches for the process, with a queue per org.
-/// This selects the runtimes that poll its work. Queues and connection pools
-/// are kept per runtime, so each runtime polls only the work it started, and a
-/// runtime that is alive but idle holds up nothing else. The SDK's own thread
-/// is only a fallback for work started outside any runtime, such as from
-/// synchronous code.
-///
-/// The runtime must have I/O and timers enabled. A current-thread runtime only
-/// makes progress while its owner drives it, so keep driving it (for example,
-/// by awaiting from inside it) until the work it started has finished.
-///
-/// If a runtime shuts down with SDK work unfinished, its queued rows upload
-/// from the SDK's thread instead. Rows from a request that got a response are
-/// never sent again, but the server may have received the request that was in
-/// flight, so its rows can arrive twice; Logs3 writes by row ID, so a repeat
-/// overwrites the same row. Operations still running on a stopped runtime fail
-/// with [`crate::ExecutionError::WorkerLost`].
+/// The SDK selects one runtime when the process first uses the service.
+/// The selected runtime must have I/O and timers enabled. Keep driving a
+/// current-thread runtime until its SDK work finishes. If the selected
+/// application runtime shuts down, the SDK moves pending rows to its own thread.
+/// In-flight operations can fail with [`crate::ExecutionError::WorkerLost`].
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub enum ServiceRuntime {
-    /// The default: share the application's runtimes. Work runs on the runtime
-    /// current where it is started, or on the SDK's thread outside any runtime.
+    /// The default: use the runtime current at first use, or start the SDK's
+    /// own runtime if there is none.
     #[default]
     Current,
     /// Everything runs on the SDK's own single-threaded runtime on a dedicated thread.
@@ -91,7 +78,9 @@ static CONFIG: Mutex<Option<ServiceConfig>> = Mutex::new(None);
 static SERVICE: OnceLock<std::result::Result<Service, String>> = OnceLock::new();
 
 /// Set process-wide limits before the first SDK client or uploader is built.
-/// Repeating identical configuration is allowed; conflicting late configuration fails.
+/// The service initializes on first use. Setting configuration alone does not
+/// start it or select the current runtime.
+/// Repeating identical configuration is allowed. Conflicting configuration fails.
 pub fn configure_service(config: ServiceConfig) -> Result<()> {
     if config.max_concurrent_requests == 0
         || config.max_cached_resolutions == 0
@@ -115,28 +104,58 @@ pub fn configure_service(config: ServiceConfig) -> Result<()> {
 }
 
 pub(crate) struct Service {
-    /// Application runtimes running SDK work. Each has a sentinel task that
-    /// removes it when the runtime shuts down.
-    lanes: Mutex<HashMap<RuntimeId, Handle>>,
+    runtime: Executor,
     pub engine: Arc<crate::log_queue::engine::Engine>,
     pub attempts: Arc<crate::scheduler::Scheduler>,
     pub config: ServiceConfig,
     pub projects: crate::resolution::Cache<crate::resolution::ProjectKey, String>,
     pub capabilities: crate::resolution::Cache<crate::resolution::CapabilityKey, (usize, bool)>,
 }
-/// The runtime that polls a piece of SDK work: an application runtime, or
-/// `None` for the SDK's own thread. Queues and connection pools are kept per
-/// lane, so a runtime that is alive but idle only holds up its own work.
-pub(crate) type Lane = Option<RuntimeId>;
-/// A task parked on each lane's runtime; dropped when that runtime shuts down.
-struct Sentinel(RuntimeId);
-impl Drop for Sentinel {
+/// One selected runtime with a dedicated fallback after shutdown.
+struct Executor {
+    primary: Option<Handle>,
+    stopped: Arc<AtomicBool>,
+}
+
+struct RuntimeLifetime {
+    id: RuntimeId,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Drop for RuntimeLifetime {
     fn drop(&mut self) {
-        if let Some(service) = started() {
-            service.lane_stopped(self.0);
+        if !self.stopped.swap(true, Ordering::AcqRel) {
+            crate::http::forget_runtime(self.id);
         }
     }
 }
+
+impl Executor {
+    fn new(config: &ServiceRuntime) -> std::result::Result<Self, String> {
+        let primary = match config {
+            ServiceRuntime::Current => Handle::try_current().ok(),
+            ServiceRuntime::Dedicated => None,
+            ServiceRuntime::Handle(handle) => Some(handle.clone()),
+        };
+        let stopped = Arc::new(AtomicBool::new(false));
+        if let Some(handle) = &primary {
+            // Capture the guard before spawning so it also drops if the
+            // chosen runtime shuts down before the task is first polled.
+            let lifetime = RuntimeLifetime {
+                id: handle.id(),
+                stopped: stopped.clone(),
+            };
+            handle.spawn(async move {
+                let _lifetime = lifetime;
+                std::future::pending::<()>().await;
+            });
+        } else {
+            dedicated()?;
+        }
+        Ok(Self { primary, stopped })
+    }
+}
+
 impl std::ops::Deref for Service {
     type Target = crate::log_queue::engine::Engine;
     fn deref(&self) -> &Self::Target {
@@ -144,61 +163,38 @@ impl std::ops::Deref for Service {
     }
 }
 impl Service {
-    /// The lane for work started here: the configured runtime, else (with
-    /// [`ServiceRuntime::Current`]) the current one, else the SDK's thread.
-    pub fn current_lane(&self) -> Lane {
-        let handle = match &self.config.runtime {
-            ServiceRuntime::Dedicated => return None,
-            ServiceRuntime::Handle(handle) => handle.clone(),
-            ServiceRuntime::Current => Handle::try_current().ok()?,
-        };
-        if is_dedicated(&handle) {
-            return None;
+    pub fn runtime_handle(&self) -> Option<Handle> {
+        if !self.runtime.stopped.load(Ordering::Acquire) {
+            if let Some(handle) = &self.runtime.primary {
+                return Some(handle.clone());
+            }
         }
-        let id = handle.id();
+        dedicated().ok()
+    }
+
+    pub fn runtime_stopped(&self, id: RuntimeId) {
         if self
-            .lanes
-            .lock()
-            .unwrap()
-            .insert(id, handle.clone())
-            .is_some()
+            .runtime
+            .primary
+            .as_ref()
+            .is_some_and(|handle| handle.id() == id)
         {
-            return Some(id);
-        }
-        // Spawned without holding the lock: on a runtime that has shut down,
-        // the sentinel is dropped at once and removes the lane again.
-        handle.spawn(async move {
-            let _sentinel = Sentinel(id);
-            std::future::pending::<()>().await
-        });
-        self.lanes.lock().unwrap().contains_key(&id).then_some(id)
-    }
-    /// The runtime for `lane`, or the SDK's thread once that runtime has stopped.
-    pub fn lane_handle(&self, lane: Lane) -> Option<Handle> {
-        lane.and_then(|id| self.lanes.lock().unwrap().get(&id).cloned())
-            .or_else(|| dedicated().ok())
-    }
-    /// Forget a runtime that shut down: its unfinished work moves to the SDK's thread.
-    pub fn lane_stopped(&self, lane: RuntimeId) {
-        if self.lanes.lock().unwrap().remove(&lane).is_some() {
-            crate::http::forget_runtime(lane);
-            tracing::debug!(runtime = %lane, "SDK runtime stopped; moving its work to the SDK's thread");
+            drop(RuntimeLifetime {
+                id,
+                stopped: self.runtime.stopped.clone(),
+            });
         }
     }
-    /// Spawn an operation a caller started on the caller's lane, so it ends
-    /// only with that runtime.
+
     pub fn spawn_operation<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.lane_handle(self.current_lane())
+        self.runtime_handle()
             .unwrap_or_else(|| panic!("no Tokio runtime is available for SDK work"))
             .spawn(future)
     }
-}
-fn is_dedicated(handle: &Handle) -> bool {
-    matches!(DEDICATED.get(), Some(Ok(dedicated)) if dedicated.id() == handle.id())
 }
 static DEDICATED: OnceLock<std::result::Result<Handle, String>> = OnceLock::new();
 /// The SDK-owned runtime: one thread, started on first use and never stopped.
@@ -244,7 +240,7 @@ pub(crate) fn global() -> Result<&'static Service> {
             let engine = Arc::new(crate::log_queue::engine::Engine::new(config.clone()));
             let cache_capacity = config.max_cached_resolutions;
             Ok(Service {
-                lanes: Mutex::new(HashMap::new()),
+                runtime: Executor::new(&config.runtime)?,
                 engine,
                 attempts: crate::scheduler::Scheduler::new(config.max_concurrent_requests),
                 config,

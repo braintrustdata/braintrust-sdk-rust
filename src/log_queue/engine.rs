@@ -36,8 +36,6 @@ struct Key {
     transport: u64,
     app_url: String,
     raw: bool,
-    /// The runtime whose submissions these are, and which runs their jobs.
-    lane: crate::service::Lane,
 }
 struct Entry {
     core: Arc<LogQueueCore>,
@@ -83,8 +81,7 @@ impl Engine {
         let _ = self.this.set(Arc::downgrade(self));
         self.schedule();
     }
-    /// Start a job for each idle partition with rows, on its lane's runtime,
-    /// so a runtime only ever polls the uploads it submitted.
+    /// Start a job for each idle partition on the process-wide runtime.
     fn schedule(&self) {
         let Some(engine) = self.this.get().and_then(Weak::upgrade) else {
             return;
@@ -93,12 +90,12 @@ impl Engine {
             return;
         };
         for (key, entries) in self.take_jobs() {
-            let Some(runtime) = service.lane_handle(key.lane) else {
+            let Some(runtime) = service.runtime_handle() else {
                 tracing::error!("no runtime can run SDK delivery");
                 self.requeue(&key, entries);
                 continue;
             };
-            runtime.spawn(engine.clone().process_job(key, entries));
+            runtime.spawn(engine.clone().process_job(key, entries, Some(runtime.id())));
         }
     }
     /// Put a job's entries back at the front of their partition.
@@ -132,7 +129,6 @@ impl Engine {
         core: Arc<LogQueueCore>,
         commands: impl IntoIterator<Item = (SubmitCommand, Option<WriteSender>)>,
     ) -> Vec<Result<(), EnqueueError>> {
-        let lane = crate::service::started().and_then(|service| service.current_lane());
         let prepared: Vec<_> = commands
             .into_iter()
             .map(|(command, sender)| {
@@ -196,7 +192,6 @@ impl Engine {
                 transport: core.client.identity,
                 app_url: core.app_url.to_string(),
                 raw: command.is_raw(),
-                lane,
             };
             results.push(Ok(()));
             intake.records.insert(
@@ -344,10 +339,12 @@ impl Engine {
         self: Arc<Self>,
         key: Key,
         entries: Vec<Entry>,
+        runtime: Option<tokio::runtime::Id>,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let job = Job {
             report: Report::new(entries.len()),
             engine: self,
+            runtime,
             key,
             entries,
         };
@@ -408,6 +405,7 @@ impl Job {
 /// usually because its runtime shut down, unsettled rows go back in the queue.
 struct Job {
     engine: Arc<Engine>,
+    runtime: Option<tokio::runtime::Id>,
     key: Key,
     entries: Vec<Entry>,
     report: Report,
@@ -417,11 +415,11 @@ impl Drop for Job {
         let entries = std::mem::take(&mut self.entries);
         let mut report = std::mem::replace(&mut self.report, Report::new(0));
         report.settle_delivered();
-        if let (Some(lane), true) = (self.key.lane, report.settled.contains(&false)) {
+        if let (Some(runtime), true) = (self.runtime, report.settled.contains(&false)) {
             // Only a runtime shutting down drops an unfinished job. Move its
             // work now rather than spawning it there again.
             if let Some(service) = crate::service::started() {
-                service.lane_stopped(lane);
+                service.runtime_stopped(runtime);
             }
         }
         let engine = &self.engine;
@@ -563,6 +561,7 @@ mod tests {
         // As when the job's runtime shuts down mid-upload.
         drop(Job {
             engine: engine.clone(),
+            runtime: None,
             key,
             entries,
             report,
@@ -661,7 +660,7 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].1.len(), 2);
         for (key, entries) in jobs {
-            engine.clone().process_job(key, entries).await;
+            engine.clone().process_job(key, entries, None).await;
         }
         x.await.unwrap();
         y.await.unwrap();
@@ -699,7 +698,7 @@ mod tests {
         let x = engine.barrier(&a.core.observation);
         let y = engine.barrier(&b.core.observation);
         for (key, entries) in engine.take_jobs() {
-            engine.clone().process_job(key, entries).await;
+            engine.clone().process_job(key, entries, None).await;
         }
         assert!(x.await.is_err());
         assert!(y.await.is_err());
@@ -734,7 +733,7 @@ mod tests {
         let x = engine.barrier(&a.core.observation);
         let y = engine.barrier(&b.core.observation);
         for (key, entries) in engine.take_jobs() {
-            engine.clone().process_job(key, entries).await;
+            engine.clone().process_job(key, entries, None).await;
         }
         x.await.unwrap();
         assert!(y.await.is_err());
@@ -766,7 +765,7 @@ mod tests {
         let jobs = engine.take_jobs();
         assert_eq!(jobs.len(), 1);
         for (key, entries) in jobs {
-            engine.clone().process_job(key, entries).await;
+            engine.clone().process_job(key, entries, None).await;
         }
         assert!(x.await.is_err());
         assert!(y.await.is_err());
@@ -800,7 +799,7 @@ mod tests {
         let jobs = engine.take_jobs();
         assert_eq!(jobs.len(), 1);
         for (key, entries) in jobs {
-            engine.clone().process_job(key, entries).await;
+            engine.clone().process_job(key, entries, None).await;
         }
         assert!(flush.await.is_err());
         assert_eq!(queue.dropped_rows().preparation_failed, 20);
@@ -836,7 +835,7 @@ mod tests {
             engine.submit(queue.core.clone(), command);
             let flush = engine.barrier(&queue.core.observation);
             for (key, entries) in engine.take_jobs() {
-                engine.clone().process_job(key, entries).await;
+                engine.clone().process_job(key, entries, None).await;
             }
             flush.await.unwrap();
         }
@@ -879,7 +878,7 @@ mod tests {
         );
         let flush = engine.barrier(&queue.core.observation);
         for (key, entries) in engine.take_jobs() {
-            engine.clone().process_job(key, entries).await;
+            engine.clone().process_job(key, entries, None).await;
         }
         assert_eq!(flush.await.unwrap().delivered(), 1);
     }
@@ -961,7 +960,7 @@ mod tests {
         ));
         let flush = engine.barrier(&queue.core.observation);
         let (key, entries) = engine.take_jobs().pop().unwrap();
-        engine.clone().process_job(key, entries).await;
+        engine.clone().process_job(key, entries, None).await;
         completion.await.unwrap();
         assert!(signal.woke.load(Ordering::SeqCst));
         assert_eq!(flush.await.unwrap().delivered(), 1);

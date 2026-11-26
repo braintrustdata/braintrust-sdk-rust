@@ -1,5 +1,4 @@
-//! Which runtime runs SDK work. The service is process-wide, so each scenario
-//! runs in its own subprocess with the default runtime selection.
+//! The SDK selects its process-wide runtime once. Each scenario starts a fresh process.
 use braintrust_sdk_rust::{
     configure_service, BraintrustClient, ServiceConfig, ServiceRuntime, TokenProvider,
 };
@@ -38,8 +37,8 @@ fn work_shares_a_current_thread_runtime() {
     run_child("current_thread_runtime_child");
 }
 #[test]
-fn uploads_run_on_the_runtime_that_submitted_their_rows() {
-    run_child("submitter_runtime_child");
+fn an_initial_sync_caller_keeps_the_same_sdk_runtime() {
+    run_child("initial_sync_caller_child");
 }
 #[test]
 fn work_runs_on_a_configured_runtime() {
@@ -54,16 +53,8 @@ fn rows_with_a_confirmed_upload_are_not_sent_again_after_the_runtime_stops() {
     run_child("interrupted_upload_child");
 }
 #[test]
-fn work_from_one_runtime_survives_another_stopping() {
-    run_child("caller_operation_child");
-}
-#[test]
-fn an_idle_runtime_does_not_hold_up_another_runtimes_uploads() {
-    run_child("idle_runtime_child");
-}
-#[test]
-fn an_idle_runtimes_connections_are_not_reused_elsewhere() {
-    run_child("idle_connection_child");
+fn later_callers_share_the_first_callers_runtime() {
+    run_child("later_callers_child");
 }
 #[test]
 fn a_background_login_interrupted_by_its_runtime_stopping_resumes() {
@@ -183,6 +174,8 @@ fn named_runtime(name: &str) -> Runtime {
 #[test]
 #[ignore = "executed in an isolated subprocess"]
 fn current_runtime_child() {
+    // Setting limits outside Tokio must not initialize a dedicated runtime.
+    configure_service(ServiceConfig::builder().max_concurrent_requests(2).build()).unwrap();
     let fixture = Fixture::new();
     let app = named_runtime("app-runtime");
     let client = app.block_on(async { fixture.client() });
@@ -300,14 +293,14 @@ fn current_thread_runtime_child() {
 
 #[test]
 #[ignore = "executed in an isolated subprocess"]
-fn submitter_runtime_child() {
+fn initial_sync_caller_child() {
     let fixture = Fixture::new();
     // Rows submitted outside any runtime upload on the SDK's thread.
     let client = fixture.client();
     let provider = Arc::new(Recorder::default());
     fixture.log(&client, &provider, &["a"]);
     assert_eq!(client.flush().blocking_wait().unwrap().delivered(), 1);
-    // Rows submitted from an application runtime upload there.
+    // A later application runtime still sends work to the SDK thread.
     let app = named_runtime("app-runtime");
     app.block_on(async {
         fixture.log(&client, &provider, &["b"]);
@@ -315,7 +308,7 @@ fn submitter_runtime_child() {
     });
     assert_eq!(
         *provider.threads.lock().unwrap(),
-        ["braintrust-delivery", "app-runtime"]
+        ["braintrust-delivery", "braintrust-delivery"]
     );
     assert_eq!(fixture.uploaded_ids(), ["a", "b"]);
 }
@@ -364,102 +357,37 @@ fn interrupted_upload_child() {
 
 #[test]
 #[ignore = "executed in an isolated subprocess"]
-fn caller_operation_child() {
+fn later_callers_child() {
     let fixture = Fixture::new();
-    fixture.server_runtime.block_on(
-        Mock::given(method("POST"))
-            .and(path("/api/apikey/login"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"org_info": [{"id": "org-id", "name": "Org"}]}))
-                    .set_delay(Duration::from_millis(500)),
-            )
-            .mount(&fixture.server),
-    );
-    // Like two concurrent tests: `first` has an upload in flight, while
-    // `second` waits for a login, when `first` ends.
     let first = named_runtime("first-runtime");
-    let client = first.block_on(async { fixture.client() });
+    let a = first.block_on(async { fixture.client() });
+    let later = Builder::new_current_thread().enable_all().build().unwrap();
+    let b = later.block_on(async { fixture.client() });
     let provider = Arc::new(Recorder::default());
-    let (stalled, entered) = mpsc::channel();
-    *provider.stall.lock().unwrap() = Some(stalled);
-    first.block_on(async { fixture.log(&client, &provider, &["a"]) });
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let second = named_runtime("second-runtime");
-    let uri = fixture.server.uri();
-    let login = second.spawn(async move {
-        BraintrustClient::builder()
-            .api_key("key")
-            .api_url(&uri)
-            .app_url(&uri)
-            .blocking_login(true)
-            .build()
-            .await
+
+    first.block_on(async { fixture.log(&a, &provider, &["a"]) });
+    later.block_on(async {
+        b.log_rows_with_token_provider(
+            provider.clone(),
+            "other-org",
+            None,
+            [json!({"id": "b", "project_id": "p"})
+                .as_object()
+                .unwrap()
+                .clone()],
+        );
     });
-    fixture.wait_for(|fixture| fixture.logins() == 1);
-    first.shutdown_timeout(Duration::from_secs(5));
-    let other = second.block_on(login).unwrap().unwrap();
-    assert!(other.is_logged_in());
-    assert_eq!(fixture.logins(), 1, "the login was never interrupted");
-    // The interrupted upload moved to the SDK's thread.
-    client.flush().blocking_wait().unwrap();
-    assert_eq!(fixture.uploaded_ids(), ["a"]);
+    // Drive neither caller task while waiting. The first runtime has its
+    // own worker and work from the second caller must also run there.
+    a.flush()
+        .blocking_wait_timeout(Duration::from_secs(5))
+        .unwrap();
+    b.flush()
+        .blocking_wait_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(fixture.uploaded_ids(), ["a", "b"]);
     assert_eq!(
         *provider.threads.lock().unwrap(),
-        ["first-runtime", "braintrust-delivery"]
+        ["first-runtime", "first-runtime"]
     );
-    // Uploads from the runtime still running stay there.
-    let provider = Arc::new(Recorder::default());
-    second.block_on(async {
-        fixture.log(&other, &provider, &["b"]);
-        assert_eq!(other.flush().await.unwrap().delivered(), 1);
-    });
-    assert_eq!(*provider.threads.lock().unwrap(), ["second-runtime"]);
-}
-
-#[test]
-#[ignore = "executed in an isolated subprocess"]
-fn idle_runtime_child() {
-    let fixture = Fixture::new();
-    let healthy = named_runtime("healthy-runtime");
-    // Two clients whose rows share an org, credential and connection profile.
-    let idle_client = healthy.block_on(async { fixture.client() });
-    let client = healthy.block_on(async { fixture.client() });
-    let provider = Arc::new(Recorder::default());
-    // A current-thread runtime that is kept alive but no longer driven.
-    let idle = Builder::new_current_thread().enable_all().build().unwrap();
-    idle.block_on(async { fixture.log(&idle_client, &provider, &["idle"]) });
-    let report = healthy.block_on(async {
-        fixture.log(&client, &provider, &["healthy"]);
-        tokio::time::timeout(Duration::from_secs(5), client.flush()).await
-    });
-    assert_eq!(report.unwrap().unwrap().delivered(), 1);
-    assert_eq!(fixture.uploaded_ids(), ["healthy"]);
-    // The idle runtime's row uploads once that runtime runs again.
-    idle.block_on(async { idle_client.flush().await.unwrap() });
-    assert_eq!(fixture.uploaded_ids(), ["healthy", "idle"]);
-}
-
-#[test]
-#[ignore = "executed in an isolated subprocess"]
-fn idle_connection_child() {
-    let fixture = Fixture::new();
-    let provider = Arc::new(Recorder::default());
-    // Leaves a pooled keep-alive connection that only `idle` can drive.
-    let idle = Builder::new_current_thread().enable_all().build().unwrap();
-    idle.block_on(async {
-        let client = fixture.client();
-        fixture.log(&client, &provider, &["a"]);
-        client.flush().await.unwrap();
-    });
-    let client = fixture.client();
-    fixture.log(&client, &provider, &["b"]);
-    let started = std::time::Instant::now();
-    let report = client
-        .flush()
-        .blocking_wait_timeout(Duration::from_secs(10))
-        .unwrap();
-    assert_eq!(report.delivered(), 1);
-    assert!(started.elapsed() < Duration::from_secs(5));
-    drop(idle);
 }

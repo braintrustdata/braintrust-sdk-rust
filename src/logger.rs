@@ -1311,11 +1311,19 @@ impl ExperimentRegistrar for BraintrustClient {
         token: &str,
         request: ExperimentRegisterRequest,
     ) -> Result<ExperimentRegisterResponse> {
-        let client = self.request_client(token)?;
-        let scope = self.request_scope(&client, token, true);
-        let response =
-            crate::internal::upload::scheduled(scope, 0, || client.register_experiment(&request));
-        Ok(response.await?.into_inner())
+        // Experiment::traced runs its callback on the caller's task, but its
+        // registration request still uses the shared SDK runtime.
+        let handle = self.clone();
+        let token = token.to_owned();
+        crate::service::submit(async move {
+            let client = handle.request_client(&token)?;
+            let scope = handle.request_scope(&client, &token, true);
+            let response = crate::internal::upload::scheduled(scope, 0, || {
+                client.register_experiment(&request)
+            });
+            Ok(response.await?.into_inner())
+        })
+        .await
     }
 }
 

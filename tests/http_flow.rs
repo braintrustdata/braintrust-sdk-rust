@@ -1,3 +1,5 @@
+mod support;
+
 use braintrust_sdk_rust::{BraintrustClient, BraintrustError, SpanLog, TokenProvider};
 use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path};
@@ -5,6 +7,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
 async fn submits_with_bearer_token() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -64,6 +67,7 @@ async fn submits_with_bearer_token() {
 
 #[tokio::test]
 async fn preparation_failure_reaches_write_and_covering_flush() {
+    support::use_dedicated_runtime();
     // Preparation failure terminates the logical batch, then is forgotten.
     let server = MockServer::start().await;
 
@@ -106,6 +110,7 @@ async fn preparation_failure_reaches_write_and_covering_flush() {
 
 #[tokio::test]
 async fn automatic_delivery_reports_backend_rejection_through_completion() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/project/register"))
@@ -144,6 +149,7 @@ async fn automatic_delivery_reports_backend_rejection_through_completion() {
 
 #[tokio::test]
 async fn tracked_stateless_update_reports_automatic_delivery_failure() {
+    support::use_dedicated_runtime();
     use braintrust_sdk_rust::{SpanComponents, SpanObjectType, WriteError};
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -183,6 +189,7 @@ async fn tracked_stateless_update_reports_automatic_delivery_failure() {
 
 #[tokio::test]
 async fn submission_and_flush_can_be_issued_without_a_call_site_runtime() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/project/register"))
@@ -222,6 +229,7 @@ async fn submission_and_flush_can_be_issued_without_a_call_site_runtime() {
 
 #[tokio::test]
 async fn a_failing_token_provider_is_retried_before_rows_are_dropped() {
+    support::use_dedicated_runtime();
     struct FailsOnce(std::sync::atomic::AtomicUsize);
     #[async_trait::async_trait]
     impl TokenProvider for FailsOnce {
