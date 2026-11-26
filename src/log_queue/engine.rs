@@ -1,4 +1,5 @@
 //! One intake and dispatcher for every facade. Observation and routing are independent.
+use super::dispatch::Report;
 use super::{
     observation::Observation,
     queue::{Credential, LogQueueCore, SubmitCommand},
@@ -11,7 +12,7 @@ use crate::{
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::{oneshot, Notify};
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -39,7 +40,6 @@ struct Entry {
     core: Arc<LogQueueCore>,
     command: SubmitCommand,
     sequence: u64,
-    bytes: usize,
 }
 type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
 struct Record {
@@ -188,7 +188,6 @@ impl Engine {
                 core: core.clone(),
                 command,
                 sequence,
-                bytes,
             });
             intake.rows += 1;
             intake.bytes = intake.bytes.saturating_add(bytes);
@@ -254,7 +253,6 @@ impl Engine {
         let scope = scope.clone();
         crate::service::global()
             .expect("initialized service")
-            .handle
             .spawn(async move {
                 let result = match tokio::time::timeout(timeout, barrier).await {
                     Ok(result) => result
@@ -337,29 +335,32 @@ impl Engine {
         jobs
     }
     async fn process_job(self: Arc<Self>, key: Key, entries: Vec<Entry>) {
-        let engine = self;
-        let core = entries[0]
+        let count = entries.len();
+        let mut job = Job {
+            engine: self,
+            key,
+            entries,
+            report: Report::new(count),
+        };
+        let core = job.entries[0]
             .core
-            .job(&key.route.endpoint, key.org_name.as_deref());
-        let mut commands = Vec::with_capacity(entries.len());
-        let mut tickets = Vec::with_capacity(entries.len());
-        for entry in entries {
-            commands.push(entry.command);
-            tickets.push((entry.sequence, entry.bytes, entry.core.observation.clone()));
-        }
+            .job(&job.key.route.endpoint, job.key.org_name.as_deref());
         // Permit covers preparation only; uploads acquire attempt permits separately.
         let request_scope = crate::scheduler::Scope::new(
             core.endpoint(),
             crate::resolution::OrgIdentity::new(
-                &key.route.id,
-                key.org_name.as_deref(),
-                &key.credential.stand_in(),
+                &job.key.route.id,
+                job.key.org_name.as_deref(),
+                &job.key.credential.stand_in(),
             )
             .scope_key(),
         )
-        .with_destination(key.destination.clone());
+        .with_destination(job.key.destination.clone());
+        let commands: Vec<_> = job.entries.iter().map(|entry| &entry.command).collect();
+        let entries = &job.entries;
+        let engine = &job.engine;
         let work = std::panic::AssertUnwindSafe(
-            crate::scheduler::SCOPE.scope(request_scope, core.dispatch(commands)),
+            crate::scheduler::SCOPE.scope(request_scope, core.dispatch(&commands, &mut job.report)),
         )
         .catch_unwind();
         let cancelled = async {
@@ -367,9 +368,9 @@ impl Engine {
                 let wake = engine.cancellations.notified();
                 {
                     let intake = engine.intake.lock().unwrap();
-                    if tickets
+                    if entries
                         .iter()
-                        .all(|(seq, _, _)| !intake.records.contains_key(seq))
+                        .all(|entry| !intake.records.contains_key(&entry.sequence))
                     {
                         return;
                     }
@@ -377,48 +378,22 @@ impl Engine {
                 wake.await;
             }
         };
-        let outcome = tokio::select! {outcome=work=>outcome,_=cancelled=>Ok(super::dispatch::Report::new(tickets.len()))};
-        let report = outcome.unwrap_or_else(|_| {
-            let mut report = super::dispatch::Report::new(tickets.len());
+        let panicked = tokio::select! {
+            outcome = work => outcome.is_err(),
+            _ = cancelled => false,
+        };
+        if panicked {
             let error = anyhow::anyhow!("delivery partition panicked");
-            for i in 0..tickets.len() {
-                report.failed(vec![i], &error, true);
-            }
-            report
-        });
-        let mut intake = engine.intake.lock().unwrap();
-        intake.active.remove(&key);
-        for loss in report.losses {
-            let mut visited = HashSet::new();
-            for index in loss.submissions {
-                if intake.records.contains_key(&tickets[index].0) {
-                    tickets[index].2.record_loss(loss.preparation, &mut visited);
+            for index in 0..count {
+                if !job.report.settled[index] {
+                    job.report.failed(vec![index], &error, true);
                 }
             }
         }
-        let mut signals = Vec::new();
-        let mut writes = Vec::new();
-        for ((sequence, _, _), error) in tickets.into_iter().zip(report.errors) {
-            if let Some(record) = Self::retire(&mut intake, sequence) {
-                let error = error.as_ref().map(|e| e.write_error());
-                record
-                    .observer
-                    .retire(sequence, error.as_ref(), &mut signals);
-                if let Some(sender) = record.sender {
-                    writes.push((sender, error.map_or(Ok(DeliveryReceipt::new()), Err)));
-                }
-            }
-        }
-        drop(intake);
-        for (sender, result) in signals {
-            let _ = sender.send(result);
-        }
-        for (sender, result) in writes {
-            let _ = sender.send(result);
-        }
-        engine.wake.notify_one();
+        // A completed job has an outcome for every submission. Dropping the job
+        // without reaching this point requeues whatever is still unsettled.
+        job.report.settle(0..count);
     }
-
     pub async fn run(self: Arc<Self>) {
         let mut active: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
         loop {
@@ -430,6 +405,77 @@ impl Engine {
                 _ = active.next(), if !active.is_empty() => {},
             }
         }
+    }
+}
+
+/// A job keeps its rows until each has an outcome. If the job is dropped first,
+/// usually because its runtime shut down, unsettled rows go back in the queue.
+struct Job {
+    engine: Arc<Engine>,
+    key: Key,
+    entries: Vec<Entry>,
+    report: Report,
+}
+impl Drop for Job {
+    fn drop(&mut self) {
+        let entries = std::mem::take(&mut self.entries);
+        let report = std::mem::replace(&mut self.report, Report::new(0));
+        let engine = &self.engine;
+        let mut intake = engine.intake.lock().unwrap_or_else(PoisonError::into_inner);
+        intake.active.remove(&self.key);
+        for loss in report.losses {
+            let mut visited = HashSet::new();
+            for index in loss.submissions {
+                let entry = &entries[index];
+                if intake.records.contains_key(&entry.sequence) {
+                    entry
+                        .core
+                        .observation
+                        .record_loss(loss.preparation, &mut visited);
+                }
+            }
+        }
+        let mut signals = Vec::new();
+        let mut writes = Vec::new();
+        let mut requeue = Vec::new();
+        let mut discarded = Vec::new();
+        for ((entry, error), settled) in entries.into_iter().zip(report.errors).zip(report.settled)
+        {
+            if !settled {
+                if intake.records.contains_key(&entry.sequence) {
+                    requeue.push(entry);
+                } else {
+                    discarded.push(entry);
+                }
+                continue;
+            }
+            if let Some(record) = Engine::retire(&mut intake, entry.sequence) {
+                let error = error.as_ref().map(|e| e.write_error());
+                record
+                    .observer
+                    .retire(entry.sequence, error.as_ref(), &mut signals);
+                if let Some(sender) = record.sender {
+                    writes.push((sender, error.map_or(Ok(DeliveryReceipt::new()), Err)));
+                }
+            }
+            discarded.push(entry);
+        }
+        if !requeue.is_empty() {
+            // Ahead of rows accepted since, so the partition keeps submission order.
+            let queue = intake.partitions.entry(self.key.clone()).or_default();
+            for entry in requeue.into_iter().rev() {
+                queue.push_front(entry);
+            }
+        }
+        drop(intake);
+        drop(discarded);
+        for (sender, result) in signals {
+            let _ = sender.send(result);
+        }
+        for (sender, result) in writes {
+            let _ = sender.send(result);
+        }
+        engine.wake.notify_one();
     }
 }
 
@@ -498,6 +544,35 @@ mod tests {
         a.core.observation.finish(jobs[0].1[0].sequence, None, 0, 0);
         assert_eq!(barrier.await.unwrap().delivered(), 1);
         assert_eq!(a.core.observation.len(), 1);
+    }
+    #[test]
+    fn a_dropped_job_requeues_unsettled_rows_ahead_of_later_ones() {
+        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let a = queue();
+        engine.submit_many(
+            a.core.clone(),
+            [
+                SubmitCommand::test_row("delivered"),
+                SubmitCommand::test_row("in-flight"),
+                SubmitCommand::test_row("unsent"),
+            ],
+        );
+        let (key, entries) = engine.take_jobs().pop().unwrap();
+        engine.submit(a.core.clone(), SubmitCommand::test_row("later"));
+        let mut report = Report::new(entries.len());
+        report.settle([0]);
+        // As when the job's runtime shuts down mid-upload.
+        drop(Job {
+            engine: engine.clone(),
+            key,
+            entries,
+            report,
+        });
+        assert_eq!(a.core.observation.len(), 3, "only the settled row retired");
+        let jobs = engine.take_jobs();
+        assert_eq!(jobs.len(), 1, "the partition is free again");
+        let sequences: Vec<_> = jobs[0].1.iter().map(|entry| entry.sequence).collect();
+        assert_eq!(sequences, [2, 3, 4]);
     }
     #[test]
     fn org_and_destination_budgets_are_shared_across_facades() {

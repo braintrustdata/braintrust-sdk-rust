@@ -292,11 +292,8 @@ impl LogQueueCore {
         if dirs.is_empty() {
             return;
         }
-        let handle = crate::service::global()
-            .expect("initialized service")
-            .handle
-            .clone();
-        handle.spawn(async move {
+        let service = crate::service::global().expect("initialized service");
+        service.spawn(async move {
             let SubmitCommand {
                 credential: _,
                 item,

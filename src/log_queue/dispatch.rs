@@ -19,21 +19,31 @@ pub(super) struct Loss {
     pub submissions: Vec<usize>,
     pub preparation: bool,
 }
+/// Outcomes recorded as a job progresses, so a job that is dropped part-way
+/// can requeue exactly the submissions that have no outcome yet.
 pub(super) struct Report {
     pub errors: Vec<Option<DeliveryError>>,
     pub losses: Vec<Loss>,
+    pub settled: Vec<bool>,
 }
 impl Report {
     pub fn new(count: usize) -> Self {
         Self {
             errors: vec![None; count],
             losses: Vec::new(),
+            settled: vec![false; count],
+        }
+    }
+    pub fn settle(&mut self, submissions: impl IntoIterator<Item = usize>) {
+        for index in submissions {
+            self.settled[index] = true;
         }
     }
     pub fn failed(&mut self, submissions: Vec<usize>, error: &anyhow::Error, preparation: bool) {
         let error = DeliveryError::from_error(error);
         for index in &submissions {
             self.errors[*index] = Some(error.clone());
+            self.settled[*index] = true;
         }
         self.losses.push(Loss {
             submissions,
@@ -92,10 +102,15 @@ impl LogQueueCore {
     }
 
     /// The engine seals a compatible partition before assigning local submission indices.
-    pub(super) async fn dispatch(self: &Arc<Self>, commands: Vec<SubmitCommand>) -> Report {
-        let mut report = Report::new(commands.len());
+    /// Commands are borrowed so the engine can requeue them if this job is
+    /// dropped before every submission is settled in `report`.
+    pub(super) async fn dispatch(
+        self: &Arc<Self>,
+        commands: &[&SubmitCommand],
+        report: &mut Report,
+    ) {
         if commands.is_empty() {
-            return report;
+            return;
         }
         let (credential, org_id, org_name, _) = commands[0].partition();
         let org_name = org_name.or_else(|| self.routing_org_name.clone());
@@ -106,7 +121,7 @@ impl LogQueueCore {
                 for i in 0..commands.len() {
                     report.failed(vec![i], &error, false);
                 }
-                return report;
+                return;
             }
         };
         let service = crate::service::global().expect("initialized service");
@@ -123,23 +138,23 @@ impl LogQueueCore {
                 for i in 0..commands.len() {
                     report.failed(vec![i], &error, false);
                 }
-                return report;
+                return;
             }
         };
         let mut failures = super::prepare::ProjectFailures::new();
         let mut spans: IndexMap<RowKey, (Logs3Row, Vec<usize>)> = IndexMap::new();
         let mut raw = Vec::new();
-        for (index, command) in commands.into_iter().enumerate() {
+        for (index, command) in commands.iter().enumerate() {
             if index % 64 == 0 {
                 tokio::task::yield_now().await;
             }
-            match command.item {
+            match &command.item {
                 QueuedItem::Span {
                     payload,
                     parent_info,
                 } => {
                     let result = self
-                        .prepare_span(&token, payload, parent_info, &mut failures)
+                        .prepare_span(&token, payload.clone(), parent_info.clone(), &mut failures)
                         .await;
                     match result {
                         Ok(row) => {
@@ -161,12 +176,12 @@ impl LogQueueCore {
                         }
                     }
                 }
-                QueuedItem::Row { row, .. } => raw.push((index, row)),
+                QueuedItem::Row { row, .. } => raw.push((index, row.clone())),
             }
         }
         drop(permit);
         if spans.is_empty() && raw.is_empty() {
-            return report;
+            return;
         }
         let (max_request_size, overflow) = self
             .get_version_info(&api_url, &token, org_name.as_deref(), &org_id)
@@ -203,7 +218,7 @@ impl LogQueueCore {
                         report.failed(vec![i], &error, true);
                     }
                 }
-                return report;
+                return;
             }
         };
         for (submissions, error) in failures {
@@ -231,6 +246,7 @@ impl LogQueueCore {
         });
         let mut sends = stream::iter(sends).buffer_unordered(usize::MAX);
         while let Some((rows, delivered, result)) = sends.next().await {
+            report.settle(rows.iter().flatten().copied());
             if let Err(error) = result {
                 tracing::warn!(%error,"destination upload failed");
                 let failure = DeliveryError::from_error(&error);
@@ -249,6 +265,5 @@ impl LogQueueCore {
                 }
             }
         }
-        report
     }
 }

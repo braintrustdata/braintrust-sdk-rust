@@ -66,6 +66,6 @@ pub use types::{
     SpanObjectType, SpanType, Usage, UsageMetrics,
 };
 
-pub use service::{configure_service, ServiceConfig};
+pub use service::{configure_service, ServiceConfig, ServiceRuntime};
 
 pub use project::Project;

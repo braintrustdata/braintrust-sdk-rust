@@ -1,0 +1,4 @@
+[env]
+# Integration tests run concurrently, each on its own short-lived runtime. The
+# SDK's default would capture whichever started first. See `ServiceRuntime`.
+BRAINTRUST_SERVICE_RUNTIME = "dedicated"

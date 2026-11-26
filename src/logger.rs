@@ -462,6 +462,7 @@ impl BraintrustClientBuilder {
                 queue,
                 login_state,
                 login_notify: Arc::new(Notify::new()),
+                background_login: Arc::default(),
                 http_client,
                 default_project: self.default_project,
                 login_skipped: self.skip_login,
@@ -480,6 +481,22 @@ impl Default for BraintrustClientBuilder {
     }
 }
 
+/// A background login that resumes if its runtime stops before it finishes.
+#[derive(Default)]
+struct BackgroundLogin {
+    /// The API key and organization, until the login succeeds or gives up.
+    pending: std::sync::Mutex<Option<(String, Option<String>)>>,
+    running: std::sync::atomic::AtomicBool,
+}
+struct LoginRunning(Arc<BackgroundLogin>);
+impl Drop for LoginRunning {
+    fn drop(&mut self) {
+        self.0
+            .running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BraintrustClient {
     inner: Arc<ClientInner>,
@@ -493,6 +510,7 @@ struct ClientInner {
     queue: LogQueue,
     login_state: LoginState,
     login_notify: Arc<Notify>,
+    background_login: Arc<BackgroundLogin>,
     http_client: crate::http::SharedHttp,
     default_project: Option<String>,
     login_skipped: bool,
@@ -962,8 +980,27 @@ impl BraintrustClient {
 
     /// Start login in a background task with retry logic.
     fn start_background_login(&self, api_key: String, org_name: Option<String>) {
+        *self.inner.background_login.pending.lock().unwrap() = Some((api_key, org_name));
+        self.resume_background_login();
+    }
+
+    /// Run the pending background login unless it is already running. A login
+    /// dropped with its runtime stays pending, so the next wait restarts it.
+    fn resume_background_login(&self) {
+        let login = &self.inner.background_login;
+        let Some((api_key, org_name)) = login.pending.lock().unwrap().clone() else {
+            return;
+        };
+        if login
+            .running
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let running = LoginRunning(login.clone());
         let client = self.clone();
-        crate::service::global().expect("initialized service").handle.spawn(async move {
+        crate::service::global().expect("initialized service").spawn(async move {
+            let _running = running;
             const MAX_ATTEMPTS: usize = 10;
             let result = (|| client.perform_login(&api_key, org_name.as_deref()))
                 .retry(ExponentialBuilder::default()
@@ -972,6 +1009,7 @@ impl BraintrustClient {
                     .with_max_times(MAX_ATTEMPTS - 1))
                 .notify(|error, delay| tracing::warn!(%error, ?delay, "Background login failed, retrying"))
                 .await;
+            client.inner.background_login.pending.lock().unwrap().take();
             match result {
                 Ok(()) => tracing::debug!("Background login completed successfully"),
                 Err(error) => tracing::error!(
@@ -990,6 +1028,7 @@ impl BraintrustClient {
         if self.inner.login_state.is_logged_in() {
             return Ok(self.inner.login_state.clone());
         }
+        self.resume_background_login();
 
         // Get notification future BEFORE checking state to avoid race condition
         let notified = self.inner.login_notify.notified();
@@ -1170,6 +1209,7 @@ impl BraintrustClient {
                 queue,
                 login_state,
                 login_notify: self.inner.login_notify.clone(),
+                background_login: self.inner.background_login.clone(),
                 http_client: self.inner.http_client.clone(),
                 default_project,
                 login_skipped: self.inner.login_skipped,
@@ -1201,7 +1241,9 @@ impl BraintrustClient {
             login_state,
             self.inner.default_project.clone(),
         );
-        Arc::get_mut(&mut client.inner).unwrap().login_notify = Arc::new(Notify::new());
+        let inner = Arc::get_mut(&mut client.inner).unwrap();
+        inner.login_notify = Arc::new(Notify::new());
+        inner.background_login = Arc::default();
         client.perform_login(&state_key, Some(&name.into())).await?;
         Ok(client)
     }
@@ -1752,7 +1794,9 @@ mod tests {
                 .span_builder()
                 .await
                 .expect("span_builder")
-                .project_name("demo-project")
+                // Other tests register "demo-project" in the same org, and a reused
+                // mock-server port would share their cache entry.
+                .project_name("project-registration-is-cached")
                 .build();
             span.log(
                 SpanLog::builder()
