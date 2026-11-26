@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::experiments::api::{
@@ -54,8 +54,56 @@ pub struct Experiment<S: SpanSubmitter> {
     pub(crate) last_start_time: Arc<AtomicU64>,
     /// Whether start_span() has been called (prevents mixing with log()).
     pub(crate) called_start_span: Arc<AtomicBool>,
-    /// Pending span handles that need to be flushed.
-    pub(crate) pending_flushes: Arc<Mutex<Vec<SpanHandle<S>>>>,
+    /// Writes started on this experiment, which its flush waits for.
+    pub(crate) writes: Arc<Writes>,
+}
+
+/// Writes still being submitted, so a flush covers every write started before
+/// it, including ones waiting for registration.
+#[derive(Default)]
+pub(crate) struct Writes {
+    state: std::sync::Mutex<(u64, std::collections::BTreeSet<u64>)>,
+    finished: tokio::sync::Notify,
+}
+impl Writes {
+    fn start(self: &Arc<Self>) -> Write {
+        let mut state = self.state.lock().unwrap();
+        let id = state.0;
+        state.0 += 1;
+        state.1.insert(id);
+        Write(self.clone(), id)
+    }
+    /// Identifies the writes started so far.
+    fn cutoff(&self) -> u64 {
+        self.state.lock().unwrap().0
+    }
+    /// Wait until every write started before `cutoff` has been submitted.
+    async fn wait(&self, cutoff: u64) {
+        loop {
+            let finished = self.finished.notified();
+            tokio::pin!(finished);
+            finished.as_mut().enable();
+            if self
+                .state
+                .lock()
+                .unwrap()
+                .1
+                .first()
+                .is_none_or(|id| *id >= cutoff)
+            {
+                return;
+            }
+            finished.await;
+        }
+    }
+}
+/// Held by a write until its row has been submitted, however it ends.
+struct Write(Arc<Writes>, u64);
+impl Drop for Write {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().1.remove(&self.1);
+        self.0.finished.notify_waiters();
+    }
 }
 
 impl<S: SpanSubmitter> Clone for Experiment<S> {
@@ -76,7 +124,7 @@ impl<S: SpanSubmitter> Clone for Experiment<S> {
             lazy_metadata: self.lazy_metadata.clone(),
             last_start_time: self.last_start_time.clone(),
             called_start_span: self.called_start_span.clone(),
-            pending_flushes: Arc::clone(&self.pending_flushes),
+            writes: self.writes.clone(),
         }
     }
 }
@@ -99,14 +147,16 @@ impl<
     /// Panics if `start_span()` has already been called on this experiment,
     /// as mixing `log()` and `start_span()` is not supported.
     pub fn log(&self, event: ExperimentLog) -> crate::Completion<String, crate::BraintrustError> {
-        let experiment = self.clone();
-        crate::service::submit(async move {
-            if experiment.called_start_span.load(Ordering::Acquire) {
-                panic!(
-                    "Cannot use log() after start_span() has been called. \
+        if self.called_start_span.load(Ordering::Acquire) {
+            panic!(
+                "Cannot use log() after start_span() has been called. \
                  Use start_span() consistently or log() consistently, but not both."
-                );
-            }
+            );
+        }
+        let experiment = self.clone();
+        let write = self.writes.start();
+        crate::service::submit(async move {
+            let _write = write;
 
             // Get or create experiment registration
             let metadata = experiment.ensure_registered().await;
@@ -131,17 +181,17 @@ impl<
             let span_log = event.into_span_log();
             span.log(span_log);
 
-            // Record end time for next log() call
+            // End the span now, so a later flush sends nothing that could
+            // overwrite feedback logged against it.
             let end_time = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
+            span.end_with_time(end_time);
+            // The next log() call starts where this one ended.
             experiment
                 .last_start_time
                 .store(end_time.to_bits(), Ordering::Release);
-
-            // Track for flush
-            experiment.pending_flushes.lock().await.push(span);
             Ok(row_id)
         })
     }
@@ -153,6 +203,7 @@ impl<
     pub fn start_span(
         &self,
     ) -> crate::Completion<ExperimentSpanBuilder<'static, S>, crate::BraintrustError> {
+        self.called_start_span.store(true, Ordering::Release);
         let experiment = self.clone();
         crate::service::submit(async move { Ok(experiment.registered_span_builder().await) })
     }
@@ -174,7 +225,9 @@ impl<
     ) -> crate::Completion<(), crate::BraintrustError> {
         let experiment = self.clone();
         let id = id.to_owned();
+        let write = self.writes.start();
         crate::service::submit(async move {
+            let _write = write;
             let metadata = experiment.ensure_registered().await;
 
             // Create a merge payload for the existing span
@@ -322,15 +375,12 @@ impl<
         })
     }
 
-    /// Flush all pending experiment data to Braintrust.
+    /// Flush this experiment's writes started before this call to Braintrust.
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let experiment = self.clone();
+        let cutoff = self.writes.cutoff();
         crate::service::submit(async move {
-            let mut pending = experiment.pending_flushes.lock().await;
-            for span in pending.drain(..) {
-                span.end();
-            }
-            drop(pending);
+            experiment.writes.wait(cutoff).await;
             experiment
                 .submitter
                 .flush()
@@ -413,7 +463,9 @@ impl<
     ) -> crate::Completion<(), crate::BraintrustError> {
         let experiment = self.clone();
         let id = id.to_owned();
+        let write = self.writes.start();
         crate::service::submit(async move {
+            let _write = write;
             let metadata = experiment.ensure_registered().await;
 
             let payload = SpanPayload {
@@ -489,8 +541,10 @@ impl<
 
     /// Ensure the experiment is registered, returning cached metadata.
     pub(crate) async fn ensure_registered(&self) -> ExperimentMetadata {
+        // A failure is cached as a placeholder too, as on main: registering
+        // again after an ambiguous failure could create a second experiment.
         self.lazy_metadata
-            .get_or_try_init(|| async {
+            .get_or_init(|| async {
                 let mut request =
                     ExperimentRegisterRequest::new(self.project_name.clone(), self.org_id.clone());
                 request.experiment_name = self.experiment_name.clone();
@@ -512,30 +566,31 @@ impl<
                     value
                 });
 
-                let response = self
+                match self
                     .submitter
                     .register_experiment(&self.token, request)
-                    .await?;
-                Ok::<_, crate::BraintrustError>(ExperimentMetadata {
-                    project_id: response.project.id,
-                    experiment_id: response.experiment.id,
-                    experiment_name: response.experiment.name,
-                })
-            })
-            .await
-            .cloned()
-            .unwrap_or_else(|error| {
-                // Preserve the existing best-effort result without caching a failed registration.
-                tracing::warn!(%error, "experiment registration failed");
-                ExperimentMetadata {
-                    project_id: String::new(),
-                    experiment_id: Uuid::new_v4().to_string(),
-                    experiment_name: self
-                        .experiment_name
-                        .clone()
-                        .unwrap_or_else(|| "unnamed".into()),
+                    .await
+                {
+                    Ok(response) => ExperimentMetadata {
+                        project_id: response.project.id,
+                        experiment_id: response.experiment.id,
+                        experiment_name: response.experiment.name,
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "experiment registration failed");
+                        ExperimentMetadata {
+                            project_id: String::new(),
+                            experiment_id: Uuid::new_v4().to_string(),
+                            experiment_name: self
+                                .experiment_name
+                                .clone()
+                                .unwrap_or_else(|| "unnamed".into()),
+                        }
+                    }
                 }
             })
+            .await
+            .clone()
     }
 
     /// Create an internal span for log() calls.

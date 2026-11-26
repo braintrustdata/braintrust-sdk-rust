@@ -639,7 +639,7 @@ impl BraintrustClient {
             let org_name = state
                 .org_name()
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-            let mut builder = DatasetBuilder::new(Arc::new(client.clone()), api_key, org_name)
+            let mut builder = DatasetBuilder::new(Arc::new(client.scoped()), api_key, org_name)
                 .org_id(state.org_id().unwrap_or_default());
             if let Some(project) = &client.inner.default_project {
                 builder = builder.project_name(project);
@@ -1063,7 +1063,7 @@ impl BraintrustClient {
         let org_id = org_id.into();
 
         let context = if self.inner.login_state.org_id().as_deref() == Some(&org_id) {
-            self.clone()
+            self.scoped()
         } else {
             // Explicit credentials for a different org must not inherit the selected org's endpoint.
             self.derive_scope(
@@ -1170,6 +1170,17 @@ impl BraintrustClient {
             Some(name.clone()),
         );
         crate::Project::new(client, name)
+    }
+
+    /// A facade whose flush covers only the writes made through it, for
+    /// resources such as experiments and datasets. The parent's flush still
+    /// includes them.
+    fn scoped(&self) -> Self {
+        self.derive_scope(
+            self.inner.queue.child(),
+            self.inner.login_state.clone(),
+            self.inner.default_project.clone(),
+        )
     }
 
     fn derive_scope(

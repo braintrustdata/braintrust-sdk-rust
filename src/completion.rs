@@ -179,6 +179,12 @@ impl<T, E> Completion<T, E> {
     pub(crate) fn panic_slot(&mut self) -> PanicSlot {
         self.panic.get_or_insert_with(Default::default).clone()
     }
+    /// A completion whose operation already finished.
+    pub(crate) fn finished(result: Result<T, E>) -> Self {
+        let (sender, completion) = Self::pair();
+        let _ = sender.send(result);
+        completion
+    }
     pub(crate) fn record_issuance(&mut self, result: Result<(), E>) {
         self.issued = result;
     }

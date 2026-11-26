@@ -469,7 +469,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             description: self.description,
             metadata: self.metadata,
             lazy_metadata: Arc::new(OnceCell::new()),
-            pending_rows: Arc::new(Mutex::new(Vec::new())),
+            pending_rows: Default::default(),
         })
     }
 }
@@ -492,7 +492,7 @@ pub struct Dataset<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + Datase
     description: Option<String>,
     metadata: Option<Map<String, Value>>,
     lazy_metadata: Arc<OnceCell<DatasetMetadata>>,
-    pending_rows: Arc<Mutex<Vec<PendingDatasetRow>>>,
+    pending_rows: Arc<std::sync::Mutex<Vec<PendingDatasetRow>>>,
 }
 
 impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> Clone
@@ -589,23 +589,18 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         &self,
         record: DatasetInsert,
     ) -> crate::Completion<String, crate::BraintrustError> {
-        let dataset = self.clone();
-        crate::service::submit(async move {
-            let id = Uuid::new_v4().to_string();
-
-            let row = PendingDatasetRow {
-                id: id.clone(),
-                input: record.input,
-                expected: record.expected,
-                metadata: record.metadata,
-                tags: record.tags,
-                is_merge: false,
-                is_delete: false,
-            };
-
-            dataset.pending_rows.lock().await.push(row);
-            Ok(id)
-        })
+        // Queued now, so a flush started after this call includes the row.
+        let id = Uuid::new_v4().to_string();
+        self.pending_rows.lock().unwrap().push(PendingDatasetRow {
+            id: id.clone(),
+            input: record.input,
+            expected: record.expected,
+            metadata: record.metadata,
+            tags: record.tags,
+            is_merge: false,
+            is_delete: false,
+        });
+        crate::Completion::finished(Ok(id))
     }
 
     /// Update an existing record by ID (merge semantics).
@@ -616,42 +611,30 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         id: &str,
         record: DatasetInsert,
     ) -> crate::Completion<(), crate::BraintrustError> {
-        let dataset = self.clone();
-        let id = id.to_owned();
-        crate::service::submit(async move {
-            let row = PendingDatasetRow {
-                id,
-                input: record.input,
-                expected: record.expected,
-                metadata: record.metadata,
-                tags: record.tags,
-                is_merge: true,
-                is_delete: false,
-            };
-
-            dataset.pending_rows.lock().await.push(row);
-            Ok(())
-        })
+        self.pending_rows.lock().unwrap().push(PendingDatasetRow {
+            id: id.to_owned(),
+            input: record.input,
+            expected: record.expected,
+            metadata: record.metadata,
+            tags: record.tags,
+            is_merge: true,
+            is_delete: false,
+        });
+        crate::Completion::finished(Ok(()))
     }
 
     /// Delete a record by ID.
     pub fn delete(&self, id: &str) -> crate::Completion<(), crate::BraintrustError> {
-        let dataset = self.clone();
-        let id = id.to_owned();
-        crate::service::submit(async move {
-            let row = PendingDatasetRow {
-                id,
-                input: None,
-                expected: None,
-                metadata: None,
-                tags: None,
-                is_merge: false,
-                is_delete: true,
-            };
-
-            dataset.pending_rows.lock().await.push(row);
-            Ok(())
-        })
+        self.pending_rows.lock().unwrap().push(PendingDatasetRow {
+            id: id.to_owned(),
+            input: None,
+            expected: None,
+            metadata: None,
+            tags: None,
+            is_merge: false,
+            is_delete: true,
+        });
+        crate::Completion::finished(Ok(()))
     }
 
     /// Fetch records with pagination.
@@ -700,15 +683,12 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         })
     }
 
-    /// Flush all pending operations.
+    /// Flush this dataset's writes made before this call.
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let dataset = self.clone();
+        let rows = std::mem::take(&mut *self.pending_rows.lock().unwrap());
         crate::service::submit(async move {
             let metadata = dataset.ensure_registered().await?;
-            let rows = {
-                let mut pending = dataset.pending_rows.lock().await;
-                std::mem::take(&mut *pending)
-            };
 
             if rows.is_empty() {
                 return dataset

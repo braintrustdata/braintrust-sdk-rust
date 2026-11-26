@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 
 use crate::experiments::experiment::Experiment;
 use crate::experiments::metadata::RepoInfo;
@@ -185,7 +185,7 @@ impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
             lazy_metadata: Arc::new(OnceCell::new()),
             last_start_time: Arc::new(AtomicU64::new(0)),
             called_start_span: Arc::new(AtomicBool::new(false)),
-            pending_flushes: Arc::new(Mutex::new(Vec::new())),
+            writes: Default::default(),
         })
     }
 }
