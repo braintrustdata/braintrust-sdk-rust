@@ -374,32 +374,30 @@ impl BraintrustClientBuilder {
     ///
     /// If `blocking_login` is true, waits for login to complete.
     /// Otherwise, login happens in the background with retry logic.
-    pub fn build(self) -> crate::Completion<BraintrustClient, BraintrustError> {
-        crate::service::submit(async move { self.build_inner().await })
-    }
-
-    async fn build_inner(mut self) -> Result<BraintrustClient> {
-        let login = (!self.skip_login).then(|| {
-            (
-                self.api_key.take(),
-                self.org_name.take(),
-                self.blocking_login,
-            )
-        });
-        let client = self.construct()?;
-        if let Some((api_key, org_name, blocking_login)) = login {
-            let api_key = api_key.ok_or_else(|| {
-                BraintrustError::InvalidConfig(
-                    "API key required: set BRAINTRUST_API_KEY or call .api_key()".into(),
+    pub fn build(mut self) -> crate::Completion<BraintrustClient, BraintrustError> {
+        crate::service::submit(async move {
+            let login = (!self.skip_login).then(|| {
+                (
+                    self.api_key.take(),
+                    self.org_name.take(),
+                    self.blocking_login,
                 )
-            })?;
-            if blocking_login {
-                client.perform_login(&api_key, org_name.as_deref()).await?;
-            } else {
-                client.start_background_login(api_key, org_name);
+            });
+            let client = self.construct()?;
+            if let Some((api_key, org_name, blocking_login)) = login {
+                let api_key = api_key.ok_or_else(|| {
+                    BraintrustError::InvalidConfig(
+                        "API key required: set BRAINTRUST_API_KEY or call .api_key()".into(),
+                    )
+                })?;
+                if blocking_login {
+                    client.perform_login(&api_key, org_name.as_deref()).await?;
+                } else {
+                    client.start_background_login(api_key, org_name);
+                }
             }
-        }
-        Ok(client)
+            Ok(client)
+        })
     }
 
     /// Build the client without logging in.
@@ -549,12 +547,7 @@ impl BraintrustClient {
     }
 
     /// Check if the client is logged in.
-    pub fn is_logged_in(&self) -> crate::Completion<bool, BraintrustError> {
-        let client = self.clone();
-        crate::service::submit(async move { Ok(client.is_logged_in_inner().await) })
-    }
-
-    async fn is_logged_in_inner(&self) -> bool {
+    pub fn is_logged_in(&self) -> bool {
         self.inner.login_state.is_logged_in()
     }
 
@@ -563,25 +556,18 @@ impl BraintrustClient {
     /// Returns the login state once available, or an error if login times out.
     pub fn wait_for_login(&self) -> crate::Completion<LoginState, BraintrustError> {
         let client = self.clone();
-        crate::service::submit(async move { client.wait_for_login_inner().await })
-    }
-
-    async fn wait_for_login_inner(&self) -> Result<LoginState> {
-        if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
-                "wait_for_login() not available when skip_login is enabled".into(),
-            ));
-        }
-        self.wait_for_login_state().await
+        crate::service::submit(async move {
+            if client.inner.login_skipped {
+                return Err(BraintrustError::InvalidConfig(
+                    "wait_for_login() not available when skip_login is enabled".into(),
+                ));
+            }
+            client.wait_for_login_state().await
+        })
     }
 
     /// Get the current login state.
-    pub fn login_state(&self) -> crate::Completion<LoginState, BraintrustError> {
-        let client = self.clone();
-        crate::service::submit(async move { Ok(client.login_state_inner().await) })
-    }
-
-    async fn login_state_inner(&self) -> LoginState {
+    pub fn login_state(&self) -> LoginState {
         self.inner.login_state.clone()
     }
 
@@ -609,36 +595,35 @@ impl BraintrustClient {
         &self,
     ) -> crate::Completion<crate::span::SpanBuilder<Self>, BraintrustError> {
         let client = self.clone();
-        crate::service::submit(async move { client.span_builder_inner().await })
-    }
-
-    async fn span_builder_inner(&self) -> Result<crate::span::SpanBuilder<Self>> {
-        if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+        crate::service::submit(async move {
+            if client.inner.login_skipped {
+                return Err(BraintrustError::InvalidConfig(
                 "span_builder() requires login; use span_builder_with_credentials() when skip_login is enabled".into(),
             ));
-        }
-        let state = self.wait_for_login_state().await?;
-        let api_key = state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_id = state
-            .org_id()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let mut builder = crate::span::SpanBuilder::new(Arc::new(self.clone()), &api_key, &org_id);
-        if let Some(name) = state.org_name() {
-            builder = builder.org_name(name);
-        }
-        if let Some(environment) = &self.inner.environment {
-            builder = builder.span_origin_environment(environment.clone());
-        }
-        if let Some(span_origin) = &self.inner.span_origin {
-            builder = builder.span_origin(span_origin.clone());
-        }
-        if let Some(ref project) = self.inner.default_project {
-            builder = builder.project_name(project);
-        }
-        Ok(builder)
+            }
+            let state = client.wait_for_login_state().await?;
+            let api_key = state
+                .api_key()
+                .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+            let org_id = state
+                .org_id()
+                .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+            let mut builder =
+                crate::span::SpanBuilder::new(Arc::new(client.clone()), &api_key, &org_id);
+            if let Some(name) = state.org_name() {
+                builder = builder.org_name(name);
+            }
+            if let Some(environment) = &client.inner.environment {
+                builder = builder.span_origin_environment(environment.clone());
+            }
+            if let Some(span_origin) = &client.inner.span_origin {
+                builder = builder.span_origin(span_origin.clone());
+            }
+            if let Some(ref project) = client.inner.default_project {
+                builder = builder.project_name(project);
+            }
+            Ok(builder)
+        })
     }
 
     /// Create a dataset builder using the logged-in state.
@@ -646,23 +631,21 @@ impl BraintrustClient {
     /// This waits for login to complete if it hasn't already.
     pub fn dataset_builder(&self) -> crate::Completion<DatasetBuilder<Self>, BraintrustError> {
         let client = self.clone();
-        crate::service::submit(async move { client.dataset_builder_inner().await })
-    }
-
-    async fn dataset_builder_inner(&self) -> Result<DatasetBuilder<Self>> {
-        let state = self.wait_for_login_state().await?;
-        let api_key = state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_name = state
-            .org_name()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let mut builder = DatasetBuilder::new(Arc::new(self.clone()), api_key, org_name)
-            .org_id(state.org_id().unwrap_or_default());
-        if let Some(project) = &self.inner.default_project {
-            builder = builder.project_name(project);
-        }
-        Ok(builder)
+        crate::service::submit(async move {
+            let state = client.wait_for_login_state().await?;
+            let api_key = state
+                .api_key()
+                .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+            let org_name = state
+                .org_name()
+                .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+            let mut builder = DatasetBuilder::new(Arc::new(client.clone()), api_key, org_name)
+                .org_id(state.org_id().unwrap_or_default());
+            if let Some(project) = &client.inner.default_project {
+                builder = builder.project_name(project);
+            }
+            Ok(builder)
+        })
     }
 
     /// Create a span builder with explicit token and org_id.
@@ -721,28 +704,27 @@ impl BraintrustClient {
     ) -> crate::Completion<(), BraintrustError> {
         let client = self.clone();
         let exported = exported.to_owned();
-        crate::service::submit(async move { client.update_span_inner(&exported, event).await })
-    }
-
-    async fn update_span_inner(&self, exported: &str, event: crate::span::SpanLog) -> Result<()> {
-        let login_state = if self.inner.login_state.is_logged_in() {
-            self.inner.login_state.clone()
-        } else if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+        crate::service::submit(async move {
+            let login_state = if client.inner.login_state.is_logged_in() {
+                client.inner.login_state.clone()
+            } else if client.inner.login_skipped {
+                return Err(BraintrustError::InvalidConfig(
                 "update_span() requires login; use update_span_with_credentials() when login is skipped".into(),
             ));
-        } else {
-            self.wait_for_login_state().await?
-        };
+            } else {
+                client.wait_for_login_state().await?
+            };
 
-        let api_key = login_state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_id = login_state
-            .org_id()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        self.update_span_internal(api_key, org_id, login_state.org_name(), exported, event)
-            .map(|_| ())
+            let api_key = login_state
+                .api_key()
+                .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+            let org_id = login_state
+                .org_id()
+                .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+            client
+                .update_span_internal(api_key, org_id, login_state.org_name(), &exported, event)
+                .map(|_| ())
+        })
     }
 
     /// Update an existing span using explicit credentials instead of shared login state.
@@ -1118,27 +1100,22 @@ impl BraintrustClient {
     ) -> crate::Completion<(), BraintrustError> {
         let client = self.clone();
         let rows: Vec<_> = rows.into_iter().collect();
-        crate::service::submit(async move { client.log_rows_inner(rows).await })
-    }
-
-    async fn log_rows_inner(
-        &self,
-        rows: impl IntoIterator<Item = Map<String, Value>>,
-    ) -> Result<()> {
-        if self.inner.login_skipped {
-            return Err(BraintrustError::InvalidConfig(
+        crate::service::submit(async move {
+            if client.inner.login_skipped {
+                return Err(BraintrustError::InvalidConfig(
                 "log_rows() requires login; use log_rows_with_credentials() when skip_login is enabled".into(),
             ));
-        }
-        let state = self.wait_for_login_state().await?;
-        let api_key = state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let org_id = state
-            .org_id()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        self.log_rows_with_credentials(&api_key, &org_id, state.org_name().as_deref(), rows);
-        Ok(())
+            }
+            let state = client.wait_for_login_state().await?;
+            let api_key = state
+                .api_key()
+                .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+            let org_id = state
+                .org_id()
+                .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+            client.log_rows_with_credentials(&api_key, &org_id, state.org_name().as_deref(), rows);
+            Ok(())
+        })
     }
 
     /// Queue caller-built rows for upload to `/logs3` with explicit credentials.
@@ -1227,25 +1204,23 @@ impl BraintrustClient {
     ) -> crate::Completion<Self, BraintrustError> {
         let client = self.clone();
         let name = name.into();
-        crate::service::submit(async move { client.with_organization_inner(name).await })
-    }
-
-    async fn with_organization_inner(&self, name: impl Into<String>) -> Result<Self> {
-        let state = self.wait_for_login().await?;
-        let state_key = state
-            .api_key()
-            .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-        let login_state = LoginState::new();
-        let mut client = self.derive_scope(
-            self.inner.queue.rebind(login_state.clone()),
-            login_state,
-            self.inner.default_project.clone(),
-        );
-        let inner = Arc::get_mut(&mut client.inner).unwrap();
-        inner.login_notify = Arc::new(Notify::new());
-        inner.background_login = Arc::default();
-        client.perform_login(&state_key, Some(&name.into())).await?;
-        Ok(client)
+        crate::service::submit(async move {
+            let state = client.wait_for_login().await?;
+            let state_key = state
+                .api_key()
+                .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
+            let login_state = LoginState::new();
+            let mut client = client.derive_scope(
+                client.inner.queue.rebind(login_state.clone()),
+                login_state,
+                client.inner.default_project.clone(),
+            );
+            let inner = Arc::get_mut(&mut client.inner).unwrap();
+            inner.login_notify = Arc::new(Notify::new());
+            inner.background_login = Arc::default();
+            client.perform_login(&state_key, Some(&name)).await?;
+            Ok(client)
+        })
     }
 
     /// Create an experiment builder using this facade's authentication and project defaults.
@@ -1253,20 +1228,18 @@ impl BraintrustClient {
         &self,
     ) -> crate::Completion<ExperimentBuilder<Self>, BraintrustError> {
         let client = self.clone();
-        crate::service::submit(async move { client.experiment_builder_inner().await })
-    }
-
-    async fn experiment_builder_inner(&self) -> Result<ExperimentBuilder<Self>> {
-        let state = self.wait_for_login().await?;
-        let (Some(api_key), Some(org_id)) = (state.api_key(), state.org_id()) else {
-            return Err(BraintrustError::InvalidConfig("Not logged in".into()));
-        };
-        // The credentials builder already applies this facade's default project.
-        let mut builder = self.experiment_builder_with_credentials(api_key, org_id);
-        if let Some(name) = state.org_name() {
-            builder = builder.org_name(name);
-        }
-        Ok(builder)
+        crate::service::submit(async move {
+            let state = client.wait_for_login().await?;
+            let (Some(api_key), Some(org_id)) = (state.api_key(), state.org_id()) else {
+                return Err(BraintrustError::InvalidConfig("Not logged in".into()));
+            };
+            // The credentials builder already applies this facade's default project.
+            let mut builder = client.experiment_builder_with_credentials(api_key, org_id);
+            if let Some(name) = state.org_name() {
+                builder = builder.org_name(name);
+            }
+            Ok(builder)
+        })
     }
 
     /// Cumulative counts of rows this client discarded instead of uploading.
@@ -1293,11 +1266,7 @@ impl BraintrustClient {
     /// Does not wait for completion - useful for streaming writes.
     pub fn trigger_flush(&self) -> crate::Completion<(), BraintrustError> {
         let client = self.clone();
-        crate::service::submit(async move { client.trigger_flush_inner().await })
-    }
-
-    async fn trigger_flush_inner(&self) -> Result<()> {
-        self.inner.queue.trigger_flush_command().await
+        crate::service::submit(async move { client.inner.queue.trigger_flush_command().await })
     }
 }
 
@@ -1900,7 +1869,7 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await.unwrap();
+        let login_state = client.login_state();
         assert!(login_state.is_logged_in(), "should be logged in");
         assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
         assert_eq!(login_state.org_name().as_deref(), Some("First Org"));
@@ -1930,7 +1899,7 @@ mod tests {
             .await
             .expect("client");
 
-        let login_state = client.login_state().await.unwrap();
+        let login_state = client.login_state();
         assert!(login_state.is_logged_in(), "should be logged in");
         assert_eq!(login_state.org_id().as_deref(), Some("org-2"));
         assert_eq!(login_state.org_name().as_deref(), Some("Second Org"));
@@ -2023,7 +1992,7 @@ mod tests {
             .expect("client");
 
         // Initially should not be logged in (background login hasn't completed)
-        let is_logged_in = client.is_logged_in().await.unwrap();
+        let is_logged_in = client.is_logged_in();
         assert!(!is_logged_in);
     }
 
@@ -2048,7 +2017,7 @@ mod tests {
         // Wait for background login to complete
         let login_state = client.wait_for_login().await.expect("login should succeed");
         assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
-        assert!(client.is_logged_in().await.unwrap());
+        assert!(client.is_logged_in());
     }
 
     #[tokio::test]
@@ -2217,7 +2186,7 @@ mod tests {
 
         // No credential leak into shared global state.
         assert!(
-            !client.is_logged_in().await.unwrap(),
+            !client.is_logged_in(),
             "per-request credentials must not populate the shared login state"
         );
 
@@ -2282,7 +2251,7 @@ mod tests {
         client.log_rows_with_credentials("token-b", "org-b", None, rows_b.clone());
         client.flush().await.expect("flush");
 
-        assert!(!client.is_logged_in().await.unwrap());
+        assert!(!client.is_logged_in());
         assert_eq!(client.dropped_rows(), DroppedRows::default());
         let requests = server.received_requests().await.unwrap();
         let mut uploaded = HashMap::new();
@@ -2338,7 +2307,7 @@ mod tests {
         client.log_rows_with_credentials("token", "org", None, [row]);
         client.flush().await.expect("flush");
 
-        assert!(!client.is_logged_in().await.unwrap());
+        assert!(!client.is_logged_in());
         let auths: Vec<String> = server
             .received_requests()
             .await

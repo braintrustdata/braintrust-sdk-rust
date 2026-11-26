@@ -205,7 +205,7 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 ///         .build(),
 /// ).await?;
 ///
-/// let _passed = runner.finish().await?;
+/// let _passed = runner.finish();
 /// Ok(())
 /// # }
 /// ```
@@ -226,26 +226,24 @@ impl BtEvalRunner {
     /// In non-list mode, this creates a `BraintrustClient` from environment variables
     /// (e.g. `BRAINTRUST_API_KEY`). In list mode, no client is created.
     pub fn from_env() -> crate::Completion<Self, crate::BraintrustError> {
-        crate::service::submit(async move { Self::from_env_inner().await })
-    }
+        crate::service::submit(async move {
+            let config = RunnerConfig::from_env();
+            let sse = create_sse_writer();
 
-    async fn from_env_inner() -> Result<Self> {
-        let config = RunnerConfig::from_env();
-        let sse = create_sse_writer();
+            // Only create a client when we'll actually run evals
+            let client = if !config.list {
+                Some(Arc::new(BraintrustClient::builder().build().await?))
+            } else {
+                None
+            };
 
-        // Only create a client when we'll actually run evals
-        let client = if !config.list {
-            Some(Arc::new(BraintrustClient::builder().build().await?))
-        } else {
-            None
-        };
-
-        Ok(Self {
-            config,
-            sse,
-            client,
-            registered_names: Default::default(),
-            all_passed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Ok(Self {
+                config,
+                sse,
+                client,
+                registered_names: Default::default(),
+                all_passed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            })
         })
     }
 
@@ -296,88 +294,83 @@ impl BtEvalRunner {
     pub fn eval<I, O>(
         &mut self,
         project: &str,
-        opts: EvalOpts<I, O>,
+        mut opts: EvalOpts<I, O>,
     ) -> crate::Completion<(), crate::BraintrustError>
     where
         I: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
         O: Serialize + DeserializeOwned + Send + Sync + PartialEq + Clone + 'static,
     {
-        let mut runner = self.clone();
+        let runner = self.clone();
         let project = project.to_owned();
-        crate::service::submit(async move { runner.eval_inner(&project, opts).await })
-    }
+        crate::service::submit(async move {
+            let name = opts.name.clone();
 
-    async fn eval_inner<I, O>(&mut self, project: &str, mut opts: EvalOpts<I, O>) -> Result<()>
-    where
-        I: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
-        O: Serialize + DeserializeOwned + Send + Sync + PartialEq + Clone + 'static,
-    {
-        let name = opts.name.clone();
+            if !runner.passes_filter(&name) {
+                return Ok(());
+            }
 
-        if !self.passes_filter(&name) {
-            return Ok(());
-        }
+            if runner.config.list {
+                runner.registered_names.lock().unwrap().push(name);
+                return Ok(());
+            }
 
-        if self.config.list {
-            self.registered_names.lock().unwrap().push(name);
-            return Ok(());
-        }
+            // Set the project name from the argument if not already set in opts
+            if opts.project_name.is_none() {
+                opts.project_name = Some(project.to_string());
+            }
 
-        // Set the project name from the argument if not already set in opts
-        if opts.project_name.is_none() {
-            opts.project_name = Some(project.to_string());
-        }
+            let client = runner.client.clone().ok_or_else(|| {
+                BraintrustError::Background("BtEvalRunner has no client".to_string())
+            })?;
 
-        let client = self
-            .client
-            .clone()
-            .ok_or_else(|| BraintrustError::Background("BtEvalRunner has no client".to_string()))?;
+            let evaluator = Evaluator::<I, O>::from_arc(client);
 
-        let evaluator = Evaluator::<I, O>::from_arc(client);
+            if let Some(sse) = &runner.sse {
+                sse.send("start", &json!({ "name": name }));
+            }
 
-        if let Some(sse) = &self.sse {
-            sse.send("start", &json!({ "name": name }));
-        }
+            match evaluator.run(opts).await {
+                Ok(summary) => {
+                    let failed = summary.failed_cases;
 
-        match evaluator.run(opts).await {
-            Ok(summary) => {
-                let failed = summary.failed_cases;
+                    if let Some(sse) = &runner.sse {
+                        let summary_value = serde_json::to_value(&summary).unwrap_or(Value::Null);
+                        sse.send("summary", &summary_value);
+                    } else if runner.config.jsonl {
+                        if let Ok(json) = serde_json::to_string(&summary) {
+                            println!("{}", json);
+                        }
+                    }
 
-                if let Some(sse) = &self.sse {
-                    let summary_value = serde_json::to_value(&summary).unwrap_or(Value::Null);
-                    sse.send("summary", &summary_value);
-                } else if self.config.jsonl {
-                    if let Ok(json) = serde_json::to_string(&summary) {
-                        println!("{}", json);
+                    if failed > 0 {
+                        runner
+                            .all_passed
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        if runner.config.terminate_on_failure {
+                            return Err(BraintrustError::Background(format!(
+                                "Evaluator '{}' failed with {} error(s)",
+                                name, failed
+                            )));
+                        }
                     }
                 }
-
-                if failed > 0 {
-                    self.all_passed
+                Err(e) => {
+                    runner
+                        .all_passed
                         .store(false, std::sync::atomic::Ordering::Release);
-                    if self.config.terminate_on_failure {
-                        return Err(BraintrustError::Background(format!(
-                            "Evaluator '{}' failed with {} error(s)",
-                            name, failed
-                        )));
+                    if let Some(sse) = &runner.sse {
+                        sse.send("error", &json!({ "message": e.to_string() }));
+                    } else {
+                        eprintln!("Evaluator '{}' failed: {}", name, e);
+                    }
+                    if runner.config.terminate_on_failure {
+                        return Err(e);
                     }
                 }
             }
-            Err(e) => {
-                self.all_passed
-                    .store(false, std::sync::atomic::Ordering::Release);
-                if let Some(sse) = &self.sse {
-                    sse.send("error", &json!({ "message": e.to_string() }));
-                } else {
-                    eprintln!("Evaluator '{}' failed: {}", name, e);
-                }
-                if self.config.terminate_on_failure {
-                    return Err(e);
-                }
-            }
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Finish the runner session.
@@ -386,18 +379,14 @@ impl BtEvalRunner {
     /// The SSE connection (if any) is closed when this method returns.
     ///
     /// Returns `true` if all evals passed, `false` if any failed.
-    pub fn finish(self) -> crate::Completion<bool, crate::BraintrustError> {
-        crate::service::submit(async move { self.finish_inner().await })
-    }
-
-    async fn finish_inner(self) -> Result<bool> {
+    pub fn finish(self) -> bool {
         if self.config.list {
             for name in self.registered_names.lock().unwrap().iter() {
                 println!("{}", name);
             }
         }
         // SSE connection is closed when `self.sse` is dropped
-        Ok(self.all_passed.load(std::sync::atomic::Ordering::Acquire))
+        self.all_passed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Convenience method: run multiple evaluations whose results can be summarized.

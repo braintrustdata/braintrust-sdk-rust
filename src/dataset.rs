@@ -567,11 +567,9 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     /// Get the dataset ID (triggers registration if needed).
     pub fn dataset_id(&self) -> crate::Completion<String, crate::BraintrustError> {
         let dataset = self.clone();
-        crate::service::submit(async move { dataset.dataset_id_inner().await })
-    }
-
-    async fn dataset_id_inner(&self) -> Result<String> {
-        Ok(self.ensure_registered().await?.dataset_id.clone())
+        crate::service::submit(
+            async move { Ok(dataset.ensure_registered().await?.dataset_id.clone()) },
+        )
     }
 
     /// Get the dataset name.
@@ -592,24 +590,22 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         record: DatasetInsert,
     ) -> crate::Completion<String, crate::BraintrustError> {
         let dataset = self.clone();
-        crate::service::submit(async move { Ok(dataset.insert_inner(record).await) })
-    }
+        crate::service::submit(async move {
+            let id = Uuid::new_v4().to_string();
 
-    async fn insert_inner(&self, record: DatasetInsert) -> String {
-        let id = Uuid::new_v4().to_string();
+            let row = PendingDatasetRow {
+                id: id.clone(),
+                input: record.input,
+                expected: record.expected,
+                metadata: record.metadata,
+                tags: record.tags,
+                is_merge: false,
+                is_delete: false,
+            };
 
-        let row = PendingDatasetRow {
-            id: id.clone(),
-            input: record.input,
-            expected: record.expected,
-            metadata: record.metadata,
-            tags: record.tags,
-            is_merge: false,
-            is_delete: false,
-        };
-
-        self.pending_rows.lock().await.push(row);
-        id
+            dataset.pending_rows.lock().await.push(row);
+            Ok(id)
+        })
     }
 
     /// Update an existing record by ID (merge semantics).
@@ -623,23 +619,19 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         let dataset = self.clone();
         let id = id.to_owned();
         crate::service::submit(async move {
-            dataset.update_inner(&id, record).await;
+            let row = PendingDatasetRow {
+                id,
+                input: record.input,
+                expected: record.expected,
+                metadata: record.metadata,
+                tags: record.tags,
+                is_merge: true,
+                is_delete: false,
+            };
+
+            dataset.pending_rows.lock().await.push(row);
             Ok(())
         })
-    }
-
-    async fn update_inner(&self, id: &str, record: DatasetInsert) {
-        let row = PendingDatasetRow {
-            id: id.to_string(),
-            input: record.input,
-            expected: record.expected,
-            metadata: record.metadata,
-            tags: record.tags,
-            is_merge: true,
-            is_delete: false,
-        };
-
-        self.pending_rows.lock().await.push(row);
     }
 
     /// Delete a record by ID.
@@ -647,23 +639,19 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         let dataset = self.clone();
         let id = id.to_owned();
         crate::service::submit(async move {
-            dataset.delete_inner(&id).await;
+            let row = PendingDatasetRow {
+                id,
+                input: None,
+                expected: None,
+                metadata: None,
+                tags: None,
+                is_merge: false,
+                is_delete: true,
+            };
+
+            dataset.pending_rows.lock().await.push(row);
             Ok(())
         })
-    }
-
-    async fn delete_inner(&self, id: &str) {
-        let row = PendingDatasetRow {
-            id: id.to_string(),
-            input: None,
-            expected: None,
-            metadata: None,
-            tags: None,
-            is_merge: false,
-            is_delete: true,
-        };
-
-        self.pending_rows.lock().await.push(row);
     }
 
     /// Fetch records with pagination.
@@ -674,120 +662,124 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
         batch_size: Option<usize>,
     ) -> crate::Completion<DatasetIterator<S>, crate::BraintrustError> {
         let dataset = self.clone();
-        crate::service::submit(async move { dataset.fetch_inner(batch_size).await })
-    }
-
-    async fn fetch_inner(&self, batch_size: Option<usize>) -> Result<DatasetIterator<S>> {
-        let metadata = self.ensure_registered().await?;
-        Ok(DatasetIterator::new(
-            Arc::clone(&self.submitter),
-            self.token.clone(),
-            metadata.dataset_id.clone(),
-            batch_size.unwrap_or(1000),
-        ))
+        crate::service::submit(async move {
+            let metadata = dataset.ensure_registered().await?;
+            Ok(DatasetIterator::new(
+                Arc::clone(&dataset.submitter),
+                dataset.token.clone(),
+                metadata.dataset_id.clone(),
+                batch_size.unwrap_or(1000),
+            ))
+        })
     }
 
     /// Get dataset summary statistics.
     pub fn summarize(&self) -> crate::Completion<DatasetSummary, crate::BraintrustError> {
         let dataset = self.clone();
-        crate::service::submit(async move { dataset.summarize_inner().await })
-    }
+        crate::service::submit(async move {
+            // Flush pending operations first
+            dataset.flush().await?;
 
-    async fn summarize_inner(&self) -> Result<DatasetSummary> {
-        // Flush pending operations first
-        self.flush().await?;
+            let metadata = dataset.ensure_registered().await?;
 
-        let metadata = self.ensure_registered().await?;
+            // Fetch summary from API
+            let response = dataset
+                .submitter
+                .fetch_dataset_summary(&dataset.token, &metadata.dataset_id)
+                .await?;
 
-        // Fetch summary from API
-        let response = self
-            .submitter
-            .fetch_dataset_summary(&self.token, &metadata.dataset_id)
-            .await?;
-
-        Ok(DatasetSummary {
-            project_name: response.project_name,
-            dataset_name: response.dataset_name,
-            project_id: Some(response.project_id),
-            dataset_id: Some(response.dataset_id),
-            project_url: response.project_url,
-            dataset_url: response.dataset_url,
-            total_records: response.data_summary.and_then(|ds| ds.total_records),
+            Ok(DatasetSummary {
+                project_name: response.project_name,
+                dataset_name: response.dataset_name,
+                project_id: Some(response.project_id),
+                dataset_id: Some(response.dataset_id),
+                project_url: response.project_url,
+                dataset_url: response.dataset_url,
+                total_records: response.data_summary.and_then(|ds| ds.total_records),
+            })
         })
     }
 
     /// Flush all pending operations.
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let dataset = self.clone();
-        crate::service::submit(async move { dataset.flush_inner().await })
-    }
-
-    async fn flush_inner(&self) -> Result<()> {
-        let metadata = self.ensure_registered().await?;
-        let rows = {
-            let mut pending = self.pending_rows.lock().await;
-            std::mem::take(&mut *pending)
-        };
-
-        if rows.is_empty() {
-            return self.submitter.flush().await.map(|_| ()).map_err(Into::into);
-        }
-
-        // Submit each row
-        for row in rows {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-
-            let payload = SpanPayload {
-                row_id: row.id.clone(),
-                span_id: row.id,
-                is_merge: row.is_merge,
-                span_components: None,
-                org_id: self.org_id.clone(),
-                org_name: Some(self.org_name.clone()),
-                project_name: Some(self.project_name.clone()),
-                input: row.input,
-                output: None,
-                expected: row.expected,
-                error: None,
-                scores: None,
-                metadata: row.metadata,
-                metrics: None,
-                tags: row.tags,
-                context: Some(serde_json::json!({
-                    "calendar_time": now,
-                })),
-                span_attributes: if row.is_delete {
-                    Some(crate::types::SpanAttributes {
-                        name: None,
-                        span_type: None,
-                        purpose: None,
-                        extra: {
-                            let mut map = std::collections::HashMap::new();
-                            map.insert("_object_delete".to_string(), Value::Bool(true));
-                            map
-                        },
-                    })
-                } else {
-                    None
-                },
-                extra: std::collections::HashMap::new(),
+        crate::service::submit(async move {
+            let metadata = dataset.ensure_registered().await?;
+            let rows = {
+                let mut pending = dataset.pending_rows.lock().await;
+                std::mem::take(&mut *pending)
             };
 
-            let parent_info = ParentSpanInfo::Dataset {
-                object_id: metadata.dataset_id.clone(),
-            };
+            if rows.is_empty() {
+                return dataset
+                    .submitter
+                    .flush()
+                    .await
+                    .map(|_| ())
+                    .map_err(Into::into);
+            }
 
-            self.submitter.submit(
-                Credential::token_value(self.token.clone()),
-                payload,
-                Some(parent_info),
-            );
-        }
+            // Submit each row
+            for row in rows {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
 
-        self.submitter.flush().await.map(|_| ()).map_err(Into::into)
+                let payload = SpanPayload {
+                    row_id: row.id.clone(),
+                    span_id: row.id,
+                    is_merge: row.is_merge,
+                    span_components: None,
+                    org_id: dataset.org_id.clone(),
+                    org_name: Some(dataset.org_name.clone()),
+                    project_name: Some(dataset.project_name.clone()),
+                    input: row.input,
+                    output: None,
+                    expected: row.expected,
+                    error: None,
+                    scores: None,
+                    metadata: row.metadata,
+                    metrics: None,
+                    tags: row.tags,
+                    context: Some(serde_json::json!({
+                        "calendar_time": now,
+                    })),
+                    span_attributes: if row.is_delete {
+                        Some(crate::types::SpanAttributes {
+                            name: None,
+                            span_type: None,
+                            purpose: None,
+                            extra: {
+                                let mut map = std::collections::HashMap::new();
+                                map.insert("_object_delete".to_string(), Value::Bool(true));
+                                map
+                            },
+                        })
+                    } else {
+                        None
+                    },
+                    extra: std::collections::HashMap::new(),
+                };
+
+                let parent_info = ParentSpanInfo::Dataset {
+                    object_id: metadata.dataset_id.clone(),
+                };
+
+                dataset.submitter.submit(
+                    Credential::token_value(dataset.token.clone()),
+                    payload,
+                    Some(parent_info),
+                );
+            }
+
+            dataset
+                .submitter
+                .flush()
+                .await
+                .map(|_| ())
+                .map_err(Into::into)
+        })
     }
 }
 

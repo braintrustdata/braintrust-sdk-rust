@@ -46,16 +46,8 @@ async fn high_level_operations_work_from_a_plain_sync_thread() {
                 .build()
                 .blocking_wait()
                 .unwrap();
-            assert!(client.is_logged_in().blocking_wait().unwrap());
-            assert_eq!(
-                client
-                    .login_state()
-                    .blocking_wait()
-                    .unwrap()
-                    .org_id()
-                    .as_deref(),
-                Some("org")
-            );
+            assert!(client.is_logged_in());
+            assert_eq!(client.login_state().org_id().as_deref(), Some("org"));
             let span = client
                 .span_builder()
                 .blocking_wait()

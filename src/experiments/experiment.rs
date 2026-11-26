@@ -9,7 +9,6 @@ use serde_json::{Map, Value};
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
-use crate::error::Result;
 use crate::experiments::api::{
     BaseExperimentFetcher, ExperimentComparisonFetcher, ExperimentRegisterRequest,
     ExperimentRegistrar,
@@ -101,52 +100,50 @@ impl<
     /// as mixing `log()` and `start_span()` is not supported.
     pub fn log(&self, event: ExperimentLog) -> crate::Completion<String, crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move { Ok(experiment.log_inner(event).await) })
-    }
-
-    async fn log_inner(&self, event: ExperimentLog) -> String {
-        if self.called_start_span.load(Ordering::Acquire) {
-            panic!(
-                "Cannot use log() after start_span() has been called. \
+        crate::service::submit(async move {
+            if experiment.called_start_span.load(Ordering::Acquire) {
+                panic!(
+                    "Cannot use log() after start_span() has been called. \
                  Use start_span() consistently or log() consistently, but not both."
-            );
-        }
+                );
+            }
 
-        // Get or create experiment registration
-        let metadata = self.ensure_registered().await;
+            // Get or create experiment registration
+            let metadata = experiment.ensure_registered().await;
 
-        // Create a span for this log event
-        let start_time = f64::from_bits(self.last_start_time.load(Ordering::Acquire));
-        let start_time = if start_time == 0.0 {
-            SystemTime::now()
+            // Create a span for this log event
+            let start_time = f64::from_bits(experiment.last_start_time.load(Ordering::Acquire));
+            let start_time = if start_time == 0.0 {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0)
+            } else {
+                start_time
+            };
+
+            let span = experiment.create_internal_span(&metadata, start_time).await;
+
+            // Get the row_id before logging - it's stable from span creation
+            let row_id = span.row_id().to_string();
+
+            // Convert ExperimentLog to SpanLog and log
+            let span_log = event.into_span_log();
+            span.log(span_log);
+
+            // Record end time for next log() call
+            let end_time = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0)
-        } else {
-            start_time
-        };
+                .unwrap_or(0.0);
+            experiment
+                .last_start_time
+                .store(end_time.to_bits(), Ordering::Release);
 
-        let span = self.create_internal_span(&metadata, start_time).await;
-
-        // Get the row_id before logging - it's stable from span creation
-        let row_id = span.row_id().to_string();
-
-        // Convert ExperimentLog to SpanLog and log
-        let span_log = event.into_span_log();
-        span.log(span_log);
-
-        // Record end time for next log() call
-        let end_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        self.last_start_time
-            .store(end_time.to_bits(), Ordering::Release);
-
-        // Track for flush
-        self.pending_flushes.lock().await.push(span);
-
-        row_id
+            // Track for flush
+            experiment.pending_flushes.lock().await.push(span);
+            Ok(row_id)
+        })
     }
 
     /// Start a new root span for this experiment.
@@ -157,10 +154,11 @@ impl<
         &self,
     ) -> crate::Completion<ExperimentSpanBuilder<'static, S>, crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move { Ok(experiment.start_span_inner().await) })
+        crate::service::submit(async move { Ok(experiment.registered_span_builder().await) })
     }
 
-    async fn start_span_inner(&self) -> ExperimentSpanBuilder<'static, S> {
+    /// Register the experiment and switch it to explicit spans.
+    async fn registered_span_builder(&self) -> ExperimentSpanBuilder<'static, S> {
         self.called_start_span.store(true, Ordering::Release);
         let metadata = self.ensure_registered().await;
         ExperimentSpanBuilder::new(self.clone(), metadata)
@@ -177,65 +175,62 @@ impl<
         let experiment = self.clone();
         let id = id.to_owned();
         crate::service::submit(async move {
-            experiment.log_feedback_inner(&id, feedback).await;
+            let metadata = experiment.ensure_registered().await;
+
+            // Create a merge payload for the existing span
+            let mut scores = HashMap::new();
+            if let Some(fb_scores) = feedback.scores {
+                scores = fb_scores;
+            }
+
+            let mut metadata_map = Map::new();
+            if let Some(fb_metadata) = feedback.metadata {
+                metadata_map = fb_metadata;
+            }
+
+            // Add feedback-specific fields to metadata
+            if let Some(comment) = feedback.comment {
+                metadata_map.insert("comment".to_string(), Value::String(comment));
+            }
+            if let Some(source) = feedback.source {
+                metadata_map.insert("source".to_string(), Value::String(source));
+            }
+
+            // Note: We don't set project_name here because the destination is
+            // determined by the experiment_id via parent_info.
+            let payload = SpanPayload {
+                row_id: id.to_string(),
+                span_id: id.to_string(), // Use same ID for merge
+                is_merge: true,
+                span_components: None,
+                org_id: experiment.org_id.clone(),
+                org_name: experiment.org_name.clone(),
+                project_name: None,
+                input: None,
+                output: None,
+                expected: feedback.expected,
+                error: None,
+                scores: (!scores.is_empty()).then_some(scores),
+                metadata: (!metadata_map.is_empty()).then_some(metadata_map),
+                metrics: None,
+                tags: feedback.tags,
+                context: None,
+                span_attributes: None,
+                extra: HashMap::new(),
+            };
+
+            let parent_info = ParentSpanInfo::Experiment {
+                object_id: metadata.experiment_id.clone(),
+            };
+
+            experiment.submitter.submit(
+                Credential::token_value(experiment.token.clone()),
+                payload,
+                Some(parent_info),
+            );
+
             Ok(())
         })
-    }
-
-    async fn log_feedback_inner(&self, id: &str, feedback: Feedback) {
-        let metadata = self.ensure_registered().await;
-
-        // Create a merge payload for the existing span
-        let mut scores = HashMap::new();
-        if let Some(fb_scores) = feedback.scores {
-            scores = fb_scores;
-        }
-
-        let mut metadata_map = Map::new();
-        if let Some(fb_metadata) = feedback.metadata {
-            metadata_map = fb_metadata;
-        }
-
-        // Add feedback-specific fields to metadata
-        if let Some(comment) = feedback.comment {
-            metadata_map.insert("comment".to_string(), Value::String(comment));
-        }
-        if let Some(source) = feedback.source {
-            metadata_map.insert("source".to_string(), Value::String(source));
-        }
-
-        // Note: We don't set project_name here because the destination is
-        // determined by the experiment_id via parent_info.
-        let payload = SpanPayload {
-            row_id: id.to_string(),
-            span_id: id.to_string(), // Use same ID for merge
-            is_merge: true,
-            span_components: None,
-            org_id: self.org_id.clone(),
-            org_name: self.org_name.clone(),
-            project_name: None,
-            input: None,
-            output: None,
-            expected: feedback.expected,
-            error: None,
-            scores: (!scores.is_empty()).then_some(scores),
-            metadata: (!metadata_map.is_empty()).then_some(metadata_map),
-            metrics: None,
-            tags: feedback.tags,
-            context: None,
-            span_attributes: None,
-            extra: HashMap::new(),
-        };
-
-        let parent_info = ParentSpanInfo::Experiment {
-            object_id: metadata.experiment_id.clone(),
-        };
-
-        self.submitter.submit(
-            Credential::token_value(self.token.clone()),
-            payload,
-            Some(parent_info),
-        );
     }
 
     /// Get a summary of the experiment's performance.
@@ -244,104 +239,105 @@ impl<
     /// If a base experiment is configured, comparison data will be included.
     pub fn summarize(&self) -> crate::Completion<ExperimentSummary, crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move { experiment.summarize_inner().await })
-    }
+        crate::service::submit(async move {
+            // Flush all pending data first
+            experiment.flush().await?;
 
-    async fn summarize_inner(&self) -> Result<ExperimentSummary> {
-        // Flush all pending data first
-        self.flush().await?;
+            let metadata = experiment.ensure_registered().await;
 
-        let metadata = self.ensure_registered().await;
+            // Try to get base experiment for comparison
+            let base_exp_id = experiment
+                .fetch_base_experiment()
+                .await
+                .ok()
+                .flatten()
+                .map(|b| b.id);
 
-        // Try to get base experiment for comparison
-        let base_exp_id = self
-            .fetch_base_experiment()
-            .await
-            .ok()
-            .flatten()
-            .map(|b| b.id);
+            // Fetch comparison data from API
+            let comparison = experiment
+                .submitter
+                .fetch_experiment_comparison(
+                    &experiment.token,
+                    &metadata.experiment_id,
+                    base_exp_id.as_deref(),
+                )
+                .await?;
 
-        // Fetch comparison data from API
-        let comparison = self
-            .submitter
-            .fetch_experiment_comparison(
-                &self.token,
-                &metadata.experiment_id,
-                base_exp_id.as_deref(),
-            )
-            .await?;
+            // Build summary from comparison response
+            let mut summary = ExperimentSummary::new(
+                experiment.project_name.clone(),
+                metadata.experiment_name.clone(),
+                Some(metadata.project_id.clone()),
+                Some(metadata.experiment_id.clone()),
+            );
 
-        // Build summary from comparison response
-        let mut summary = ExperimentSummary::new(
-            self.project_name.clone(),
-            metadata.experiment_name.clone(),
-            Some(metadata.project_id.clone()),
-            Some(metadata.experiment_id.clone()),
-        );
+            // Set comparison experiment name if present
+            if let Some(base_name) = comparison.base_experiment_name {
+                summary.set_comparison_experiment_name(base_name);
+            }
 
-        // Set comparison experiment name if present
-        if let Some(base_name) = comparison.base_experiment_name {
-            summary.set_comparison_experiment_name(base_name);
-        }
-
-        // Convert scores from comparison response
-        let scores: HashMap<String, ScoreSummary> = comparison
-            .scores
-            .into_iter()
-            .map(|(name, data)| {
-                let mut score_summary = ScoreSummary::new(name.clone(), data.score);
-                if let Some(diff) = data.diff {
-                    score_summary.set_diff(diff);
-                }
-                if let Some(improvements) = data.improvements {
-                    score_summary.set_improvements(improvements);
-                }
-                if let Some(regressions) = data.regressions {
-                    score_summary.set_regressions(regressions);
-                }
-                (name, score_summary)
-            })
-            .collect();
-        summary.set_scores(scores);
-
-        // Convert metrics from comparison response
-        if !comparison.metrics.is_empty() {
-            let metrics: HashMap<String, MetricSummary> = comparison
-                .metrics
+            // Convert scores from comparison response
+            let scores: HashMap<String, ScoreSummary> = comparison
+                .scores
                 .into_iter()
                 .map(|(name, data)| {
-                    let mut metric_summary = MetricSummary::new(name.clone(), data.metric);
+                    let mut score_summary = ScoreSummary::new(name.clone(), data.score);
                     if let Some(diff) = data.diff {
-                        metric_summary.set_diff(diff);
+                        score_summary.set_diff(diff);
                     }
                     if let Some(improvements) = data.improvements {
-                        metric_summary.set_improvements(improvements);
+                        score_summary.set_improvements(improvements);
                     }
                     if let Some(regressions) = data.regressions {
-                        metric_summary.set_regressions(regressions);
+                        score_summary.set_regressions(regressions);
                     }
-                    (name, metric_summary)
+                    (name, score_summary)
                 })
                 .collect();
-            summary.set_metrics(metrics);
-        }
+            summary.set_scores(scores);
 
-        Ok(summary)
+            // Convert metrics from comparison response
+            if !comparison.metrics.is_empty() {
+                let metrics: HashMap<String, MetricSummary> = comparison
+                    .metrics
+                    .into_iter()
+                    .map(|(name, data)| {
+                        let mut metric_summary = MetricSummary::new(name.clone(), data.metric);
+                        if let Some(diff) = data.diff {
+                            metric_summary.set_diff(diff);
+                        }
+                        if let Some(improvements) = data.improvements {
+                            metric_summary.set_improvements(improvements);
+                        }
+                        if let Some(regressions) = data.regressions {
+                            metric_summary.set_regressions(regressions);
+                        }
+                        (name, metric_summary)
+                    })
+                    .collect();
+                summary.set_metrics(metrics);
+            }
+
+            Ok(summary)
+        })
     }
 
     /// Flush all pending experiment data to Braintrust.
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move { experiment.flush_inner().await })
-    }
-
-    async fn flush_inner(&self) -> Result<()> {
-        let mut pending = self.pending_flushes.lock().await;
-        for span in pending.drain(..) {
-            span.end();
-        }
-        drop(pending);
-        self.submitter.flush().await.map(|_| ()).map_err(Into::into)
+        crate::service::submit(async move {
+            let mut pending = experiment.pending_flushes.lock().await;
+            for span in pending.drain(..) {
+                span.end();
+            }
+            drop(pending);
+            experiment
+                .submitter
+                .flush()
+                .await
+                .map(|_| ())
+                .map_err(Into::into)
+        })
     }
 
     /// Get the experiment ID (after registration).
@@ -364,15 +360,13 @@ impl<
     /// Get the project containing this experiment.
     pub fn project(&self) -> crate::Completion<ProjectMetadata, crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move { Ok(experiment.project_inner().await) })
-    }
-
-    async fn project_inner(&self) -> ProjectMetadata {
-        let metadata = self.ensure_registered().await;
-        ProjectMetadata {
-            id: metadata.project_id.clone(),
-            name: self.project_name.clone(),
-        }
+        crate::service::submit(async move {
+            let metadata = experiment.ensure_registered().await;
+            Ok(ProjectMetadata {
+                id: metadata.project_id.clone(),
+                name: experiment.project_name.clone(),
+            })
+        })
     }
 
     /// Execute a callback within a traced span.
@@ -395,19 +389,17 @@ impl<
         R: Send + 'static,
     {
         let experiment = self.clone();
-        crate::service::submit(async move { Ok(experiment.traced_inner(callback).await) })
-    }
-
-    async fn traced_inner<F, Fut, R>(&self, callback: F) -> R
-    where
-        F: FnOnce(SpanHandle<S>) -> Fut,
-        Fut: std::future::Future<Output = R>,
-    {
-        let span = self.start_span_inner().await.name("root").build();
-        let result = callback(span.clone()).await;
-        // Flush span data - ignore errors since this is best-effort
-        let _ = span.flush().await;
-        result
+        crate::service::submit(async move {
+            let span = experiment
+                .registered_span_builder()
+                .await
+                .name("root")
+                .build();
+            let result = callback(span.clone()).await;
+            // Flush span data - ignore errors since this is best-effort
+            let _ = span.flush().await;
+            Ok(result)
+        })
     }
 
     /// Update an existing span by ID, merging new data with existing data.
@@ -422,49 +414,46 @@ impl<
         let experiment = self.clone();
         let id = id.to_owned();
         crate::service::submit(async move {
-            experiment.update_span_inner(&id, event).await;
+            let metadata = experiment.ensure_registered().await;
+
+            let payload = SpanPayload {
+                row_id: id.to_string(),
+                span_id: id.to_string(),
+                is_merge: true,
+                span_components: None,
+                org_id: experiment.org_id.clone(),
+                org_name: experiment.org_name.clone(),
+                project_name: None,
+                input: event.input,
+                output: event.output,
+                expected: event.expected,
+                error: event.error,
+                scores: event.scores,
+                metadata: event.metadata,
+                metrics: event.metrics,
+                tags: event.tags,
+                context: event.context,
+                span_attributes: event.name.map(|name| SpanAttributes {
+                    name: Some(name),
+                    span_type: None,
+                    purpose: None,
+                    extra: HashMap::new(),
+                }),
+                extra: HashMap::new(),
+            };
+
+            let parent_info = ParentSpanInfo::Experiment {
+                object_id: metadata.experiment_id.clone(),
+            };
+
+            experiment.submitter.submit(
+                Credential::token_value(experiment.token.clone()),
+                payload,
+                Some(parent_info),
+            );
+
             Ok(())
         })
-    }
-
-    async fn update_span_inner(&self, id: &str, event: SpanLog) {
-        let metadata = self.ensure_registered().await;
-
-        let payload = SpanPayload {
-            row_id: id.to_string(),
-            span_id: id.to_string(),
-            is_merge: true,
-            span_components: None,
-            org_id: self.org_id.clone(),
-            org_name: self.org_name.clone(),
-            project_name: None,
-            input: event.input,
-            output: event.output,
-            expected: event.expected,
-            error: event.error,
-            scores: event.scores,
-            metadata: event.metadata,
-            metrics: event.metrics,
-            tags: event.tags,
-            context: event.context,
-            span_attributes: event.name.map(|name| SpanAttributes {
-                name: Some(name),
-                span_type: None,
-                purpose: None,
-                extra: HashMap::new(),
-            }),
-            extra: HashMap::new(),
-        };
-
-        let parent_info = ParentSpanInfo::Experiment {
-            object_id: metadata.experiment_id.clone(),
-        };
-
-        self.submitter.submit(
-            Credential::token_value(self.token.clone()),
-            payload,
-            Some(parent_info),
-        );
     }
 
     /// Fetch the base experiment used for comparison.
@@ -474,14 +463,13 @@ impl<
         &self,
     ) -> crate::Completion<Option<BaseExperimentInfo>, crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move { experiment.fetch_base_experiment_inner().await })
-    }
-
-    async fn fetch_base_experiment_inner(&self) -> Result<Option<BaseExperimentInfo>> {
-        let metadata = self.ensure_registered().await;
-        self.submitter
-            .fetch_base_experiment(&self.token, &metadata.experiment_id)
-            .await
+        crate::service::submit(async move {
+            let metadata = experiment.ensure_registered().await;
+            experiment
+                .submitter
+                .fetch_base_experiment(&experiment.token, &metadata.experiment_id)
+                .await
+        })
     }
 
     /// Export experiment context for distributed tracing.
@@ -490,15 +478,13 @@ impl<
     /// allowing spans created there to be linked to this experiment.
     pub fn export(&self) -> crate::Completion<ExportedExperiment, crate::BraintrustError> {
         let experiment = self.clone();
-        crate::service::submit(async move { Ok(experiment.export_inner().await) })
-    }
-
-    async fn export_inner(&self) -> ExportedExperiment {
-        let metadata = self.ensure_registered().await;
-        ExportedExperiment {
-            object_type: "experiment".to_string(),
-            object_id: metadata.experiment_id.clone(),
-        }
+        crate::service::submit(async move {
+            let metadata = experiment.ensure_registered().await;
+            Ok(ExportedExperiment {
+                object_type: "experiment".to_string(),
+                object_id: metadata.experiment_id.clone(),
+            })
+        })
     }
 
     /// Ensure the experiment is registered, returning cached metadata.

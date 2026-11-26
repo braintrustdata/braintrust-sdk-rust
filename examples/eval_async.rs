@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
         )
         .await?;
 
-    let passed = runner.finish().await?;
+    let passed = runner.finish();
     if !passed {
         std::process::exit(1);
     }

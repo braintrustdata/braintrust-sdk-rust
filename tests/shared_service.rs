@@ -324,10 +324,7 @@ async fn org_selection_uses_discovered_endpoints_without_retargeting_existing_wo
     let (x, y) = tokio::join!(client.flush(), other.flush());
     x.unwrap();
     y.unwrap();
-    assert_eq!(
-        client.login_state().await.unwrap().org_id().as_deref(),
-        Some("a")
-    );
+    assert_eq!(client.login_state().org_id().as_deref(), Some("a"));
     assert!(client.with_organization("forbidden").await.is_err());
 }
 
@@ -493,7 +490,7 @@ async fn invalid_public_login_state_does_not_stop_other_clients() {
     let server = MockServer::start().await;
     accept(&server).await;
     let bad = client(&server);
-    bad.login_state().await.unwrap().set(
+    bad.login_state().set(
         "token".into(),
         "org".into(),
         "org".into(),
