@@ -276,7 +276,8 @@ impl LogQueueCore {
             project: project_name.into(),
         };
         let entry = crate::service::global()?.projects.entry(key);
-        let timeout = crate::service::global()?.config.preparation_timeout;
+        // Bounded by the retry budget and request timeouts, not a deadline, so
+        // registration can wait out a 429 cooldown.
         let resolve = entry.get_or_try_init(|| async {
             // Prefer the login-state control-plane URL (logged-in path), falling back
             // to the client-configured URL for per-request-credential callers.
@@ -309,10 +310,7 @@ impl LogQueueCore {
 
             Ok::<_, anyhow::Error>(register_response.project.id)
         });
-        let result = match tokio::time::timeout(timeout, resolve).await {
-            Ok(result) => result.cloned(),
-            Err(_) => Err(anyhow::anyhow!("project registration timed out")),
-        };
+        let result = resolve.await.cloned();
         if let Err(error) = &result {
             failures.insert(
                 project_name.to_owned(),

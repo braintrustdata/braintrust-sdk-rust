@@ -186,17 +186,11 @@ impl UploadCoordinator {
         Self { logs, policy }
     }
 
-    /// The caller's scope, or this client's endpoint and organization.
+    /// The caller's scope; every caller sets one for its org.
     fn scope(&self) -> Scope {
-        SCOPE.try_with(Clone::clone).unwrap_or_else(|_| {
-            let org = self
-                .logs
-                .organization()
-                .map(|org| org.id.clone())
-                .or_else(|| self.logs.organization_name().map(str::to_owned))
-                .unwrap_or_default();
-            Scope::new(self.logs.baseurl(), org)
-        })
+        SCOPE
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| Scope::new(self.logs.baseurl(), ""))
     }
 
     pub async fn capabilities(

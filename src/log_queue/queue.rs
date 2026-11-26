@@ -16,11 +16,11 @@ use url::Url;
 
 /// Supplies the bearer token for queued uploads when they are sent.
 ///
-/// The queue calls [`TokenProvider::token`] when preparing and sending upload
-/// groups. Cache tokens that are expensive to mint. Calls run on the shared SDK
-/// runtime and are bounded by [`crate::ServiceConfig::preparation_timeout`]. When it
-/// returns an error, the rows waiting on it are dropped and counted in
-/// [`DroppedRows::upload_failed`].
+/// The queue calls [`TokenProvider::token`] once per upload job, on the runtime
+/// that submitted the job's rows. Cache tokens that are expensive to mint. Each
+/// call is bounded by [`crate::ServiceConfig::token_provider_timeout`], and a
+/// failed call is retried like an upload. Once retries run out, the rows
+/// waiting on it are dropped and counted in [`DroppedRows::upload_failed`].
 #[async_trait::async_trait]
 pub trait TokenProvider: Send + Sync {
     /// Return the token for the next upload.
@@ -63,7 +63,7 @@ impl Credential {
         match self {
             Self::Token(token) => Ok(Cow::Borrowed(token.as_ref())),
             Self::Provider(provider) => tokio::time::timeout(
-                crate::service::global()?.config.preparation_timeout,
+                crate::service::global()?.config.token_provider_timeout,
                 provider.token(),
             )
             .await

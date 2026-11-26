@@ -26,7 +26,7 @@ fn global_limits_and_configuration_are_process_wide() {
 #[ignore = "executed in an isolated subprocess"]
 async fn configuration_child() {
     let config = ServiceConfig::builder()
-        .preparation_timeout(Duration::from_secs(1))
+        .token_provider_timeout(Duration::from_secs(1))
         .max_concurrent_requests(2)
         .max_rows(6)
         .max_org_rows(6)

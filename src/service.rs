@@ -14,9 +14,6 @@ pub struct ServiceConfig {
     /// Maximum simultaneous ingestion HTTP attempts, including overflow uploads.
     #[builder(default = 8)]
     pub max_concurrent_requests: usize,
-    /// Maximum simultaneous destination preparation operations.
-    #[builder(default = 16)]
-    pub max_concurrent_preparations: usize,
     /// Maximum retained rows across all clients, including in-flight work.
     pub max_rows: Option<usize>,
     /// Maximum estimated retained payload bytes across all clients.
@@ -28,9 +25,9 @@ pub struct ServiceConfig {
     /// Maximum entries in each shared project and server-capability cache.
     #[builder(default = 256)]
     pub max_cached_resolutions: usize,
-    /// Maximum duration of one credential provider or preparation operation.
+    /// Maximum duration of one [`crate::TokenProvider::token`] call.
     #[builder(default = Duration::from_secs(30))]
-    pub preparation_timeout: Duration,
+    pub token_provider_timeout: Duration,
     /// The Tokio runtime that runs SDK work. See [`ServiceRuntime`].
     #[builder(default)]
     pub runtime: ServiceRuntime,
@@ -98,10 +95,8 @@ static SERVICE: OnceLock<std::result::Result<Service, String>> = OnceLock::new()
 /// Repeating identical configuration is allowed; conflicting late configuration fails.
 pub fn configure_service(config: ServiceConfig) -> Result<()> {
     if config.max_concurrent_requests == 0
-        || config.max_concurrent_preparations == 0
-        || config.max_concurrent_preparations > tokio::sync::Semaphore::MAX_PERMITS
         || config.max_cached_resolutions == 0
-        || config.preparation_timeout.is_zero()
+        || config.token_provider_timeout.is_zero()
     {
         return Err(BraintrustError::InvalidConfig(
             "service concurrency, cache capacity, and preparation timeout must be positive and supported".into(),
@@ -126,7 +121,6 @@ pub(crate) struct Service {
     lanes: Mutex<HashMap<RuntimeId, Handle>>,
     pub engine: Arc<crate::log_queue::engine::Engine>,
     pub attempts: Arc<crate::scheduler::Scheduler>,
-    pub preparations: Arc<tokio::sync::Semaphore>,
     pub config: ServiceConfig,
     pub projects: crate::resolution::Cache<crate::resolution::ProjectKey, String>,
     pub capabilities: crate::resolution::Cache<crate::resolution::CapabilityKey, (usize, bool)>,
@@ -254,9 +248,6 @@ pub(crate) fn global() -> Result<&'static Service> {
                 lanes: Mutex::new(HashMap::new()),
                 engine,
                 attempts: crate::scheduler::Scheduler::new(config.max_concurrent_requests),
-                preparations: Arc::new(tokio::sync::Semaphore::new(
-                    config.max_concurrent_preparations,
-                )),
                 config,
                 projects: crate::resolution::Cache::new(cache_capacity),
                 capabilities: crate::resolution::Cache::new(cache_capacity),

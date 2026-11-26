@@ -406,6 +406,8 @@ impl Job {
             _ = cancelled => false,
         };
         if panicked {
+            // Rows whose request succeeded were delivered; fail only the rest.
+            job.report.settle_delivered();
             let error = anyhow::anyhow!("delivery partition panicked");
             for index in 0..count {
                 if !job.report.settled[index] {

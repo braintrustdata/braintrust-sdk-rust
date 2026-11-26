@@ -4,6 +4,7 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
+/// A bounded map of single-flight resolutions, evicting least recently used.
 pub(crate) struct Cache<K, V> {
     entries: Mutex<IndexMap<K, Arc<OnceCell<V>>>>,
     capacity: usize,
@@ -17,11 +18,19 @@ impl<K: Hash + Eq, V> Cache<K, V> {
     }
     pub fn entry(&self, key: K) -> Arc<OnceCell<V>> {
         let mut entries = self.entries.lock().unwrap();
-        if let Some(value) = entries.get(&key) {
-            return value.clone();
+        if let Some(index) = entries.get_index_of(&key) {
+            let last = entries.len() - 1;
+            entries.move_index(index, last);
+            return entries[last].clone();
         }
         if entries.len() >= self.capacity {
-            entries.shift_remove_index(0);
+            // Unresolved entries, such as ones whose resolution failed, go
+            // first, so they cannot crowd out working ones.
+            let victim = entries
+                .values()
+                .position(|cell| !cell.initialized())
+                .unwrap_or(0);
+            entries.shift_remove_index(victim);
         }
         let value = Arc::new(OnceCell::new());
         entries.insert(key, value.clone());
@@ -73,4 +82,28 @@ pub(crate) struct ProjectKey {
 #[derive(Hash, PartialEq, Eq)]
 pub(crate) struct CapabilityKey {
     pub api_url: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn keys(cache: &Cache<&'static str, u32>) -> Vec<&'static str> {
+        cache.entries.lock().unwrap().keys().copied().collect()
+    }
+    #[test]
+    fn the_cache_keeps_recently_used_and_resolved_entries() {
+        let cache = Cache::new(2);
+        cache.entry("a").set(1).unwrap();
+        cache.entry("b").set(2).unwrap();
+        // Using `a` makes `b` the least recently used.
+        assert_eq!(cache.entry("a").get(), Some(&1));
+        cache.entry("c").set(3).unwrap();
+        assert_eq!(keys(&cache), ["a", "c"]);
+        // An entry whose resolution failed stays unresolved...
+        cache.entry("failed");
+        assert_eq!(keys(&cache), ["c", "failed"]);
+        // ...and is evicted before resolved entries.
+        cache.entry("d").set(4).unwrap();
+        assert_eq!(keys(&cache), ["c", "d"]);
+    }
 }

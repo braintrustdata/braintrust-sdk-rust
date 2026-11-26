@@ -130,21 +130,11 @@ impl LogQueueCore {
                 return;
             }
         };
-        let service = crate::service::global().expect("initialized service");
         // One token serves the whole job: preparation, registration, and uploads.
-        // A provider can fail transiently, so it is retried like an upload; the
-        // wait between attempts holds no preparation permit.
+        // A provider can fail transiently, so it is retried like an upload.
         let mut delays = crate::internal::upload::queue_delays(self.config.num_retries());
         let token = loop {
-            let fetched = {
-                let _permit = service
-                    .preparations
-                    .acquire()
-                    .await
-                    .expect("service stays open");
-                credential.token().await
-            };
-            match (fetched, delays.next()) {
+            match (credential.token().await, delays.next()) {
                 (Ok(token), _) => break token,
                 (Err(error), Some(delay)) => {
                     tracing::warn!(%error, ?delay, "failed to get upload token, retrying");
@@ -159,11 +149,6 @@ impl LogQueueCore {
                 }
             }
         };
-        let permit = service
-            .preparations
-            .acquire()
-            .await
-            .expect("service stays open");
         let mut failures = super::prepare::ProjectFailures::new();
         let mut spans: IndexMap<RowKey, (Logs3Row, Vec<usize>)> = IndexMap::new();
         let mut raw = Vec::new();
@@ -202,7 +187,6 @@ impl LogQueueCore {
                 QueuedItem::Row { row, .. } => raw.push((index, row.clone())),
             }
         }
-        drop(permit);
         if spans.is_empty() && raw.is_empty() {
             return;
         }
