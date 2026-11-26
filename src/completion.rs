@@ -1,10 +1,11 @@
 //! Observation of work submitted when an SDK method is called.
 use crate::ExecutionError;
 use std::{
+    any::Any,
     future::Future,
     ops::Deref,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
@@ -36,6 +37,7 @@ pub enum BlockingWaitError<E> {
 /// `&mut` (for example with `tokio::time::timeout(duration, &mut completion)`)
 /// and passed to combinators like `futures::future::join_all`. Once the result
 /// has been returned, polling again returns [`ExecutionError::AlreadyTaken`].
+/// If the operation panics, the panic resumes in whoever awaits or waits on it.
 ///
 /// ```no_run
 /// use braintrust_sdk_rust::{BraintrustClient, SpanHandle, SpanLog};
@@ -58,6 +60,17 @@ pub struct Completion<T, E> {
     receiver: oneshot::Receiver<Result<T, E>>,
     /// The result has been returned by `poll`.
     taken: bool,
+    /// Where a panicking operation leaves its payload, to re-raise for the waiter.
+    panic: Option<PanicSlot>,
+}
+pub(crate) type PanicSlot = Arc<Mutex<Option<Box<dyn Any + Send>>>>;
+/// The error for a sender dropped without a result: the operation's panic,
+/// re-raised here, or a lost worker.
+fn lost<E: From<ExecutionError>>(panic: &Option<PanicSlot>) -> E {
+    if let Some(payload) = panic.as_ref().and_then(|slot| slot.lock().unwrap().take()) {
+        std::panic::resume_unwind(payload);
+    }
+    ExecutionError::WorkerLost.into()
 }
 impl<T, E> Completion<T, E> {
     /// Borrow the immediate submission result without waiting for delivery.
@@ -84,13 +97,13 @@ impl<T, E> Completion<T, E> {
     where
         E: From<ExecutionError>,
     {
-        let receiver = match self.ready() {
+        let (receiver, panic) = match self.ready() {
             Ok(result) => return result,
-            Err(receiver) => receiver,
+            Err(pending) => pending,
         };
         receiver
             .blocking_recv()
-            .unwrap_or_else(|_| Err(ExecutionError::WorkerLost.into()))
+            .unwrap_or_else(|_| Err(lost(&panic)))
             .map_err(BlockingWaitError::Operation)
     }
 
@@ -100,9 +113,9 @@ impl<T, E> Completion<T, E> {
     where
         E: From<ExecutionError>,
     {
-        let mut receiver = match self.ready() {
+        let (mut receiver, panic) = match self.ready() {
             Ok(result) => return result,
-            Err(receiver) => receiver,
+            Err(pending) => pending,
         };
         let deadline = Instant::now() + timeout;
         let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
@@ -110,7 +123,7 @@ impl<T, E> Completion<T, E> {
         loop {
             if let Poll::Ready(result) = Pin::new(&mut receiver).poll(&mut context) {
                 return result
-                    .unwrap_or_else(|_| Err(ExecutionError::WorkerLost.into()))
+                    .unwrap_or_else(|_| Err(lost(&panic)))
                     .map_err(BlockingWaitError::Operation);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -123,7 +136,9 @@ impl<T, E> Completion<T, E> {
 
     /// The result if a wait needs no blocking, otherwise the receiver to block on.
     #[allow(clippy::type_complexity)]
-    fn ready(mut self) -> Result<Result<T, BlockingWaitError<E>>, oneshot::Receiver<Result<T, E>>>
+    fn ready(
+        mut self,
+    ) -> Result<Result<T, BlockingWaitError<E>>, (oneshot::Receiver<Result<T, E>>, Option<PanicSlot>)>
     where
         E: From<ExecutionError>,
     {
@@ -138,16 +153,14 @@ impl<T, E> Completion<T, E> {
         match self.receiver.try_recv() {
             Ok(result) => return Ok(result.map_err(BlockingWaitError::Operation)),
             Err(oneshot::error::TryRecvError::Closed) => {
-                return Ok(Err(BlockingWaitError::Operation(
-                    ExecutionError::WorkerLost.into(),
-                )));
+                return Ok(Err(BlockingWaitError::Operation(lost(&self.panic))));
             }
             Err(oneshot::error::TryRecvError::Empty) => {}
         }
         if tokio::runtime::Handle::try_current().is_ok() {
             return Ok(Err(BlockingWaitError::InRuntime));
         }
-        Err(self.receiver)
+        Err((self.receiver, self.panic))
     }
 
     pub(crate) fn pair() -> (oneshot::Sender<Result<T, E>>, Self) {
@@ -158,8 +171,13 @@ impl<T, E> Completion<T, E> {
                 issued: Ok(()),
                 receiver,
                 taken: false,
+                panic: None,
             },
         )
+    }
+    /// A slot for the operation's panic, re-raised when this is awaited or waited on.
+    pub(crate) fn panic_slot(&mut self) -> PanicSlot {
+        self.panic.get_or_insert_with(Default::default).clone()
     }
     pub(crate) fn record_issuance(&mut self, result: Result<(), E>) {
         self.issued = result;
@@ -208,7 +226,10 @@ impl<T, E: From<ExecutionError>> Future for Completion<T, E> {
         let result = match Pin::new(&mut this.receiver).poll(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Ok(result)) => result,
-            Poll::Ready(Err(_)) => Err(ExecutionError::WorkerLost.into()),
+            Poll::Ready(Err(_)) => {
+                this.taken = true;
+                Err(lost(&this.panic))
+            }
         };
         // A completed receiver must not be polled again.
         this.taken = true;
@@ -306,6 +327,21 @@ mod tests {
             Ok(42)
         );
         worker.join().unwrap();
+    }
+    #[tokio::test]
+    async fn an_operations_panic_reaches_whoever_awaits_it() {
+        let completion = crate::service::submit::<(), ExecutionError>(async { panic!("boom") });
+        let caught = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(completion));
+        let payload = caught.await.unwrap_err();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+    }
+    #[test]
+    fn an_operations_panic_reaches_a_blocking_waiter() {
+        let completion = crate::service::submit::<(), ExecutionError>(async { panic!("boom") });
+        let payload =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| completion.blocking_wait()))
+                .unwrap_err();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
     }
     #[test]
     fn blocking_wait_timeout_returns_the_operation_error_unchanged() {

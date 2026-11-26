@@ -264,10 +264,11 @@ pub(crate) fn global() -> Result<&'static Service> {
 pub(crate) async fn execute<T: Send + 'static>(
     operation: impl Future<Output = Result<T>> + Send + 'static,
 ) -> Result<T> {
-    global()?
-        .spawn_operation(operation)
-        .await
-        .map_err(|e| BraintrustError::Background(e.to_string()))?
+    match global()?.spawn_operation(operation).await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(BraintrustError::Background(error.to_string())),
+    }
 }
 
 /// Issue an owned operation immediately, independently of whether its completion is observed.
@@ -281,8 +282,17 @@ where
     let (sender, mut completion) = crate::Completion::pair();
     match global() {
         Ok(service) => {
+            let panic = completion.panic_slot();
             service.spawn_operation(async move {
-                let _ = sender.send(operation.await);
+                use futures::FutureExt;
+                match std::panic::AssertUnwindSafe(operation).catch_unwind().await {
+                    Ok(result) => {
+                        let _ = sender.send(result);
+                    }
+                    // Dropping the sender after storing the payload lets the
+                    // waiter re-raise the panic instead of seeing WorkerLost.
+                    Err(payload) => *panic.lock().unwrap() = Some(payload),
+                }
             });
         }
         Err(_) => {
