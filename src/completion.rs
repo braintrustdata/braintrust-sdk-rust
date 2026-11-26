@@ -59,8 +59,6 @@ pub struct Completion<T, E> {
     /// The result has been returned by `poll`.
     taken: bool,
 }
-/// Compatibility name for the future returned by converting a completion.
-pub type CompletionFuture<T, E> = Completion<T, E>;
 
 impl<T, E> Completion<T, E> {
     /// Borrow the immediate submission result without waiting for delivery.
