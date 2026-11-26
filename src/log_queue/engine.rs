@@ -10,7 +10,6 @@ use crate::{
     ShutdownError, ShutdownReport, WriteError,
 };
 use futures::FutureExt;
-use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use tokio::sync::{oneshot, Notify};
@@ -32,7 +31,7 @@ struct Key {
     /// The organization name sent with requests.
     org_name: Option<String>,
     credential: Credential,
-    policy: super::config::LogQueueConfig,
+    policy: Arc<super::config::LogQueueConfig>,
     transport: u64,
     app_url: String,
     raw: bool,
@@ -53,9 +52,8 @@ struct Record {
 struct Intake {
     sequence: u64,
     records: HashMap<u64, Record>,
-    rows: usize,
     bytes: usize,
-    partitions: IndexMap<Key, VecDeque<Entry>>,
+    partitions: HashMap<Key, VecDeque<Entry>>,
     active: HashSet<Key>,
     org_rows: HashMap<OrgKey, usize>,
 }
@@ -79,34 +77,37 @@ impl Engine {
     /// Start jobs from now on, as rows arrive and earlier jobs finish.
     pub fn start_jobs(self: &Arc<Self>) {
         let _ = self.this.set(Arc::downgrade(self));
-        self.schedule();
     }
-    /// Start a job for each idle partition on the process-wide runtime.
-    fn schedule(&self) {
-        let Some(engine) = self.this.get().and_then(Weak::upgrade) else {
+    /// Start a job for a partition made ready by submission or retirement.
+    fn schedule(&self, key: Key) {
+        let Some((engine, service)) = self
+            .this
+            .get()
+            .and_then(Weak::upgrade)
+            .zip(crate::service::started())
+        else {
             return;
         };
-        let Some(service) = crate::service::started() else {
+        // Leave the queued rows in place if no runtime can accept them.
+        let Some(runtime) = service.runtime_handle() else {
+            tracing::error!("no runtime can run SDK delivery");
             return;
         };
-        for (key, entries) in self.take_jobs() {
-            let Some(runtime) = service.runtime_handle() else {
-                tracing::error!("no runtime can run SDK delivery");
-                self.requeue(&key, entries);
-                continue;
-            };
-            runtime.spawn(engine.clone().process_job(key, entries, Some(runtime.id())));
+        if let Some(entries) = self.take_job(&key) {
+            runtime.spawn(engine.process_job(key, entries, Some(runtime.id())));
         }
     }
-    /// Put a job's entries back at the front of their partition.
-    fn requeue(&self, key: &Key, entries: Vec<Entry>) {
-        let mut intake = self.intake.lock().unwrap_or_else(PoisonError::into_inner);
-        intake.active.remove(key);
-        let queue = intake.partitions.entry(key.clone()).or_default();
-        for entry in entries.into_iter().rev() {
-            queue.push_front(entry);
+
+    fn take_job(&self, key: &Key) -> Option<Vec<Entry>> {
+        let mut intake = self.intake.lock().unwrap();
+        if intake.active.contains(key) {
+            return None;
         }
+        let entries = intake.partitions.remove(key)?;
+        intake.active.insert(key.clone());
+        Some(entries.into())
     }
+
     pub fn submit(
         &self,
         core: Arc<LogQueueCore>,
@@ -132,13 +133,17 @@ impl Engine {
         let prepared: Vec<_> = commands
             .into_iter()
             .map(|(command, sender)| {
-                let bytes = command.estimated_bytes();
+                let bytes = self
+                    .config
+                    .max_bytes
+                    .map_or(0, |_| command.estimated_bytes());
                 let partition = command.partition();
                 (command, bytes, partition, sender)
             })
             .collect();
         let mut rejected = Vec::new();
         let mut results = Vec::new();
+        let mut ready = Vec::new();
         let mut intake = self.intake.lock().unwrap();
         for (command, bytes, (credential, org, org_name), sender) in prepared {
             let (endpoint, org_name) = core.route(&org, org_name.as_deref());
@@ -159,7 +164,10 @@ impl Engine {
             let client_rows = root.len();
             let closed = core.observation.closed();
             if closed
-                || self.config.max_rows.is_some_and(|max| intake.rows >= max)
+                || self
+                    .config
+                    .max_rows
+                    .is_some_and(|max| intake.records.len() >= max)
                 || self
                     .config
                     .max_bytes
@@ -168,7 +176,7 @@ impl Engine {
                     .config
                     .max_org_rows
                     .is_some_and(|max| intake.org_rows.get(&route).copied().unwrap_or(0) >= max)
-                || client_rows >= core.config.queue_max_size()
+                || client_rows >= core.settings.config.queue_max_size()
             {
                 let error = if closed {
                     EnqueueError::Closed
@@ -188,9 +196,9 @@ impl Engine {
                 route,
                 org_name,
                 credential,
-                policy: core.config.clone(),
-                transport: core.client.identity,
-                app_url: core.app_url.to_string(),
+                policy: core.settings.config.clone(),
+                transport: core.settings.client.identity,
+                app_url: core.settings.app_url.to_string(),
                 raw: command.is_raw(),
             };
             results.push(Ok(()));
@@ -203,12 +211,16 @@ impl Engine {
                     sender,
                 },
             );
-            intake.partitions.entry(key).or_default().push_back(Entry {
+            let idle = !intake.active.contains(&key);
+            let partition = intake.partitions.entry(key.clone()).or_default();
+            if idle && partition.is_empty() {
+                ready.push(key);
+            }
+            partition.push_back(Entry {
                 core: core.clone(),
                 command,
                 sequence,
             });
-            intake.rows += 1;
             intake.bytes = intake.bytes.saturating_add(bytes);
         }
         drop(intake);
@@ -218,7 +230,9 @@ impl Engine {
                 let _ = sender.send(Err(error.into()));
             }
         }
-        self.schedule();
+        for key in ready {
+            self.schedule(key);
+        }
         results
     }
     /// Delivery is continuous, so a barrier only observes work accepted before it.
@@ -228,7 +242,6 @@ impl Engine {
     }
     fn retire(intake: &mut Intake, sequence: u64) -> Option<Record> {
         let record = intake.records.remove(&sequence)?;
-        intake.rows -= 1;
         intake.bytes = intake.bytes.saturating_sub(record.bytes);
         if let Some(rows) = intake.org_rows.get_mut(&record.route) {
             *rows -= 1;
@@ -248,7 +261,6 @@ impl Engine {
         scope.state.lock().unwrap().closed = true;
         let barrier = scope.barrier(intake.sequence, true);
         drop(intake);
-        self.schedule();
         let engine = self.clone();
         let scope = scope.clone();
         crate::service::global()
@@ -313,26 +325,23 @@ impl Engine {
         }
         drop(discarded);
         self.cancellations.notify_waiters();
-        self.schedule();
     }
-    /// Start one job per idle partition. Request fairness across organizations
-    /// is the scheduler's responsibility, not job order.
+
+    #[cfg(test)]
     fn take_jobs(&self) -> Vec<(Key, Vec<Entry>)> {
-        let mut intake = self.intake.lock().unwrap();
-        let Intake {
-            partitions, active, ..
-        } = &mut *intake;
-        let mut jobs = Vec::new();
-        partitions.retain(|key, entries| {
-            if active.contains(key) {
-                return true;
-            }
-            active.insert(key.clone());
-            jobs.push((key.clone(), Vec::from(std::mem::take(entries))));
-            false
-        });
-        jobs
+        let keys: Vec<_> = self
+            .intake
+            .lock()
+            .unwrap()
+            .partitions
+            .keys()
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.take_job(&key).map(|entries| (key, entries)))
+            .collect()
     }
+
     /// The job exists before the future is first polled, so a runtime that
     /// drops the task unpolled still requeues its rows.
     fn process_job(
@@ -355,16 +364,17 @@ impl Job {
     async fn run(mut self) {
         let job = &mut self;
         let count = job.entries.len();
-        let core = job.entries[0]
-            .core
-            .job(&job.key.route.endpoint, job.key.org_name.as_deref());
-        let request_scope = crate::scheduler::Scope::new(core.endpoint(), &job.key.route.org);
+        let settings = &job.entries[0].core.settings;
+        let endpoint = &job.key.route.endpoint;
+        let org_name = job.key.org_name.as_deref();
+        let request_scope = crate::scheduler::Scope::new(endpoint, &job.key.route.org);
         let commands: Vec<_> = job.entries.iter().map(|entry| &entry.command).collect();
         let entries = &job.entries;
         let engine = &job.engine;
-        let work = std::panic::AssertUnwindSafe(
-            crate::scheduler::SCOPE.scope(request_scope, core.dispatch(&commands, &mut job.report)),
-        )
+        let work = std::panic::AssertUnwindSafe(crate::scheduler::SCOPE.scope(
+            request_scope,
+            settings.dispatch(&commands, &mut job.report, endpoint, org_name),
+        ))
         .catch_unwind();
         let cancelled = async {
             loop {
@@ -477,7 +487,7 @@ impl Drop for Job {
         for (sender, result) in writes {
             let _ = sender.send(result);
         }
-        engine.schedule();
+        engine.schedule(self.key.clone());
     }
 }
 
@@ -506,7 +516,7 @@ mod tests {
             [SubmitCommand::test_row("a1"), SubmitCommand::test_row("a2")],
         );
         engine.submit(b.core.clone(), SubmitCommand::test_row("b"));
-        assert_eq!(engine.intake.lock().unwrap().rows, 2);
+        assert_eq!(engine.intake.lock().unwrap().records.len(), 2);
         assert_eq!(a.dropped_rows().queue_full, 0);
         assert_eq!(b.dropped_rows().queue_full, 1);
         assert_eq!(a.core.observation.len(), 2);
@@ -555,7 +565,7 @@ mod tests {
         // Rows 0 and 1 went in one upload; the request holding row 0 succeeded
         // before the job was dropped, while row 1's was still in flight.
         report.uploads.push((
-            vec![vec![0], vec![1]],
+            vec![vec![0], vec![1]].into(),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         ));
         // As when the job's runtime shuts down mid-upload.
@@ -598,7 +608,7 @@ mod tests {
             SubmitCommand::test_scoped_row("other-org", "p", "other"),
         );
         assert_eq!(b.dropped_rows().queue_full, 1);
-        assert_eq!(engine.intake.lock().unwrap().rows, 4);
+        assert_eq!(engine.intake.lock().unwrap().records.len(), 4);
     }
 
     #[test]
@@ -615,11 +625,7 @@ mod tests {
         );
         let jobs = engine.take_jobs();
         assert_eq!(jobs[0].0.route.endpoint, "http://localhost/");
-        let job = jobs[0].1[0]
-            .core
-            .job(&jobs[0].0.route.endpoint, jobs[0].0.org_name.as_deref());
-        assert_eq!(job.endpoint(), "http://localhost/");
-        assert_eq!(job.routing_org_name, None);
+        assert_eq!(jobs[0].0.org_name, None);
     }
     fn http_queue(server: &wiremock::MockServer, max_items: usize) -> LogQueue {
         LogQueue::new(
@@ -665,7 +671,7 @@ mod tests {
         x.await.unwrap();
         y.await.unwrap();
         let state = engine.intake.lock().unwrap();
-        assert_eq!((state.rows, state.bytes), (0, 0));
+        assert_eq!((state.records.len(), state.bytes), (0, 0));
         assert!(state.org_rows.is_empty() && state.active.is_empty());
     }
 
@@ -898,7 +904,7 @@ mod tests {
                 });
             }
         });
-        assert_eq!(engine.intake.lock().unwrap().rows, 17);
+        assert_eq!(engine.intake.lock().unwrap().records.len(), 17);
         assert_eq!(queue.core.observation.len(), 17);
         assert_eq!(queue.dropped_rows().queue_full, 783);
     }
@@ -964,6 +970,6 @@ mod tests {
         completion.await.unwrap();
         assert!(signal.woke.load(Ordering::SeqCst));
         assert_eq!(flush.await.unwrap().delivered(), 1);
-        assert_eq!(engine.intake.lock().unwrap().rows, 1);
+        assert_eq!(engine.intake.lock().unwrap().records.len(), 1);
     }
 }

@@ -2,7 +2,6 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use reqwest::Client;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Id as RuntimeId;
 
@@ -12,7 +11,7 @@ use crate::error::{BraintrustError, Result};
 /// profile share a request.
 #[derive(Clone, Debug)]
 pub(crate) struct SharedHttp {
-    settings: Arc<Settings>,
+    pool: Arc<ProfilePool>,
     pub identity: u64,
 }
 #[derive(Debug)]
@@ -35,32 +34,30 @@ impl Settings {
             .map_err(|err| BraintrustError::InvalidConfig(err.to_string()))
     }
 }
-/// Connection pools by profile and runtime. hyper drives each connection from
-/// the runtime that opened it, so a pool shared across runtimes would let an
-/// idle runtime stall other runtimes' requests.
-type Pools = HashMap<(u64, Option<RuntimeId>), Client>;
-static RUNTIME_POOLS: Mutex<Option<Pools>> = Mutex::new(None);
+/// The profile owns its pool, including its lifetime after cache eviction.
+#[derive(Debug)]
+struct ProfilePool {
+    settings: Settings,
+    client: Mutex<(Option<RuntimeId>, Client)>,
+}
+
 impl SharedHttp {
-    /// This profile's connection pool for the current runtime.
     pub fn client(&self) -> Client {
         let runtime = tokio::runtime::Handle::try_current().ok().map(|h| h.id());
-        let mut pools = RUNTIME_POOLS.lock().unwrap();
-        let pools = pools.get_or_insert_with(HashMap::new);
-        pools
-            .entry((self.identity, runtime))
-            .or_insert_with(|| {
-                // The same settings built successfully when the profile was created.
-                self.settings
+        let mut pool = self.pool.client.lock().unwrap();
+        if let Some(runtime) = runtime {
+            // The first runtime adopts the validated client. After a runtime
+            // shuts down, use a fresh pool so old connections cannot stall it.
+            if pool.0.is_some_and(|previous| previous != runtime) {
+                pool.1 = self
+                    .pool
+                    .settings
                     .build()
-                    .expect("validated HTTP client settings")
-            })
-            .clone()
-    }
-}
-/// Drop the connection pools of a runtime that shut down.
-pub(crate) fn forget_runtime(runtime: RuntimeId) {
-    if let Some(pools) = RUNTIME_POOLS.lock().unwrap().as_mut() {
-        pools.retain(|(_, pool_runtime), _| *pool_runtime != Some(runtime));
+                    .expect("validated HTTP client settings");
+            }
+            pool.0 = Some(runtime);
+        }
+        pool.1.clone()
     }
 }
 
@@ -172,10 +169,13 @@ pub(crate) fn build_http_client(
         user_agent: user_agent.unwrap_or(USER_AGENT).to_owned(),
         certificates,
     };
-    settings.build()?;
+    let http = settings.build()?;
     static NEXT_PROFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let client = SharedHttp {
-        settings: Arc::new(settings),
+        pool: Arc::new(ProfilePool {
+            settings,
+            client: Mutex::new((None, http)),
+        }),
         identity: NEXT_PROFILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     };
     if pools.len() >= 32 {

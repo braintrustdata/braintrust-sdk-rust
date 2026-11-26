@@ -132,38 +132,32 @@ pub struct DroppedRows {
     pub upload_failed: u64,
 }
 
-/// Immutable routing and policy for a facade. Queue storage and workers live in Service.
+/// Settings shared by a client and its derived handles.
+pub(crate) struct QueueSettings {
+    pub(crate) config: Arc<LogQueueConfig>,
+    pub(crate) client: crate::http::SharedHttp,
+    pub(crate) api_url: Url,
+    pub(crate) app_url: Url,
+}
+
 pub(crate) struct LogQueueCore {
-    pub(crate) config: LogQueueConfig,
+    pub(crate) settings: Arc<QueueSettings>,
     pub(crate) observation: Arc<super::observation::Observation>,
     dropped_count: AtomicUsize,
     last_drop_log_time: AtomicU64,
     queue_depth_warning_emitted: AtomicBool,
     pub(super) login_state: LoginState,
-    pub(super) client: crate::http::SharedHttp,
-    pub(super) api_url: Url,
-    pub(super) app_url: Url,
-    pub(super) routing_org_name: Option<String>,
-    routing_api_url: Option<String>,
 }
 
 impl LogQueueCore {
     fn new(
-        config: LogQueueConfig,
+        settings: Arc<QueueSettings>,
         login_state: LoginState,
-        client: crate::http::SharedHttp,
-        api_url: Url,
-        app_url: Url,
         parent: Option<Arc<super::observation::Observation>>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            config,
+            settings,
             login_state,
-            client,
-            api_url,
-            app_url,
-            routing_org_name: None,
-            routing_api_url: None,
             observation: Arc::new(super::observation::Observation::new(parent)),
             dropped_count: AtomicUsize::new(0),
             last_drop_log_time: AtomicU64::new(0),
@@ -176,31 +170,14 @@ impl LogQueueCore {
             || (org_id.is_empty()
                 && org_name.is_some()
                 && self.login_state.org_name().as_deref() == org_name);
-        let endpoint = if same_org {
-            self.endpoint()
-        } else {
-            self.api_url.to_string()
-        };
+        let endpoint = same_org
+            .then(|| self.login_state.api_url())
+            .flatten()
+            .unwrap_or_else(|| self.settings.api_url.to_string());
         let name = org_name
             .map(str::to_owned)
             .or_else(|| same_org.then(|| self.login_state.org_name()).flatten());
         (endpoint, name)
-    }
-
-    pub(crate) fn job(&self, endpoint: &str, org_name: Option<&str>) -> Arc<Self> {
-        Arc::new(Self {
-            config: self.config.clone(),
-            observation: self.observation.clone(),
-            login_state: LoginState::new(),
-            client: self.client.clone(),
-            api_url: self.api_url.clone(),
-            routing_api_url: Some(endpoint.to_owned()),
-            app_url: self.app_url.clone(),
-            routing_org_name: org_name.map(str::to_owned),
-            dropped_count: AtomicUsize::new(0),
-            last_drop_log_time: AtomicU64::new(0),
-            queue_depth_warning_emitted: AtomicBool::new(false),
-        })
     }
 
     fn push(
@@ -217,13 +194,6 @@ impl LogQueueCore {
         self.observation.queue_full();
         self.log_drop_warning();
         self.dump_dropped_row_if_configured(cmd);
-    }
-
-    pub(crate) fn endpoint(&self) -> String {
-        self.routing_api_url
-            .clone()
-            .or_else(|| self.login_state.api_url())
-            .unwrap_or_else(|| self.api_url.to_string())
     }
 
     pub(crate) fn retained(&self, rows: usize) {
@@ -245,7 +215,7 @@ impl LogQueueCore {
             .as_secs();
 
         let last_log = self.last_drop_log_time.load(Ordering::Relaxed);
-        let throttle_secs = self.config.queue_drop_logging_period().as_secs();
+        let throttle_secs = self.settings.config.queue_drop_logging_period().as_secs();
 
         if now - last_log >= throttle_secs
             && self
@@ -258,7 +228,7 @@ impl LogQueueCore {
                 warn!(
                     "Log queue full (size: {}), dropped {} items since last warning. \
                      Consider increasing BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE.",
-                    self.config.queue_max_size(),
+                    self.settings.config.queue_max_size(),
                     count
                 );
             }
@@ -267,7 +237,7 @@ impl LogQueueCore {
 
     /// Warn once per fill cycle when the queue reaches 80% of its configured maximum.
     fn log_queue_depth_warning(&self, queue_size: usize) {
-        let queue_max_size = self.config.queue_max_size();
+        let queue_max_size = self.settings.config.queue_max_size();
         let warning_threshold = queue_max_size.saturating_mul(4).div_ceil(5);
 
         if queue_size >= warning_threshold
@@ -285,8 +255,8 @@ impl LogQueueCore {
     /// If debug directories are configured, serialize the dropped command's payload
     /// and write it to disk. Spawns a background task — best-effort, non-blocking.
     fn dump_dropped_row_if_configured(&self, cmd: SubmitCommand) {
-        let all_dir = self.config.all_publish_payloads_dir();
-        let failed_dir = self.config.failed_publish_payloads_dir();
+        let all_dir = self.settings.config.all_publish_payloads_dir();
+        let failed_dir = self.settings.config.failed_publish_payloads_dir();
         let dirs: Vec<_> = [all_dir, failed_dir].into_iter().flatten().collect();
         if dirs.is_empty() {
             return;
@@ -552,7 +522,16 @@ impl LogQueue {
         app_url: Url,
     ) -> Self {
         Self {
-            core: LogQueueCore::new(config, login_state, client, api_url, app_url, None),
+            core: LogQueueCore::new(
+                Arc::new(QueueSettings {
+                    config: Arc::new(config),
+                    client,
+                    api_url,
+                    app_url,
+                }),
+                login_state,
+                None,
+            ),
         }
     }
 
@@ -563,11 +542,8 @@ impl LogQueue {
     pub(crate) fn child_with_login(&self, state: LoginState) -> Self {
         Self {
             core: LogQueueCore::new(
-                self.core.config.clone(),
+                self.core.settings.clone(),
                 state,
-                self.core.client.clone(),
-                self.core.api_url.clone(),
-                self.core.app_url.clone(),
                 Some(self.core.observation.clone()),
             ),
         }
@@ -575,14 +551,7 @@ impl LogQueue {
 
     pub(crate) fn rebind(&self, state: LoginState) -> Self {
         Self {
-            core: LogQueueCore::new(
-                self.core.config.clone(),
-                state,
-                self.core.client.clone(),
-                self.core.api_url.clone(),
-                self.core.app_url.clone(),
-                None,
-            ),
+            core: LogQueueCore::new(self.core.settings.clone(), state, None),
         }
     }
 

@@ -25,7 +25,7 @@ mod types;
 /// Generated client for the public Braintrust REST API.
 pub use braintrust_api_client as api;
 
-pub use completion::{BlockingWaitError, Completion};
+pub use completion::{BlockingWaitError, Completion, CompletionFuture};
 pub use dataset::{
     DatasetBuilder, DatasetBuilderError, DatasetInsert, DatasetInsertBuilder,
     DatasetInsertBuilderError, DatasetIterator, DatasetRecord, DatasetSummary,

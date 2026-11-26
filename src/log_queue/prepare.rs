@@ -1,16 +1,15 @@
 //! Resolve resource destinations without borrowing global login state from another facade.
-use super::queue::LogQueueCore;
+use super::queue::QueueSettings;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use chrono::Utc;
 use std::collections::HashMap;
-use url::Url;
 
 /// Project names that failed to resolve during one delivery job. Later spans for
 /// the same name fail with the same error instead of repeating the request.
 pub(super) type ProjectFailures = HashMap<String, anyhow::Error>;
 
-impl LogQueueCore {
+impl QueueSettings {
     /// Prepare a `Logs3Row` from the job's token, payload, and parent info.
     ///
     /// Resolves the destination (including calling the project registration API
@@ -251,8 +250,6 @@ impl LogQueueCore {
     /// Ensure a project ID is available for the given project name, registering
     /// it via the API if it is not yet cached.
     ///
-    /// Uses `login_state.app_url()` for the registration endpoint so the URL
-    /// doesn't need to be passed separately.
     async fn ensure_project_id(
         &self,
         token: &str,
@@ -264,10 +261,7 @@ impl LogQueueCore {
         if let Some(error) = failures.get(project_name) {
             return Err(super::observation::duplicate_error(error));
         }
-        let app_url_key = self
-            .login_state
-            .app_url()
-            .unwrap_or_else(|| self.app_url.to_string());
+        let app_url_key = self.app_url.to_string();
         let org = crate::resolution::OrgIdentity::new(org_id, org_name, token);
         let scope = crate::scheduler::Scope::new(app_url_key.clone(), org.scope_key());
         let key = crate::resolution::ProjectKey {
@@ -279,14 +273,6 @@ impl LogQueueCore {
         // Bounded by the retry budget and request timeouts, not a deadline, so
         // registration can wait out a 429 cooldown.
         let resolve = entry.get_or_try_init(|| async {
-            // Prefer the login-state control-plane URL (logged-in path), falling back
-            // to the client-configured URL for per-request-credential callers.
-            let app_url = match self.login_state.app_url() {
-                Some(app_url_str) => {
-                    Url::parse(&app_url_str).map_err(|e| anyhow::anyhow!("invalid app URL: {e}"))?
-                }
-                None => self.app_url.clone(),
-            };
             let mut request = crate::api::ProjectRegisterRequest::new(project_name.to_owned());
             request.org_id = (!org_id.is_empty()).then(|| org_id.to_owned());
             request.org_name = org_name.map(str::to_owned);
@@ -294,7 +280,7 @@ impl LogQueueCore {
             let client = crate::http::api_client(
                 &self.client.client(),
                 self.api_url.as_str(),
-                app_url.as_str(),
+                self.app_url.as_str(),
                 token,
                 org_name,
             )?;

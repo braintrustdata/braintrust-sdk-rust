@@ -71,7 +71,7 @@ fn default_max_concurrent_requests() -> usize {
     std::env::var("BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
+        .filter(|v| (1..=tokio::sync::Semaphore::MAX_PERMITS).contains(v))
         .unwrap_or(8)
 }
 static CONFIG: Mutex<Option<ServiceConfig>> = Mutex::new(None);
@@ -83,6 +83,7 @@ static SERVICE: OnceLock<std::result::Result<Service, String>> = OnceLock::new()
 /// Repeating identical configuration is allowed. Conflicting configuration fails.
 pub fn configure_service(config: ServiceConfig) -> Result<()> {
     if config.max_concurrent_requests == 0
+        || config.max_concurrent_requests > tokio::sync::Semaphore::MAX_PERMITS
         || config.max_cached_resolutions == 0
         || config.token_provider_timeout.is_zero()
     {
@@ -117,16 +118,11 @@ struct Executor {
     stopped: Arc<AtomicBool>,
 }
 
-struct RuntimeLifetime {
-    id: RuntimeId,
-    stopped: Arc<AtomicBool>,
-}
+struct RuntimeLifetime(Arc<AtomicBool>);
 
 impl Drop for RuntimeLifetime {
     fn drop(&mut self) {
-        if !self.stopped.swap(true, Ordering::AcqRel) {
-            crate::http::forget_runtime(self.id);
-        }
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -141,10 +137,7 @@ impl Executor {
         if let Some(handle) = &primary {
             // Capture the guard before spawning so it also drops if the
             // chosen runtime shuts down before the task is first polled.
-            let lifetime = RuntimeLifetime {
-                id: handle.id(),
-                stopped: stopped.clone(),
-            };
+            let lifetime = RuntimeLifetime(stopped.clone());
             handle.spawn(async move {
                 let _lifetime = lifetime;
                 std::future::pending::<()>().await;
@@ -179,10 +172,7 @@ impl Service {
             .as_ref()
             .is_some_and(|handle| handle.id() == id)
         {
-            drop(RuntimeLifetime {
-                id,
-                stopped: self.runtime.stopped.clone(),
-            });
+            self.runtime.stopped.store(true, Ordering::Release);
         }
     }
 

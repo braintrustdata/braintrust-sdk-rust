@@ -70,6 +70,9 @@ pub struct Completion<T, E> {
     /// Where a panicking operation leaves its payload, to re-raise for the waiter.
     panic: Option<PanicSlot>,
 }
+/// Compatibility name for the future returned by converting a completion.
+pub type CompletionFuture<T, E> = Completion<T, E>;
+
 pub(crate) type PanicSlot = Arc<Mutex<Option<Box<dyn Any + Send>>>>;
 /// The error for a sender dropped without a result: the operation's panic,
 /// re-raised here, or a lost worker.
@@ -124,7 +127,7 @@ impl<T, E> Completion<T, E> {
             Ok(result) => return result,
             Err(pending) => pending,
         };
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
         let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
         let mut context = Context::from_waker(&waker);
         loop {
@@ -133,7 +136,7 @@ impl<T, E> Completion<T, E> {
                     .unwrap_or_else(|_| Err(lost(&panic)))
                     .map_err(BlockingWaitError::Operation);
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 return Err(BlockingWaitError::TimedOut);
             }

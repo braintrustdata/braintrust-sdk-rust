@@ -121,10 +121,10 @@ impl EncodedBatch {
             .collect()
     }
 
-    pub(crate) fn submissions(&self) -> Vec<Vec<usize>> {
+    pub(crate) fn take_submissions(&mut self) -> Vec<Vec<usize>> {
         self.rows
-            .iter()
-            .map(|row| row.submissions.clone())
+            .iter_mut()
+            .map(|row| std::mem::take(&mut row.submissions))
             .collect()
     }
 

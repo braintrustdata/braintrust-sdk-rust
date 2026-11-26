@@ -3,7 +3,7 @@ use super::batching::build_overflow_row_from_logs3row;
 use super::http::send_batch_counting;
 use super::merge::merge_row_into;
 use super::observation::DeliveryError;
-use super::queue::{LogQueueCore, QueuedItem, SubmitCommand};
+use super::queue::{QueueSettings, QueuedItem, SubmitCommand};
 use super::row_key::RowKey;
 use crate::{
     internal::ingest::{EncodedBatch, EncodedRow},
@@ -20,6 +20,8 @@ pub(super) struct Loss {
     pub submissions: Vec<usize>,
     pub preparation: bool,
 }
+type BatchSubmissions = Arc<[Vec<usize>]>;
+
 /// Outcomes recorded as a job progresses, so a job that is dropped part-way
 /// can requeue exactly the submissions that have no outcome yet.
 pub(super) struct Report {
@@ -28,7 +30,7 @@ pub(super) struct Report {
     pub settled: Vec<bool>,
     /// Batches being uploaded: each row's submissions in batch order, and how
     /// many leading rows have been delivered so far.
-    pub uploads: Vec<(Vec<Vec<usize>>, Arc<AtomicUsize>)>,
+    pub uploads: Vec<(BatchSubmissions, Arc<AtomicUsize>)>,
 }
 impl Report {
     pub fn new(count: usize) -> Self {
@@ -44,8 +46,8 @@ impl Report {
     pub fn settle_delivered(&mut self) {
         for (rows, delivered) in std::mem::take(&mut self.uploads) {
             let delivered = delivered.load(Ordering::Acquire);
-            for submissions in rows.into_iter().take(delivered) {
-                self.settle(submissions);
+            for submissions in rows.iter().take(delivered) {
+                self.settle(submissions.iter().copied());
             }
         }
     }
@@ -67,7 +69,7 @@ impl Report {
     }
 }
 
-impl LogQueueCore {
+impl QueueSettings {
     async fn get_version_info(
         &self,
         api_url: &Url,
@@ -111,16 +113,17 @@ impl LogQueueCore {
     /// Commands are borrowed so the engine can requeue them if this job is
     /// dropped before every submission is settled in `report`.
     pub(super) async fn dispatch(
-        self: &Arc<Self>,
+        &self,
         commands: &[&SubmitCommand],
         report: &mut Report,
+        endpoint: &str,
+        org_name: Option<&str>,
     ) {
         if commands.is_empty() {
             return;
         }
-        let (credential, _, org_name) = commands[0].partition();
-        let org_name = org_name.or_else(|| self.routing_org_name.clone());
-        let api_url = match Url::parse(&self.endpoint()) {
+        let credential = &commands[0].credential;
+        let api_url = match Url::parse(endpoint) {
             Ok(url) => url,
             Err(error) => {
                 let error = anyhow::Error::from(error);
@@ -190,9 +193,7 @@ impl LogQueueCore {
         if spans.is_empty() && raw.is_empty() {
             return;
         }
-        let (max_request_size, overflow) = self
-            .get_version_info(&api_url, &token, org_name.as_deref())
-            .await;
+        let (max_request_size, overflow) = self.get_version_info(&api_url, &token, org_name).await;
         let max_bytes = self.config.batch_max_bytes().min(max_request_size / 2);
         let max_items = self.config.batch_max_items();
         let encoded = tokio::task::spawn_blocking(move || {
@@ -233,20 +234,19 @@ impl LogQueueCore {
         }
         let batches: Vec<_> = batches
             .into_iter()
-            .map(|batch| {
+            .map(|mut batch| {
                 let delivered = Arc::new(AtomicUsize::new(0));
+                let submissions: Arc<[_]> = batch.take_submissions().into();
                 report
                     .uploads
-                    .push((batch.submissions(), delivered.clone()));
-                (batch, delivered)
+                    .push((submissions.clone(), delivered.clone()));
+                (batch, submissions, delivered)
             })
             .collect();
-        let sends = batches.into_iter().map(|(batch, delivered)| {
+        let sends = batches.into_iter().map(|(batch, submissions, delivered)| {
             let api_url = &api_url;
             let token = token.as_ref();
-            let org_name = org_name.as_deref();
             async move {
-                let submissions = batch.submissions();
                 let result = send_batch_counting(
                     &self.client.client(),
                     api_url,
@@ -262,7 +262,13 @@ impl LogQueueCore {
                 (submissions, delivered.load(Ordering::Acquire), result)
             }
         });
-        let mut sends = stream::iter(sends).buffer_unordered(usize::MAX);
+        // Keep only a bounded number of requests from this partition waiting
+        // for permits, even when its backlog splits into many batches.
+        let concurrency = crate::service::global()
+            .expect("initialized service")
+            .config
+            .max_concurrent_requests;
+        let mut sends = stream::iter(sends).buffer_unordered(concurrency);
         while let Some((rows, delivered, result)) = sends.next().await {
             report.settle(rows.iter().flatten().copied());
             if let Err(error) = result {
@@ -270,13 +276,13 @@ impl LogQueueCore {
                 let failure = DeliveryError::from_error(&error);
                 // A split may have delivered a prefix. The whole logical batch fails
                 // its checked observers, but only undelivered rows count as lost.
-                for (position, submissions) in rows.into_iter().enumerate() {
-                    for index in &submissions {
+                for (position, submissions) in rows.iter().enumerate() {
+                    for index in submissions {
                         report.errors[*index] = Some(failure.clone());
                     }
                     if position >= delivered {
                         report.losses.push(Loss {
-                            submissions,
+                            submissions: submissions.clone(),
                             preparation: false,
                         });
                     }

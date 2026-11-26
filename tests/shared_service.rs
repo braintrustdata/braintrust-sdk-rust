@@ -397,7 +397,7 @@ async fn concurrent_clients_share_project_resolution_without_sharing_delivery_re
 }
 
 #[tokio::test]
-async fn dataset_registration_retries_failure_and_clones_share_success() {
+async fn dataset_flush_retains_pending_rows_when_registration_fails() {
     support::use_dedicated_runtime();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -441,10 +441,30 @@ async fn dataset_registration_retries_failure_and_clones_share_success() {
         .dataset_name("d")
         .build()
         .unwrap();
+    accept(&server).await;
+    let row_id = dataset
+        .insert(
+            braintrust_sdk_rust::DatasetInsert::builder()
+                .input(json!("pending row"))
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(dataset.flush().await.is_err());
     let clone = dataset.clone();
-    assert!(dataset.dataset_id().await.is_err());
     assert_eq!(clone.dataset_id().await.unwrap(), "d");
-    assert_eq!(dataset.dataset_id().await.unwrap(), "d");
+    dataset.flush().await.unwrap();
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| {
+            request.url.path() == "/logs3"
+                && String::from_utf8_lossy(&request.body).contains(&row_id)
+        }));
 }
 
 struct Panicking;

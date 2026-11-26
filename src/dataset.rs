@@ -492,7 +492,7 @@ pub struct Dataset<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + Datase
     description: Option<String>,
     metadata: Option<Map<String, Value>>,
     lazy_metadata: Arc<OnceCell<DatasetMetadata>>,
-    pending_rows: Arc<std::sync::Mutex<Vec<PendingDatasetRow>>>,
+    pending_rows: Arc<std::sync::Mutex<PendingDatasetRows>>,
 }
 
 impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> Clone
@@ -523,6 +523,19 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> f
             .field("dataset_name", &self.dataset_name)
             .field("description", &self.description)
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
+struct PendingDatasetRows {
+    next: u64,
+    rows: Vec<(u64, PendingDatasetRow)>,
+}
+
+impl PendingDatasetRows {
+    fn push(&mut self, row: PendingDatasetRow) {
+        self.rows.push((self.next, row));
+        self.next += 1;
     }
 }
 
@@ -690,79 +703,70 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     #[must_use = "await or call blocking_wait to observe delivery"]
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let dataset = self.clone();
-        let rows = std::mem::take(&mut *self.pending_rows.lock().unwrap());
+        let cutoff = self.pending_rows.lock().unwrap().next;
         crate::service::submit(async move {
             let metadata = dataset.ensure_registered().await?;
+            let flush = {
+                let mut pending = dataset.pending_rows.lock().unwrap();
+                let count = pending.rows.partition_point(|(index, _)| *index < cutoff);
+                // Keep draining and submitting in the same critical section
+                // so concurrent flushes cannot reorder dataset rows.
+                for (_, row) in pending.rows.drain(..count) {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64();
 
-            if rows.is_empty() {
-                return dataset
-                    .submitter
-                    .flush()
-                    .await
-                    .map(|_| ())
-                    .map_err(Into::into);
-            }
+                    let payload = SpanPayload {
+                        row_id: row.id.clone(),
+                        span_id: row.id,
+                        is_merge: row.is_merge,
+                        span_components: None,
+                        org_id: dataset.org_id.clone(),
+                        org_name: Some(dataset.org_name.clone()),
+                        project_name: Some(dataset.project_name.clone()),
+                        input: row.input,
+                        output: None,
+                        expected: row.expected,
+                        error: None,
+                        scores: None,
+                        metadata: row.metadata,
+                        metrics: None,
+                        tags: row.tags,
+                        context: Some(serde_json::json!({
+                            "calendar_time": now,
+                        })),
+                        span_attributes: if row.is_delete {
+                            Some(crate::types::SpanAttributes {
+                                name: None,
+                                span_type: None,
+                                purpose: None,
+                                extra: {
+                                    let mut map = std::collections::HashMap::new();
+                                    map.insert("_object_delete".to_string(), Value::Bool(true));
+                                    map
+                                },
+                            })
+                        } else {
+                            None
+                        },
+                        extra: std::collections::HashMap::new(),
+                    };
 
-            // Submit each row
-            for row in rows {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64();
+                    let parent_info = ParentSpanInfo::Dataset {
+                        object_id: metadata.dataset_id.clone(),
+                    };
 
-                let payload = SpanPayload {
-                    row_id: row.id.clone(),
-                    span_id: row.id,
-                    is_merge: row.is_merge,
-                    span_components: None,
-                    org_id: dataset.org_id.clone(),
-                    org_name: Some(dataset.org_name.clone()),
-                    project_name: Some(dataset.project_name.clone()),
-                    input: row.input,
-                    output: None,
-                    expected: row.expected,
-                    error: None,
-                    scores: None,
-                    metadata: row.metadata,
-                    metrics: None,
-                    tags: row.tags,
-                    context: Some(serde_json::json!({
-                        "calendar_time": now,
-                    })),
-                    span_attributes: if row.is_delete {
-                        Some(crate::types::SpanAttributes {
-                            name: None,
-                            span_type: None,
-                            purpose: None,
-                            extra: {
-                                let mut map = std::collections::HashMap::new();
-                                map.insert("_object_delete".to_string(), Value::Bool(true));
-                                map
-                            },
-                        })
-                    } else {
-                        None
-                    },
-                    extra: std::collections::HashMap::new(),
-                };
+                    dataset.submitter.submit(
+                        Credential::token_value(dataset.token.clone()),
+                        payload,
+                        Some(parent_info),
+                    );
+                }
 
-                let parent_info = ParentSpanInfo::Dataset {
-                    object_id: metadata.dataset_id.clone(),
-                };
-
-                dataset.submitter.submit(
-                    Credential::token_value(dataset.token.clone()),
-                    payload,
-                    Some(parent_info),
-                );
-            }
-
-            dataset
-                .submitter
-                .flush()
-                .await
-                .map(|_| ())
-                .map_err(Into::into)
+                dataset.submitter.flush()
+            };
+            flush.await.map(|_| ()).map_err(Into::into)
         })
     }
 }

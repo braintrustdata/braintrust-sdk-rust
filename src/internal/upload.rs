@@ -36,7 +36,6 @@ impl UploadPolicy {
         RetryBudget {
             delays,
             requests: 0,
-            bytes: 1,
         }
     }
 }
@@ -118,7 +117,7 @@ where
 pub(crate) async fn admitted<T>(scope: Scope, operation: impl Future<Output = T>) -> Result<T> {
     let service = crate::service::global()?;
     let admitted = SCOPE.scope(scope, async {
-        let _permit = service.attempts.acquire(1).await;
+        let _permit = service.attempts.acquire().await;
         operation.await
     });
     Ok(admitted.await)
@@ -128,7 +127,6 @@ pub(crate) async fn admitted<T>(scope: Scope, operation: impl Future<Output = T>
 struct RetryBudget {
     delays: ExponentialBackoff,
     requests: usize,
-    bytes: usize,
 }
 impl RetryBudget {
     async fn run<T, F, Fut>(&mut self, mut operation: F) -> Result<T>
@@ -139,10 +137,9 @@ impl RetryBudget {
         (|| {
             self.requests += 1;
             let operation = operation();
-            let bytes = self.bytes;
             async move {
                 let service = crate::service::global().map_err(|error| Attempt { error, retry_after: None })?;
-                let _permit = service.attempts.acquire(bytes).await;
+                let _permit = service.attempts.acquire().await;
                 operation.await
             }
         })
@@ -242,7 +239,6 @@ impl UploadCoordinator {
         delivered: &AtomicUsize,
     ) -> (UploadResult, Result<()>) {
         let mut budget = self.policy.budget();
-        budget.bytes = batch.data.len().max(1);
         let mut result = UploadResult::default();
         // Resolution may have replaced a project name with its canonical ID.
         let scope = self.scope();

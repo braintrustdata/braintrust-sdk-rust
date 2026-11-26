@@ -447,26 +447,25 @@ impl BraintrustClientBuilder {
         let queue = LogQueue::new(
             log_config,
             login_state.clone(),
-            http_client.clone(),
+            http_client,
             self.queue_size,
-            api_url.clone(),
-            app_url.clone(),
+            api_url,
+            app_url,
         );
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
-                api_url,
-                explicit_api_url,
-                app_url,
+                settings: Arc::new(ClientSettings {
+                    explicit_api_url,
+                    login_skipped: self.skip_login,
+                    environment: self.environment,
+                    span_origin: self.span_origin,
+                }),
                 queue,
                 login_state,
                 login_notify: Arc::new(Notify::new()),
                 background_login: Arc::default(),
-                http_client,
                 default_project: self.default_project,
-                login_skipped: self.skip_login,
-                environment: self.environment,
-                span_origin: self.span_origin,
             }),
         };
 
@@ -502,16 +501,16 @@ pub struct BraintrustClient {
 }
 
 struct ClientInner {
-    #[allow(dead_code)]
-    api_url: Url,
-    explicit_api_url: bool,
-    app_url: Url,
+    settings: Arc<ClientSettings>,
     queue: LogQueue,
     login_state: LoginState,
     login_notify: Arc<Notify>,
     background_login: Arc<BackgroundLogin>,
-    http_client: crate::http::SharedHttp,
     default_project: Option<String>,
+}
+
+struct ClientSettings {
+    explicit_api_url: bool,
     login_skipped: bool,
     environment: Option<SpanOriginEnvironment>,
     span_origin: Option<SpanOrigin>,
@@ -520,8 +519,8 @@ struct ClientInner {
 impl std::fmt::Debug for ClientInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientInner")
-            .field("api_url", &self.api_url)
-            .field("app_url", &self.app_url)
+            .field("api_url", &self.queue.core.settings.api_url)
+            .field("app_url", &self.queue.core.settings.app_url)
             .field("default_project", &self.default_project)
             .finish_non_exhaustive()
     }
@@ -559,7 +558,7 @@ impl BraintrustClient {
     pub fn wait_for_login(&self) -> crate::Completion<LoginState, BraintrustError> {
         let client = self.clone();
         crate::service::submit(async move {
-            if client.inner.login_skipped {
+            if client.inner.settings.login_skipped {
                 return Err(BraintrustError::InvalidConfig(
                     "wait_for_login() not available when skip_login is enabled".into(),
                 ));
@@ -599,7 +598,7 @@ impl BraintrustClient {
     ) -> crate::Completion<crate::span::SpanBuilder<Self>, BraintrustError> {
         let client = self.clone();
         crate::service::submit(async move {
-            if client.inner.login_skipped {
+            if client.inner.settings.login_skipped {
                 return Err(BraintrustError::InvalidConfig(
                 "span_builder() requires login; use span_builder_with_credentials() when skip_login is enabled".into(),
             ));
@@ -616,10 +615,10 @@ impl BraintrustClient {
             if let Some(name) = state.org_name() {
                 builder = builder.org_name(name);
             }
-            if let Some(environment) = &client.inner.environment {
+            if let Some(environment) = &client.inner.settings.environment {
                 builder = builder.span_origin_environment(environment.clone());
             }
-            if let Some(span_origin) = &client.inner.span_origin {
+            if let Some(span_origin) = &client.inner.settings.span_origin {
                 builder = builder.span_origin(span_origin.clone());
             }
             if let Some(ref project) = client.inner.default_project {
@@ -686,10 +685,10 @@ impl BraintrustClient {
         let submitter = Arc::new(self.clone());
         let mut builder =
             crate::span::SpanBuilder::new_with_credential(submitter, credential, org_id);
-        if let Some(environment) = &self.inner.environment {
+        if let Some(environment) = &self.inner.settings.environment {
             builder = builder.span_origin_environment(environment.clone());
         }
-        if let Some(span_origin) = &self.inner.span_origin {
+        if let Some(span_origin) = &self.inner.settings.span_origin {
             builder = builder.span_origin(span_origin.clone());
         }
         if let Some(project) = &self.inner.default_project {
@@ -711,7 +710,7 @@ impl BraintrustClient {
         crate::service::submit(async move {
             let login_state = if client.inner.login_state.is_logged_in() {
                 client.inner.login_state.clone()
-            } else if client.inner.login_skipped {
+            } else if client.inner.settings.login_skipped {
                 return Err(BraintrustError::InvalidConfig(
                 "update_span() requires login; use update_span_with_credentials() when login is skipped".into(),
             ));
@@ -817,11 +816,11 @@ impl BraintrustClient {
             tags: event.tags,
             context: merge_span_origin_context(
                 event.context,
-                self.inner.environment.as_ref(),
+                self.inner.settings.environment.as_ref(),
                 event
                     .span_origin
                     .as_ref()
-                    .or(self.inner.span_origin.as_ref()),
+                    .or(self.inner.settings.span_origin.as_ref()),
                 event.skip_span_origin,
             ),
             span_attributes: {
@@ -878,17 +877,17 @@ impl BraintrustClient {
         } else {
             None
         }
-        .unwrap_or_else(|| self.inner.api_url.to_string());
+        .unwrap_or_else(|| self.inner.queue.core.settings.api_url.to_string());
         let app_url = self
             .inner
             .login_state
             .app_url()
-            .unwrap_or_else(|| self.inner.app_url.to_string());
+            .unwrap_or_else(|| self.inner.queue.core.settings.app_url.to_string());
         let org_name = (self.inner.login_state.api_key().as_deref() == Some(token))
             .then(|| self.inner.login_state.org_name())
             .flatten();
         api_client(
-            &self.inner.http_client.client(),
+            &self.inner.queue.core.settings.client.client(),
             &api_url,
             &app_url,
             token,
@@ -922,17 +921,20 @@ impl BraintrustClient {
     async fn perform_login(&self, api_key: &str, org_name: Option<&str>) -> Result<()> {
         let mut builder = crate::api::Client::builder()
             .api_key(api_key)
-            .app_url(self.inner.app_url.as_str())
-            .http_client(self.inner.http_client.client())
-            .upload_http_client(self.inner.http_client.client());
-        if self.inner.explicit_api_url {
-            builder = builder.api_url(self.inner.api_url.as_str());
+            .app_url(self.inner.queue.core.settings.app_url.as_str())
+            .http_client(self.inner.queue.core.settings.client.client())
+            .upload_http_client(self.inner.queue.core.settings.client.client());
+        if self.inner.settings.explicit_api_url {
+            builder = builder.api_url(self.inner.queue.core.settings.api_url.as_str());
         }
         if let Some(org_name) = org_name {
             builder = builder.org_name(org_name);
         }
         let org = crate::resolution::OrgIdentity::new("", org_name, api_key);
-        let scope = crate::scheduler::Scope::new(self.inner.app_url.as_str(), org.scope_key());
+        let scope = crate::scheduler::Scope::new(
+            self.inner.queue.core.settings.app_url.as_str(),
+            org.scope_key(),
+        );
         let result = crate::internal::upload::admitted(scope, builder.build_with_login()).await?;
         let client = match result {
             Ok(client) => client,
@@ -1103,7 +1105,7 @@ impl BraintrustClient {
         let client = self.clone();
         let rows: Vec<_> = rows.into_iter().collect();
         crate::service::submit(async move {
-            if client.inner.login_skipped {
+            if client.inner.settings.login_skipped {
                 return Err(BraintrustError::InvalidConfig(
                 "log_rows() requires login; use log_rows_with_credentials() when skip_login is enabled".into(),
             ));
@@ -1193,18 +1195,12 @@ impl BraintrustClient {
     ) -> Self {
         Self {
             inner: Arc::new(ClientInner {
-                api_url: self.inner.api_url.clone(),
-                explicit_api_url: self.inner.explicit_api_url,
-                app_url: self.inner.app_url.clone(),
+                settings: self.inner.settings.clone(),
                 queue,
                 login_state,
                 login_notify: self.inner.login_notify.clone(),
                 background_login: self.inner.background_login.clone(),
-                http_client: self.inner.http_client.clone(),
                 default_project,
-                login_skipped: self.inner.login_skipped,
-                environment: self.inner.environment.clone(),
-                span_origin: self.inner.span_origin.clone(),
             }),
         }
     }

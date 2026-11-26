@@ -3,7 +3,7 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 /// Who a request counts against. Every SDK request runs inside one, so permits
 /// rotate fairly across orgs and a 429 pauses only the requests sharing its org.
@@ -23,33 +23,24 @@ impl Scope {
 }
 tokio::task_local! { pub(crate) static SCOPE: Scope; }
 
-struct Request {
-    bytes: usize,
-    sender: oneshot::Sender<Permit>,
-}
-#[derive(Default)]
-struct OrgQueue {
-    pending: VecDeque<Request>,
-    credit: usize,
-}
-#[derive(Default)]
-struct State {
-    active: usize,
-    orgs: IndexMap<Option<Scope>, OrgQueue>,
-}
+type OrgQueues = IndexMap<Option<Scope>, VecDeque<oneshot::Sender<Permit>>>;
+
 pub(crate) struct Scheduler {
-    max: usize,
-    state: Mutex<State>,
+    slots: Arc<Semaphore>,
+    orgs: Mutex<OrgQueues>,
     cooldowns: Mutex<HashMap<Scope, tokio::time::Instant>>,
 }
+
 pub(crate) struct Permit {
-    scheduler: Option<Arc<Scheduler>>,
+    slot: Option<OwnedSemaphorePermit>,
+    scheduler: Arc<Scheduler>,
 }
+
 impl Scheduler {
     pub fn new(max: usize) -> Arc<Self> {
         Arc::new(Self {
-            max,
-            state: Mutex::new(State::default()),
+            slots: Arc::new(Semaphore::new(max)),
+            orgs: Mutex::new(IndexMap::new()),
             cooldowns: Mutex::new(HashMap::new()),
         })
     }
@@ -88,7 +79,7 @@ impl Scheduler {
             .and_modify(|old| *old = (*old).max(until))
             .or_insert(until);
     }
-    pub async fn acquire(self: &Arc<Self>, bytes: usize) -> Permit {
+    pub async fn acquire(self: &Arc<Self>) -> Permit {
         let scope = SCOPE.try_with(Clone::clone).ok();
         loop {
             if let Some(until) = self.deadline(scope.as_ref()) {
@@ -96,17 +87,12 @@ impl Scheduler {
                 continue;
             }
             let (sender, receiver) = oneshot::channel();
-            self.state
+            self.orgs
                 .lock()
                 .unwrap()
-                .orgs
                 .entry(scope.clone())
                 .or_default()
-                .pending
-                .push_back(Request {
-                    bytes: bytes.max(1),
-                    sender,
-                });
+                .push_back(sender);
             self.dispatch();
             let permit = receiver.await.expect("scheduler retains queued requests");
             // A 429 may have arrived while this request waited for a permit.
@@ -117,43 +103,41 @@ impl Scheduler {
             return permit;
         }
     }
-    fn dispatch(self: &Arc<Self>) {
-        let mut state = self.state.lock().unwrap();
-        while state.active < self.max && !state.orgs.is_empty() {
-            let (org, mut queue) = state.orgs.shift_remove_index(0).unwrap();
-            // Deficit rounds account for bytes without making large uploads serial.
-            queue.credit = queue.credit.saturating_add(64 * 1024);
-            if queue.pending.front().unwrap().bytes > queue.credit {
-                state.orgs.insert(org, queue);
+    fn next(&self) -> Option<(oneshot::Sender<Permit>, OwnedSemaphorePermit)> {
+        let mut orgs = self.orgs.lock().unwrap();
+        let slot = self.slots.clone().try_acquire_owned().ok()?;
+        while let Some((org, mut queue)) = orgs.shift_remove_index(0) {
+            let Some(sender) = queue.pop_front() else {
                 continue;
-            }
-            let request = queue.pending.pop_front().unwrap();
-            queue.credit -= request.bytes;
-            if !queue.pending.is_empty() {
-                state.orgs.insert(org, queue);
-            }
-            if request.sender.is_closed() {
-                continue;
-            }
-            // Reserve before sending. If cancellation races the send, drop outside the lock.
-            state.active += 1;
-            let permit = Permit {
-                scheduler: Some(self.clone()),
             };
-            if let Err(mut permit) = request.sender.send(permit) {
-                state.active -= 1;
-                permit.scheduler = None;
+            if !queue.is_empty() {
+                orgs.insert(org, queue);
+            }
+            if !sender.is_closed() {
+                return Some((sender, slot));
+            }
+        }
+        None
+    }
+
+    fn dispatch(self: &Arc<Self>) {
+        while let Some((sender, slot)) = self.next() {
+            let permit = Permit {
+                slot: Some(slot),
+                scheduler: self.clone(),
+            };
+            if let Err(mut permit) = sender.send(permit) {
+                // Release here instead of recursively dispatching from Drop.
+                permit.slot.take();
             }
         }
     }
 }
 impl Drop for Permit {
     fn drop(&mut self) {
-        if let Some(scheduler) = self.scheduler.take() {
-            {
-                scheduler.state.lock().unwrap().active -= 1;
-            }
-            scheduler.dispatch();
+        if let Some(slot) = self.slot.take() {
+            drop(slot);
+            self.scheduler.dispatch();
         }
     }
 }
@@ -167,10 +151,10 @@ mod tests {
     #[tokio::test]
     async fn permits_rotate_orgs_and_cancelled_waits_release_capacity() {
         let scheduler = Scheduler::new(1);
-        let initial = scheduler.acquire(1).await;
-        let a = SCOPE.scope(scope("a"), scheduler.acquire(1));
-        let another_a = SCOPE.scope(scope("a"), scheduler.acquire(1));
-        let b = SCOPE.scope(scope("b"), scheduler.acquire(1));
+        let initial = scheduler.acquire().await;
+        let a = SCOPE.scope(scope("a"), scheduler.acquire());
+        let another_a = SCOPE.scope(scope("a"), scheduler.acquire());
+        let b = SCOPE.scope(scope("b"), scheduler.acquire());
         tokio::pin!(a, another_a, b);
         // Poll each once to establish a deterministic waiting order.
         for request in [a.as_mut(), another_a.as_mut(), b.as_mut()] {
@@ -184,15 +168,15 @@ mod tests {
         assert!(futures::poll!(another_a.as_mut()).is_pending());
         drop(second);
         drop(another_a.await);
-        assert_eq!(scheduler.state.lock().unwrap().active, 0);
-        let initial = scheduler.acquire(1).await;
-        let mut cancelled = Box::pin(scheduler.acquire(1));
+        assert_eq!(scheduler.slots.available_permits(), 1);
+        let initial = scheduler.acquire().await;
+        let mut cancelled = Box::pin(scheduler.acquire());
         assert!(futures::poll!(cancelled.as_mut()).is_pending());
         drop(cancelled);
         drop(initial);
-        drop(scheduler.acquire(1).await);
-        assert_eq!(scheduler.state.lock().unwrap().active, 0);
-        assert!(scheduler.state.lock().unwrap().orgs.is_empty());
+        drop(scheduler.acquire().await);
+        assert_eq!(scheduler.slots.available_permits(), 1);
+        assert!(scheduler.orgs.lock().unwrap().is_empty());
     }
     #[tokio::test]
     async fn a_full_cooldown_table_still_pauses_newly_throttled_orgs() {
@@ -220,20 +204,5 @@ mod tests {
         assert!(scheduler.paused(&scope("org")));
         assert!(!scheduler.paused(&scope("other")));
         assert!(!scheduler.paused(&Scope::new("https://elsewhere.com", "org")));
-    }
-    #[tokio::test]
-    async fn byte_deficits_allow_small_orgs_to_progress_before_large_requests() {
-        let scheduler = Scheduler::new(1);
-        let held = scheduler.acquire(1).await;
-        let large = SCOPE.scope(scope("large"), scheduler.acquire(128 * 1024));
-        let small = SCOPE.scope(scope("small"), scheduler.acquire(1));
-        tokio::pin!(large, small);
-        assert!(futures::poll!(large.as_mut()).is_pending());
-        assert!(futures::poll!(small.as_mut()).is_pending());
-        drop(held);
-        let permit = small.await;
-        assert!(futures::poll!(large.as_mut()).is_pending());
-        drop(permit);
-        drop(large.await);
     }
 }
