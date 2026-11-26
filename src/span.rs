@@ -648,8 +648,12 @@ impl<S: SpanSubmitter> SpanHandle<S> {
 
     /// Trigger a non-blocking background flush.
     /// Useful for streaming writes to get partial updates visible immediately.
-    pub async fn trigger_flush(&self) -> Result<()> {
-        self.submitter.trigger_flush().await
+    pub fn trigger_flush(&self) -> crate::Completion<(), crate::BraintrustError>
+    where
+        S: 'static,
+    {
+        let submitter = self.submitter.clone();
+        crate::operation::submit(async move { submitter.trigger_flush().await })
     }
 
     /// Export the span as SpanComponents for passing to other systems or SDKs.

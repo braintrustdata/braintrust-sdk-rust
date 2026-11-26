@@ -144,7 +144,8 @@ async fn dataset_insert_flushes_to_logs_endpoint() {
                 .build()
                 .expect("record"),
         )
-        .await;
+        .await
+        .unwrap();
 
     assert!(!record_id.is_empty());
 
@@ -216,7 +217,7 @@ async fn dataset_fetch_returns_records() {
 
     // Fetch records
     let iter = dataset.fetch(Some(10)).await.expect("fetch");
-    let records = iter.collect().await;
+    let records = iter.collect().await.unwrap();
 
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].id, "rec-1");

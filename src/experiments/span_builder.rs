@@ -9,20 +9,22 @@ use crate::types::{ParentSpanInfo, SpanType};
 /// Builder for creating spans within an experiment.
 #[allow(private_bounds)]
 pub struct ExperimentSpanBuilder<'a, S: SpanSubmitter> {
-    experiment: &'a Experiment<S>,
+    experiment: Experiment<S>,
     metadata: ExperimentMetadata,
     name: Option<String>,
     span_type: SpanType,
+    _lifetime: std::marker::PhantomData<&'a ()>,
 }
 
 #[allow(private_bounds)]
 impl<'a, S: SpanSubmitter + 'static> ExperimentSpanBuilder<'a, S> {
-    pub(crate) fn new(experiment: &'a Experiment<S>, metadata: ExperimentMetadata) -> Self {
+    pub(crate) fn new(experiment: Experiment<S>, metadata: ExperimentMetadata) -> Self {
         Self {
             experiment,
             metadata,
             name: None,
             span_type: SpanType::Eval,
+            _lifetime: std::marker::PhantomData,
         }
     }
 

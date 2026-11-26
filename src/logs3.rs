@@ -19,7 +19,7 @@ pub struct Logs3UploadResult {
 pub struct Logs3BatchUploader {
     coordinator: UploadCoordinator,
     max_request_size_override: Option<usize>,
-    payload_limits: Option<Capabilities>,
+    payload_limits: std::sync::Arc<tokio::sync::Mutex<Option<Capabilities>>>,
 }
 
 impl Logs3BatchUploader {
@@ -72,7 +72,7 @@ impl Logs3BatchUploader {
         Ok(Self {
             coordinator: UploadCoordinator::new(api, UploadPolicy::Standalone),
             max_request_size_override: None,
-            payload_limits: None,
+            payload_limits: Default::default(),
         })
     }
 
@@ -81,47 +81,57 @@ impl Logs3BatchUploader {
         self
     }
 
-    pub async fn upload_rows(
-        &mut self,
+    /// Upload rows in batches, stopping at the first failure. Earlier batches
+    /// may have been delivered.
+    #[must_use = "await or call blocking_wait to check whether the upload succeeded"]
+    pub fn upload_rows(
+        &self,
         rows: &[Map<String, Value>],
         batch_max_num_items: usize,
-    ) -> Result<Logs3UploadResult> {
-        if rows.is_empty() {
-            return Ok(Logs3UploadResult::default());
-        }
-
-        let limits = match self.payload_limits {
-            Some(limits) => limits,
-            None => {
-                let limits = self
-                    .coordinator
-                    .capabilities(DEFAULT_MAX_REQUEST_SIZE, self.max_request_size_override)
-                    .await;
-                self.payload_limits = Some(limits);
-                limits
+    ) -> crate::Completion<Logs3UploadResult, BraintrustError> {
+        let uploader = self.clone();
+        let rows = rows.to_vec();
+        crate::operation::submit(async move {
+            if rows.is_empty() {
+                return Ok(Logs3UploadResult::default());
             }
-        };
-        let row_payloads = rows
-            .iter()
-            .map(EncodedRow::from_map)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| {
-                BraintrustError::InvalidConfig(format!("failed to serialize logs3 row: {error}"))
-            })?;
-        let batches = EncodedBatch::partition(
-            row_payloads,
-            batch_max_num_items.max(1),
-            (limits.max_request_size / 2).max(1),
-        );
 
-        let mut result = Logs3UploadResult::default();
-        for batch in batches {
-            let batch_result = self.coordinator.upload(batch, limits).await?;
-            result.bytes_processed += batch_result.bytes_processed;
-            result.requests_sent += batch_result.requests_sent;
-            result.rows_uploaded += batch_result.rows_uploaded;
-        }
-        Ok(result)
+            let mut cached = uploader.payload_limits.lock().await;
+            let limits = match *cached {
+                Some(limits) => limits,
+                None => {
+                    let limits = uploader
+                        .coordinator
+                        .capabilities(DEFAULT_MAX_REQUEST_SIZE, uploader.max_request_size_override)
+                        .await;
+                    *cached = Some(limits);
+                    limits
+                }
+            };
+            drop(cached);
+            let row_payloads = rows
+                .iter()
+                .map(EncodedRow::from_map)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    BraintrustError::InvalidConfig(format!(
+                        "failed to serialize logs3 row: {error}"
+                    ))
+                })?;
+            let batches = EncodedBatch::partition(
+                row_payloads,
+                batch_max_num_items.max(1),
+                (limits.max_request_size / 2).max(1),
+            );
+            let mut result = Logs3UploadResult::default();
+            for batch in batches {
+                let uploaded = uploader.coordinator.upload(batch, limits).await?;
+                result.bytes_processed += uploaded.bytes_processed;
+                result.requests_sent += uploaded.requests_sent;
+                result.rows_uploaded += uploaded.rows_uploaded;
+            }
+            Ok(result)
+        })
     }
 }
 
