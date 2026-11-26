@@ -42,7 +42,6 @@ pub struct EvalOpts<I, O> {
 }
 
 /// Async evaluator for running evaluations
-#[derive(Clone)]
 pub struct Evaluator<I, O> {
     client: Arc<BraintrustClient>,
     _phantom: PhantomData<(I, O)>,
@@ -70,135 +69,129 @@ where
     }
 
     /// Run the evaluation
-    pub fn run(
-        &self,
-        mut opts: EvalOpts<I, O>,
-    ) -> crate::Completion<EvalSummary<I, O>, crate::BraintrustError> {
-        let evaluator = self.clone();
-        crate::service::submit(async move {
-            if !opts.quiet {
-                println!("Running evaluation: {}", opts.name);
-            }
+    pub async fn run(&self, mut opts: EvalOpts<I, O>) -> Result<EvalSummary<I, O>> {
+        if !opts.quiet {
+            println!("Running evaluation: {}", opts.name);
+        }
 
-            // Create root span for the evaluation
-            let root_span = evaluator
-                .client
-                .span_builder()
-                .await?
-                .span_type(crate::SpanType::Eval)
-                .build();
+        // Create root span for the evaluation
+        let root_span = self
+            .client
+            .span_builder()
+            .await?
+            .span_type(crate::SpanType::Eval)
+            .build();
 
-            // Set name and metadata on the span
-            let mut log_builder = crate::SpanLog::builder().name(format!("eval-{}", opts.name));
+        // Set name and metadata on the span
+        let mut log_builder = crate::SpanLog::builder().name(format!("eval-{}", opts.name));
 
-            if let Some(metadata) = &opts.metadata {
-                log_builder = log_builder.metadata(metadata.clone());
-            }
-            if let Some(tags) = &opts.tags {
-                log_builder = log_builder.tags(tags.clone());
-            }
+        if let Some(metadata) = &opts.metadata {
+            log_builder = log_builder.metadata(metadata.clone());
+        }
+        if let Some(tags) = &opts.tags {
+            log_builder = log_builder.tags(tags.clone());
+        }
 
-            root_span.log(log_builder.build().unwrap());
+        root_span.log(log_builder.build().unwrap());
 
-            // Get dataset ID if available
-            let dataset_id = opts.dataset.id();
+        // Get dataset ID if available
+        let dataset_id = opts.dataset.id();
 
-            // Collect all results
-            let mut results = Vec::new();
-            let mut case_count = 0;
+        // Collect all results
+        let mut results = Vec::new();
+        let mut case_count = 0;
 
-            // Create semaphore for concurrency control
-            let semaphore = Arc::new(Semaphore::new(opts.max_concurrency));
+        // Create semaphore for concurrency control
+        let semaphore = Arc::new(Semaphore::new(opts.max_concurrency));
 
-            // Process cases with controlled concurrency
-            let mut futures = FuturesUnordered::new();
+        // Process cases with controlled concurrency
+        let mut futures = FuturesUnordered::new();
 
-            loop {
-                // Try to get next case
-                let case = match opts.dataset.next().await {
-                    Ok(Some(case)) => case,
-                    Ok(None) => break,
-                    Err(e) => {
-                        eprintln!("Error fetching case: {}", e);
-                        break;
-                    }
-                };
+        loop {
+            // Try to get next case
+            let case = match opts.dataset.next().await {
+                Ok(Some(case)) => case,
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("Error fetching case: {}", e);
+                    break;
+                }
+            };
 
-                case_count += 1;
+            case_count += 1;
 
-                // Clone what we need for the async task
-                let client = Arc::clone(&evaluator.client);
-                let root_span = root_span.clone();
-                let task = &opts.task;
-                let scorers = &opts.scorers;
-                let semaphore = Arc::clone(&semaphore);
-                let quiet = opts.quiet;
+            // Clone what we need for the async task
+            let client = Arc::clone(&self.client);
+            let root_span = root_span.clone();
+            let task = &opts.task;
+            let scorers = &opts.scorers;
+            let semaphore = Arc::clone(&semaphore);
+            let quiet = opts.quiet;
 
-                // Acquire permit before spawning
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
+            // Acquire permit before spawning
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
 
-                // Process this case
-                let future = async move {
-                    let result = Self::process_case(
-                        case,
-                        task.as_ref(),
-                        scorers,
-                        &root_span,
-                        &client,
-                        case_count,
-                        quiet,
-                    )
-                    .await;
-                    drop(permit); // Release permit
-                    result
-                };
+            // Process this case
+            let future = async move {
+                let result = Self::process_case(
+                    case,
+                    task.as_ref(),
+                    scorers,
+                    &root_span,
+                    &client,
+                    case_count,
+                    quiet,
+                )
+                .await;
+                drop(permit); // Release permit
+                result
+            };
 
-                futures.push(future);
+            futures.push(future);
 
-                // Collect completed futures if we have many pending
-                while futures.len() >= opts.max_concurrency {
-                    if let Some(result) = futures.next().await {
-                        results.push(result?);
-                    }
+            // Collect completed futures if we have many pending
+            while futures.len() >= opts.max_concurrency {
+                if let Some(result) = futures.next().await {
+                    results.push(result?);
                 }
             }
+        }
 
-            // Collect remaining futures
-            while let Some(result) = futures.next().await {
-                results.push(result?);
+        // Collect remaining futures
+        while let Some(result) = futures.next().await {
+            results.push(result?);
+        }
+
+        // End root span
+        root_span.end();
+
+        // Compute statistics
+        let score_stats = EvalSummary::<I, O>::compute_stats(&results);
+        let successful = results.iter().filter(|r| r.error.is_none()).count();
+        let failed = results.len() - successful;
+
+        if !opts.quiet {
+            println!("\nEvaluation complete!");
+            println!("Total cases: {}", results.len());
+            println!("Successful: {}", successful);
+            println!("Failed: {}", failed);
+            println!("\nScore summary:");
+            for stat in &score_stats {
+                println!(
+                    "  {}: mean={:.3}, min={:.3}, max={:.3}, count={}",
+                    stat.name, stat.mean, stat.min, stat.max, stat.count
+                );
             }
+        }
 
-            // End root span
-            root_span.end();
-
-            // Compute statistics
-            let score_stats = EvalSummary::<I, O>::compute_stats(&results);
-            let successful = results.iter().filter(|r| r.error.is_none()).count();
-            let failed = results.len() - successful;
-
-            if !opts.quiet {
-                println!("\nEvaluation complete!");
-                println!("Total cases: {}", results.len());
-                println!("Successful: {}", successful);
-                println!("Failed: {}", failed);
-                println!("\nScore summary:");
-                for stat in &score_stats {
-                    println!(
-                        "  {}: mean={:.3}, min={:.3}, max={:.3}, count={}",
-                        stat.name, stat.mean, stat.min, stat.max, stat.count
-                    );
-                }
-            }
-
-            Ok(EvalSummary {
-                name: opts.name,
-                results,
-                score_stats,
-                total_cases: case_count,
-                successful_cases: successful,
-                failed_cases: failed,
-                dataset_id,
-            })
+        Ok(EvalSummary {
+            name: opts.name,
+            results,
+            score_stats,
+            total_cases: case_count,
+            successful_cases: successful,
+            failed_cases: failed,
+            dataset_id,
         })
     }
 
@@ -353,9 +346,10 @@ where
     }
 }
 
-/// Synchronous evaluator using the shared SDK runtime.
+/// Sync evaluator (wraps async evaluator with Runtime::block_on)
 pub struct SyncEvaluator<I, O> {
     evaluator: Evaluator<I, O>,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl<I, O> SyncEvaluator<I, O>
@@ -365,20 +359,17 @@ where
 {
     /// Create a new sync evaluator
     pub fn new(client: BraintrustClient) -> Result<Self> {
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| crate::BraintrustError::Background(e.to_string()))?;
         Ok(Self {
             evaluator: Evaluator::new(client),
+            runtime,
         })
     }
 
     /// Run the evaluation synchronously
     pub fn run(&self, opts: EvalOpts<I, O>) -> Result<EvalSummary<I, O>> {
-        self.evaluator
-            .run(opts)
-            .blocking_wait()
-            .map_err(|error| match error {
-                crate::BlockingWaitError::Operation(error) => error,
-                error => crate::BraintrustError::Background(error.to_string()),
-            })
+        self.runtime.block_on(self.evaluator.run(opts))
     }
 }
 

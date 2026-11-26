@@ -419,10 +419,12 @@ impl<
         })
     }
 
-    /// Execute a callback within a traced span.
+    /// Execute a callback within a traced root span.
     ///
-    /// The span is automatically flushed when the callback completes (success or error).
-    /// This ensures all span data is sent to Braintrust before the method returns.
+    /// The callback runs in the caller's task, so dropping the returned future
+    /// cancels it. When the callback returns, the span is ended and its data is
+    /// flushed. Flush errors are ignored, and a callback that panics leaves the
+    /// span open.
     ///
     /// # Example
     ///
@@ -432,24 +434,16 @@ impl<
     ///     compute_result()
     /// }).await;
     /// ```
-    pub fn traced<F, Fut, R>(&self, callback: F) -> crate::Completion<R, crate::BraintrustError>
+    pub async fn traced<F, Fut, R>(&self, callback: F) -> R
     where
-        F: FnOnce(SpanHandle<S>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = R> + Send + 'static,
-        R: Send + 'static,
+        F: FnOnce(SpanHandle<S>) -> Fut,
+        Fut: std::future::Future<Output = R>,
     {
-        let experiment = self.clone();
-        crate::service::submit(async move {
-            let span = experiment
-                .registered_span_builder()
-                .await
-                .name("root")
-                .build();
-            let result = callback(span.clone()).await;
-            // Flush span data - ignore errors since this is best-effort
-            let _ = span.flush().await;
-            Ok(result)
-        })
+        let span = self.registered_span_builder().await.name("root").build();
+        let result = callback(span.clone()).await;
+        span.end();
+        let _ = span.flush().await;
+        result
     }
 
     /// Update an existing span by ID, merging new data with existing data.

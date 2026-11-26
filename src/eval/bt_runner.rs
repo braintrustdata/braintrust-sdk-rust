@@ -21,7 +21,6 @@ use super::{
 };
 
 /// A filter for selecting which evaluators to run, read from `BT_EVAL_FILTER_PARSED`.
-#[derive(Clone)]
 struct EvalFilter {
     path: Vec<String>,
     pattern: regex::Regex,
@@ -40,7 +39,6 @@ impl EvalFilter {
 }
 
 /// Configuration read from `BT_EVAL_*` environment variables.
-#[derive(Clone)]
 struct RunnerConfig {
     /// Output summaries as JSONL to stdout (`BT_EVAL_JSONL=1`)
     jsonl: bool,
@@ -209,55 +207,14 @@ fn create_sse_writer() -> Option<Arc<SseWriter>> {
 /// Ok(())
 /// # }
 /// ```
-#[derive(Clone)]
 pub struct BtEvalRunner {
     config: RunnerConfig,
     sse: Option<Arc<SseWriter>>,
     client: Option<Arc<BraintrustClient>>,
     /// Names registered in list mode, in order of registration.
-    registered_names: Arc<Mutex<Vec<String>>>,
+    registered_names: Vec<String>,
     /// Whether all evals that have run so far passed (no failures).
-    all_passed: Arc<std::sync::atomic::AtomicBool>,
-    /// Evals started from this runner or its clones that have not finished.
-    running: Arc<RunningEvals>,
-}
-
-/// Counts running evals, so [`BtEvalRunner::finish`] can report on all of them.
-#[derive(Default)]
-struct RunningEvals {
-    count: std::sync::atomic::AtomicUsize,
-    idle: tokio::sync::Notify,
-}
-impl RunningEvals {
-    fn start(self: &Arc<Self>) -> RunningEval {
-        self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        RunningEval(self.clone())
-    }
-    async fn wait_idle(&self) {
-        loop {
-            let idle = self.idle.notified();
-            tokio::pin!(idle);
-            idle.as_mut().enable();
-            if self.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
-                return;
-            }
-            idle.await;
-        }
-    }
-}
-/// Held by a running eval; dropped when it finishes, however it ends.
-struct RunningEval(Arc<RunningEvals>);
-impl Drop for RunningEval {
-    fn drop(&mut self) {
-        if self
-            .0
-            .count
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-            == 1
-        {
-            self.0.idle.notify_waiters();
-        }
-    }
+    all_passed: bool,
 }
 
 impl BtEvalRunner {
@@ -265,26 +222,23 @@ impl BtEvalRunner {
     ///
     /// In non-list mode, this creates a `BraintrustClient` from environment variables
     /// (e.g. `BRAINTRUST_API_KEY`). In list mode, no client is created.
-    pub fn from_env() -> crate::Completion<Self, crate::BraintrustError> {
-        crate::service::submit(async move {
-            let config = RunnerConfig::from_env();
-            let sse = create_sse_writer();
+    pub async fn from_env() -> Result<Self> {
+        let config = RunnerConfig::from_env();
+        let sse = create_sse_writer();
 
-            // Only create a client when we'll actually run evals
-            let client = if !config.list {
-                Some(Arc::new(BraintrustClient::builder().build().await?))
-            } else {
-                None
-            };
+        // Only create a client when we'll actually run evals
+        let client = if !config.list {
+            Some(Arc::new(BraintrustClient::builder().build().await?))
+        } else {
+            None
+        };
 
-            Ok(Self {
-                config,
-                sse,
-                client,
-                registered_names: Default::default(),
-                all_passed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                running: Default::default(),
-            })
+        Ok(Self {
+            config,
+            sse,
+            client,
+            registered_names: Vec::new(),
+            all_passed: true,
         })
     }
 
@@ -299,9 +253,8 @@ impl BtEvalRunner {
             config,
             sse,
             client: Some(client),
-            registered_names: Default::default(),
-            all_passed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            running: Default::default(),
+            registered_names: Vec::new(),
+            all_passed: true,
         }
     }
 
@@ -315,10 +268,9 @@ impl BtEvalRunner {
         self.config.no_send_logs
     }
 
-    /// Returns `true` if all evals that have finished so far passed. Evals still
-    /// running are not included; [`Self::finish`] waits for them.
+    /// Returns `true` if all evals that have run so far passed.
     pub fn all_passed(&self) -> bool {
-        self.all_passed.load(std::sync::atomic::Ordering::Acquire)
+        self.all_passed
     }
 
     fn passes_filter(&self, name: &str) -> bool {
@@ -334,137 +286,105 @@ impl BtEvalRunner {
     /// - In **normal mode**: runs the evaluator and sends results via SSE if configured.
     ///
     /// If the eval name does not pass the configured filters, it is skipped silently.
-    pub fn eval<I, O>(
-        &mut self,
-        project: &str,
-        mut opts: EvalOpts<I, O>,
-    ) -> crate::Completion<(), crate::BraintrustError>
+    pub async fn eval<I, O>(&mut self, project: &str, mut opts: EvalOpts<I, O>) -> Result<()>
     where
         I: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
         O: Serialize + DeserializeOwned + Send + Sync + PartialEq + Clone + 'static,
     {
-        let runner = self.clone();
-        let project = project.to_owned();
-        // Counted now, so a `finish` called before this eval runs still waits for it.
-        let running = self.running.start();
-        crate::service::submit(async move {
-            let _running = running;
-            let name = opts.name.clone();
+        let name = opts.name.clone();
 
-            if !runner.passes_filter(&name) {
-                return Ok(());
-            }
+        if !self.passes_filter(&name) {
+            return Ok(());
+        }
 
-            if runner.config.list {
-                runner.registered_names.lock().unwrap().push(name);
-                return Ok(());
-            }
+        if self.config.list {
+            self.registered_names.push(name);
+            return Ok(());
+        }
 
-            // Set the project name from the argument if not already set in opts
-            if opts.project_name.is_none() {
-                opts.project_name = Some(project.to_string());
-            }
+        // Set the project name from the argument if not already set in opts
+        if opts.project_name.is_none() {
+            opts.project_name = Some(project.to_string());
+        }
 
-            let Some(client) = runner.client.clone() else {
-                runner
-                    .all_passed
-                    .store(false, std::sync::atomic::Ordering::Release);
-                return Err(BraintrustError::Background(
-                    "BtEvalRunner has no client".to_string(),
-                ));
-            };
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| BraintrustError::Background("BtEvalRunner has no client".to_string()))?;
 
-            let evaluator = Evaluator::<I, O>::from_arc(client);
+        let evaluator = Evaluator::<I, O>::from_arc(client);
 
-            if let Some(sse) = &runner.sse {
-                sse.send("start", &json!({ "name": name }));
-            }
+        if let Some(sse) = &self.sse {
+            sse.send("start", &json!({ "name": name }));
+        }
 
-            match evaluator.run(opts).await {
-                Ok(summary) => {
-                    let failed = summary.failed_cases;
+        match evaluator.run(opts).await {
+            Ok(summary) => {
+                let failed = summary.failed_cases;
 
-                    if let Some(sse) = &runner.sse {
-                        let summary_value = serde_json::to_value(&summary).unwrap_or(Value::Null);
-                        sse.send("summary", &summary_value);
-                    } else if runner.config.jsonl {
-                        if let Ok(json) = serde_json::to_string(&summary) {
-                            println!("{}", json);
-                        }
-                    }
-
-                    if failed > 0 {
-                        runner
-                            .all_passed
-                            .store(false, std::sync::atomic::Ordering::Release);
-                        if runner.config.terminate_on_failure {
-                            return Err(BraintrustError::Background(format!(
-                                "Evaluator '{}' failed with {} error(s)",
-                                name, failed
-                            )));
-                        }
+                if let Some(sse) = &self.sse {
+                    let summary_value = serde_json::to_value(&summary).unwrap_or(Value::Null);
+                    sse.send("summary", &summary_value);
+                } else if self.config.jsonl {
+                    if let Ok(json) = serde_json::to_string(&summary) {
+                        println!("{}", json);
                     }
                 }
-                Err(e) => {
-                    runner
-                        .all_passed
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    if let Some(sse) = &runner.sse {
-                        sse.send("error", &json!({ "message": e.to_string() }));
-                    } else {
-                        eprintln!("Evaluator '{}' failed: {}", name, e);
-                    }
-                    if runner.config.terminate_on_failure {
-                        return Err(e);
+
+                if failed > 0 {
+                    self.all_passed = false;
+                    if self.config.terminate_on_failure {
+                        return Err(BraintrustError::Background(format!(
+                            "Evaluator '{}' failed with {} error(s)",
+                            name, failed
+                        )));
                     }
                 }
             }
+            Err(e) => {
+                self.all_passed = false;
+                if let Some(sse) = &self.sse {
+                    sse.send("error", &json!({ "message": e.to_string() }));
+                } else {
+                    eprintln!("Evaluator '{}' failed: {}", name, e);
+                }
+                if self.config.terminate_on_failure {
+                    return Err(e);
+                }
+            }
+        }
 
-            Ok(())
-        })
+        Ok(())
     }
 
-    /// Finish the runner session, once every eval started from this runner or
-    /// its clones has finished, including evals whose completions were dropped.
+    /// Finish the runner session.
     ///
     /// In list mode, prints all registered eval names to stdout (one per line).
-    /// The SSE connection (if any) is closed when the last running eval and this
-    /// runner have released it.
+    /// The SSE connection (if any) is closed when this method returns.
     ///
-    /// Resolves to `true` if all evals passed, `false` if any failed. `bt eval`
-    /// uses it for the process's exit status.
-    pub fn finish(self) -> crate::Completion<bool, crate::BraintrustError> {
-        crate::service::submit(async move {
-            self.running.wait_idle().await;
-            if self.config.list {
-                for name in self.registered_names.lock().unwrap().iter() {
-                    println!("{}", name);
-                }
+    /// Returns `true` if all evals passed, `false` if any failed.
+    pub async fn finish(self) -> Result<bool> {
+        if self.config.list {
+            for name in &self.registered_names {
+                println!("{}", name);
             }
-            // SSE connection is closed when the last `self.sse` is dropped
-            Ok(self.all_passed.load(std::sync::atomic::Ordering::Acquire))
-        })
+        }
+        // SSE connection is closed when `self.sse` is dropped
+        Ok(self.all_passed)
     }
 
     /// Convenience method: run multiple evaluations whose results can be summarized.
     ///
     /// Returns `true` if all evals passed.
-    pub fn run_all<F, Fut>(
-        &mut self,
-        evals: Vec<F>,
-    ) -> crate::Completion<bool, crate::BraintrustError>
+    pub async fn run_all<F, Fut>(&mut self, evals: Vec<F>) -> Result<bool>
     where
-        F: FnOnce(&mut Self) -> Fut + Send + 'static,
-        Fut: std::future::IntoFuture<Output = Result<()>> + Send + 'static,
-        Fut::IntoFuture: Send,
+        F: FnOnce(&mut Self) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
     {
-        let mut runner = self.clone();
-        crate::service::submit(async move {
-            for evaluate in evals {
-                evaluate(&mut runner).await?;
-            }
-            Ok(runner.all_passed())
-        })
+        for eval_fn in evals {
+            eval_fn(self).await?;
+        }
+        Ok(self.all_passed)
     }
 }
 
@@ -484,65 +404,6 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::eval::{Case, SimpleFnTask};
-
-    fn test_runner(list: bool) -> BtEvalRunner {
-        BtEvalRunner {
-            config: RunnerConfig {
-                jsonl: false,
-                list,
-                terminate_on_failure: false,
-                filters: Vec::new(),
-                no_send_logs: true,
-            },
-            sse: None,
-            client: None,
-            registered_names: Default::default(),
-            all_passed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            running: Default::default(),
-        }
-    }
-
-    #[tokio::test]
-    async fn finish_waits_for_evals_whose_completions_were_dropped() {
-        let runner = test_runner(false);
-        let held = runner.running.start();
-        let finish = runner.finish();
-        tokio::pin!(finish);
-        assert!(futures::poll!(finish.as_mut()).is_pending());
-        drop(held);
-        assert!(finish.await.unwrap());
-
-        let mut runner = test_runner(false);
-        let opts = EvalOpts::<String, String>::builder()
-            .name("dropped".to_string())
-            .dataset(Vec::<Case<String, String>>::new().into())
-            .task(Box::new(SimpleFnTask::new(|input: &String| {
-                Ok(input.clone())
-            })))
-            .scorers(Vec::new())
-            .build();
-        // Started and ignored; without a client it fails.
-        drop(runner.eval("project", opts));
-        assert!(!runner.finish().await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn finish_lists_names_registered_by_evals_still_running() {
-        let mut runner = test_runner(true);
-        let observer = runner.registered_names.clone();
-        let opts = EvalOpts::<String, String>::builder()
-            .name("listed".to_string())
-            .dataset(Vec::<Case<String, String>>::new().into())
-            .task(Box::new(SimpleFnTask::new(|input: &String| {
-                Ok(input.clone())
-            })))
-            .scorers(Vec::new())
-            .build();
-        drop(runner.eval("project", opts));
-        assert!(runner.finish().await.unwrap());
-        assert_eq!(*observer.lock().unwrap(), ["listed"]);
-    }
 
     // Serialize tests that mutate BT_EVAL_FILTER_PARSED to avoid race conditions.
     static FILTER_ENV_MUTEX: Mutex<()> = Mutex::new(());

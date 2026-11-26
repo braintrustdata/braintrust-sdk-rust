@@ -109,7 +109,9 @@ async fn high_level_operations_work_from_a_plain_sync_thread() {
                 )
                 .blocking_wait()
                 .unwrap();
-            let summary = braintrust_sdk_rust::eval::Evaluator::new(client.clone())
+            // Evaluations run user tasks, so sync code drives them on its own runtime.
+            let summary = braintrust_sdk_rust::eval::SyncEvaluator::new(client.clone())
+                .unwrap()
                 .run(
                     braintrust_sdk_rust::eval::EvalOpts::builder()
                         .name("async-task-from-sync-code".into())
@@ -131,7 +133,6 @@ async fn high_level_operations_work_from_a_plain_sync_thread() {
                         .quiet(true)
                         .build(),
                 )
-                .blocking_wait()
                 .unwrap();
             assert_eq!(summary.successful_cases, 1);
             assert_eq!(summary.results[0].output.as_deref(), Some("HELLO"));
