@@ -1,10 +1,12 @@
 //! Observation of work submitted when an SDK method is called.
 use crate::ExecutionError;
 use std::{
-    future::{Future, IntoFuture},
+    future::Future,
     ops::Deref,
     pin::Pin,
-    task::{Context, Poll},
+    sync::Arc,
+    task::{Context, Poll, Wake, Waker},
+    time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
 
@@ -15,6 +17,9 @@ pub enum BlockingWaitError<E> {
     /// A pending wait was refused in an entered Tokio runtime context.
     #[error("cannot block in a Tokio runtime context; await the completion instead")]
     InRuntime,
+    /// [`Completion::blocking_wait_timeout`] gave up. The operation keeps running.
+    #[error("timed out waiting for the operation to complete")]
+    TimedOut,
     /// Submission, execution or delivery failed.
     #[error(transparent)]
     Operation(#[from] E),
@@ -22,9 +27,15 @@ pub enum BlockingWaitError<E> {
 
 /// A synchronously recorded issuance result and an eventual operation result.
 ///
-/// Inspect [`Completion::submission`] to check admission without waiting. Awaiting returns
-/// that error, or the accepted operation's result. Dropping this token does not
-/// cancel accepted work. No work is started by polling the token.
+/// The operation starts when the SDK method is called, not when this is polled.
+/// Inspect [`Completion::submission`] to check admission without waiting. Awaiting
+/// returns that error, or the accepted operation's result. Dropping this token does
+/// not cancel accepted work.
+///
+/// `Completion` is an [`Unpin`] [`Future`], so it can also be awaited through
+/// `&mut` (for example with `tokio::time::timeout(duration, &mut completion)`)
+/// and passed to combinators like `futures::future::join_all`. Once the result
+/// has been returned, polling again returns [`ExecutionError::AlreadyTaken`].
 ///
 /// ```no_run
 /// use braintrust_sdk_rust::{BraintrustClient, SpanHandle, SpanLog};
@@ -45,48 +56,101 @@ pub enum BlockingWaitError<E> {
 pub struct Completion<T, E> {
     issued: Result<(), E>,
     receiver: oneshot::Receiver<Result<T, E>>,
+    /// The result has been returned by `poll`.
+    taken: bool,
 }
+/// Compatibility name for the future returned by converting a completion.
+pub type CompletionFuture<T, E> = Completion<T, E>;
+
 impl<T, E> Completion<T, E> {
     /// Borrow the immediate submission result without waiting for delivery.
     ///
     /// An accepted submission may still fail during delivery. Await this
-    /// completion to observe the final result.
+    /// completion to observe the final result. After awaiting has returned a
+    /// submission error, this returns [`ExecutionError::AlreadyTaken`] instead.
     pub fn submission(&self) -> &Result<(), E> {
         &self.issued
     }
 
     /// Wait for the operation's final result from synchronous code.
     ///
-    /// Work already runs on the selected runtime; this only waits on its response.
-    /// Ready results can be read anywhere. Pending waits return
-    /// [`BlockingWaitError::InRuntime`] whenever a Tokio runtime context is entered,
-    /// including contexts where blocking might happen to work. Await instead there.
-    /// Refusing a wait does not cancel accepted work.
+    /// Work already runs on the runtime selected by the operation;
+    /// this only waits on its response. Ready results can be read anywhere.
+    /// Pending waits return [`BlockingWaitError::InRuntime`] whenever a Tokio
+    /// runtime context is entered, including contexts where blocking might happen
+    /// to work. Await instead there. Refusing a wait does not cancel accepted work.
     ///
-    /// Outside Tokio, the SDK-owned runtime progresses independently. An explicit
-    /// runtime must be kept alive and driven on another thread; its progress
-    /// cannot be inferred from its handle. This method does not drive that runtime.
-    pub fn blocking_wait(mut self) -> Result<T, BlockingWaitError<E>>
+    /// Outside Tokio this blocks until the result arrives. If the SDK runs on a
+    /// current-thread runtime, another thread must be driving it, or this waits
+    /// forever; [`Self::blocking_wait_timeout`] bounds the wait.
+    pub fn blocking_wait(self) -> Result<T, BlockingWaitError<E>>
     where
         E: From<ExecutionError>,
     {
-        self.issued.map_err(BlockingWaitError::Operation)?;
+        let receiver = match self.ready() {
+            Ok(result) => return result,
+            Err(receiver) => receiver,
+        };
+        receiver
+            .blocking_recv()
+            .unwrap_or_else(|_| Err(ExecutionError::WorkerLost.into()))
+            .map_err(BlockingWaitError::Operation)
+    }
+
+    /// Like [`Self::blocking_wait`], but gives up after `timeout` with
+    /// [`BlockingWaitError::TimedOut`]. The operation keeps running.
+    pub fn blocking_wait_timeout(self, timeout: Duration) -> Result<T, BlockingWaitError<E>>
+    where
+        E: From<ExecutionError>,
+    {
+        let mut receiver = match self.ready() {
+            Ok(result) => return result,
+            Err(receiver) => receiver,
+        };
+        let started = Instant::now();
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(result) = Pin::new(&mut receiver).poll(&mut context) {
+                return result
+                    .unwrap_or_else(|_| Err(ExecutionError::WorkerLost.into()))
+                    .map_err(BlockingWaitError::Operation);
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(BlockingWaitError::TimedOut);
+            }
+            std::thread::park_timeout(remaining);
+        }
+    }
+
+    /// The result if a wait needs no blocking, otherwise the receiver to block on.
+    #[allow(clippy::type_complexity)]
+    fn ready(mut self) -> Result<Result<T, BlockingWaitError<E>>, oneshot::Receiver<Result<T, E>>>
+    where
+        E: From<ExecutionError>,
+    {
+        if self.taken {
+            return Ok(Err(BlockingWaitError::Operation(
+                ExecutionError::AlreadyTaken.into(),
+            )));
+        }
+        if let Err(error) = self.issued {
+            return Ok(Err(BlockingWaitError::Operation(error)));
+        }
         match self.receiver.try_recv() {
-            Ok(result) => return result.map_err(BlockingWaitError::Operation),
+            Ok(result) => return Ok(result.map_err(BlockingWaitError::Operation)),
             Err(oneshot::error::TryRecvError::Closed) => {
-                return Err(BlockingWaitError::Operation(
+                return Ok(Err(BlockingWaitError::Operation(
                     ExecutionError::WorkerLost.into(),
-                ));
+                )));
             }
             Err(oneshot::error::TryRecvError::Empty) => {}
         }
         if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(BlockingWaitError::InRuntime);
+            return Ok(Err(BlockingWaitError::InRuntime));
         }
-        self.receiver
-            .blocking_recv()
-            .unwrap_or_else(|_| Err(ExecutionError::WorkerLost.into()))
-            .map_err(BlockingWaitError::Operation)
+        Err(self.receiver)
     }
 
     pub(crate) fn pair() -> (oneshot::Sender<Result<T, E>>, Self) {
@@ -96,11 +160,19 @@ impl<T, E> Completion<T, E> {
             Self {
                 issued: Ok(()),
                 receiver,
+                taken: false,
             },
         )
     }
     pub(crate) fn record_issuance(&mut self, result: Result<(), E>) {
         self.issued = result;
+    }
+}
+/// Wakes a thread parked in [`Completion::blocking_wait_timeout`].
+struct Unpark(std::thread::Thread);
+impl Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
     }
 }
 impl<T, E> Deref for Completion<T, E> {
@@ -119,35 +191,31 @@ where
             .finish_non_exhaustive()
     }
 }
-/// The future produced by consuming a [`Completion`].
-pub struct CompletionFuture<T, E> {
-    issued: Option<Result<(), E>>,
-    receiver: oneshot::Receiver<Result<T, E>>,
-}
-// Neither field is structurally pinned; the channel receiver is Unpin.
-impl<T, E> Unpin for CompletionFuture<T, E> {}
-impl<T, E: From<ExecutionError>> IntoFuture for Completion<T, E> {
-    type Output = Result<T, E>;
-    type IntoFuture = CompletionFuture<T, E>;
-    fn into_future(self) -> Self::IntoFuture {
-        CompletionFuture {
-            issued: Some(self.issued),
-            receiver: self.receiver,
-        }
-    }
-}
-impl<T, E: From<ExecutionError>> Future for CompletionFuture<T, E> {
+// No field is structurally pinned; the channel receiver is Unpin.
+impl<T, E> Unpin for Completion<T, E> {}
+impl<T, E: From<ExecutionError>> Future for Completion<T, E> {
     type Output = Result<T, E>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if let Some(Err(error)) = this.issued.take() {
-            return Poll::Ready(Err(error));
+        if this.taken {
+            return Poll::Ready(Err(ExecutionError::AlreadyTaken.into()));
         }
-        match Pin::new(&mut this.receiver).poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(result)) => Poll::Ready(result),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(ExecutionError::WorkerLost.into())),
+        if this.issued.is_err() {
+            this.taken = true;
+            let issued =
+                std::mem::replace(&mut this.issued, Err(ExecutionError::AlreadyTaken.into()));
+            if let Err(error) = issued {
+                return Poll::Ready(Err(error));
+            }
         }
+        let result = match Pin::new(&mut this.receiver).poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(result)) => result,
+            Poll::Ready(Err(_)) => Err(ExecutionError::WorkerLost.into()),
+        };
+        // A completed receiver must not be polled again.
+        this.taken = true;
+        Poll::Ready(result)
     }
 }
 
@@ -183,6 +251,98 @@ mod tests {
         let (sender, token) = Completion::<(), ExecutionError>::pair();
         drop(sender);
         assert_eq!(token.await, Err(ExecutionError::WorkerLost));
+    }
+    #[tokio::test]
+    async fn awaiting_through_a_reference_keeps_the_completion_until_its_result_is_taken() {
+        let (sender, mut completion) = Completion::<usize, ExecutionError>::pair();
+        let timeout = std::time::Duration::from_millis(1);
+        assert!(tokio::time::timeout(timeout, &mut completion)
+            .await
+            .is_err());
+        assert!(completion.submission().is_ok());
+        sender.send(Ok(42)).unwrap();
+        assert_eq!((&mut completion).await, Ok(42));
+        assert_eq!(completion.await, Err(ExecutionError::AlreadyTaken));
+
+        let (_, mut rejected) = Completion::<(), ExecutionError>::pair();
+        rejected.record_issuance(Err(ExecutionError::TimedOut));
+        assert_eq!((&mut rejected).await, Err(ExecutionError::TimedOut));
+        // The error was moved out; E need not be Clone.
+        assert_eq!(rejected.submission(), &Err(ExecutionError::AlreadyTaken));
+        assert_eq!(
+            rejected.blocking_wait(),
+            Err(BlockingWaitError::Operation(ExecutionError::AlreadyTaken))
+        );
+    }
+    #[tokio::test]
+    async fn completions_work_with_future_combinators() {
+        let mut senders = Vec::new();
+        let mut completions = Vec::new();
+        for _ in 0..3 {
+            let (sender, completion) = Completion::<usize, ExecutionError>::pair();
+            senders.push(sender);
+            completions.push(completion);
+        }
+        for (i, sender) in senders.into_iter().enumerate() {
+            sender.send(Ok(i)).unwrap();
+        }
+        let results = futures::future::join_all(completions).await;
+        assert_eq!(results, [Ok(0), Ok(1), Ok(2)]);
+    }
+    #[test]
+    fn blocking_wait_timeout_gives_up_without_cancelling_the_operation() {
+        let (sender, completion) = Completion::<usize, ExecutionError>::pair();
+        let timeout = std::time::Duration::from_millis(20);
+        assert_eq!(
+            completion.blocking_wait_timeout(timeout),
+            Err(BlockingWaitError::TimedOut)
+        );
+        drop(sender);
+
+        let (sender, completion) = Completion::<usize, ExecutionError>::pair();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            sender.send(Ok(42)).unwrap();
+        });
+        assert_eq!(
+            completion.blocking_wait_timeout(std::time::Duration::from_secs(5)),
+            Ok(42)
+        );
+        worker.join().unwrap();
+    }
+    #[test]
+    fn blocking_wait_timeout_returns_the_operation_error_unchanged() {
+        let later = |result: Option<Result<(), ExecutionError>>| {
+            let (sender, completion) = Completion::<(), ExecutionError>::pair();
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                match result {
+                    Some(result) => sender.send(result).unwrap(),
+                    None => drop(sender),
+                }
+            });
+            let waited = completion.blocking_wait_timeout(std::time::Duration::from_secs(5));
+            worker.join().unwrap();
+            waited
+        };
+        // The operation's own error arrives as sent.
+        assert_eq!(
+            later(Some(Err(ExecutionError::TimedOut))),
+            Err(BlockingWaitError::Operation(ExecutionError::TimedOut))
+        );
+        // Only a sender dropped without a result, which carries no error, is WorkerLost.
+        assert_eq!(
+            later(None),
+            Err(BlockingWaitError::Operation(ExecutionError::WorkerLost))
+        );
+    }
+    #[tokio::test]
+    async fn pending_blocking_wait_timeout_in_async_context_returns_an_error() {
+        let (_sender, completion) = Completion::<(), ExecutionError>::pair();
+        assert_eq!(
+            completion.blocking_wait_timeout(std::time::Duration::from_secs(5)),
+            Err(BlockingWaitError::InRuntime)
+        );
     }
     #[test]
     fn blocking_wait_observes_the_background_response_without_a_runtime() {

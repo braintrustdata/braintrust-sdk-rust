@@ -17,6 +17,9 @@ pub enum ExecutionError {
     WorkerLost,
     #[error("delivery shutdown timed out")]
     TimedOut,
+    /// A completion was polled again after returning its result.
+    #[error("the completion's result was already taken")]
+    AlreadyTaken,
 }
 /// A terminal preparation, encoding or upload failure shared by a logical batch.
 #[derive(Debug, Error)]
