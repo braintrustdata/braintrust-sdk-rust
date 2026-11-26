@@ -307,6 +307,32 @@ mod tests {
         );
         worker.join().unwrap();
     }
+    #[test]
+    fn blocking_wait_timeout_returns_the_operation_error_unchanged() {
+        let later = |result: Option<Result<(), ExecutionError>>| {
+            let (sender, completion) = Completion::<(), ExecutionError>::pair();
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                match result {
+                    Some(result) => sender.send(result).unwrap(),
+                    None => drop(sender),
+                }
+            });
+            let waited = completion.blocking_wait_timeout(std::time::Duration::from_secs(5));
+            worker.join().unwrap();
+            waited
+        };
+        // The operation's own error arrives as sent.
+        assert_eq!(
+            later(Some(Err(ExecutionError::TimedOut))),
+            Err(BlockingWaitError::Operation(ExecutionError::TimedOut))
+        );
+        // Only a sender dropped without a result, which carries no error, is WorkerLost.
+        assert_eq!(
+            later(None),
+            Err(BlockingWaitError::Operation(ExecutionError::WorkerLost))
+        );
+    }
     #[tokio::test]
     async fn pending_blocking_wait_timeout_in_async_context_returns_an_error() {
         let (_sender, completion) = Completion::<(), ExecutionError>::pair();
