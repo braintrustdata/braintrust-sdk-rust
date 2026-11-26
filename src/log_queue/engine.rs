@@ -253,7 +253,7 @@ impl Engine {
         let scope = scope.clone();
         crate::service::global()
             .expect("initialized service")
-            .spawn(async move {
+            .spawn_operation(async move {
                 let result = match tokio::time::timeout(timeout, barrier).await {
                     Ok(result) => result
                         .map(|report| ShutdownReport {

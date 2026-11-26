@@ -40,54 +40,41 @@ pub struct ServiceConfig {
     pub runtime: ServiceRuntime,
 }
 
-/// Where the SDK runs its background work: delivery, uploads and API calls.
+/// Where the SDK runs its work.
+///
+/// Every client shares one delivery service: one intake, scheduler and set of
+/// upload jobs for the process. This selects the runtime that hosts it, and the
+/// runtime that runs each operation a client method starts, such as an API
+/// call or a flush.
 ///
 /// The runtime must have I/O and timers enabled. A current-thread runtime only
-/// makes progress while some thread drives it, so delivery stalls, and
-/// [`crate::Completion::blocking_wait`] can wait forever, when nothing does.
+/// makes progress while some thread drives it, so [`ServiceRuntime::Current`]
+/// never selects one; pass it as [`ServiceRuntime::Handle`] to use it anyway.
 ///
-/// If the runtime shuts down, delivery restarts straight away on the SDK's own
-/// thread, and a stopped runtime is never selected again. Rows that were being
-/// uploaded go back in the queue, so rows from a request that was in flight may
-/// be sent twice; Logs3 writes by row ID, so a repeat overwrites the same row.
-/// Other operations still pending on the stopped runtime fail with
-/// [`crate::ExecutionError::WorkerLost`].
-///
-/// Without explicit configuration, `BRAINTRUST_SERVICE_RUNTIME=dedicated`
-/// selects [`ServiceRuntime::Dedicated`]. Test suites usually want it: each
-/// `#[tokio::test]` has its own runtime, and when the captured one ends, other
-/// tests' pending operations fail.
-#[derive(Clone, Debug)]
+/// If the runtime hosting delivery shuts down, delivery restarts straight away
+/// on the SDK's own thread, and a stopped runtime is never selected again.
+/// Rows whose upload was interrupted go back in the queue. Rows from a request
+/// that got a response are never sent again, but the server may have received
+/// the request that was in flight, so its rows can arrive twice; Logs3 writes
+/// by row ID, so a repeat overwrites the same row. Operations still running on
+/// a stopped runtime fail with [`crate::ExecutionError::WorkerLost`].
+#[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub enum ServiceRuntime {
-    /// The runtime that is current when the first SDK client is built, or the
-    /// SDK's own thread when there is none. The default.
+    /// The default. Operations run on the runtime current where they are
+    /// started. Delivery runs on the runtime current when the first client is
+    /// built. Either uses the SDK's own thread when there is no current runtime,
+    /// or it is a current-thread runtime.
+    ///
+    /// Each operation depends only on its caller's runtime, so runtimes that
+    /// end while others keep using the SDK, like one per `#[tokio::test]`,
+    /// stop only their own operations.
+    #[default]
     Current,
-    /// Always the SDK's own single-threaded runtime on a dedicated thread.
+    /// Everything runs on the SDK's own single-threaded runtime on a dedicated thread.
     Dedicated,
-    /// A runtime the application provides and keeps running.
+    /// Everything runs on a runtime the application provides and keeps running.
     Handle(Handle),
-}
-impl Default for ServiceRuntime {
-    fn default() -> Self {
-        // Unit tests run concurrently on short-lived runtimes; sharing one that
-        // stops mid-test would fail unrelated tests.
-        if cfg!(test) {
-            Self::Dedicated
-        } else {
-            Self::Current
-        }
-    }
-}
-impl ServiceRuntime {
-    /// The default, unless `BRAINTRUST_SERVICE_RUNTIME` names another selection.
-    fn from_env() -> Self {
-        match std::env::var("BRAINTRUST_SERVICE_RUNTIME").as_deref() {
-            Ok("dedicated") => Self::Dedicated,
-            Ok("current") => Self::Current,
-            _ => Self::default(),
-        }
-    }
 }
 impl PartialEq for ServiceRuntime {
     fn eq(&self, other: &Self) -> bool {
@@ -109,7 +96,6 @@ impl Default for ServiceConfig {
                     .filter(|v| *v > 0)
                     .unwrap_or(8),
             )
-            .runtime(ServiceRuntime::from_env())
             .build()
     }
 }
@@ -205,12 +191,29 @@ impl Service {
         }
         executor.handle.clone()
     }
+    /// Spawn shared delivery work on the runtime hosting the service.
     pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
         self.handle().spawn(future)
+    }
+    /// Spawn an operation a caller started. With [`ServiceRuntime::Current`] it
+    /// runs on the caller's runtime, so it ends only with that runtime.
+    pub fn spawn_operation<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = self.handle();
+        if self.config.runtime == ServiceRuntime::Current {
+            let caller = current_runtime(&self.executor.lock().unwrap().stopped);
+            if let Some(caller) = caller {
+                return caller.spawn(future);
+            }
+        }
+        handle.spawn(future)
     }
 }
 impl Executor {
@@ -219,11 +222,7 @@ impl Executor {
         engine: &Arc<crate::log_queue::engine::Engine>,
         stopped: HashSet<tokio::runtime::Id>,
     ) -> std::result::Result<Self, (String, HashSet<tokio::runtime::Id>)> {
-        let current = || {
-            Handle::try_current()
-                .ok()
-                .filter(|handle| !stopped.contains(&handle.id()))
-        };
+        let current = || current_runtime(&stopped);
         let handle = match runtime {
             ServiceRuntime::Handle(handle) if !stopped.contains(&handle.id()) => Ok(handle.clone()),
             ServiceRuntime::Handle(_) => {
@@ -252,6 +251,13 @@ impl Executor {
             stopped,
         })
     }
+}
+/// The current runtime, if work can rely on it without driving it.
+fn current_runtime(stopped: &HashSet<tokio::runtime::Id>) -> Option<Handle> {
+    Handle::try_current().ok().filter(|handle| {
+        handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            && !stopped.contains(&handle.id())
+    })
 }
 /// The SDK-owned runtime: one thread, started on first use and never stopped.
 fn dedicated() -> std::result::Result<Handle, String> {
@@ -319,7 +325,7 @@ pub(crate) async fn execute<T: Send + 'static>(
     operation: impl Future<Output = Result<T>> + Send + 'static,
 ) -> Result<T> {
     global()?
-        .spawn(operation)
+        .spawn_operation(operation)
         .await
         .map_err(|e| BraintrustError::Background(e.to_string()))?
 }
@@ -335,7 +341,7 @@ where
     let (sender, mut completion) = crate::Completion::pair();
     match global() {
         Ok(service) => {
-            service.spawn(async move {
+            service.spawn_operation(async move {
                 let _ = sender.send(operation.await);
             });
         }

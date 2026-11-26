@@ -981,7 +981,7 @@ impl BraintrustClient {
         }
         let running = LoginRunning(login.clone());
         let client = self.clone();
-        crate::service::global().expect("initialized service").spawn(async move {
+        crate::service::global().expect("initialized service").spawn_operation(async move {
             let _running = running;
             const MAX_ATTEMPTS: usize = 10;
             let result = (|| client.perform_login(&api_key, org_name.as_deref()))

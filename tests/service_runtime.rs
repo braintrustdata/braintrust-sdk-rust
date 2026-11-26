@@ -15,7 +15,6 @@ use wiremock::{
 fn run_child(name: &str) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--ignored", "--nocapture"])
-        .env_remove("BRAINTRUST_SERVICE_RUNTIME")
         .output()
         .unwrap();
     assert!(
@@ -35,12 +34,20 @@ fn work_runs_on_the_sdk_thread_outside_a_runtime() {
     run_child("no_runtime_child");
 }
 #[test]
+fn delivery_does_not_rely_on_a_current_thread_runtime() {
+    run_child("current_thread_runtime_child");
+}
+#[test]
 fn work_runs_on_a_configured_runtime() {
     run_child("configured_runtime_child");
 }
 #[test]
 fn rows_in_flight_when_the_runtime_stops_are_delivered_on_another() {
     run_child("stopped_runtime_child");
+}
+#[test]
+fn operations_survive_the_delivery_runtime_stopping() {
+    run_child("caller_operation_child");
 }
 #[test]
 fn a_background_login_interrupted_by_its_runtime_stopping_resumes() {
@@ -97,6 +104,13 @@ impl Fixture {
             .app_url(self.server.uri())
             .build_without_login()
             .unwrap()
+    }
+    fn wait_for(&self, condition: impl Fn(&Self) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !condition(self) {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
     fn log(&self, client: &BraintrustClient, provider: &Arc<Recorder>, ids: &[&str]) {
         client.log_rows_with_token_provider(
@@ -244,13 +258,58 @@ fn interrupted_login_child() {
         })
         .unwrap();
     // Stop the runtime while the first login request is waiting for its response.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while fixture.logins() == 0 {
-        assert!(std::time::Instant::now() < deadline, "login never started");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    fixture.wait_for(|fixture| fixture.logins() == 1);
     app.shutdown_timeout(Duration::from_secs(5));
     let state = client.wait_for_login().blocking_wait().unwrap();
     assert_eq!(state.org_id().as_deref(), Some("org-id"));
     assert_eq!(fixture.logins(), 2);
+}
+
+#[test]
+#[ignore = "executed in an isolated subprocess"]
+fn current_thread_runtime_child() {
+    let fixture = Fixture::new();
+    // Like `#[tokio::test]`: it only runs while its test drives it.
+    let app = Builder::new_current_thread().enable_all().build().unwrap();
+    let client = app.block_on(async { fixture.client() });
+    let provider = Arc::new(Recorder::default());
+    fixture.log(&client, &provider, &["a"]);
+    assert_eq!(client.flush().blocking_wait().unwrap().delivered(), 1);
+    assert_eq!(*provider.threads.lock().unwrap(), ["braintrust-delivery"]);
+}
+
+#[test]
+#[ignore = "executed in an isolated subprocess"]
+fn caller_operation_child() {
+    let fixture = Fixture::new();
+    fixture.server_runtime.block_on(
+        Mock::given(method("POST"))
+            .and(path("/api/apikey/login"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"org_info": [{"id": "org-id", "name": "Org"}]}))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&fixture.server),
+    );
+    // The first client makes `host` the delivery runtime.
+    let host = named_runtime("host-runtime");
+    host.block_on(async { fixture.client() });
+    // Another runtime, like a concurrent test, starts an operation.
+    let caller = named_runtime("caller-runtime");
+    let uri = fixture.server.uri();
+    let login = caller.spawn(async move {
+        BraintrustClient::builder()
+            .api_key("key")
+            .api_url(&uri)
+            .app_url(&uri)
+            .blocking_login(true)
+            .build()
+            .await
+    });
+    fixture.wait_for(|fixture| fixture.logins() == 1);
+    host.shutdown_timeout(Duration::from_secs(5));
+    let client = caller.block_on(login).unwrap().unwrap();
+    assert!(client.is_logged_in());
+    assert_eq!(fixture.logins(), 1, "the login was never interrupted");
 }
