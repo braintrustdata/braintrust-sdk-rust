@@ -143,7 +143,7 @@ let other_org = client.with_organization("another-org").await?;
 
 For different credentials, construct another client normally. `build_without_login()` also works without a caller Tokio runtime; its per-call credential methods route uploads through the same shared service. Token providers execute on the SDK runtime, so their implementations must not depend on a caller runtime remaining alive.
 
-Process-wide, per-org, and per-destination admission limits are optional. Unresolved project names and explicit IDs have separate admission identities. Configure them before constructing the first client or bulk uploader; conflicting later configuration returns an error. Per-client queue limits always apply, and retries remain counted against retained work while releasing active HTTP request capacity.
+Process-wide and per-org admission limits are optional. Configure them before constructing the first client or bulk uploader; conflicting later configuration returns an error. Per-client queue limits always apply, and retries remain counted against retained work while releasing active HTTP request capacity.
 
 ```rust,no_run
 use braintrust_sdk_rust::{configure_service, ServiceConfig};

@@ -496,34 +496,17 @@ impl SubmitCommand {
         }
         command
     }
-    pub(crate) fn partition(
-        &self,
-    ) -> (
-        Credential,
-        String,
-        Option<String>,
-        crate::destination::Destination,
-    ) {
+    /// The credential and org a command is delivered for.
+    pub(crate) fn partition(&self) -> (Credential, String, Option<String>) {
         match &self.item {
-            QueuedItem::Span {
-                payload,
-                parent_info,
-            } => (
+            QueuedItem::Span { payload, .. } => (
                 self.credential.clone(),
                 payload.org_id.clone(),
                 payload.org_name.clone(),
-                crate::destination::Destination::span(payload, parent_info.as_ref()),
             ),
             QueuedItem::Row {
-                org_id,
-                org_name,
-                row,
-            } => (
-                self.credential.clone(),
-                org_id.clone(),
-                org_name.clone(),
-                crate::destination::Destination::row(row),
-            ),
+                org_id, org_name, ..
+            } => (self.credential.clone(), org_id.clone(), org_name.clone()),
         }
     }
     pub(crate) fn is_raw(&self) -> bool {

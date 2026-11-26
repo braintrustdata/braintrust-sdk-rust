@@ -73,19 +73,14 @@ impl LogQueueCore {
         api_url: &Url,
         token: &str,
         org_name: Option<&str>,
-        org_id: &str,
     ) -> (usize, bool) {
         let service = crate::service::global().expect("initialized service");
         let key = crate::resolution::CapabilityKey {
             api_url: api_url.to_string(),
         };
-        // Capabilities are not tied to the job's destination.
-        let scope = crate::scheduler::Scope::current_org().unwrap_or_else(|| {
-            crate::scheduler::Scope::new(
-                api_url.as_str(),
-                crate::resolution::OrgIdentity::new(org_id, org_name, token).scope_key(),
-            )
-        });
+        // Capabilities belong to the server, and every org waits for the first
+        // lookup, so it must not wait out one org's cooldown.
+        let scope = crate::scheduler::Scope::new(api_url.as_str(), "");
         let cell = service.capabilities.entry(key);
         *cell
             .get_or_try_init(|| async {
@@ -96,13 +91,9 @@ impl LogQueueCore {
                     token,
                     org_name,
                 )?;
-                let version = crate::internal::upload::scheduled(
-                    scope,
-                    crate::internal::upload::RequestPolicy::ONCE,
-                    || api.version(),
-                )
-                .await?
-                .into_inner();
+                let version = crate::internal::upload::scheduled(scope, 0, || api.version())
+                    .await?
+                    .into_inner();
                 let bytes = version.logs3_payload_max_bytes.filter(|n| *n > 0);
                 Ok::<_, BraintrustError>((
                     bytes.unwrap_or(super::config::DEFAULT_BATCH_MAX_BYTES * 2),
@@ -127,7 +118,7 @@ impl LogQueueCore {
         if commands.is_empty() {
             return;
         }
-        let (credential, org_id, org_name, _) = commands[0].partition();
+        let (credential, _, org_name) = commands[0].partition();
         let org_name = org_name.or_else(|| self.routing_org_name.clone());
         let api_url = match Url::parse(&self.endpoint()) {
             Ok(url) => url,
@@ -216,7 +207,7 @@ impl LogQueueCore {
             return;
         }
         let (max_request_size, overflow) = self
-            .get_version_info(&api_url, &token, org_name.as_deref(), &org_id)
+            .get_version_info(&api_url, &token, org_name.as_deref())
             .await;
         let max_bytes = self.config.batch_max_bytes().min(max_request_size / 2);
         let max_items = self.config.batch_max_items();

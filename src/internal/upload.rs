@@ -3,7 +3,7 @@ use super::ingest::EncodedBatch;
 use crate::api::{self, transport::Logs3OverflowRequest};
 use crate::error::{BraintrustError, Result};
 use crate::http::api_result;
-use crate::scheduler::{Pause, Scope, SCOPE};
+use crate::scheduler::{Scope, SCOPE};
 use crate::types::LOGS_API_VERSION;
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, Retryable};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,9 +37,6 @@ impl UploadPolicy {
             delays,
             requests: 0,
             bytes: 1,
-            // The 429 does not say whether a project or org limit was hit, so
-            // pause the whole org rather than let sibling destinations repeat it.
-            pause: Pause::Org,
         }
     }
 }
@@ -80,47 +77,31 @@ async fn attempt<T>(
 /// Wait at least as long as the server asked, without retrying once the budget is exhausted.
 /// Every 429 pauses its scope, even when this request has no retries left, so
 /// other requests sharing the limit do not repeat the rejected attempt.
-fn retry_delay(attempt: &Attempt, backoff: Option<Duration>, pause: Pause) -> Option<Duration> {
+fn retry_delay(attempt: &Attempt, backoff: Option<Duration>) -> Option<Duration> {
     let hint = attempt.retry_after.map(|hint| hint.min(MAX_RETRY_AFTER));
     let delay = backoff.map(|backoff| hint.map_or(backoff, |hint| hint.max(backoff)));
     if matches!(attempt.error, BraintrustError::Api { status: 429, .. }) {
         if let (Ok(service), Some(wait)) = (crate::service::global(), delay.or(hint)) {
-            service.attempts.cool_down(wait, pause);
+            service.attempts.cool_down(wait);
         }
     }
     delay
 }
 
-/// How a non-upload request is retried and how widely its 429s pause others.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RequestPolicy {
-    pub retries: usize,
-    pub pause: Pause,
-}
-impl RequestPolicy {
-    /// One attempt; a 429 still pauses the org for other requests.
-    pub const ONCE: Self = Self {
-        retries: 0,
-        pause: Pause::Org,
-    };
-}
-
 /// Issue a request through the shared scheduler within `scope`: it waits out
-/// cooldowns, holds a request permit only while in flight, and retries per `policy`.
+/// cooldowns, holds a request permit only while in flight, and retries
+/// transient failures `retries` times. A 429 pauses the org even when no
+/// retries are left.
 pub(crate) async fn scheduled<T, F, Fut>(
     scope: Scope,
-    policy: RequestPolicy,
+    retries: usize,
     mut operation: F,
 ) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::result::Result<T, crate::api::Error<serde_json::Value>>>,
 {
-    let mut budget = UploadPolicy::Queue {
-        retries: policy.retries,
-    }
-    .budget();
-    budget.pause = policy.pause;
+    let mut budget = UploadPolicy::Queue { retries }.budget();
     SCOPE
         .scope(
             scope,
@@ -148,7 +129,6 @@ struct RetryBudget {
     delays: ExponentialBackoff,
     requests: usize,
     bytes: usize,
-    pause: Pause,
 }
 impl RetryBudget {
     async fn run<T, F, Fut>(&mut self, mut operation: F) -> Result<T>
@@ -156,7 +136,6 @@ impl RetryBudget {
         F: FnMut() -> Fut,
         Fut: Future<Output = std::result::Result<T, Attempt>>,
     {
-        let pause = self.pause;
         (|| {
             self.requests += 1;
             let operation = operation();
@@ -169,7 +148,7 @@ impl RetryBudget {
         })
         .retry(&mut self.delays)
         .when(|attempt| retryable(&attempt.error))
-        .adjust(|attempt, backoff| retry_delay(attempt, backoff, pause))
+        .adjust(retry_delay)
         .notify(|attempt, delay| {
             warn!(error = %attempt.error, ?delay, "ingestion request failed, retrying")
         })
@@ -225,7 +204,7 @@ impl UploadCoordinator {
         fallback: usize,
         override_bytes: Option<usize>,
     ) -> Capabilities {
-        let version = scheduled(self.scope(), RequestPolicy::ONCE, || self.logs.version());
+        let version = scheduled(self.scope(), 0, || self.logs.version());
         let server_limit = match version.await.map(|v| v.into_inner()) {
             Ok(version) => version.logs3_payload_max_bytes.filter(|limit| *limit > 0),
             Err(error) => {
@@ -272,7 +251,7 @@ impl UploadCoordinator {
         budget.bytes = batch.data.len().max(1);
         let mut result = UploadResult::default();
         // Resolution may have replaced a project name with its canonical ID.
-        let scope = self.scope().with_destination(batch.destination());
+        let scope = self.scope();
         let outcome = SCOPE
             .scope(
                 scope,
@@ -726,15 +705,9 @@ mod tests {
             )
             .await;
         assert!(outcome.is_err());
-        let sibling = crate::destination::Destination::row(
-            serde_json::json!({"project_id":"sibling"})
-                .as_object()
-                .unwrap(),
-        );
         let scheduler = &crate::service::global().unwrap().attempts;
-        assert!(scheduler.paused(&org.clone().with_destination(sibling.clone())));
         assert!(scheduler.paused(&org));
-        assert!(!scheduler.paused(&Scope::new(server.uri(), "other-org").with_destination(sibling)));
+        assert!(!scheduler.paused(&Scope::new(server.uri(), "other-org")));
     }
 
     #[test]
@@ -748,39 +721,20 @@ mod tests {
         };
         let backoff = Some(Duration::from_secs(2));
         assert_eq!(
-            retry_delay(
-                &rate_limited(Some(Duration::from_secs(20))),
-                backoff,
-                Pause::Destination
-            ),
+            retry_delay(&rate_limited(Some(Duration::from_secs(20))), backoff),
             Some(Duration::from_secs(20))
         );
         assert_eq!(
-            retry_delay(
-                &rate_limited(Some(Duration::ZERO)),
-                backoff,
-                Pause::Destination
-            ),
+            retry_delay(&rate_limited(Some(Duration::ZERO)), backoff),
             backoff
         );
+        assert_eq!(retry_delay(&rate_limited(None), backoff), backoff);
         assert_eq!(
-            retry_delay(&rate_limited(None), backoff, Pause::Destination),
-            backoff
-        );
-        assert_eq!(
-            retry_delay(
-                &rate_limited(Some(Duration::from_secs(3600))),
-                backoff,
-                Pause::Destination
-            ),
+            retry_delay(&rate_limited(Some(Duration::from_secs(3600))), backoff),
             Some(MAX_RETRY_AFTER)
         );
         assert_eq!(
-            retry_delay(
-                &rate_limited(Some(Duration::from_secs(20))),
-                None,
-                Pause::Destination
-            ),
+            retry_delay(&rate_limited(Some(Duration::from_secs(20))), None),
             None,
             "an exhausted retry budget must stay exhausted"
         );

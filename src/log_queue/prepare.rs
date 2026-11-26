@@ -300,11 +300,8 @@ impl LogQueueCore {
             // Registration shares the upload scheduler, so it waits out 429
             // cooldowns, counts against request concurrency, and retries
             // transient failures instead of dropping the span on the first one.
-            let policy = crate::internal::upload::RequestPolicy {
-                retries: self.config.num_retries(),
-                pause: crate::scheduler::Pause::Org,
-            };
-            let register_response = crate::internal::upload::scheduled(scope, policy, || {
+            let retries = self.config.num_retries();
+            let register_response = crate::internal::upload::scheduled(scope, retries, || {
                 client.register_project(&request)
             })
             .await?

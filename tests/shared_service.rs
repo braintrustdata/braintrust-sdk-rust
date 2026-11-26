@@ -210,7 +210,7 @@ async fn terminal_failure_is_scoped_and_does_not_poison_later_flushes() {
 }
 
 #[tokio::test]
-async fn retry_sleep_releases_capacity_for_healthy_destinations() {
+async fn retry_sleep_releases_capacity_for_healthy_orgs() {
     let server = MockServer::start().await;
     let healthy_at = Arc::new(Mutex::new(None));
     Mock::given(method("POST"))
@@ -237,14 +237,14 @@ async fn retry_sleep_releases_capacity_for_healthy_destinations() {
         .checked_delivery(true)
         .build_without_login()
         .unwrap();
+    // A 429 pauses its whole org, so the healthy row belongs to another one.
     client.log_rows_with_credentials(
         "token",
-        "org",
+        "throttled-org",
         None,
-        (0..8)
-            .map(|i| row(&i.to_string(), "throttled"))
-            .chain([row("healthy", "healthy")]),
+        (0..8).map(|i| row(&i.to_string(), "throttled")),
     );
+    client.log_rows_with_credentials("token", "healthy-org", None, [row("healthy", "healthy")]);
     let start = Instant::now();
     assert!(client.flush().await.is_err());
     assert!(
@@ -328,12 +328,12 @@ async fn org_selection_uses_discovered_endpoints_without_retargeting_existing_wo
     assert!(client.with_organization("forbidden").await.is_err());
 }
 
-struct Blocked(Arc<tokio::sync::Notify>);
+/// Waits until released, then fails every request, including retries.
+struct Blocked(Arc<tokio::sync::Semaphore>);
 #[async_trait::async_trait]
 impl TokenProvider for Blocked {
     async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let release = self.0.clone();
-        release.notified().await;
+        let _ = self.0.acquire().await;
         Err("unavailable".into())
     }
 }
@@ -343,7 +343,7 @@ async fn stalled_credentials_and_cancelled_waiters_do_not_block_other_clients() 
     accept(&server).await;
     let blocked = client(&server);
     let healthy = client(&server);
-    let release = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
     blocked.log_rows_with_token_provider(
         Arc::new(Blocked(release.clone())),
         "org",
@@ -358,7 +358,7 @@ async fn stalled_credentials_and_cancelled_waiters_do_not_block_other_clients() 
         .await
         .unwrap()
         .unwrap();
-    release.notify_one();
+    release.close();
     assert!(flush.await.is_err());
     blocked.flush().await.unwrap();
 }
@@ -457,32 +457,6 @@ async fn provider_panic_fails_its_partition_without_stopping_the_service() {
     assert_eq!(bad.dropped_rows().preparation_failed, 1);
     good.log_rows_with_credentials("token", "org", None, [row("good", "p")]);
     good.flush().await.unwrap();
-}
-
-#[tokio::test]
-async fn bulk_uploader_attempts_healthy_destinations_even_when_another_fails() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .and(body_string_contains("bad"))
-        .respond_with(ResponseTemplate::new(400))
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/logs3"))
-        .and(body_string_contains("healthy"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .with_priority(2)
-        .expect(1)
-        .mount(&server)
-        .await;
-    let uploader =
-        braintrust_sdk_rust::Logs3BatchUploader::new(server.uri(), "token", None).unwrap();
-    assert!(uploader
-        .upload_rows(&[row("bad", "bad"), row("healthy", "healthy")], 100)
-        .await
-        .is_err());
 }
 
 #[tokio::test]

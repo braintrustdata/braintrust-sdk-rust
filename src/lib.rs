@@ -1,7 +1,6 @@
 mod completion;
 mod dataset;
 mod delivery;
-mod destination;
 mod error;
 pub mod eval;
 mod experiments;

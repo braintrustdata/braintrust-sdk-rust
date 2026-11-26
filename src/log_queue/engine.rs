@@ -4,7 +4,7 @@ use super::{
     observation::Observation,
     queue::{Credential, LogQueueCore, SubmitCommand},
 };
-use crate::{destination::Destination, ServiceConfig};
+use crate::ServiceConfig;
 use crate::{
     Completion, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushReport,
     ShutdownError, ShutdownReport, WriteError,
@@ -16,21 +16,22 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use tokio::runtime::{Handle, Id as RuntimeId};
 use tokio::sync::{oneshot, Notify};
 
+/// An org at one endpoint: what budgets and request scheduling count against.
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct OrgKey {
     endpoint: String,
-    id: String,
-    name: Option<String>,
+    /// See [`crate::resolution::OrgIdentity::scope_key`].
+    org: String,
 }
 
-/// One delivery partition. Each has at most one job in flight, so a destination
-/// that is retrying or cooling down never delays another partition's uploads.
+/// One delivery partition: an org's rows that can share requests. Each has at
+/// most one job in flight, so an org that is retrying or cooling down never
+/// delays another org's uploads.
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct Key {
     route: OrgKey,
-    /// The organization name sent with requests, even when `route.id` is known.
+    /// The organization name sent with requests.
     org_name: Option<String>,
-    destination: Destination,
     credential: Credential,
     policy: super::config::LogQueueConfig,
     transport: u64,
@@ -49,7 +50,6 @@ struct Record {
     observer: Arc<Observation>,
     bytes: usize,
     route: OrgKey,
-    destination: Destination,
     sender: Option<WriteSender>,
 }
 #[derive(Default)]
@@ -61,7 +61,6 @@ struct Intake {
     partitions: IndexMap<Key, VecDeque<Entry>>,
     active: HashSet<Key>,
     org_rows: HashMap<OrgKey, usize>,
-    destination_rows: HashMap<(OrgKey, Destination), usize>,
 }
 
 pub(crate) struct Engine {
@@ -152,14 +151,17 @@ impl Engine {
         let mut rejected = Vec::new();
         let mut results = Vec::new();
         let mut intake = self.intake.lock().unwrap();
-        for (command, bytes, (credential, org, org_name, destination), sender) in prepared {
+        for (command, bytes, (credential, org, org_name), sender) in prepared {
             let (endpoint, org_name) = core.route(&org, org_name.as_deref());
             let route = OrgKey {
                 endpoint,
-                id: org.clone(),
-                name: org.is_empty().then(|| org_name.clone()).flatten(),
+                org: crate::resolution::OrgIdentity::new(
+                    &org,
+                    org_name.as_deref(),
+                    &credential.stand_in(),
+                )
+                .scope_key(),
             };
-            let destination_key = (route.clone(), destination.clone());
 
             let mut root = &core.observation;
             while let Some(parent) = &root.parent {
@@ -181,14 +183,6 @@ impl Engine {
                     .config
                     .max_org_rows
                     .is_some_and(|max| intake.org_rows.get(&route).copied().unwrap_or(0) >= max)
-                || self.config.max_destination_rows.is_some_and(|max| {
-                    intake
-                        .destination_rows
-                        .get(&destination_key)
-                        .copied()
-                        .unwrap_or(0)
-                        >= max
-                })
                 || client_rows >= core.config.queue_max_size()
             {
                 let error = if closed {
@@ -205,11 +199,9 @@ impl Engine {
             core.observation.accept(sequence);
             core.retained(client_rows + 1);
             *intake.org_rows.entry(route.clone()).or_default() += 1;
-            *intake.destination_rows.entry(destination_key).or_default() += 1;
             let key = Key {
                 route,
                 org_name,
-                destination,
                 credential,
                 policy: core.config.clone(),
                 transport: core.client.identity,
@@ -223,7 +215,6 @@ impl Engine {
                     observer: core.observation.clone(),
                     bytes,
                     route: key.route.clone(),
-                    destination: key.destination.clone(),
                     sender,
                 },
             );
@@ -263,13 +254,6 @@ impl Engine {
             *rows -= 1;
             if *rows == 0 {
                 intake.org_rows.remove(&record.route);
-            }
-        }
-        let key = (record.route.clone(), record.destination.clone());
-        if let Some(rows) = intake.destination_rows.get_mut(&key) {
-            *rows -= 1;
-            if *rows == 0 {
-                intake.destination_rows.remove(&key);
             }
         }
         Some(record)
@@ -361,7 +345,7 @@ impl Engine {
         self.schedule();
     }
     /// Start one job per idle partition. Request fairness across organizations
-    /// and destinations is the scheduler's responsibility, not job order.
+    /// is the scheduler's responsibility, not job order.
     fn take_jobs(&self) -> Vec<(Key, Vec<Entry>)> {
         let mut intake = self.intake.lock().unwrap();
         let Intake {
@@ -403,17 +387,7 @@ impl Job {
         let core = job.entries[0]
             .core
             .job(&job.key.route.endpoint, job.key.org_name.as_deref());
-        // Permit covers preparation only; uploads acquire attempt permits separately.
-        let request_scope = crate::scheduler::Scope::new(
-            core.endpoint(),
-            crate::resolution::OrgIdentity::new(
-                &job.key.route.id,
-                job.key.org_name.as_deref(),
-                &job.key.credential.stand_in(),
-            )
-            .scope_key(),
-        )
-        .with_destination(job.key.destination.clone());
+        let request_scope = crate::scheduler::Scope::new(core.endpoint(), &job.key.route.org);
         let commands: Vec<_> = job.entries.iter().map(|entry| &entry.command).collect();
         let entries = &job.entries;
         let engine = &job.engine;
@@ -639,13 +613,8 @@ mod tests {
         assert_eq!(sequences, [2, 3, 4]);
     }
     #[test]
-    fn org_and_destination_budgets_are_shared_across_facades() {
-        let engine = Engine::new(
-            ServiceConfig::builder()
-                .max_org_rows(2)
-                .max_destination_rows(1)
-                .build(),
-        );
+    fn org_budgets_are_shared_across_facades() {
+        let engine = Engine::new(ServiceConfig::builder().max_org_rows(3).build());
         let a = queue();
         let b = queue();
         engine.submit(
@@ -668,8 +637,8 @@ mod tests {
             b.core.clone(),
             SubmitCommand::test_scoped_row("other-org", "p", "other"),
         );
-        assert_eq!(b.dropped_rows().queue_full, 2);
-        assert_eq!(engine.intake.lock().unwrap().rows, 3);
+        assert_eq!(b.dropped_rows().queue_full, 1);
+        assert_eq!(engine.intake.lock().unwrap().rows, 4);
     }
 
     #[test]
@@ -740,11 +709,7 @@ mod tests {
         y.await.unwrap();
         let state = engine.intake.lock().unwrap();
         assert_eq!((state.rows, state.bytes), (0, 0));
-        assert!(
-            state.org_rows.is_empty()
-                && state.destination_rows.is_empty()
-                && state.active.is_empty()
-        );
+        assert!(state.org_rows.is_empty() && state.active.is_empty());
     }
 
     #[tokio::test]

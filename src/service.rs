@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::runtime::{Handle, Id as RuntimeId};
 
 /// Process-wide SDK limits. Configure before constructing the first SDK facade.
-/// Additional process, organization, and destination budgets are opt-in.
+/// Additional process and organization budgets are opt-in.
 /// Per-client retained work remains bounded by its configured queue capacity.
 #[derive(Clone, Debug, PartialEq, Eq, bon::Builder)]
 pub struct ServiceConfig {
@@ -25,9 +25,6 @@ pub struct ServiceConfig {
     pub max_client_rows: Option<usize>,
     /// Maximum retained rows for one organization across client facades.
     pub max_org_rows: Option<usize>,
-    /// Maximum retained rows for one destination across client facades.
-    /// Unresolved names and explicit IDs have separate admission identities.
-    pub max_destination_rows: Option<usize>,
     /// Maximum entries in each shared project and server-capability cache.
     #[builder(default = 256)]
     pub max_cached_resolutions: usize,

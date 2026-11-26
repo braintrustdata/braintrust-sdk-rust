@@ -128,10 +128,6 @@ impl EncodedBatch {
             .collect()
     }
 
-    pub(crate) fn destination(&self) -> crate::destination::Destination {
-        crate::destination::Destination::row(&self.rows[0].overflow.object_ids)
-    }
-
     pub fn overflow_rows(&self) -> Vec<Logs3OverflowInputRow> {
         self.rows.iter().map(|row| row.overflow.clone()).collect()
     }

@@ -1300,11 +1300,9 @@ impl ExperimentRegistrar for BraintrustClient {
         let client = self.request_client(token)?;
         let scope = self.request_scope(&client, token, true);
         crate::service::execute(async move {
-            let response = crate::internal::upload::scheduled(
-                scope,
-                crate::internal::upload::RequestPolicy::ONCE,
-                || client.register_experiment(&request),
-            );
+            let response = crate::internal::upload::scheduled(scope, 0, || {
+                client.register_experiment(&request)
+            });
             Ok(response.await?.into_inner())
         })
         .await
@@ -1322,12 +1320,8 @@ impl BaseExperimentFetcher for BraintrustClient {
         let scope = self.request_scope(&client, token, true);
         let experiment_id = experiment_id.to_owned();
         let response = crate::service::execute(async move {
-            crate::internal::upload::scheduled(
-                scope,
-                crate::internal::upload::RequestPolicy::ONCE,
-                || client.base_experiment(&experiment_id),
-            )
-            .await
+            crate::internal::upload::scheduled(scope, 0, || client.base_experiment(&experiment_id))
+                .await
         })
         .await;
         let base_response: BaseExperimentResponse = match response {
@@ -1357,11 +1351,9 @@ impl ExperimentComparisonFetcher for BraintrustClient {
         let experiment_id = experiment_id.to_owned();
         let base_experiment_id = base_experiment_id.map(str::to_owned);
         let response = crate::service::execute(async move {
-            crate::internal::upload::scheduled(
-                scope,
-                crate::internal::upload::RequestPolicy::ONCE,
-                || client.experiment_comparison(&experiment_id, base_experiment_id.as_deref()),
-            )
+            crate::internal::upload::scheduled(scope, 0, || {
+                client.experiment_comparison(&experiment_id, base_experiment_id.as_deref())
+            })
             .await
         })
         .await?;
@@ -1379,11 +1371,8 @@ impl DatasetRegistrar for BraintrustClient {
         let client = self.request_client(token)?;
         let scope = self.request_scope(&client, token, true);
         crate::service::execute(async move {
-            let response = crate::internal::upload::scheduled(
-                scope,
-                crate::internal::upload::RequestPolicy::ONCE,
-                || client.register_dataset(&request),
-            );
+            let response =
+                crate::internal::upload::scheduled(scope, 0, || client.register_dataset(&request));
             Ok(response.await?.into_inner())
         })
         .await
@@ -1396,11 +1385,9 @@ impl DatasetFetcher for BraintrustClient {
         let client = self.request_client(token)?;
         let scope = self.request_scope(&client, token, false);
         crate::service::execute(async move {
-            let response = crate::internal::upload::scheduled(
-                scope,
-                crate::internal::upload::RequestPolicy::ONCE,
-                || client.btql_json_as::<_, BTQLResponse>(&query),
-            );
+            let response = crate::internal::upload::scheduled(scope, 0, || {
+                client.btql_json_as::<_, BTQLResponse>(&query)
+            });
             Ok(response.await?.into_inner())
         })
         .await
@@ -1418,12 +1405,8 @@ impl DatasetSummarizer for BraintrustClient {
         let scope = self.request_scope(&client, token, false);
         let dataset_id = dataset_id.to_owned();
         let response = crate::service::execute(async move {
-            crate::internal::upload::scheduled(
-                scope,
-                crate::internal::upload::RequestPolicy::ONCE,
-                || client.dataset_summary(&dataset_id),
-            )
-            .await
+            crate::internal::upload::scheduled(scope, 0, || client.dataset_summary(&dataset_id))
+                .await
         })
         .await?;
         Ok(response.into_inner())

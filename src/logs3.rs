@@ -83,9 +83,8 @@ impl Logs3BatchUploader {
         self
     }
 
-    /// Upload destination groups independently under the shared HTTP request cap.
-    /// Returns the first error after all destination groups finish; other groups
-    /// may have succeeded. Counts are returned when every group succeeds.
+    /// Upload rows in batches, stopping at the first failure. Earlier batches
+    /// may have been delivered.
     pub fn upload_rows(
         &self,
         rows: &[Map<String, Value>],
@@ -120,48 +119,19 @@ impl Logs3BatchUploader {
                         "failed to serialize logs3 row: {error}"
                     ))
                 })?;
-            let batches = EncodedBatch::partition_by_destination(
+            let batches = EncodedBatch::partition(
                 row_payloads,
                 batch_max_num_items.max(1),
                 (limits.max_request_size / 2).max(1),
             );
-
-            let mut groups = indexmap::IndexMap::new();
+            let mut result = Logs3UploadResult::default();
             for batch in batches {
-                groups
-                    .entry(batch.destination())
-                    .or_insert_with(Vec::new)
-                    .push(batch);
+                let uploaded = uploader.coordinator.upload(batch, limits).await?;
+                result.bytes_processed += uploaded.bytes_processed;
+                result.requests_sent += uploaded.requests_sent;
+                result.rows_uploaded += uploaded.rows_uploaded;
             }
-            let results = futures::future::join_all(groups.into_values().map(|batches| {
-                let coordinator = uploader.coordinator.clone();
-                async move {
-                    let mut result = Logs3UploadResult::default();
-                    for batch in batches {
-                        let uploaded = coordinator.upload(batch, limits).await?;
-                        result.bytes_processed += uploaded.bytes_processed;
-                        result.requests_sent += uploaded.requests_sent;
-                        result.rows_uploaded += uploaded.rows_uploaded;
-                    }
-                    Ok::<_, BraintrustError>(result)
-                }
-            }))
-            .await;
-            let mut total = Logs3UploadResult::default();
-            let mut error = None;
-            for result in results {
-                match result {
-                    Ok(uploaded) => {
-                        total.bytes_processed += uploaded.bytes_processed;
-                        total.requests_sent += uploaded.requests_sent;
-                        total.rows_uploaded += uploaded.rows_uploaded;
-                    }
-                    Err(failure) => {
-                        error.get_or_insert(failure);
-                    }
-                }
-            }
-            error.map_or(Ok(total), Err)
+            Ok(result)
         })
     }
 }
