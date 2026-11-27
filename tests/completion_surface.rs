@@ -61,12 +61,13 @@ async fn high_level_operations_work_from_a_plain_sync_thread() {
                 })
                 .build();
             span.log(Default::default()).blocking_wait().unwrap();
-            client.wait_for_login().blocking_wait().unwrap();
+            let selected = client.with_organization("org").blocking_wait().unwrap();
+            selected.wait_for_login().blocking_wait().unwrap();
             let dataset = client
+                .project("p")
                 .dataset_builder()
                 .blocking_wait()
                 .unwrap()
-                .project_name("p")
                 .dataset_name("d")
                 .build()
                 .unwrap();
@@ -87,7 +88,9 @@ async fn high_level_operations_work_from_a_plain_sync_thread() {
             );
             assert!(records.next().blocking_wait().unwrap().is_none());
             let experiment = client
-                .experiment_builder_with_credentials("key", "org")
+                .experiment_builder()
+                .blocking_wait()
+                .unwrap()
                 .project_name("p")
                 .experiment_name("e")
                 .build()

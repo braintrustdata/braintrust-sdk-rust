@@ -115,6 +115,29 @@ let anthropic_response = json!({
 let usage = extract_anthropic_usage(&anthropic_response);
 ```
 
+## Organizations and projects
+
+Use `project(name)` to log to a specific project. To work in another organization
+that your API key can access, call `with_organization(name)` and select a project
+from that client.
+
+```rust,no_run
+# use braintrust_sdk_rust::BraintrustClient;
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let client = BraintrustClient::builder().api_key("your-key").build().await?;
+let other_org = client.with_organization("another-org").await?;
+let evaluations = other_org.project("evaluations");
+
+let span = evaluations.span_builder().await?.build();
+span.end();
+evaluations.flush().await?;
+# Ok(())
+# }
+```
+
+A project handle's `flush()` waits for writes through that handle. Flushing its
+client also covers writes through the client's project handles.
+
 ## Service configuration
 
 Call `configure_service` before creating your first SDK client or bulk uploader.

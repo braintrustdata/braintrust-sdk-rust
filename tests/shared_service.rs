@@ -86,6 +86,84 @@ async fn delivery_survives_the_constructing_runtime() {
     client.flush().await.unwrap();
 }
 
+/// A credential gate stays open after release, including subsequent upload attempts.
+struct Gate(tokio::sync::watch::Receiver<bool>);
+#[async_trait::async_trait]
+impl TokenProvider for Gate {
+    async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let mut ready = self.0.clone();
+        ready.wait_for(|ready| *ready).await?;
+        Ok("token".into())
+    }
+}
+
+#[tokio::test]
+async fn project_flush_excludes_siblings_and_parent_includes_children() {
+    let server = MockServer::start().await;
+    accept(&server).await;
+    let client = client(&server);
+    let a = client.project("a");
+    let b = client.project("b");
+    let (release, gate) = tokio::sync::watch::channel(false);
+    b.log_rows_with_token_provider(Arc::new(Gate(gate)), "org", None, [row("b", "b")]);
+    a.log_rows_with_credentials("token", "org", None, [row("a", "a")]);
+    a.flush().await.unwrap();
+    let mut parent = Box::pin(client.flush().into_future());
+    assert!(futures::poll!(&mut parent).is_pending());
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/logs3")
+            .count(),
+        1
+    );
+    release.send(true).unwrap();
+    parent.await.unwrap();
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/logs3")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn project_shutdown_times_out_its_work_without_closing_siblings() {
+    use braintrust_sdk_rust::{EnqueueError, ExecutionError, ShutdownError, WriteError};
+    let server = MockServer::start().await;
+    accept(&server).await;
+    let client = client(&server);
+    let stopped = client.project("stopped");
+    let healthy = client.project("healthy");
+    let (_release, gate) = tokio::sync::watch::channel(false);
+    stopped.log_rows_with_token_provider(Arc::new(Gate(gate)), "org", None, [row("blocked", "p")]);
+    let pending = stopped.flush();
+    let shutdown = stopped.shutdown(Duration::from_millis(10));
+    let span = stopped
+        .span_builder_with_credentials("token", "org")
+        .project_name("p")
+        .build();
+    assert!(matches!(
+        span.log(Default::default()).submission(),
+        Err(WriteError::Admission(EnqueueError::Closed))
+    ));
+    assert!(matches!(
+        shutdown.await,
+        Err(ShutdownError::Execution(ExecutionError::TimedOut))
+    ));
+    assert!(pending.await.is_err());
+    healthy.log_rows_with_credentials("token", "org", None, [row("healthy", "p")]);
+    healthy.flush().await.unwrap();
+    client.flush().await.unwrap();
+}
+
 #[tokio::test]
 async fn shutdown_drains_accepted_writes_even_if_its_completion_is_dropped() {
     use braintrust_sdk_rust::{EnqueueError, FlushError};
@@ -210,6 +288,48 @@ async fn a_flush_excludes_submissions_after_its_cutoff() {
         1
     );
     client.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn org_selection_uses_discovered_endpoints_without_retargeting_existing_work() {
+    use wiremock::matchers::header;
+
+    let app = MockServer::start().await;
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"org_info":[
+            {"id":"a","name":"a","api_url":a.uri()},{"id":"b","name":"b","api_url":b.uri()}]})))
+        .mount(&app)
+        .await;
+    for (server, org) in [(&a, "a"), (&b, "b")] {
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .and(header("x-bt-org-name", org))
+            .and(header("authorization", "Bearer key"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+    let client = BraintrustClient::builder()
+        .api_key("key")
+        .app_url(app.uri())
+        .org_name("a")
+        .blocking_login(true)
+        .checked_delivery(true)
+        .build()
+        .await
+        .unwrap();
+    client.log_rows([row("first", "p")]).await.unwrap();
+    let other = client.with_organization("b").await.unwrap();
+    other.log_rows([row("second", "p")]).await.unwrap();
+    let (x, y) = tokio::join!(client.flush(), other.flush());
+    x.unwrap();
+    y.unwrap();
+    assert_eq!(client.login_state().org_id().as_deref(), Some("a"));
+    assert!(client.with_organization("forbidden").await.is_err());
 }
 
 /// Waits until released, then fails every request, including retries.
