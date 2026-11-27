@@ -14,6 +14,42 @@ pub(crate) struct Capabilities {
     pub overflow: bool,
 }
 
+impl Capabilities {
+    pub async fn resolve(
+        client: Result<api::Client>,
+        fallback: usize,
+        override_bytes: Option<usize>,
+    ) -> Self {
+        let server_limit = async {
+            let client = client?;
+            let endpoint = client.baseurl();
+            let cell = crate::resolution::capabilities(endpoint);
+            cell.get_or_try_init(|| async {
+                let version = api_result(client.version().await).await?.into_inner();
+                Ok::<_, BraintrustError>(version.logs3_payload_max_bytes.filter(|limit| *limit > 0))
+            })
+            .await
+            .copied()
+        }
+        .await
+        .unwrap_or_else(|error| {
+            warn!(%error, "failed to fetch ingestion capabilities");
+            None
+        });
+        let max_request_size = match (server_limit, override_bytes) {
+            (Some(server), Some(local)) => server.min(local),
+            (Some(server), None) => server,
+            (None, Some(local)) => local,
+            (None, None) => fallback,
+        }
+        .max(1);
+        Self {
+            max_request_size,
+            overflow: server_limit.is_some(),
+        }
+    }
+}
+
 /// Queue and bulk uploads use bounded backoff policies. Retries are shared across all stages and splits of one batch.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UploadPolicy {
@@ -134,27 +170,7 @@ impl UploadCoordinator {
         fallback: usize,
         override_bytes: Option<usize>,
     ) -> Capabilities {
-        let server_limit = match api_result(self.logs.version().await)
-            .await
-            .map(|v| v.into_inner())
-        {
-            Ok(version) => version.logs3_payload_max_bytes.filter(|limit| *limit > 0),
-            Err(error) => {
-                warn!(%error, "failed to fetch ingestion capabilities");
-                None
-            }
-        };
-        let max_request_size = match (server_limit, override_bytes) {
-            (Some(server), Some(local)) => server.min(local),
-            (Some(server), None) => server,
-            (None, Some(local)) => local,
-            (None, None) => fallback,
-        }
-        .max(1);
-        Capabilities {
-            max_request_size,
-            overflow: server_limit.is_some(),
-        }
+        Capabilities::resolve(Ok(self.logs.clone()), fallback, override_bytes).await
     }
 
     pub async fn upload(
