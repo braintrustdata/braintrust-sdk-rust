@@ -30,6 +30,10 @@ pub(super) struct Key {
 }
 
 impl Key {
+    pub(super) fn aliases(&self, other: &Self) -> bool {
+        self.destination.aliases(&other.destination)
+    }
+
     pub(super) fn merges_spans(&self) -> bool {
         matches!(self.destination, PartitionDestination::Span(_))
     }

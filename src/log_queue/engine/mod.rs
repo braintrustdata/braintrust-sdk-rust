@@ -3,6 +3,7 @@ mod dispatch;
 mod intake;
 mod job;
 mod partition;
+mod row_order;
 
 use self::{
     intake::{Entry, FinishedWrites, Intake, Record, RowOrderKey, WriteSender},
@@ -71,10 +72,13 @@ impl Engine {
         let mut entries = Vec::new();
         let mut selected = HashSet::new();
         while let Some(entry) = partition.pending.front() {
-            let predecessor = entry
-                .row
-                .as_ref()
-                .and_then(|row| row_order.get(row)?.range(..entry.sequence).next_back());
+            let predecessor = entry.row.as_ref().and_then(|row| {
+                row_order
+                    .get(row)?
+                    .range(..entry.sequence)
+                    .rev()
+                    .find(|(_, earlier)| key.aliases(earlier))
+            });
             if predecessor
                 .is_some_and(|(sequence, _)| !key.merges_spans() || !selected.contains(sequence))
             {
@@ -260,8 +264,8 @@ impl Engine {
         let mut intake = self.intake.lock().unwrap();
         let ready = rows
             .into_iter()
-            .filter_map(|row| intake.release_row(row))
-            .collect::<Vec<_>>();
+            .flat_map(|row| intake.release_row(row))
+            .collect::<HashSet<_>>();
         drop(intake);
         for key in ready {
             self.schedule(key);
@@ -271,7 +275,7 @@ impl Engine {
     fn retire_entries(self: &Arc<Self>, writes: Vec<(intake::ReleasedEntry, Option<WriteError>)>) {
         let mut intake = self.intake.lock().unwrap();
         let mut completed = FinishedWrites::default();
-        let mut ready = Vec::new();
+        let mut ready = HashSet::new();
         for (released, error) in writes {
             completed.retire(&mut intake, released.1, error);
             ready.extend(intake.release_row(released));

@@ -405,3 +405,16 @@ async fn a_timed_out_owner_is_removed_before_a_shared_batch_uploads() {
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
     assert_eq!(body["rows"][0]["id"], "active");
 }
+
+#[test]
+fn distinct_known_projects_can_reuse_the_same_row_id() {
+    let queue = queue();
+    let engine = Engine::manual();
+    for project in ["a", "b"] {
+        engine.submit(
+            queue.core.clone(),
+            SubmitCommand::test_scoped_row("same", project, "org"),
+        );
+    }
+    assert_eq!(engine.take_jobs().len(), 2);
+}
