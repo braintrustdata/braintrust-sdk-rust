@@ -161,7 +161,7 @@ struct SpanBatchProcessor {
     drops: Arc<DropCounters>,
     config: LogQueueConfig,
     login_state: LoginState,
-    client: reqwest::Client,
+    client: crate::http::SharedHttp,
     api_url: Url,
     app_url: Url,
     project_cache: TokioMutex<IndexMap<String, String>>,
@@ -172,7 +172,7 @@ impl SpanBatchProcessor {
         config: LogQueueConfig,
         drops: Arc<DropCounters>,
         login_state: LoginState,
-        client: reqwest::Client,
+        client: crate::http::SharedHttp,
         api_url: Url,
         app_url: Url,
     ) -> Arc<Self> {
@@ -199,7 +199,7 @@ impl SpanBatchProcessor {
         *self
             .version_info
             .get_or_init(|| async {
-                fetch_version_info(&self.client, api_url, token, org_name).await
+                fetch_version_info(&self.client.client(), api_url, token, org_name).await
             })
             .await
     }
@@ -441,7 +441,7 @@ impl SpanBatchProcessor {
         let send_futures = batches.into_iter().map(|batch| async move {
             let count = batch.len();
             let (delivered, result) = send_batch_counting(
-                &self.client,
+                &self.client.client(),
                 api_url,
                 token,
                 org_name,
@@ -524,7 +524,7 @@ impl SpanBatchProcessor {
 
         let token = credential.token().await?;
         let client = crate::http::api_client(
-            &self.client,
+            &self.client.client(),
             self.api_url.as_str(),
             app_url.as_str(),
             &token,
@@ -651,7 +651,7 @@ impl LogQueue {
         runtime: tokio::runtime::Handle,
         config: LogQueueConfig,
         login_state: LoginState,
-        client: reqwest::Client,
+        client: crate::http::SharedHttp,
         _worker_queue_size: usize,
         api_url: Url,
         app_url: Url,
@@ -846,7 +846,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             LogQueueConfig::builder().num_retries(0).build(),
             LoginState::new(),
-            reqwest::Client::new(),
+            crate::http::build_http_client(std::time::Duration::from_secs(30), None, None).unwrap(),
             32,
             Url::parse(&server.uri()).unwrap(),
             Url::parse(&server.uri()).unwrap(),
