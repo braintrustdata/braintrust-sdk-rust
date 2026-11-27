@@ -380,7 +380,7 @@ impl<S: SpanSubmitter> SpanBuilder<S> {
         token: impl Into<String>,
         org_id: impl Into<String>,
     ) -> Self {
-        Self::new_with_credential(submitter, Credential::Token(token.into()), org_id)
+        Self::new_with_credential(submitter, Credential::token_value(token.into()), org_id)
     }
 
     pub(crate) fn new_with_credential(

@@ -1,5 +1,6 @@
 use super::batching::{batch_and_serialize_maps, batch_and_serialize_rows, SerializedBatch};
 use super::config::LogQueueConfig;
+use super::credential::{Credential, TokenProvider};
 use super::http::{fetch_version_info, save_payload_debug, send_batch_counting};
 use super::merge::merge_row_into;
 use super::prepare::SpanRoute;
@@ -14,81 +15,11 @@ use crate::{
 use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
-use std::borrow::Cow;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use url::Url;
-
-/// Supplies the bearer token for queued uploads when they are sent.
-///
-/// The queue calls [`TokenProvider::token`] once per upload group each time it
-/// flushes. Resolving an uncached project name can also request a token.
-/// Cache tokens that are expensive to mint, and bound how long a call
-/// can take: a call that never returns stalls this client's uploads. When it
-/// returns an error, the rows waiting on it are dropped and counted in
-/// [`DroppedRows::upload_failed`].
-#[async_trait::async_trait]
-pub trait TokenProvider: Send + Sync {
-    /// Return the token for the next upload.
-    async fn token(&self) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>>;
-}
-
-/// How a queued item authenticates its upload.
-#[derive(Clone)]
-pub(crate) enum Credential {
-    Token(String),
-    /// Fetched when the item is sent. Items share a credential only if they share
-    /// the provider `Arc`.
-    Provider(Arc<dyn TokenProvider>),
-}
-
-impl std::fmt::Debug for Credential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Token(_) => "Token([redacted])",
-            Self::Provider(_) => "TokenProvider",
-        })
-    }
-}
-
-impl Credential {
-    async fn token(&self) -> std::result::Result<Cow<'_, str>, anyhow::Error> {
-        match self {
-            Self::Token(token) => Ok(Cow::Borrowed(token)),
-            Self::Provider(provider) => provider
-                .token()
-                .await
-                .map(Cow::Owned)
-                .map_err(|error| anyhow::anyhow!("token provider failed: {error}")),
-        }
-    }
-}
-
-impl PartialEq for Credential {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Token(a), Self::Token(b)) => a == b,
-            (Self::Provider(a), Self::Provider(b)) => {
-                std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
-            }
-            _ => false,
-        }
-    }
-}
-
-impl Eq for Credential {}
-
-impl Hash for Credential {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Self::Token(token) => token.hash(state),
-            Self::Provider(provider) => Arc::as_ptr(provider).cast::<()>().hash(state),
-        }
-    }
-}
 
 /// An item queued for deferred preparation and flushing, with the credential used
 /// to upload it.
@@ -702,7 +633,12 @@ impl LogQueue {
         org_name: Option<&str>,
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
-        self.submit_rows_with(Credential::Token(token.to_owned()), org_id, org_name, rows);
+        self.submit_rows_with(
+            Credential::token_value(token.to_owned()),
+            org_id,
+            org_name,
+            rows,
+        );
     }
 
     /// Return delivery receipts for writes admitted before their credentials were known.
@@ -713,7 +649,7 @@ impl LogQueue {
         org_name: Option<&str>,
         rows: Vec<Map<String, Value>>,
     ) -> Vec<Completion<DeliveryReceipt, WriteError>> {
-        let credential = Credential::Token(token.to_owned());
+        let credential = Credential::token_value(token.to_owned());
         rows.into_iter()
             .map(|row| {
                 self.enqueue(SubmitCommand {
