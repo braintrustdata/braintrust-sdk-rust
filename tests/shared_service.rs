@@ -524,3 +524,53 @@ async fn a_project_submitted_after_a_sibling_429_delivers_before_the_retry() {
         .expect("healthy project delivery");
     let _ = throttled.shutdown(Duration::ZERO).await;
 }
+
+#[tokio::test]
+async fn dataset_flush_reports_rejected_rows_when_client_capacity_is_full() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"org_info":[{"id":"org","name":"org"}]})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/dataset/register"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"project":{"id":"p","name":"p"},"dataset":{"id":"d","name":"d"}}),
+        ))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .api_key("key")
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .with_queue_max_size(1)
+        .blocking_login(true)
+        .build()
+        .await
+        .unwrap();
+    let dataset = client
+        .dataset_builder()
+        .await
+        .unwrap()
+        .project_name("p")
+        .dataset_name("d")
+        .build()
+        .unwrap();
+    let (release, gate) = tokio::sync::watch::channel(false);
+    client.log_rows_with_token_provider(Arc::new(Gate(gate)), "org", None, [row("held", "p")]);
+    dataset
+        .insert(
+            braintrust_sdk_rust::DatasetInsert::builder()
+                .input(json!("rejected"))
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(dataset.flush().await.is_err());
+    release.send(true).unwrap();
+}
