@@ -57,6 +57,7 @@ pub struct BraintrustClient {
     inner: Arc<ClientInner>,
 }
 
+#[derive(Clone)]
 struct ClientInner {
     pending_auth: Arc<pending_auth::PendingAuth>,
     settings: Arc<ClientSettings>,
@@ -677,7 +678,9 @@ impl BraintrustClient {
         let token = token.into();
         let org_id = org_id.into();
 
-        let submitter = Arc::new(self.clone());
+        let mut context = self.clone();
+        Arc::make_mut(&mut context.inner).resource_org = Some(org_id.clone());
+        let submitter = Arc::new(context);
         let mut builder = ExperimentBuilder::new(submitter, token, org_id);
         if let Some(project) = &self.inner.default_project {
             builder = builder.project_name(project);
@@ -2307,5 +2310,30 @@ mod tests {
             .unwrap()
             .iter()
             .all(|request| request.url.path() != "/logs3"));
+    }
+
+    #[test]
+    fn experiment_routes_by_organization_when_credentials_rotate() {
+        let client = BraintrustClient::builder()
+            .api_url("https://fallback.example")
+            .app_url("https://app.example")
+            .build_without_login()
+            .unwrap();
+        client.login_state().set(
+            "old".into(),
+            "org".into(),
+            "name".into(),
+            "https://discovered.example".into(),
+            "https://app.example".into(),
+        );
+        for (org, matches) in [("org", true), ("other", false)] {
+            let experiment = client
+                .experiment_builder_with_credentials("rotated", org)
+                .project_name("project")
+                .experiment_name("experiment")
+                .build()
+                .unwrap();
+            assert_eq!(experiment.submitter.uses_login_route("rotated"), matches);
+        }
     }
 }

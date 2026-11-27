@@ -634,3 +634,16 @@ async fn merged_rows_complete_all_owners_and_count_ancestor_loss_once() {
     assert_eq!(b.dropped_rows().upload_failed, 1);
     assert_eq!(root.dropped_rows().upload_failed, 1);
 }
+
+#[test]
+fn distinct_known_projects_can_reuse_the_same_row_id() {
+    let queue = queue();
+    let engine = Engine::manual(ServiceConfig::default());
+    for project in ["a", "b"] {
+        engine.submit(
+            queue.core.clone(),
+            SubmitCommand::test_scoped_row("same", project, "org"),
+        );
+    }
+    assert_eq!(engine.take_jobs().len(), 2);
+}
