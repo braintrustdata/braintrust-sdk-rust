@@ -14,6 +14,7 @@ pub(super) struct Entry {
     pub(super) command: SubmitCommand,
     pub(super) sequence: u64,
     pub(super) row: Option<RowOrderKey>,
+    pub(super) route: OrgKey,
 }
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(super) struct RowOrderKey {
@@ -21,11 +22,19 @@ pub(super) struct RowOrderKey {
     pub(super) id: String,
 }
 
-pub(super) type ReleasedEntry = (Option<RowOrderKey>, u64);
+pub(super) struct ReleasedEntry {
+    pub(super) sequence: u64,
+    row: Option<RowOrderKey>,
+    route: OrgKey,
+}
 
 impl Entry {
     pub(super) fn release(self) -> ReleasedEntry {
-        (self.row, self.sequence)
+        ReleasedEntry {
+            sequence: self.sequence,
+            row: self.row,
+            route: self.route,
+        }
     }
 }
 
@@ -40,6 +49,8 @@ pub(super) struct Intake {
     pub(super) records: HashMap<u64, Record>,
     pub(super) partitions: HashMap<Key, Partition>,
     pub(super) row_order: HashMap<RowOrderKey, RowOrder>,
+    pub(super) retained: usize,
+    pub(super) org_rows: HashMap<OrgKey, usize>,
 }
 
 #[derive(Default)]
@@ -59,7 +70,19 @@ impl RowOrder {
 }
 
 impl Intake {
-    pub(super) fn release_row(&mut self, (row, sequence): ReleasedEntry) -> Vec<Key> {
+    pub(super) fn release_row(&mut self, released: ReleasedEntry) -> Vec<Key> {
+        let ReleasedEntry {
+            row,
+            sequence,
+            route,
+        } = released;
+        self.retained -= 1;
+        if let Some(rows) = self.org_rows.get_mut(&route) {
+            *rows -= 1;
+            if *rows == 0 {
+                self.org_rows.remove(&route);
+            }
+        }
         let Some(row) = row else {
             return Vec::new();
         };
