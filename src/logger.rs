@@ -461,6 +461,7 @@ impl BraintrustClient {
                 "Login state already set".to_string(),
             ));
         }
+        crate::resolution::remember_org(client.baseurl(), &org.id, &org.name);
         self.inner.login_notify.notify_waiters();
         Ok(())
     }

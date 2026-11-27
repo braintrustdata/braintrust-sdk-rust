@@ -214,7 +214,10 @@ impl SpanBatchProcessor {
             };
 
             let org = crate::resolution::OrgIdentity::new(&org_id, org_name.as_deref(), &token);
-            let scope = crate::scheduler::Scope::new(api_url.as_str(), org.scope_key());
+            let scope = crate::scheduler::Scope::new(
+                api_url.as_str(),
+                org.request_scope_key(api_url.as_str()),
+            );
             // Version info reflects a server-wide limit, so it is fetched once
             // (with the first group's credentials) and cached.
             let (max_request_size, can_use_overflow) =
