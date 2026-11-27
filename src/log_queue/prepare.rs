@@ -169,3 +169,66 @@ impl SpanRoute {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload() -> SpanPayload {
+        SpanPayload {
+            row_id: "row".into(),
+            span_id: "child".into(),
+            is_merge: false,
+            span_components: None,
+            org_id: "org".into(),
+            org_name: None,
+            project_name: None,
+            input: None,
+            output: None,
+            expected: None,
+            error: None,
+            scores: None,
+            metadata: None,
+            metrics: None,
+            tags: None,
+            context: None,
+            span_attributes: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn parent(metadata: serde_json::Value) -> ParentSpanInfo {
+        ParentSpanInfo::FullSpan {
+            object_type: SpanObjectType::ProjectLogs,
+            object_id: None,
+            compute_object_metadata_args: Some(metadata.as_object().unwrap().clone()),
+            span_id: "parent".into(),
+            root_span_id: "root".into(),
+            span_parents: None,
+            propagated_event: None,
+        }
+    }
+
+    #[test]
+    fn rejected_span_uses_metadata_project_id_and_preserves_its_ancestry() {
+        let payload = payload();
+        let parent = parent(serde_json::json!({"project_id": "project", "project_name": "name"}));
+        let row = SpanRoute::new(&payload, Some(&parent))
+            .unwrap()
+            .into_known_row(payload)
+            .expect("metadata supplies a usable project ID");
+        assert_eq!(row.destination.project_id(), Some("project"));
+        assert_eq!(row.root_span_id, "root");
+        assert_eq!(row.span_parents, Some(vec!["parent".into()]));
+    }
+
+    #[test]
+    fn rejected_span_with_only_a_project_name_has_no_debug_row() {
+        let payload = payload();
+        let parent = parent(serde_json::json!({"project_name": "name"}));
+        assert!(SpanRoute::new(&payload, Some(&parent))
+            .unwrap()
+            .into_known_row(payload)
+            .is_none());
+    }
+}
