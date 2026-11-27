@@ -42,12 +42,16 @@ struct BackgroundLogin {
     pending: std::sync::Mutex<Option<(String, Option<String>)>>,
     running: std::sync::atomic::AtomicBool,
 }
-struct LoginRunning(Arc<BackgroundLogin>);
+struct LoginRunning {
+    login: Arc<BackgroundLogin>,
+    notify: Arc<Notify>,
+}
 impl Drop for LoginRunning {
     fn drop(&mut self) {
-        self.0
+        self.login
             .running
             .store(false, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
     }
 }
 
@@ -561,17 +565,22 @@ impl BraintrustClient {
     /// dropped with its runtime stays pending, so the next wait restarts it.
     fn resume_background_login(&self) {
         let login = &self.inner.background_login;
-        if login
-            .running
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return;
-        }
-        let running = LoginRunning(login.clone());
-        // Read only once running: a login that finished cleared `pending`
-        // before it stopped running, so this cannot start a stale second one.
-        let Some((api_key, org_name)) = login.pending.lock().unwrap().clone() else {
-            return;
+        let (api_key, org_name) = {
+            let pending = login.pending.lock().unwrap();
+            let Some(credentials) = pending.as_ref() else {
+                return;
+            };
+            if login
+                .running
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+            credentials.clone()
+        };
+        let running = LoginRunning {
+            login: login.clone(),
+            notify: self.inner.login_notify.clone(),
         };
         let client = self.clone();
         crate::service::global().expect("initialized service").spawn_operation(async move {
@@ -599,39 +608,34 @@ impl BraintrustClient {
 
     /// Wait for login state to be available.
     async fn wait_for_login_state(&self) -> Result<LoginState> {
-        // Check if already logged in
-        if self.inner.login_state.is_logged_in() {
-            return Ok(self.inner.login_state.clone());
-        }
-
-        self.resume_background_login();
-
-        // Get notification future BEFORE checking state to avoid race condition
-        let notified = self.inner.login_notify.notified();
-
-        // Check state again (may have been set between our first check and now)
-        if self.inner.login_state.is_logged_in() {
-            return Ok(self.inner.login_state.clone());
-        }
-
-        // Wait for notification or timeout
-        tokio::select! {
-            _ = notified => {
-                // Login completed - return the login state
+        tokio::time::timeout(LOGIN_TIMEOUT, async {
+            loop {
+                // Register before checking state so a task dropping concurrently
+                // wakes this waiter even if its runtime has already stopped.
+                let notified = self.inner.login_notify.notified();
+                self.resume_background_login();
+                let is_pending = self
+                    .inner
+                    .background_login
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .is_some();
                 if self.inner.login_state.is_logged_in() {
-                    Ok(self.inner.login_state.clone())
-                } else {
-                    Err(BraintrustError::InvalidConfig(
-                        "Login notification received but state not set".into(),
-                    ))
+                    return Ok(self.inner.login_state.clone());
                 }
+                if !is_pending {
+                    return Err(BraintrustError::InvalidConfig(
+                        "Login notification received but state not set".into(),
+                    ));
+                }
+                notified.await;
             }
-            _ = tokio::time::sleep(LOGIN_TIMEOUT) => {
-                Err(BraintrustError::InvalidConfig(
-                    "Timeout waiting for login to complete".into(),
-                ))
-            }
-        }
+        })
+        .await
+        .map_err(|_| {
+            BraintrustError::InvalidConfig("Timeout waiting for login to complete".into())
+        })?
     }
 
     /// Create an experiment builder with explicit credentials.
@@ -1475,6 +1479,43 @@ mod tests {
         let login_state = client.wait_for_login().await.expect("login should succeed");
         assert_eq!(login_state.org_id().as_deref(), Some("org-1"));
         assert!(client.is_logged_in());
+    }
+
+    #[tokio::test]
+    async fn waiting_login_restarts_when_the_previous_task_drops() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/apikey/login"))
+            .respond_with(mock_login_response(&[("org-1", "Test Org")]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .api_key("test-api-key")
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .skip_login(true)
+            .build()
+            .await
+            .unwrap();
+        let login = &client.inner.background_login;
+        *login.pending.lock().unwrap() = Some(("test-api-key".into(), None));
+        login
+            .running
+            .store(true, std::sync::atomic::Ordering::Release);
+        let stopped = LoginRunning {
+            login: login.clone(),
+            notify: client.inner.login_notify.clone(),
+        };
+        let mut wait = std::pin::pin!(client.wait_for_login_state());
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        drop(stopped);
+
+        let state = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .expect("the old task must wake the waiting login")
+            .unwrap();
+        assert_eq!(state.org_id().as_deref(), Some("org-1"));
     }
 
     #[tokio::test]
