@@ -2,7 +2,7 @@
 use crate::error::{BraintrustError, Result};
 use crate::http::api_result;
 use crate::scheduler::{self, Scope, SCOPE};
-use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, Retryable};
+use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use std::{future::Future, time::Duration};
 use tracing::warn;
 
@@ -40,18 +40,18 @@ async fn attempt<T>(
         .map_err(|error| Attempt { error, retry_after })
 }
 
-/// Wait at least as long as the server asked, without retrying once the budget is exhausted.
-/// A 429 pauses its scope, even when this request has no retries left, so
-/// other requests sharing the limit do not repeat the rejected attempt.
+// Keep terminal 429s visible to other requests even without a server hint.
+const DEFAULT_COOLDOWN: Duration = Duration::from_secs(1);
+
 fn retry_delay(attempt: &Attempt, backoff: Option<Duration>) -> Option<Duration> {
     let hint = attempt.retry_after.map(|hint| hint.min(MAX_RETRY_AFTER));
-    let delay = backoff.map(|backoff| hint.map_or(backoff, |hint| hint.max(backoff)));
-    if matches!(attempt.error, BraintrustError::Api { status: 429, .. }) {
-        if let Some(wait) = delay.or(hint) {
-            scheduler::shared().cool_down(wait);
-        }
-    }
+    backoff.map(|backoff| hint.map_or(backoff, |hint| hint.max(backoff)))
+}
+
+fn cooldown(attempt: &Attempt, delay: Option<Duration>) -> Duration {
     delay
+        .or_else(|| attempt.retry_after.map(|hint| hint.min(MAX_RETRY_AFTER)))
+        .unwrap_or(DEFAULT_COOLDOWN)
 }
 
 /// Issue a request through the shared scheduler within `scope`: it waits out
@@ -71,7 +71,7 @@ where
         .await
 }
 
-// Borrowing the iterator lets backon share retries across overflow stages and splits.
+// Reuse the iterator across all overflow stages and splits.
 pub(crate) struct RetryBudget {
     delays: ExponentialBackoff,
     requests: usize,
@@ -93,22 +93,30 @@ impl RetryBudget {
         F: FnMut() -> Fut,
         Fut: Future<Output = std::result::Result<T, crate::api::Error<serde_json::Value>>>,
     {
-        (|| {
+        loop {
+            let permit = scheduler::shared().acquire().await;
             self.requests += 1;
-            let operation = operation();
-            async move {
-                let _permit = scheduler::shared().acquire().await;
-                attempt(operation.await).await
+            let failure = match attempt(operation().await).await {
+                Ok(result) => return Ok(result),
+                Err(failure) => failure,
+            };
+            let delay = if retryable(&failure.error) {
+                retry_delay(&failure, self.delays.next())
+            } else {
+                None
+            };
+            if matches!(failure.error, BraintrustError::Api { status: 429, .. }) {
+                // Releasing a slot wakes other waiters, so publish the pause first.
+                scheduler::shared().cool_down(cooldown(&failure, delay));
             }
-        })
-        .retry(&mut self.delays)
-        .when(|attempt| retryable(&attempt.error))
-        .adjust(retry_delay)
-        .notify(|attempt, delay| {
-            warn!(error = %attempt.error, ?delay, "ingestion request failed, retrying")
-        })
-        .await
-        .map_err(|attempt| attempt.error)
+            drop(permit);
+
+            let Some(delay) = delay else {
+                return Err(failure.error);
+            };
+            warn!(error = %failure.error, ?delay, "ingestion request failed, retrying");
+            tokio::time::sleep(delay).await;
+        }
     }
 }
 
@@ -176,6 +184,11 @@ mod tests {
             retry_delay(&rate_limited(Some(Duration::from_secs(20))), None),
             None,
             "an exhausted retry budget must stay exhausted"
+        );
+        assert_eq!(cooldown(&rate_limited(None), None), DEFAULT_COOLDOWN);
+        assert_eq!(
+            cooldown(&rate_limited(Some(Duration::from_secs(20))), None),
+            Duration::from_secs(20)
         );
     }
 }
