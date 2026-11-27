@@ -684,7 +684,7 @@ async fn upload_timeout_preserves_the_original_error_for_flush_and_write() {
     let write = engine.submit(queue.core.clone(), SubmitCommand::test_row("timed-out"));
     let flush = engine.barrier(&queue.core.observation);
     let (key, entries) = engine.take_jobs().pop().unwrap();
-    engine.clone().process_job(key, entries).await;
+    engine.clone().process_job(key, entries, None).await;
 
     let WriteError::Delivery(write) = write.await.unwrap_err() else {
         panic!("expected delivery failure");
