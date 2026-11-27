@@ -9,8 +9,10 @@ pub(crate) struct Scope {
 }
 impl Scope {
     pub fn new(endpoint: impl Into<String>, org: impl Into<String>) -> Self {
+        let mut endpoint = endpoint.into();
+        endpoint.truncate(endpoint.trim_end_matches('/').len());
         Self {
-            endpoint: endpoint.into(),
+            endpoint,
             org: org.into(),
             destination: None,
         }
