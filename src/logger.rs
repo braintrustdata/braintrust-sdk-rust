@@ -1,3 +1,5 @@
+mod pending_auth;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -459,6 +461,7 @@ impl BraintrustClientBuilder {
                 queue,
                 login_state,
                 login_notify: Notify::new(),
+                pending_auth: Arc::default(),
                 http_client,
                 default_project: self.default_project,
                 login_skipped: self.skip_login,
@@ -483,6 +486,7 @@ pub struct BraintrustClient {
 }
 
 struct ClientInner {
+    pending_auth: Arc<pending_auth::PendingAuth>,
     #[allow(dead_code)]
     api_url: Url,
     explicit_api_url: bool,
@@ -679,10 +683,15 @@ impl BraintrustClient {
         exported: &str,
         event: crate::span::SpanLog,
     ) -> crate::Completion<(), BraintrustError> {
+        let reservation = match self.inner.pending_auth.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => return crate::Completion::finished(Err(error)),
+        };
         let client = self.clone();
         let exported = exported.to_owned();
         crate::operation::submit(async move {
-            let login_state = if client.inner.login_state.is_logged_in() {
+            let auth = async {
+                let login_state = if client.inner.login_state.is_logged_in() {
                 client.inner.login_state.clone()
             } else if client.inner.login_skipped {
                 return Err(BraintrustError::InvalidConfig(
@@ -698,9 +707,14 @@ impl BraintrustClient {
             let org_id = login_state
                 .org_id()
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-            client
-                .update_span_internal(api_key, org_id, login_state.org_name(), &exported, event)
-                .map(|_| ())
+                Ok((api_key, org_id, login_state.org_name()))
+            }.await;
+            reservation.publish(|| {
+                let (api_key, org_id, org_name) = auth?;
+                client
+                    .update_span_internal(api_key, org_id, org_name, &exported, event)
+                    .map(|write| vec![write])
+            })
         })
     }
 
@@ -719,7 +733,7 @@ impl BraintrustClient {
         let token = token.into();
         let org_id = org_id.into();
 
-        self.update_span_internal(token, org_id, None, exported, event)
+        self.update_span_with_credentials_tracked(token, org_id, exported, event)
             .map(|_| ())
     }
 
@@ -734,7 +748,12 @@ impl BraintrustClient {
         exported: &str,
         event: crate::span::SpanLog,
     ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
-        self.update_span_internal(token.into(), org_id.into(), None, exported, event)
+        self.inner
+            .pending_auth
+            .direct(|| {
+                self.update_span_internal(token.into(), org_id.into(), None, exported, event)
+            })
+            .unwrap_or_else(|| Err(pending_auth::closed()))
     }
 
     fn update_span_internal(
@@ -837,7 +856,10 @@ impl BraintrustClient {
             extra: event_data.extra,
         };
 
-        let completion = self.submit_payload(Credential::Token(token), payload, None);
+        let completion = self
+            .inner
+            .queue
+            .submit(Credential::Token(token), payload, None);
         if let Err(error) = completion.submission() {
             return Err(BraintrustError::Background(error.to_string()));
         }
@@ -999,7 +1021,10 @@ impl BraintrustClient {
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
-        self.inner.queue.submit(credential, payload, parent_info)
+        self.inner
+            .pending_auth
+            .direct(|| self.inner.queue.submit(credential, payload, parent_info))
+            .unwrap_or_else(|| crate::Completion::finished(Err(crate::EnqueueError::Closed.into())))
     }
 
     /// Queue caller-built rows for upload to `/logs3` using the logged-in credentials.
@@ -1010,9 +1035,14 @@ impl BraintrustClient {
         &self,
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) -> crate::Completion<(), BraintrustError> {
+        let reservation = match self.inner.pending_auth.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => return crate::Completion::finished(Err(error)),
+        };
         let client = self.clone();
         let rows: Vec<_> = rows.into_iter().collect();
         crate::operation::submit(async move {
+            let auth = async {
             if client.inner.login_skipped {
                 return Err(BraintrustError::InvalidConfig(
                 "log_rows() requires login; use log_rows_with_credentials() when skip_login is enabled".into(),
@@ -1025,8 +1055,17 @@ impl BraintrustClient {
             let org_id = state
                 .org_id()
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-            client.log_rows_with_credentials(&api_key, &org_id, state.org_name().as_deref(), rows);
-            Ok(())
+                Ok((api_key, org_id, state.org_name()))
+            }.await;
+            reservation.publish(|| {
+                let (api_key, org_id, org_name) = auth?;
+                Ok(client.inner.queue.submit_rows_tracked(
+                    &api_key,
+                    &org_id,
+                    org_name.as_deref(),
+                    rows,
+                ))
+            })
         })
     }
 
@@ -1050,7 +1089,10 @@ impl BraintrustClient {
         org_name: Option<&str>,
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
-        self.inner.queue.submit_rows(token, org_id, org_name, rows);
+        let rows: Vec<_> = rows.into_iter().collect();
+        self.inner
+            .pending_auth
+            .direct(|| self.inner.queue.submit_rows(token, org_id, org_name, rows));
     }
 
     /// Queue caller-built rows for upload to `/logs3`, fetching the token from
@@ -1068,9 +1110,12 @@ impl BraintrustClient {
         org_name: Option<&str>,
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
-        self.inner
-            .queue
-            .submit_rows_with_provider(provider, org_id, org_name, rows);
+        let rows: Vec<_> = rows.into_iter().collect();
+        self.inner.pending_auth.direct(|| {
+            self.inner
+                .queue
+                .submit_rows_with_provider(provider, org_id, org_name, rows)
+        });
     }
 
     /// Cumulative counts of rows this client discarded instead of uploading.
@@ -1084,13 +1129,59 @@ impl BraintrustClient {
         &self,
         timeout: std::time::Duration,
     ) -> crate::Completion<crate::ShutdownReport, crate::ShutdownError> {
-        self.inner.queue.shutdown(timeout)
+        let started = tokio::time::Instant::now();
+        let (result, pending) = self.inner.pending_auth.snapshot(true, |empty| {
+            if empty {
+                Ok(self.inner.queue.shutdown(timeout))
+            } else {
+                Err(self.inner.queue.flush())
+            }
+        });
+        let barrier = match result {
+            Ok(shutdown) => return shutdown,
+            Err(barrier) => barrier,
+        };
+        let client = self.clone();
+        crate::operation::submit(async move {
+            match tokio::time::timeout(
+                timeout.saturating_sub(started.elapsed()),
+                pending_auth::join(barrier, pending),
+            )
+            .await
+            {
+                Ok(result) => {
+                    client
+                        .inner
+                        .queue
+                        .shutdown(timeout.saturating_sub(started.elapsed()))
+                        .await?;
+                    result
+                        .map(|report| crate::ShutdownReport {
+                            delivered: report.delivered,
+                        })
+                        .map_err(Into::into)
+                }
+                Err(_) => {
+                    client.inner.pending_auth.abort();
+                    let _ = client.inner.queue.shutdown(std::time::Duration::ZERO).await;
+                    Err(crate::ExecutionError::TimedOut.into())
+                }
+            }
+        })
     }
 
     /// Capture a cutoff immediately and observe delivery of the covered batch.
     /// New writes belong to later work; completed failures are never replayed.
     pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
-        self.inner.queue.flush()
+        let (barrier, pending) = self
+            .inner
+            .pending_auth
+            .snapshot(false, |_| self.inner.queue.flush());
+        if pending.is_empty() {
+            barrier
+        } else {
+            crate::operation::submit(pending_auth::join(barrier, pending))
+        }
     }
 
     /// Trigger a non-blocking background flush.
