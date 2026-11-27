@@ -328,7 +328,7 @@ cb0bfZ7fHHs=
                 .install_default()
                 .expect("install ring crypto provider");
         });
-        let certificate = generate_simple_self_signed(vec!["localhost".to_string()])
+        let certificate = generate_simple_self_signed(vec!["127.0.0.1".to_string()])
             .expect("generate test certificate");
         let certificate_pem = certificate.cert.pem();
         let certificate_der: CertificateDer<'static> = certificate.cert.der().clone();
@@ -372,11 +372,7 @@ cb0bfZ7fHHs=
             }
         });
 
-        (
-            format!("https://localhost:{}", address.port()),
-            certificate_pem,
-            server,
-        )
+        (format!("https://{address}"), certificate_pem, server)
     }
 
     #[test]
