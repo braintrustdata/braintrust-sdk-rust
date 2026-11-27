@@ -37,3 +37,8 @@ impl From<crate::FlushError> for BraintrustError {
         Self::Background(error.to_string())
     }
 }
+impl From<crate::ExecutionError> for BraintrustError {
+    fn from(error: crate::ExecutionError) -> Self {
+        Self::Background(error.to_string())
+    }
+}

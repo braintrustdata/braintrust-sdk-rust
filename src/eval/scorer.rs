@@ -8,7 +8,7 @@ use super::types::{Score, ScorerArgs, Scores};
 /// Scorer trait for evaluating task outputs
 ///
 /// Scorers compare the task output against expected values and produce numeric scores.
-/// Only async version is needed - SyncEvaluator uses this via Runtime::block_on().
+/// The evaluator awaits this callback, including when its own completion is observed synchronously.
 #[async_trait]
 pub trait Scorer<I, O>: Send + Sync {
     /// Name of this scorer (used in results)

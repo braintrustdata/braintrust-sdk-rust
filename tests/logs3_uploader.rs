@@ -88,7 +88,7 @@ async fn uploader_splits_batches_on_413_without_overflow() {
         .mount(&server)
         .await;
 
-    let mut uploader = Logs3BatchUploader::new(server.uri(), "test-key", None).expect("uploader");
+    let uploader = Logs3BatchUploader::new(server.uri(), "test-key", None).expect("uploader");
     let rows = vec![make_row("1", 32), make_row("2", 32), make_row("3", 32)];
 
     let result = uploader.upload_rows(&rows, 100).await.expect("upload");
@@ -149,7 +149,7 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
         .mount(&server)
         .await;
 
-    let mut uploader =
+    let uploader =
         Logs3BatchUploader::new(server.uri(), "test-key", Some("my-org".into())).expect("uploader");
     let rows = vec![make_row("big", 8_000)];
 
@@ -206,7 +206,7 @@ async fn uploader_does_not_retry_malformed_overflow_responses() {
         .expect(1)
         .mount(&server)
         .await;
-    let mut uploader = Logs3BatchUploader::new(server.uri(), "key", None).unwrap();
+    let uploader = Logs3BatchUploader::new(server.uri(), "key", None).unwrap();
     let error = uploader
         .upload_rows(&[make_row("big", 8000)], 100)
         .await

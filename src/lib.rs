@@ -11,6 +11,7 @@ mod json_merge;
 mod log_queue;
 mod logger;
 mod logs3;
+mod operation;
 mod span;
 mod span_components;
 mod stream;
