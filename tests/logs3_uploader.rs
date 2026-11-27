@@ -10,6 +10,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 #[test]
 fn uploader_rejects_malformed_custom_ca_bundle() {
+    support::use_dedicated_runtime();
     let error = Logs3BatchUploader::new_with_custom_ca_bundle_pem(
         "https://example.com",
         "test-key",

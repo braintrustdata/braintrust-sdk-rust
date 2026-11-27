@@ -2192,22 +2192,24 @@ mod tests {
 
     // A batch of spans resolves its shared credential after the writes are queued.
     #[tokio::test]
-    async fn span_builder_with_token_provider_resolves_once_at_upload() {
+    async fn span_builder_with_token_provider_resolves_at_upload() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-        #[derive(Default)]
-        struct Rotating {
+        // Delivery starts immediately, so the gate holds sends until the token rotates.
+        struct State {
             rotated: AtomicBool,
             calls: AtomicUsize,
+            gate: tokio::sync::Semaphore,
         }
-
+        struct Rotating(Arc<State>);
         #[async_trait::async_trait]
         impl TokenProvider for Rotating {
             async fn token(
                 &self,
             ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(if self.rotated.load(Ordering::SeqCst) {
+                drop(self.0.gate.acquire().await?);
+                self.0.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(if self.0.rotated.load(Ordering::SeqCst) {
                     "refreshed"
                 } else {
                     "expired"
@@ -2224,16 +2226,21 @@ mod tests {
                 "Bearer refreshed",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-            .expect(1)
+            .expect(1..=2)
             .mount(&server)
             .await;
         let client = BraintrustClient::builder()
             .api_url(server.uri())
+            .checked_delivery(true)
             .build_without_login()
             .unwrap();
-        let provider = Arc::new(Rotating::default());
+        let state = Arc::new(State {
+            rotated: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            gate: tokio::sync::Semaphore::new(0),
+        });
         let builder = client
-            .span_builder_with_token_provider(provider.clone(), "org")
+            .span_builder_with_token_provider(Arc::new(Rotating(state.clone())), "org")
             .parent_info(ParentSpanInfo::ProjectLogs {
                 object_id: "project".into(),
             });
@@ -2242,23 +2249,32 @@ mod tests {
             span.log(crate::SpanLog::builder().name(id).build().unwrap());
         }
 
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-        provider.rotated.store(true, Ordering::SeqCst);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        state.rotated.store(true, Ordering::SeqCst);
+        state.gate.add_permits(1);
         client.flush().await.unwrap();
 
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-        let uploaded = server.received_requests().await.unwrap();
-        let batch = uploaded
-            .iter()
-            .find(|request| request.url.path() == "/logs3")
-            .unwrap();
-        let body: Value = serde_json::from_slice(&batch.body).unwrap();
-        let ids: Vec<_> = body["rows"]
-            .as_array()
+        let uploads: Vec<_> = server
+            .received_requests()
+            .await
             .unwrap()
-            .iter()
-            .map(|row| row["id"].as_str().unwrap())
+            .into_iter()
+            .filter(|request| request.url.path() == "/logs3")
             .collect();
+        assert_eq!(state.calls.load(Ordering::SeqCst), uploads.len());
+        let mut ids: Vec<String> = uploads
+            .iter()
+            .flat_map(|request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                body["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort();
         assert_eq!(ids, ["first", "second"]);
     }
 
