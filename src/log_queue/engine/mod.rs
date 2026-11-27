@@ -57,7 +57,7 @@ impl Engine {
             return;
         };
         if let Some(entries) = self.take_job(&key) {
-            runtime.spawn(self.clone().process_job(key, entries));
+            runtime.spawn(self.clone().process_job(key, entries, Some(runtime.id())));
         }
     }
 
@@ -328,13 +328,14 @@ impl Engine {
     }
 
     /// The job exists before the future is first polled, so a runtime that
-    /// drops the task unpolled still reports the lost worker.
+    /// drops the task unpolled still requeues its rows.
     fn process_job(
         self: Arc<Self>,
         key: Key,
         entries: Vec<Entry>,
+        runtime: Option<tokio::runtime::Id>,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
-        Job::new(self, key, entries).run()
+        Job::new(self, key, entries, runtime).run()
     }
 }
 

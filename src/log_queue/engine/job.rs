@@ -11,16 +11,25 @@ pub(super) struct Job {
     pub(super) entries: Vec<Option<Entry>>,
     pub(super) report: Report,
     pub(super) retry_cancelled: bool,
+    runtime: Option<tokio::runtime::Id>,
+    finished: bool,
 }
 
 impl Job {
-    pub(super) fn new(engine: Arc<Engine>, key: Key, entries: Vec<Entry>) -> Self {
+    pub(super) fn new(
+        engine: Arc<Engine>,
+        key: Key,
+        entries: Vec<Entry>,
+        runtime: Option<tokio::runtime::Id>,
+    ) -> Self {
         Self {
             report: Report::new(entries.len()),
             engine,
             key,
             entries: entries.into_iter().map(Some).collect(),
             retry_cancelled: false,
+            runtime,
+            finished: false,
         }
     }
 
@@ -66,6 +75,7 @@ impl Job {
                 }
             }
         }
+        self.finished = true;
     }
 
     pub(super) fn discard_expired(&mut self) {
@@ -124,12 +134,19 @@ impl Drop for Job {
     fn drop(&mut self) {
         self.report.settle_delivered();
         self.retire_ready();
+        if !self.finished && self.entries.iter().any(Option::is_some) {
+            if let Some(runtime) = self.runtime {
+                crate::runtime::mark_stopped(runtime);
+            }
+        }
         let engine = &self.engine;
         let mut intake = engine.intake.lock().unwrap();
         let mut requeue = Vec::new();
         let mut discarded = Vec::new();
         for entry in std::mem::take(&mut self.entries).into_iter().flatten() {
-            if self.retry_cancelled && intake.records.contains_key(&entry.sequence) {
+            if (!self.finished || self.retry_cancelled)
+                && intake.records.contains_key(&entry.sequence)
+            {
                 requeue.push(entry);
             } else {
                 discarded.push(entry);
