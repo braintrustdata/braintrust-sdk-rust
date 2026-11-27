@@ -128,6 +128,12 @@ impl Drop for Reservation {
     }
 }
 
+pub(super) fn rejected<T, E>(error: E) -> Completion<T, E> {
+    let (_, mut completion) = Completion::pair();
+    completion.record_issuance(Err(error));
+    completion
+}
+
 pub(super) fn closed() -> BraintrustError {
     BraintrustError::Background(EnqueueError::Closed.to_string())
 }
