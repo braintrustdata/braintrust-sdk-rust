@@ -1,5 +1,6 @@
 mod batching;
 mod config;
+mod credential;
 mod http;
 mod merge;
 mod prepare;
@@ -8,5 +9,6 @@ mod row_key;
 
 // Public API exports
 pub use config::LogQueueConfig;
-pub(crate) use queue::Credential;
-pub use queue::{DroppedRows, LogQueue, TokenProvider};
+pub(crate) use credential::Credential;
+pub use credential::TokenProvider;
+pub use queue::{DroppedRows, LogQueue};
