@@ -9,7 +9,7 @@ use super::types::TaskHooks;
 /// Task trait for transforming inputs to outputs
 ///
 /// Tasks can be async functions, closures, or custom structs implementing this trait.
-/// Only async version is needed - SyncEvaluator uses this via Runtime::block_on().
+/// The evaluator awaits this callback, including when its own completion is observed synchronously.
 #[async_trait]
 pub trait Task<I, O>: Send + Sync {
     /// Execute the task on the given input

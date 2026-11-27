@@ -144,7 +144,8 @@ async fn dataset_insert_flushes_to_logs_endpoint() {
                 .build()
                 .expect("record"),
         )
-        .await;
+        .await
+        .unwrap();
 
     assert!(!record_id.is_empty());
 
@@ -215,12 +216,69 @@ async fn dataset_fetch_returns_records() {
         .expect("dataset builder");
 
     // Fetch records
-    let iter = dataset.fetch(Some(10)).await.expect("fetch");
-    let records = iter.collect().await;
+    let mut iter = dataset.fetch(Some(10)).await.expect("fetch");
+    let first = iter.next();
+    let rest = iter.collect();
+    let records = rest.await.unwrap();
 
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0].id, "rec-1");
-    assert_eq!(records[1].id, "rec-2");
+    assert_eq!(first.await.unwrap().unwrap().id, "rec-1");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, "rec-2");
+}
+
+#[tokio::test]
+async fn overlapping_dataset_flushes_share_the_covered_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/dataset/register"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "project": { "id": "p", "name": "project" },
+            "dataset": { "id": "d", "name": "dataset" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/project/register"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"p"}})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = BraintrustClient::builder()
+        .api_key("key")
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .blocking_login(true)
+        .build()
+        .await
+        .unwrap();
+    let dataset = client
+        .dataset_builder()
+        .await
+        .unwrap()
+        .project_name("project")
+        .dataset_name("dataset")
+        .build()
+        .unwrap();
+    dataset
+        .insert(DatasetInsert::builder().input(json!(1)).build().unwrap())
+        .await
+        .unwrap();
+    let first = dataset.flush();
+    let second = dataset.flush();
+    assert!(second.await.is_err());
+    assert!(first.await.is_err());
+    dataset.flush().await.unwrap();
 }
 
 #[tokio::test]

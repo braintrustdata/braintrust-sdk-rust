@@ -605,6 +605,24 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         completion
     }
 
+    /// Submit an already-finished event as one snapshot.
+    pub(crate) fn log_and_end(&self, event: SpanLog, end_time: f64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("span mutex should not be poisoned");
+        apply_span_log_to_data(&mut inner, event);
+        inner.end_time = Some(end_time);
+        let payload = current_span_payload(&mut inner);
+        let completion =
+            self.submitter
+                .submit(self.credential.clone(), payload, self.parent_info.clone());
+        if completion.is_ok() {
+            inner.has_flushed = true;
+            inner.end_submitted = true;
+        }
+    }
+
     /// Flush all queued span data through to Braintrust.
     ///
     /// This does not create a new queued span update. Call [`SpanHandle::log`] or
@@ -648,8 +666,12 @@ impl<S: SpanSubmitter> SpanHandle<S> {
 
     /// Trigger a non-blocking background flush.
     /// Useful for streaming writes to get partial updates visible immediately.
-    pub async fn trigger_flush(&self) -> Result<()> {
-        self.submitter.trigger_flush().await
+    pub fn trigger_flush(&self) -> crate::Completion<(), crate::BraintrustError>
+    where
+        S: 'static,
+    {
+        let submitter = self.submitter.clone();
+        crate::operation::submit(async move { submitter.trigger_flush().await })
     }
 
     /// Export the span as SpanComponents for passing to other systems or SDKs.
@@ -1612,5 +1634,13 @@ mod tests {
                 "demo-project".to_string()
             ))
         );
+    }
+    #[test]
+    fn a_finished_event_submits_one_snapshot() {
+        let (builder, collector) = crate::test_utils::mock_span_builder();
+        let span = builder.build();
+        span.log_and_end(SpanLog::default(), 12.0);
+        span.end_with_time(13.0);
+        assert_eq!(collector.spans().len(), 1);
     }
 }
