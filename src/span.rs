@@ -260,9 +260,6 @@ pub(crate) trait SpanSubmitter: Send + Sync {
 
     /// Flush all queued span data through to the server.
     fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError>;
-
-    /// Trigger a non-blocking background flush.
-    async fn trigger_flush(&self) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -610,6 +607,7 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     /// This does not create a new queued span update. Call [`SpanHandle::log`] or
     /// [`SpanHandle::end`] first to submit changes, then call `flush()` when you need
     /// to ensure the background queue has been processed.
+    #[must_use = "await or call blocking_wait to observe delivery"]
     pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         self.submitter.flush()
     }
@@ -646,14 +644,11 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         chosen_time
     }
 
-    /// Trigger a non-blocking background flush.
-    /// Useful for streaming writes to get partial updates visible immediately.
-    pub fn trigger_flush(&self) -> crate::Completion<(), crate::BraintrustError>
-    where
-        S: 'static,
-    {
-        let submitter = self.submitter.clone();
-        crate::operation::submit(async move { submitter.trigger_flush().await })
+    /// Kept for compatibility: delivery is continuous, so logged span data is
+    /// already on its way and there is nothing to trigger. Use
+    /// [`Self::flush`] to wait for delivery.
+    pub fn trigger_flush(&self) -> crate::Completion<(), crate::BraintrustError> {
+        crate::Completion::finished(Ok(()))
     }
 
     /// Export the span as SpanComponents for passing to other systems or SDKs.
@@ -1111,9 +1106,6 @@ mod tests {
                 let (sender, completion) = crate::Completion::pair();
                 let _ = sender.send(Ok(crate::FlushReport::default()));
                 completion
-            }
-            async fn trigger_flush(&self) -> Result<()> {
-                Ok(())
             }
         }
         let submitter = Arc::new(Submitter {

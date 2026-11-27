@@ -106,7 +106,7 @@ fn default_all_publish_payloads_dir() -> Option<PathBuf> {
 ///     .num_retries(5)
 ///     .build();
 /// ```
-#[derive(bon::Builder, Debug, Clone)]
+#[derive(bon::Builder, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogQueueConfig {
     /// Max queue size (BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE, default: 15000)
     #[builder(default = default_queue_max_size())]
@@ -144,8 +144,9 @@ pub struct LogQueueConfig {
     #[builder(default = default_flush_chunk_size())]
     flush_chunk_size: usize,
 
-    /// Max concurrent `/logs3` requests per flush (BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS,
-    /// default: 8, matching the TypeScript SDK).
+    /// Legacy concurrency configuration snapshot, retained for compatibility.
+    /// The shared service reads `BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS` once at
+    /// initialization. Use [`crate::ServiceConfig`] for explicit process-wide limits.
     #[builder(default = default_max_concurrent_log_requests())]
     max_concurrent_log_requests: usize,
 

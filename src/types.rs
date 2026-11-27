@@ -414,7 +414,7 @@ pub(crate) struct Logs3Row {
     pub audit_source: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct SpanPayload {
     pub row_id: String,
     pub span_id: String,

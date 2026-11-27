@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 /// Supplies the bearer token for queued uploads when they are sent.
 ///
-/// The queue calls [`TokenProvider::token`] once per upload group each time it
-/// flushes. Resolving an uncached project name can also request a token.
-/// Cache tokens that are expensive to mint, and bound how long a call
-/// can take: a call that never returns stalls this client's uploads. When it
-/// returns an error, the rows waiting on it are dropped and counted in
-/// [`crate::DroppedRows::upload_failed`].
+/// The queue calls [`TokenProvider::token`] on the SDK service's runtime. Cache
+/// tokens that are expensive to mint. Each
+/// call is bounded by [`crate::ServiceConfig::token_provider_timeout`], and a
+/// failed call is retried like an upload. Once retries run out, the rows
+/// waiting on it are dropped and counted in [`crate::DroppedRows::upload_failed`].
 #[async_trait::async_trait]
 pub trait TokenProvider: Send + Sync {
     /// Return the token for the next upload.
@@ -39,14 +38,26 @@ impl Credential {
         Self::Token(Arc::from(token))
     }
 
-    pub(super) async fn token(&self) -> std::result::Result<Cow<'_, str>, anyhow::Error> {
+    /// Identifies the credential when no organization is known. Providers are
+    /// identified by instance, matching how they partition work.
+    pub(crate) fn stand_in(&self) -> String {
         match self {
-            Self::Token(token) => Ok(Cow::Borrowed(token)),
-            Self::Provider(provider) => provider
-                .token()
-                .await
-                .map(Cow::Owned)
-                .map_err(|error| anyhow::anyhow!("token provider failed: {error}")),
+            Self::Token(token) => token.to_string(),
+            Self::Provider(provider) => format!("provider:{:p}", Arc::as_ptr(provider)),
+        }
+    }
+
+    pub(crate) async fn token(&self) -> std::result::Result<Cow<'_, str>, anyhow::Error> {
+        match self {
+            Self::Token(token) => Ok(Cow::Borrowed(token.as_ref())),
+            Self::Provider(provider) => tokio::time::timeout(
+                crate::service::config().token_provider_timeout,
+                provider.token(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("token provider timed out"))?
+            .map(Cow::Owned)
+            .map_err(|error| anyhow::anyhow!("token provider failed: {error}")),
         }
     }
 }

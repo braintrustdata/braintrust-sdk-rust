@@ -16,7 +16,7 @@ impl Scope {
         }
     }
 
-    pub(super) fn for_destination(&self, destination: Option<String>) -> Self {
+    pub fn for_destination(&self, destination: Option<String>) -> Self {
         Self {
             destination,
             ..self.clone()

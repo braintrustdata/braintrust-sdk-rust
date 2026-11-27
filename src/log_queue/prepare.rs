@@ -1,7 +1,9 @@
 //! Span routing and construction of logs3 rows.
+use super::core::QueueSettings;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use anyhow::{anyhow, Result};
+use tokio::sync::OnceCell;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(super) enum Destination {
@@ -167,5 +169,73 @@ impl SpanRoute {
             object_delete: None,
             audit_source: Some("api".into()),
         }
+    }
+}
+
+pub(super) type ProjectResolution = OnceCell<Result<String>>;
+
+impl QueueSettings {
+    pub(super) async fn prepare_span(
+        &self,
+        token: &str,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+        project: &ProjectResolution,
+    ) -> Result<Logs3Row> {
+        SpanRoute::new(&payload, parent_info.as_ref())?
+            .into_row(payload, async |org_id, org_name, name| {
+                // A job has at most one unresolved project name. Reuse its
+                // result for each row, including a failed registration.
+                project
+                    .get_or_init(|| self.ensure_project_id(token, org_id, org_name, name))
+                    .await
+                    .as_ref()
+                    .cloned()
+                    .map_err(super::observation::duplicate_error)
+            })
+            .await
+    }
+
+    /// Ensure a project ID is available for the given project name, registering
+    /// it via the API if it is not yet cached.
+    ///
+    async fn ensure_project_id(
+        &self,
+        token: &str,
+        org_id: &str,
+        org_name: Option<&str>,
+        project_name: &str,
+    ) -> Result<String> {
+        let app_url_key = self.app_url.to_string();
+        let org = crate::resolution::OrgIdentity::new(org_id, org_name, token);
+        let scope = crate::scheduler::Scope::new(app_url_key.clone(), org.scope_key());
+        let entry = crate::resolution::project(&app_url_key, org, project_name);
+        // Bounded by the retry budget and request timeouts, not a deadline, so
+        // registration can wait out a 429 cooldown.
+        let resolve = entry.get_or_try_init(|| async {
+            let mut request = crate::api::ProjectRegisterRequest::new(project_name.to_owned());
+            request.org_id = (!org_id.is_empty()).then(|| org_id.to_owned());
+            request.org_name = org_name.map(str::to_owned);
+
+            let client = crate::http::api_client(
+                &self.client.client(),
+                self.api_url.as_str(),
+                self.app_url.as_str(),
+                token,
+                org_name,
+            )?;
+            // Registration shares the upload scheduler, so it waits out 429
+            // cooldowns, counts against request concurrency, and retries
+            // transient failures instead of dropping the span on the first one.
+            let retries = self.config.num_retries();
+            let register_response = crate::internal::request::scheduled(scope, retries, || {
+                client.register_project(&request)
+            })
+            .await?
+            .into_inner();
+
+            Ok::<_, anyhow::Error>(register_response.project.id)
+        });
+        resolve.await.cloned()
     }
 }

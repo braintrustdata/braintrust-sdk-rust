@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 pub(crate) struct EncodedRow {
     data: Bytes,
     overflow: Logs3OverflowInputRow,
+    submissions: Vec<usize>,
 }
 
 impl EncodedRow {
@@ -21,21 +22,17 @@ impl EncodedRow {
         Ok(Self {
             data: data.into(),
             overflow,
+            submissions: Vec::new(),
         })
     }
 
+    pub(crate) fn with_submissions(mut self, submissions: Vec<usize>) -> Self {
+        self.submissions = submissions;
+        self
+    }
+
     pub fn from_map(row: &Map<String, Value>) -> Result<Self, serde_json::Error> {
-        let object_ids = [
-            "experiment_id",
-            "dataset_id",
-            "prompt_session_id",
-            "project_id",
-            "log_id",
-            "function_data",
-        ]
-        .into_iter()
-        .filter_map(|key| row.get(key).map(|value| (key.to_owned(), value.clone())))
-        .collect();
+        let object_ids = raw_object_ids(row);
         Self::encode(row, {
             let mut value =
                 Logs3OverflowInputRow::new(object_ids, Logs3OverflowInputRowMeta::new(0));
@@ -43,6 +40,28 @@ impl EncodedRow {
             value
         })
     }
+}
+
+fn raw_object_ids(row: &Map<String, Value>) -> Map<String, Value> {
+    [
+        "experiment_id",
+        "dataset_id",
+        "prompt_session_id",
+        "project_id",
+        "log_id",
+        "function_data",
+    ]
+    .into_iter()
+    .filter_map(|key| row.get(key).map(|value| (key.to_owned(), value.clone())))
+    .collect()
+}
+
+pub(crate) fn raw_destination_key(row: &Map<String, Value>) -> String {
+    destination_key(&raw_object_ids(row))
+}
+
+fn destination_key(ids: &Map<String, Value>) -> String {
+    serde_json::to_string(ids).expect("JSON destination IDs are serializable")
 }
 
 #[derive(Debug, Clone)]
@@ -105,12 +124,25 @@ impl EncodedBatch {
     ) -> Vec<Self> {
         let mut destinations: IndexMap<String, Vec<EncodedRow>> = IndexMap::new();
         for row in rows {
-            let destination = serde_json::to_string(&row.overflow.object_ids).unwrap_or_default();
+            let destination = destination_key(&row.overflow.object_ids);
             destinations.entry(destination).or_default().push(row);
         }
         destinations
             .into_values()
             .flat_map(|rows| Self::partition(rows, max_items, max_bytes))
+            .collect()
+    }
+
+    /// All rows in a queued batch share a destination.
+    pub(crate) fn destination(&self) -> Option<String> {
+        let ids = &self.rows.first()?.overflow.object_ids;
+        (!ids.is_empty()).then(|| destination_key(ids))
+    }
+
+    pub(crate) fn take_submissions(&mut self) -> Vec<Vec<usize>> {
+        self.rows
+            .iter_mut()
+            .map(|row| std::mem::take(&mut row.submissions))
             .collect()
     }
 

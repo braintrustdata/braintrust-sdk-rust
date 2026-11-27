@@ -12,6 +12,8 @@ use url::Url;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_QUEUE_SIZE: usize = 256;
 
+use super::ClientSettings;
+
 /// Builder for creating a BraintrustClient with configuration.
 ///
 /// Configuration is loaded from environment variables by default,
@@ -183,7 +185,9 @@ impl BraintrustClientBuilder {
         self
     }
 
-    /// Set the internal queue size for buffering log events.
+    /// Legacy worker command capacity, retained for source compatibility.
+    /// The shared service coalesces wakeups. Use `with_queue_max_size` or
+    /// [`crate::ServiceConfig`] to limit retained rows.
     pub fn queue_size(mut self, size: usize) -> Self {
         self.queue_size = size;
         self
@@ -263,8 +267,8 @@ impl BraintrustClientBuilder {
     /// Equivalent to `.skip_login(true).build()`, but synchronous, since only login
     /// needs to wait. Upload with per-call credentials, such as
     /// [`BraintrustClient::log_rows_with_credentials`] or
-    /// [`BraintrustClient::log_rows_with_token_provider`]. The SDK selects its
-    /// background runtime on first use.
+    /// [`BraintrustClient::log_rows_with_token_provider`]. Delivery runs on the
+    /// shared SDK service; a caller Tokio runtime is not required.
     pub fn build_without_login(mut self) -> Result<BraintrustClient> {
         self.skip_login = true;
         self.construct()
@@ -286,6 +290,7 @@ impl BraintrustClientBuilder {
             self.user_agent.as_deref(),
         )?;
 
+        crate::service::global()?;
         // Create login state (initially empty, populated by login)
         let login_state = LoginState::new();
 
@@ -298,32 +303,30 @@ impl BraintrustClientBuilder {
             .checked_delivery(self.checked_delivery)
             .build();
 
-        // LogQueue owns the background worker. It is given the client-configured
-        // URLs so that flushes with per-request credentials work without relying on
-        // the shared (set-once) login state to hold URLs.
+        // This queue facade carries routing and observation state. Intake and
+        // dispatch are owned by the process-wide service.
         let queue = LogQueue::new(
-            crate::runtime::handle()?,
             log_config,
             login_state.clone(),
-            http_client.clone(),
+            http_client,
             self.queue_size,
-            api_url.clone(),
-            app_url.clone(),
+            api_url,
+            app_url,
         );
 
         let client = BraintrustClient {
             inner: Arc::new(ClientInner {
-                api_url,
-                explicit_api_url,
-                app_url,
+                settings: Arc::new(ClientSettings {
+                    explicit_api_url,
+                    login_skipped: self.skip_login,
+                    environment: self.environment,
+                    span_origin: self.span_origin,
+                }),
                 queue,
                 login_state,
-                login_notify: Notify::new(),
-                http_client,
+                login_notify: Arc::new(Notify::new()),
+                background_login: Arc::default(),
                 default_project: self.default_project,
-                login_skipped: self.skip_login,
-                environment: self.environment,
-                span_origin: self.span_origin,
             }),
         };
 
