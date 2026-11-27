@@ -657,6 +657,29 @@ impl LogQueue {
         );
     }
 
+    /// Return delivery receipts for writes admitted before their credentials were known.
+    pub(crate) fn submit_rows_tracked(
+        &self,
+        token: &str,
+        org_id: &str,
+        org_name: Option<&str>,
+        rows: Vec<Map<String, Value>>,
+    ) -> Vec<Completion<DeliveryReceipt, WriteError>> {
+        let credential = Credential::token_value(token.to_owned());
+        rows.into_iter()
+            .map(|row| {
+                self.enqueue(SubmitCommand {
+                    credential: credential.clone(),
+                    item: QueuedItem::Row {
+                        org_id: org_id.to_owned(),
+                        org_name: org_name.map(str::to_owned),
+                        row,
+                    },
+                })
+            })
+            .collect()
+    }
+
     /// Submit caller-built rows whose token is fetched from `provider` when they
     /// are sent.
     pub(crate) fn submit_rows_with_provider(

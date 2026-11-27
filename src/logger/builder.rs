@@ -319,6 +319,7 @@ impl BraintrustClientBuilder {
                 queue,
                 login_state,
                 login_notify: Notify::new(),
+                pending_auth: Arc::default(),
                 http_client,
                 default_project: self.default_project,
                 login_skipped: self.skip_login,
