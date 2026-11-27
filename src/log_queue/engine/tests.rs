@@ -583,7 +583,7 @@ fn distinct_known_projects_can_reuse_the_same_row_id() {
 #[test]
 fn row_retirement_reports_each_waiting_partition_once() {
     let queue = queue();
-    let engine = Engine::manual();
+    let engine = Engine::manual(ServiceConfig::default());
     for _ in 0..128 {
         engine.submit(queue.core.clone(), SubmitCommand::test_row("same"));
     }
@@ -599,7 +599,7 @@ fn row_retirement_reports_each_waiting_partition_once() {
 #[tokio::test]
 async fn dropping_shutdown_completion_does_not_admit_a_second_drain() {
     let queue = queue();
-    let engine = Arc::new(Engine::manual());
+    let engine = Engine::manual(ServiceConfig::default());
     let scope = &queue.core.observation;
     let write = engine.submit(queue.core.clone(), SubmitCommand::test_row("pending"));
     drop(engine.shutdown(scope, std::time::Duration::from_secs(10)));
@@ -647,7 +647,7 @@ async fn upload_timeout_preserves_the_original_error_for_flush_and_write() {
         server.uri().parse().unwrap(),
         server.uri().parse().unwrap(),
     );
-    let engine = Engine::manual();
+    let engine = Engine::manual(ServiceConfig::default());
     let write = engine.submit(queue.core.clone(), SubmitCommand::test_row("timed-out"));
     let flush = engine.barrier(&queue.core.observation);
     let (key, entries) = engine.take_jobs().pop().unwrap();
