@@ -6,7 +6,8 @@ use std::sync::OnceLock;
 #[derive(Clone, Debug, PartialEq, Eq, bon::Builder)]
 #[non_exhaustive]
 pub struct ServiceConfig {
-    /// Maximum entries in each shared project and server-capability cache.
+    /// Target capacity for each shared project and server-capability cache.
+    /// Entries in use may temporarily exceed this limit.
     #[builder(default = 256)]
     pub max_cached_resolutions: usize,
     /// The Tokio runtime that runs SDK work. See [`ServiceRuntime`].
