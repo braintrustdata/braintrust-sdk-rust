@@ -156,6 +156,7 @@ impl<
         let experiment = self.clone();
         let write = self.writes.start();
         crate::operation::submit(async move {
+            write.0.wait(write.1).await;
             let _write = write;
 
             // Get or create experiment registration
@@ -177,17 +178,13 @@ impl<
             // Get the row_id before logging - it's stable from span creation
             let row_id = span.row_id().to_string();
 
-            // Convert ExperimentLog to SpanLog and log
-            let span_log = event.into_span_log();
-            span.log(span_log);
-
             // End the span now, so a later flush sends nothing that could
             // overwrite feedback logged against it.
             let end_time = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
-            span.end_with_time(end_time);
+            span.log_and_end(event.into_span_log(), end_time);
             // The next log() call starts where this one ended.
             experiment
                 .last_start_time
@@ -228,6 +225,7 @@ impl<
         let id = id.to_owned();
         let write = self.writes.start();
         crate::operation::submit(async move {
+            write.0.wait(write.1).await;
             let _write = write;
             let metadata = experiment.ensure_registered().await;
 
@@ -463,6 +461,7 @@ impl<
         let id = id.to_owned();
         let write = self.writes.start();
         crate::operation::submit(async move {
+            write.0.wait(write.1).await;
             let _write = write;
             let metadata = experiment.ensure_registered().await;
 
