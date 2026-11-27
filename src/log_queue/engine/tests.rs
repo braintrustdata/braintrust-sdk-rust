@@ -83,7 +83,7 @@ async fn compatible_facades_share_uploads_with_independent_barriers() {
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].1.len(), 2);
     for (key, entries) in jobs {
-        engine.clone().process_job(key, entries).await;
+        engine.clone().process_job(key, entries, None).await;
     }
     x.await.unwrap();
     y.await.unwrap();
@@ -121,7 +121,7 @@ async fn shared_split_failures_report_partial_delivery_to_each_owner() {
     let x = engine.barrier(&a.core.observation);
     let y = engine.barrier(&b.core.observation);
     for (key, entries) in engine.take_jobs() {
-        engine.clone().process_job(key, entries).await;
+        engine.clone().process_job(key, entries, None).await;
     }
     assert!(x.await.is_err());
     assert!(y.await.is_err());
@@ -156,7 +156,7 @@ async fn failure_in_a_different_physical_batch_does_not_fail_a_successful_owner(
     let x = engine.barrier(&a.core.observation);
     let y = engine.barrier(&b.core.observation);
     for (key, entries) in engine.take_jobs() {
-        engine.clone().process_job(key, entries).await;
+        engine.clone().process_job(key, entries, None).await;
     }
     x.await.unwrap();
     assert!(y.await.is_err());
@@ -188,7 +188,7 @@ async fn a_failed_project_registration_is_attempted_once_per_job() {
     let jobs = engine.take_jobs();
     assert_eq!(jobs.len(), 1);
     for (key, entries) in jobs {
-        engine.clone().process_job(key, entries).await;
+        engine.clone().process_job(key, entries, None).await;
     }
     assert!(flush.await.is_err());
     assert_eq!(queue.dropped_rows().preparation_failed, 20);
@@ -224,7 +224,7 @@ async fn rotated_tokens_in_one_org_reuse_the_project_registration() {
         engine.submit(queue.core.clone(), command);
         let flush = engine.barrier(&queue.core.observation);
         for (key, entries) in engine.take_jobs() {
-            engine.clone().process_job(key, entries).await;
+            engine.clone().process_job(key, entries, None).await;
         }
         flush.await.unwrap();
     }
@@ -267,7 +267,7 @@ async fn transient_project_registration_failures_are_retried() {
     );
     let flush = engine.barrier(&queue.core.observation);
     for (key, entries) in engine.take_jobs() {
-        engine.clone().process_job(key, entries).await;
+        engine.clone().process_job(key, entries, None).await;
     }
     assert_eq!(flush.await.unwrap().delivered(), 1);
 }
@@ -299,7 +299,10 @@ fn project_name_span_reserves_its_row_before_a_raw_update() {
         engine.take_jobs().is_empty(),
         "the raw update still waits for the span"
     );
-    drop(Job::new(engine.clone(), name_key, before));
+    // A finished write frees the row for its next submission.
+    let mut job = Job::new(engine.clone(), name_key, before, None);
+    job.report.settle([0]);
+    drop(job);
     drop(first);
     let after = engine.take_jobs();
     assert_eq!(after.len(), 1);
@@ -335,7 +338,7 @@ async fn completed_batch_retires_while_another_batch_is_waiting() {
     engine.submit(b.core.clone(), SubmitCommand::test_row("held"));
     let barrier = engine.barrier(&a.core.observation);
     let (key, entries) = engine.take_jobs().pop().unwrap();
-    let job = tokio::spawn(engine.clone().process_job(key, entries));
+    let job = tokio::spawn(engine.clone().process_job(key, entries, None));
     assert_eq!(
         tokio::time::timeout(std::time::Duration::from_secs(2), barrier)
             .await
@@ -390,7 +393,7 @@ async fn a_timed_out_owner_is_removed_before_a_shared_batch_uploads() {
     }
     let (key, entries) = engine.take_jobs().pop().unwrap();
     assert_eq!(entries.len(), 2);
-    let job = tokio::spawn(engine.clone().process_job(key, entries));
+    let job = tokio::spawn(engine.clone().process_job(key, entries, None));
     provider.started.notified().await;
     engine.expire(&a.core.observation);
     provider.release.notify_one();
@@ -528,7 +531,7 @@ async fn completion_wakes_after_capacity_is_released_and_control_is_unlocked() {
     ));
     let flush = engine.barrier(&queue.core.observation);
     let (key, entries) = engine.take_jobs().pop().unwrap();
-    engine.clone().process_job(key, entries).await;
+    engine.clone().process_job(key, entries, None).await;
     completion.await.unwrap();
     assert!(signal.woke.load(Ordering::SeqCst));
     assert_eq!(flush.await.unwrap().delivered(), 1);
@@ -549,7 +552,7 @@ fn expired_running_rows_hold_budgets_until_the_job_releases_them() {
         engine.submit(survivor.core.clone(), SubmitCommand::test_row("survivor"));
         let (key, entries) = engine.take_jobs().pop().unwrap();
         assert_eq!(entries.len(), 2);
-        let mut job = Job::new(engine.clone(), key, entries);
+        let mut job = Job::new(engine.clone(), key, entries, None);
 
         engine.expire(&expired.core.observation);
         assert_eq!(engine.intake.lock().unwrap().retained, 2);
@@ -565,6 +568,36 @@ fn expired_running_rows_hold_budgets_until_the_job_releases_them() {
             .submit(incoming.core.clone(), SubmitCommand::test_row("late"))
             .is_ok());
     }
+}
+
+#[test]
+fn a_dropped_job_requeues_unsettled_rows_ahead_of_later_ones() {
+    let engine = Engine::manual(ServiceConfig::default());
+    let a = queue();
+    engine.submit_many(
+        a.core.clone(),
+        [
+            SubmitCommand::test_row("delivered"),
+            SubmitCommand::test_row("in-flight"),
+            SubmitCommand::test_row("unsent"),
+        ],
+    );
+    let (key, entries) = engine.take_jobs().pop().unwrap();
+    engine.submit(a.core.clone(), SubmitCommand::test_row("later"));
+    let mut job = Job::new(engine.clone(), key, entries, None);
+    // Rows 0 and 1 went in one upload; the request holding row 0 succeeded
+    // before the job was dropped, while row 1's was still in flight.
+    job.report.uploads.push((
+        vec![vec![0], vec![1]].into(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+    ));
+    // As when the job's runtime shuts down mid-upload.
+    drop(job);
+    assert_eq!(a.core.observation.len(), 3, "only the settled row retired");
+    let jobs = engine.take_jobs();
+    assert_eq!(jobs.len(), 1, "the partition is free again");
+    let sequences: Vec<_> = jobs[0].1.iter().map(|entry| entry.sequence).collect();
+    assert_eq!(sequences, [2, 3, 4]);
 }
 
 #[test]
@@ -651,7 +684,7 @@ async fn upload_timeout_preserves_the_original_error_for_flush_and_write() {
     let write = engine.submit(queue.core.clone(), SubmitCommand::test_row("timed-out"));
     let flush = engine.barrier(&queue.core.observation);
     let (key, entries) = engine.take_jobs().pop().unwrap();
-    engine.clone().process_job(key, entries).await;
+    engine.clone().process_job(key, entries, None).await;
 
     let WriteError::Delivery(write) = write.await.unwrap_err() else {
         panic!("expected delivery failure");
