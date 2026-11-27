@@ -2,7 +2,6 @@ mod batching;
 mod config;
 mod core;
 mod credential;
-mod dispatch;
 pub(crate) mod engine;
 mod http;
 mod merge;

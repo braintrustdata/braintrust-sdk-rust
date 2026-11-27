@@ -30,6 +30,10 @@ pub(super) struct Key {
 }
 
 impl Key {
+    pub(super) fn merges_spans(&self) -> bool {
+        matches!(self.destination, PartitionDestination::Span(_))
+    }
+
     pub(super) fn new(core: &LogQueueCore, command: &SubmitCommand) -> Self {
         let (org_id, org_name) = command.organization();
         let (endpoint, org_name) = core.route(org_id, org_name);
@@ -39,7 +43,7 @@ impl Key {
             org_name.as_deref(),
             &credential.stand_in(),
         )
-        .scope_key();
+        .request_scope_key(&endpoint);
         Self {
             route: OrgKey { endpoint, org },
             org_name,

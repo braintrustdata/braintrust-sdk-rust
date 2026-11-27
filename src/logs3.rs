@@ -21,6 +21,7 @@ pub struct Logs3BatchUploader {
     api_url: Url,
     api_key: String,
     org_name: Option<String>,
+    org_id: Option<String>,
     max_request_size_override: Option<usize>,
 }
 
@@ -80,6 +81,7 @@ impl Logs3BatchUploader {
             api_url,
             api_key: api_key.into(),
             org_name,
+            org_id: None,
             max_request_size_override: None,
         };
         // Report invalid credentials or URLs here rather than at upload time.
@@ -98,6 +100,15 @@ impl Logs3BatchUploader {
             self.org_name.as_deref(),
         )?;
         Ok(UploadCoordinator::new(api, UploadPolicy::Standalone))
+    }
+
+    /// Use the organization ID for shared request limits and cooldowns.
+    ///
+    /// Supply the ID when sending for a known organization without logging in
+    /// through the SDK. The configured organization name still routes HTTP requests.
+    pub fn with_organization_id(mut self, id: impl Into<String>) -> Self {
+        self.org_id = Some(id.into());
+        self
     }
 
     pub fn with_max_request_size_override(mut self, max_bytes: usize) -> Self {
@@ -119,8 +130,12 @@ impl Logs3BatchUploader {
         // it has none, like the queue's.
         let scope = crate::scheduler::Scope::new(
             self.api_url.as_str(),
-            crate::resolution::OrgIdentity::new("", self.org_name.as_deref(), &self.api_key)
-                .scope_key(),
+            crate::resolution::OrgIdentity::new(
+                self.org_id.as_deref().unwrap_or_default(),
+                self.org_name.as_deref(),
+                &self.api_key,
+            )
+            .request_scope_key(self.api_url.as_str()),
         );
         crate::operation::submit(crate::scheduler::SCOPE.scope(scope, async move {
             if rows.is_empty() {

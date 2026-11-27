@@ -20,6 +20,7 @@ pub(super) enum Outcome {
 pub(super) struct Report {
     pub outcomes: Vec<Outcome>,
     pub losses: Vec<Loss>,
+    pub ready: Vec<usize>,
     /// Batches being uploaded: each row's submissions in batch order, and how
     /// many leading rows have been delivered so far.
     pub uploads: Vec<(BatchSubmissions, Arc<AtomicUsize>)>,
@@ -29,6 +30,7 @@ impl Report {
         Self {
             outcomes: vec![Outcome::Pending; count],
             losses: Vec::new(),
+            ready: Vec::new(),
             uploads: Vec::new(),
         }
     }
@@ -46,6 +48,7 @@ impl Report {
         for index in submissions {
             if matches!(self.outcomes[index], Outcome::Pending) {
                 self.outcomes[index] = Outcome::Delivered;
+                self.ready.push(index);
             }
         }
     }
@@ -60,13 +63,10 @@ impl Report {
 
     pub fn fail_submissions(&mut self, submissions: &[usize], error: &DeliveryError) {
         for &index in submissions {
+            if matches!(self.outcomes[index], Outcome::Pending) {
+                self.ready.push(index);
+            }
             self.outcomes[index] = Outcome::Failed(error.clone());
         }
-    }
-
-    pub fn has_pending(&self) -> bool {
-        self.outcomes
-            .iter()
-            .any(|outcome| matches!(outcome, Outcome::Pending))
     }
 }
