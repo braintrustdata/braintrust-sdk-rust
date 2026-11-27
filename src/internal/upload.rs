@@ -6,6 +6,7 @@ use crate::error::{BraintrustError, Result};
 use crate::scheduler::Scope;
 use crate::types::LOGS_API_VERSION;
 use backon::{BackoffBuilder, ExponentialBuilder};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::warn;
 
@@ -106,20 +107,27 @@ impl UploadCoordinator {
         batch: EncodedBatch,
         capabilities: Capabilities,
     ) -> Result<UploadResult> {
-        let (result, outcome) = self.upload_counting(batch, capabilities).await;
+        let progress = AtomicUsize::new(0);
+        let (result, outcome) = self.upload_counting(batch, capabilities, &progress).await;
         outcome.map(|()| result)
     }
 
     /// Upload a batch, reporting what was delivered even when a later split fails.
+    ///
+    /// `delivered` counts the batch's leading rows whose request got a
+    /// successful response, as each response arrives. Split parts are sent in
+    /// row order, so those rows are a prefix of the batch even if this future
+    /// is dropped part-way.
     pub async fn upload_counting(
         &self,
         batch: EncodedBatch,
         capabilities: Capabilities,
+        delivered: &AtomicUsize,
     ) -> (UploadResult, Result<()>) {
         let mut budget = self.policy.budget();
         let mut result = UploadResult::default();
         let outcome = self
-            .upload_into(batch, capabilities, &mut budget, &mut result)
+            .upload_into(batch, capabilities, &mut budget, &mut result, delivered)
             .await;
         result.requests_sent = budget.requests();
         (result, outcome)
@@ -131,12 +139,14 @@ impl UploadCoordinator {
         capabilities: Capabilities,
         budget: &mut RetryBudget,
         result: &mut UploadResult,
+        delivered: &AtomicUsize,
     ) -> Result<()> {
         let mut pending = vec![batch];
         while let Some(batch) = pending.pop() {
             if batch.data.len() <= capabilities.max_request_size {
                 match budget.run(|| self.logs.logs3_raw(batch.data.clone())).await {
                     Ok(_) => {
+                        delivered.fetch_add(batch.len(), Ordering::Release);
                         result.rows_uploaded += batch.len();
                         result.bytes_processed += batch.data.len();
                         continue;
@@ -147,6 +157,7 @@ impl UploadCoordinator {
             }
             if capabilities.overflow {
                 self.overflow(&batch, budget).await?;
+                delivered.fetch_add(batch.len(), Ordering::Release);
                 result.rows_uploaded += batch.len();
                 result.bytes_processed += batch.data.len();
             } else if batch.len() > 1 {
