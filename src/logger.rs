@@ -495,7 +495,7 @@ struct ClientInner {
     queue: LogQueue,
     login_state: LoginState,
     login_notify: Notify,
-    http_client: reqwest::Client,
+    http_client: crate::http::SharedHttp,
     default_project: Option<String>,
     login_skipped: bool,
     environment: Option<SpanOriginEnvironment>,
@@ -878,16 +878,23 @@ impl BraintrustClient {
             .login_state
             .app_url()
             .unwrap_or_else(|| self.inner.app_url.to_string());
-        api_client(&self.inner.http_client, &api_url, &app_url, token, None)
+        api_client(
+            &self.inner.http_client.client(),
+            &api_url,
+            &app_url,
+            token,
+            None,
+        )
     }
 
     /// Log in and discover the selected organization's API endpoint.
     async fn perform_login(&self, api_key: &str, org_name: Option<&str>) -> Result<()> {
+        let http = self.inner.http_client.client();
         let mut builder = crate::api::Client::builder()
             .api_key(api_key)
             .app_url(self.inner.app_url.as_str())
-            .http_client(self.inner.http_client.clone())
-            .upload_http_client(self.inner.http_client.clone());
+            .http_client(http.clone())
+            .upload_http_client(http);
         if self.inner.explicit_api_url {
             builder = builder.api_url(self.inner.api_url.as_str());
         }

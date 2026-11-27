@@ -2,8 +2,62 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use reqwest::Client;
+use std::sync::{Arc, Mutex};
+use tokio::runtime::Id as RuntimeId;
 
 use crate::error::{BraintrustError, Result};
+
+/// A reusable HTTP connection pool for a transport profile.
+#[derive(Clone, Debug)]
+pub(crate) struct SharedHttp {
+    pool: Arc<ProfilePool>,
+}
+#[derive(Debug)]
+struct Settings {
+    timeout: std::time::Duration,
+    user_agent: String,
+    certificates: Vec<reqwest::Certificate>,
+}
+impl Settings {
+    fn build(&self) -> Result<Client> {
+        let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(self.timeout)
+            .user_agent(&self.user_agent);
+        for certificate in &self.certificates {
+            builder = builder.add_root_certificate(certificate.clone());
+        }
+        builder
+            .build()
+            .map_err(|err| BraintrustError::InvalidConfig(err.to_string()))
+    }
+}
+/// The profile owns its pool, including its lifetime after cache eviction.
+#[derive(Debug)]
+struct ProfilePool {
+    settings: Settings,
+    client: Mutex<(Option<RuntimeId>, Client)>,
+}
+
+impl SharedHttp {
+    pub fn client(&self) -> Client {
+        let runtime = tokio::runtime::Handle::try_current().ok().map(|h| h.id());
+        let mut pool = self.pool.client.lock().unwrap();
+        if let Some(runtime) = runtime {
+            // The first runtime adopts the validated client. After a runtime
+            // shuts down, use a fresh pool so old connections cannot stall it.
+            if pool.0.is_some_and(|previous| previous != runtime) {
+                pool.1 = self
+                    .pool
+                    .settings
+                    .build()
+                    .expect("validated HTTP client settings");
+            }
+            pool.0 = Some(runtime);
+        }
+        pool.1.clone()
+    }
+}
 
 pub(crate) const CUSTOM_CA_BUNDLE_ENV: &str = "BRAINTRUST_CUSTOM_CA_BUNDLE";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -57,14 +111,43 @@ pub(crate) fn build_http_client(
     timeout: std::time::Duration,
     ca_bundle: Option<&CaBundleConfig>,
     user_agent: Option<&str>,
-) -> Result<Client> {
-    let mut builder = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(timeout)
-        .user_agent(user_agent.unwrap_or(USER_AGENT));
-
-    if let Some(ca_bundle) = ca_bundle {
-        let (pem, source) = ca_bundle.load_pem()?;
+) -> Result<SharedHttp> {
+    #[derive(PartialEq, Eq)]
+    struct Profile {
+        timeout: std::time::Duration,
+        pem: Option<Vec<u8>>,
+        user_agent: String,
+        proxy: Vec<Option<OsString>>,
+    }
+    type Pools = std::sync::Mutex<std::collections::VecDeque<(Profile, SharedHttp)>>;
+    static POOLS: std::sync::OnceLock<Pools> = std::sync::OnceLock::new();
+    let loaded = ca_bundle.map(CaBundleConfig::load_pem).transpose()?;
+    let profile = Profile {
+        timeout,
+        pem: loaded.as_ref().map(|(pem, _)| pem.clone()),
+        user_agent: user_agent.unwrap_or(USER_AGENT).to_owned(),
+        proxy: [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ]
+        .map(std::env::var_os)
+        .to_vec(),
+    };
+    let mut pools = POOLS.get_or_init(Default::default).lock().unwrap();
+    if let Some(index) = pools.iter().position(|(key, _)| key == &profile) {
+        let entry = pools.remove(index).unwrap();
+        let client = entry.1.clone();
+        pools.push_back(entry);
+        return Ok(client);
+    }
+    let mut certificates = Vec::new();
+    if let Some((pem, source)) = loaded {
         let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|err| {
             BraintrustError::InvalidConfig(format!(
                 "failed to parse PEM certificates from CA bundle {}: {}",
@@ -77,14 +160,25 @@ pub(crate) fn build_http_client(
                 source
             )));
         }
-        for cert in certs {
-            builder = builder.add_root_certificate(cert);
-        }
+        certificates = certs;
     }
-
-    builder
-        .build()
-        .map_err(|err| BraintrustError::InvalidConfig(err.to_string()))
+    let settings = Settings {
+        timeout,
+        user_agent: user_agent.unwrap_or(USER_AGENT).to_owned(),
+        certificates,
+    };
+    let http = settings.build()?;
+    let client = SharedHttp {
+        pool: Arc::new(ProfilePool {
+            settings,
+            client: Mutex::new((None, http)),
+        }),
+    };
+    if pools.len() >= 32 {
+        pools.pop_front();
+    }
+    pools.push_back((profile, client.clone()));
+    Ok(client)
 }
 
 /// Scope shared connection pools to one request's credentials and endpoints.
@@ -204,6 +298,16 @@ NP64Q8OosOHraKRn7bvST7bXvGFZUp06aIFrlwdmSQPXU/6o4zYNmkR4RVv4VvQ7
 cb0bfZ7fHHs=
 -----END CERTIFICATE-----
 "#;
+
+    #[test]
+    fn pools_are_reused_only_for_matching_transport_profiles() {
+        let timeout = Duration::from_secs(3);
+        let first = build_http_client(timeout, None, Some("pool-test")).unwrap();
+        let same = build_http_client(timeout, None, Some("pool-test")).unwrap();
+        let different = build_http_client(timeout, None, Some("other-pool-test")).unwrap();
+        assert!(Arc::ptr_eq(&first.pool, &same.pool));
+        assert!(!Arc::ptr_eq(&first.pool, &different.pool));
+    }
 
     pub(crate) fn write_temp_bundle(contents: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -355,7 +459,7 @@ cb0bfZ7fHHs=
         let default_client =
             build_http_client(Duration::from_secs(1), None, None).expect("default client");
         let api = api_client(
-            &default_client,
+            &default_client.client(),
             &url,
             crate::api::DEFAULT_APP_URL,
             "test-key",
@@ -371,10 +475,11 @@ cb0bfZ7fHHs=
             .expect("generate unrelated test certificate");
         let bundle = format!("{}{certificate_pem}", unrelated_certificate.cert.pem());
         let config = CaBundleConfig::from_pem(bundle, "test bundle");
-        let custom_ca_client = build_http_client(Duration::from_secs(1), Some(&config), None)
+        // Long enough for a TLS handshake while the rest of the suite runs.
+        let custom_ca_client = build_http_client(Duration::from_secs(10), Some(&config), None)
             .expect("custom CA client");
         let api = api_client(
-            &custom_ca_client,
+            &custom_ca_client.client(),
             &url,
             crate::api::DEFAULT_APP_URL,
             "test-key",
@@ -400,9 +505,17 @@ cb0bfZ7fHHs=
         std::env::set_var(CUSTOM_CA_BUNDLE_ENV, certificate_pem);
 
         let config = CaBundleConfig::from_environment().expect("environment CA bundle");
-        let client = build_http_client(Duration::from_secs(1), Some(&config), None)
+        // Long enough for a TLS handshake while the rest of the suite runs.
+        let client = build_http_client(Duration::from_secs(10), Some(&config), None)
             .expect("custom CA client");
-        let api = api_client(&client, &url, crate::api::DEFAULT_APP_URL, "test-key", None).unwrap();
+        let api = api_client(
+            &client.client(),
+            &url,
+            crate::api::DEFAULT_APP_URL,
+            "test-key",
+            None,
+        )
+        .unwrap();
         let response = api
             .btql(&serde_json::json!({"query":"select 1"}))
             .await
