@@ -170,7 +170,7 @@ impl<S: SpanSubmitter + 'static> ExperimentBuilder<S> {
             .ok_or(ExperimentBuilderError::MissingProjectName)?;
 
         Ok(Experiment {
-            submitter: self.submitter,
+            submitter: self.submitter.for_resource(&self.org_id),
             token: self.token,
             org_id: self.org_id,
             org_name: self.org_name,

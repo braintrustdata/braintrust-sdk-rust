@@ -5,7 +5,7 @@ use crate::log_queue::{
     submission::SubmitCommand,
 };
 use crate::{DeliveryReceipt, WriteError};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -13,11 +13,34 @@ pub(super) struct Entry {
     pub(super) core: Arc<LogQueueCore>,
     pub(super) command: SubmitCommand,
     pub(super) sequence: u64,
+    pub(super) row: Option<RowOrderKey>,
+    pub(super) route: OrgKey,
 }
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(super) struct RowOrderKey {
+    pub(super) route: OrgKey,
+    pub(super) id: String,
+}
+
+pub(super) struct ReleasedEntry {
+    pub(super) sequence: u64,
+    row: Option<RowOrderKey>,
+    route: OrgKey,
+}
+
+impl Entry {
+    pub(super) fn release(self) -> ReleasedEntry {
+        ReleasedEntry {
+            sequence: self.sequence,
+            row: self.row,
+            route: self.route,
+        }
+    }
+}
+
 pub(super) type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
 pub(super) struct Record {
     pub(super) observer: Arc<Observation>,
-    pub(super) route: OrgKey,
     pub(super) sender: Option<WriteSender>,
 }
 #[derive(Default)]
@@ -25,7 +48,40 @@ pub(super) struct Intake {
     pub(super) sequence: u64,
     pub(super) records: HashMap<u64, Record>,
     pub(super) partitions: HashMap<Key, Partition>,
+    pub(super) row_order: HashMap<RowOrderKey, BTreeMap<u64, Key>>,
+    pub(super) retained: usize,
     pub(super) org_rows: HashMap<OrgKey, usize>,
+}
+
+impl Intake {
+    pub(super) fn release_row(&mut self, released: ReleasedEntry) -> Option<Key> {
+        let ReleasedEntry {
+            row,
+            sequence,
+            route,
+        } = released;
+        self.retained -= 1;
+        if let Some(rows) = self.org_rows.get_mut(&route) {
+            *rows -= 1;
+            if *rows == 0 {
+                self.org_rows.remove(&route);
+            }
+        }
+        let row = row?;
+        let order = self.row_order.get_mut(&row)?;
+        let was_first = order
+            .first_key_value()
+            .is_some_and(|(first, _)| *first == sequence);
+        order.remove(&sequence);
+        if order.is_empty() {
+            self.row_order.remove(&row);
+            None
+        } else if was_first {
+            order.first_key_value().map(|(_, key)| key.clone())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
@@ -46,12 +102,6 @@ impl FinishedWrites {
         let Some(record) = intake.records.remove(&sequence) else {
             return;
         };
-        if let Some(rows) = intake.org_rows.get_mut(&record.route) {
-            *rows -= 1;
-            if *rows == 0 {
-                intake.org_rows.remove(&record.route);
-            }
-        }
         record
             .observer
             .retire(sequence, error.as_ref(), &mut self.flushes);

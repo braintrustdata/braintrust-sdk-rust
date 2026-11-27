@@ -106,6 +106,13 @@ impl SubmitCommand {
         }
     }
 
+    pub(super) fn row_id(&self) -> Option<&str> {
+        match &self.item {
+            QueuedItem::Span { payload, .. } => Some(&payload.row_id),
+            QueuedItem::Row { row, .. } => row.get("id").and_then(serde_json::Value::as_str),
+        }
+    }
+
     pub(super) fn destination(&self) -> PartitionDestination {
         match &self.item {
             QueuedItem::Span {

@@ -25,6 +25,7 @@
 //! dataset.flush().await?;
 //! ```
 
+use futures::FutureExt;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
@@ -460,7 +461,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             .ok_or(DatasetBuilderError::MissingDatasetName)?;
 
         Ok(Dataset {
-            submitter: self.submitter,
+            submitter: self.submitter.for_resource(&self.org_id),
             token: self.token,
             org_name: self.org_name,
             org_id: self.org_id,
@@ -470,6 +471,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             metadata: self.metadata,
             lazy_metadata: Arc::new(OnceCell::new()),
             pending_rows: Default::default(),
+            active_flush: Default::default(),
         })
     }
 }
@@ -477,6 +479,33 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 // ============================================================================
 // Dataset
 // ============================================================================
+
+type DatasetFlush = futures::future::Shared<
+    futures::future::BoxFuture<'static, std::result::Result<(), Arc<crate::BraintrustError>>>,
+>;
+
+fn copy_flush_error(error: Arc<crate::BraintrustError>) -> crate::BraintrustError {
+    match error.as_ref() {
+        crate::BraintrustError::Api { status, message } => crate::BraintrustError::Api {
+            status: *status,
+            message: message.clone(),
+        },
+        crate::BraintrustError::InvalidConfig(message) => {
+            crate::BraintrustError::InvalidConfig(message.clone())
+        }
+        crate::BraintrustError::Http(error) => crate::BraintrustError::Network(error.to_string()),
+        crate::BraintrustError::Network(message) => {
+            crate::BraintrustError::Network(message.clone())
+        }
+        crate::BraintrustError::Background(message) => {
+            crate::BraintrustError::Background(message.clone())
+        }
+        crate::BraintrustError::ChannelClosed => crate::BraintrustError::ChannelClosed,
+        crate::BraintrustError::StreamAggregation(message) => {
+            crate::BraintrustError::StreamAggregation(message.clone())
+        }
+    }
+}
 
 /// A dataset for storing test/evaluation data.
 ///
@@ -493,6 +522,7 @@ pub struct Dataset<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + Datase
     metadata: Option<Map<String, Value>>,
     lazy_metadata: Arc<OnceCell<DatasetMetadata>>,
     pending_rows: Arc<std::sync::Mutex<PendingDatasetRows>>,
+    active_flush: Arc<std::sync::Mutex<Option<DatasetFlush>>>,
 }
 
 impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> Clone
@@ -510,6 +540,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> C
             metadata: self.metadata.clone(),
             lazy_metadata: self.lazy_metadata.clone(),
             pending_rows: self.pending_rows.clone(),
+            active_flush: self.active_flush.clone(),
         }
     }
 }
@@ -702,72 +733,89 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     /// Flush this dataset's writes made before this call.
     #[must_use = "await or call blocking_wait to observe delivery"]
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
-        let dataset = self.clone();
+        let mut active = self.active_flush.lock().unwrap();
         let cutoff = self.pending_rows.lock().unwrap().next;
-        crate::operation::submit(async move {
-            let metadata = dataset.ensure_registered().await?;
-            let flush = {
-                let mut pending = dataset.pending_rows.lock().unwrap();
-                let count = pending.rows.partition_point(|(index, _)| *index < cutoff);
-                // Keep draining and submitting in the same critical section
-                // so concurrent flushes cannot reorder dataset rows.
-                for (_, row) in pending.rows.drain(..count) {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
-
-                    let payload = SpanPayload {
-                        row_id: row.id.clone(),
-                        span_id: row.id,
-                        is_merge: row.is_merge,
-                        span_components: None,
-                        org_id: dataset.org_id.clone(),
-                        org_name: Some(dataset.org_name.clone()),
-                        project_name: Some(dataset.project_name.clone()),
-                        input: row.input,
-                        output: None,
-                        expected: row.expected,
-                        error: None,
-                        scores: None,
-                        metadata: row.metadata,
-                        metrics: None,
-                        tags: row.tags,
-                        context: Some(serde_json::json!({
-                            "calendar_time": now,
-                        })),
-                        span_attributes: if row.is_delete {
-                            Some(crate::types::SpanAttributes {
-                                name: None,
-                                span_type: None,
-                                purpose: None,
-                                extra: {
-                                    let mut map = std::collections::HashMap::new();
-                                    map.insert("_object_delete".to_string(), Value::Bool(true));
-                                    map
-                                },
-                            })
-                        } else {
-                            None
-                        },
-                        extra: std::collections::HashMap::new(),
-                    };
-
-                    let parent_info = ParentSpanInfo::Dataset {
-                        object_id: metadata.dataset_id.clone(),
-                    };
-
-                    dataset.submitter.submit(
-                        Credential::token_value(dataset.token.clone()),
-                        payload,
-                        Some(parent_info),
-                    );
-                }
-
-                dataset.submitter.flush()
+        let previous = active.take().filter(|flush| flush.peek().is_none());
+        let mut dataset = self.clone();
+        dataset.active_flush = Default::default();
+        let flush = async move {
+            let prior = match previous {
+                Some(flush) => flush.await,
+                None => Ok(()),
             };
-            flush.await.map(|_| ()).map_err(Into::into)
-        })
+            let result = dataset.flush_through(cutoff).await.map_err(Arc::new);
+            prior.and(result)
+        }
+        .boxed()
+        .shared();
+        *active = Some(flush.clone());
+        crate::operation::submit(async move { flush.await.map_err(copy_flush_error) })
+    }
+
+    async fn flush_through(&self, cutoff: u64) -> Result<()> {
+        let dataset = self;
+        let metadata = dataset.ensure_registered().await?;
+        let flush = {
+            let mut pending = dataset.pending_rows.lock().unwrap();
+            let count = pending.rows.partition_point(|(index, _)| *index < cutoff);
+            // Keep draining and submitting in the same critical section
+            // so concurrent flushes cannot reorder dataset rows.
+            for (_, row) in pending.rows.drain(..count) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+
+                let payload = SpanPayload {
+                    row_id: row.id.clone(),
+                    span_id: row.id,
+                    is_merge: row.is_merge,
+                    span_components: None,
+                    org_id: dataset.org_id.clone(),
+                    org_name: Some(dataset.org_name.clone()),
+                    project_name: Some(dataset.project_name.clone()),
+                    input: row.input,
+                    output: None,
+                    expected: row.expected,
+                    error: None,
+                    scores: None,
+                    metadata: row.metadata,
+                    metrics: None,
+                    tags: row.tags,
+                    context: Some(serde_json::json!({
+                        "calendar_time": now,
+                    })),
+                    span_attributes: if row.is_delete {
+                        Some(crate::types::SpanAttributes {
+                            name: None,
+                            span_type: None,
+                            purpose: None,
+                            extra: {
+                                let mut map = std::collections::HashMap::new();
+                                map.insert("_object_delete".to_string(), Value::Bool(true));
+                                map
+                            },
+                        })
+                    } else {
+                        None
+                    },
+                    extra: std::collections::HashMap::new(),
+                };
+
+                let parent_info = ParentSpanInfo::Dataset {
+                    object_id: metadata.dataset_id.clone(),
+                };
+
+                dataset.submitter.submit(
+                    Credential::token_value(dataset.token.clone()),
+                    payload,
+                    Some(parent_info),
+                );
+            }
+
+            dataset.submitter.flush()
+        };
+        flush.await.map(|_| ()).map_err(Into::into)
     }
 }
 
@@ -779,6 +827,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 #[allow(private_bounds)]
 pub struct DatasetIterator<S: DatasetFetcher> {
     state: Arc<Mutex<DatasetIteratorState<S>>>,
+    sequence: crate::operation::Sequence,
 }
 struct DatasetIteratorState<S: DatasetFetcher> {
     fetcher: Arc<S>,
@@ -852,6 +901,7 @@ impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
             state: Arc::new(Mutex::new(DatasetIteratorState::new(
                 fetcher, token, dataset_id, batch_size,
             ))),
+            sequence: crate::operation::Sequence::default(),
         }
     }
     /// Issue the next page or buffered-record operation immediately.
@@ -860,13 +910,15 @@ impl<S: DatasetFetcher + 'static> DatasetIterator<S> {
     #[must_use = "await or call blocking_wait to read the record"]
     pub fn next(&mut self) -> crate::Completion<Option<DatasetRecord>, crate::BraintrustError> {
         let state = self.state.clone();
-        crate::operation::submit(async move { Ok(state.lock().await.next().await) })
+        self.sequence
+            .submit(async move { Ok(state.lock().await.next().await) })
     }
     /// Collect remaining records on the shared executor.
     #[must_use = "await or call blocking_wait to obtain the result"]
     pub fn collect(self) -> crate::Completion<Vec<DatasetRecord>, crate::BraintrustError> {
-        crate::operation::submit(async move {
-            let mut state = self.state.lock().await;
+        let state = self.state;
+        self.sequence.submit(async move {
+            let mut state = state.lock().await;
             let mut records = Vec::new();
             while let Some(row) = state.next().await {
                 records.push(row);
