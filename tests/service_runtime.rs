@@ -3,11 +3,11 @@ use braintrust_sdk_rust::{
     configure_service, BraintrustClient, ServiceConfig, ServiceRuntime, TokenProvider,
 };
 use serde_json::json;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use wiremock::{
-    matchers::{body_string_contains, method, path},
+    matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
 };
 
@@ -45,39 +45,18 @@ fn work_runs_on_a_configured_runtime() {
     run_child("configured_runtime_child");
 }
 #[test]
-fn rows_in_flight_when_the_runtime_stops_are_delivered_on_another() {
-    run_child("stopped_runtime_child");
-}
-#[test]
-fn rows_with_a_confirmed_upload_are_not_sent_again_after_the_runtime_stops() {
-    run_child("interrupted_upload_child");
-}
-#[test]
 fn later_callers_share_the_first_callers_runtime() {
     run_child("later_callers_child");
 }
-#[test]
-fn a_background_login_interrupted_by_its_runtime_stopping_resumes() {
-    run_child("interrupted_login_child");
-}
-
-/// Records the thread each token request runs on. While `stall` holds a
-/// sender, the next request signals it and never finishes.
 #[derive(Default)]
 struct Recorder {
     threads: Mutex<Vec<String>>,
-    stall: Mutex<Option<mpsc::Sender<()>>>,
 }
 #[async_trait::async_trait]
 impl TokenProvider for Recorder {
     async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let thread = std::thread::current().name().unwrap_or_default().to_owned();
         self.threads.lock().unwrap().push(thread);
-        let stall = self.stall.lock().unwrap().take();
-        if let Some(stall) = stall {
-            stall.send(()).unwrap();
-            std::future::pending::<()>().await;
-        }
         Ok("token".into())
     }
 }
@@ -112,13 +91,7 @@ impl Fixture {
             .build_without_login()
             .unwrap()
     }
-    fn wait_for(&self, condition: impl Fn(&Self) -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !condition(self) {
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
+
     fn log(&self, client: &BraintrustClient, provider: &Arc<Recorder>, ids: &[&str]) {
         client.log_rows_with_token_provider(
             provider.clone(),
@@ -132,14 +105,7 @@ impl Fixture {
             }),
         );
     }
-    fn logins(&self) -> usize {
-        self.server_runtime
-            .block_on(self.server.received_requests())
-            .unwrap()
-            .iter()
-            .filter(|request| request.url.path() == "/api/apikey/login")
-            .count()
-    }
+
     fn uploaded_ids(&self) -> Vec<String> {
         let requests = self
             .server_runtime
@@ -219,63 +185,6 @@ fn configured_runtime_child() {
 
 #[test]
 #[ignore = "executed in an isolated subprocess"]
-fn stopped_runtime_child() {
-    let fixture = Fixture::new();
-    let app = named_runtime("app-runtime");
-    let client = app.block_on(async { fixture.client() });
-    let provider = Arc::new(Recorder::default());
-    let (stalled, entered) = mpsc::channel();
-    *provider.stall.lock().unwrap() = Some(stalled);
-    app.block_on(async { fixture.log(&client, &provider, &["a", "b"]) });
-    // The job holding both rows is mid-flight when its runtime stops.
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    app.shutdown_timeout(Duration::from_secs(5));
-    let report = client.flush().blocking_wait().unwrap();
-    assert_eq!(report.delivered(), 2);
-    assert_eq!(fixture.uploaded_ids(), ["a", "b"]);
-    assert_eq!(
-        *provider.threads.lock().unwrap(),
-        ["app-runtime", "braintrust-delivery"]
-    );
-}
-
-#[test]
-#[ignore = "executed in an isolated subprocess"]
-fn interrupted_login_child() {
-    let fixture = Fixture::new();
-    fixture.server_runtime.block_on(
-        Mock::given(method("POST"))
-            .and(path("/api/apikey/login"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"org_info": [{"id": "org-id", "name": "Org"}]}))
-                    .set_delay(Duration::from_millis(500)),
-            )
-            .mount(&fixture.server),
-    );
-    let app = named_runtime("app-runtime");
-    // Built inside `app`: `build()` starts the SDK when called, so calling it
-    // as `block_on`'s argument would start it outside any runtime.
-    let client = app
-        .block_on(async {
-            BraintrustClient::builder()
-                .api_key("key")
-                .api_url(fixture.server.uri())
-                .app_url(fixture.server.uri())
-                .build()
-                .await
-        })
-        .unwrap();
-    // Stop the runtime while the first login request is waiting for its response.
-    fixture.wait_for(|fixture| fixture.logins() == 1);
-    app.shutdown_timeout(Duration::from_secs(5));
-    let state = client.wait_for_login().blocking_wait().unwrap();
-    assert_eq!(state.org_id().as_deref(), Some("org-id"));
-    assert_eq!(fixture.logins(), 2);
-}
-
-#[test]
-#[ignore = "executed in an isolated subprocess"]
 fn current_thread_runtime_child() {
     let fixture = Fixture::new();
     // Like `#[tokio::main(flavor = "current_thread")]` or `#[tokio::test]`.
@@ -311,48 +220,6 @@ fn initial_sync_caller_child() {
         ["braintrust-delivery", "braintrust-delivery"]
     );
     assert_eq!(fixture.uploaded_ids(), ["a", "b"]);
-}
-
-#[test]
-#[ignore = "executed in an isolated subprocess"]
-fn interrupted_upload_child() {
-    let fixture = Fixture::new();
-    // Rows a and b form one batch. The server rejects it as too large, so the
-    // SDK splits it: a's request succeeds, and b's is still waiting for its
-    // response when the runtime stops.
-    fixture.server_runtime.block_on(async {
-        Mock::given(method("POST"))
-            .and(path("/logs3"))
-            .and(body_string_contains(r#""id":"a""#))
-            .and(body_string_contains(r#""id":"b""#))
-            .respond_with(ResponseTemplate::new(413))
-            .with_priority(1)
-            .mount(&fixture.server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/logs3"))
-            .and(body_string_contains(r#""id":"b""#))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string("{}")
-                    .set_delay(Duration::from_secs(30)),
-            )
-            .up_to_n_times(1)
-            .with_priority(2)
-            .mount(&fixture.server)
-            .await;
-    });
-    let app = named_runtime("app-runtime");
-    let client = app.block_on(async { fixture.client() });
-    let provider = Arc::new(Recorder::default());
-    app.block_on(async { fixture.log(&client, &provider, &["a", "b"]) });
-    // The rejected pair, then a, then b.
-    fixture.wait_for(|fixture| fixture.uploaded_ids() == ["a", "a", "b", "b"]);
-    app.shutdown_timeout(Duration::from_secs(5));
-    let report = client.flush().blocking_wait().unwrap();
-    assert_eq!(report.delivered(), 1, "only b was still outstanding");
-    // Besides the rejected pair: a once, and b again because its outcome was unknown.
-    assert_eq!(fixture.uploaded_ids(), ["a", "a", "b", "b", "b"]);
 }
 
 #[test]

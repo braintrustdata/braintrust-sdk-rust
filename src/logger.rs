@@ -34,22 +34,6 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
 pub const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
 
-/// A background login that resumes if its runtime stops before it finishes.
-#[derive(Default)]
-struct BackgroundLogin {
-    /// The API key and organization, until the login succeeds or gives up.
-    pending: std::sync::Mutex<Option<(String, Option<String>)>>,
-    running: std::sync::atomic::AtomicBool,
-}
-struct LoginRunning(Arc<BackgroundLogin>);
-impl Drop for LoginRunning {
-    fn drop(&mut self) {
-        self.0
-            .running
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct BraintrustClient {
     inner: Arc<ClientInner>,
@@ -60,7 +44,6 @@ struct ClientInner {
     queue: LogQueue,
     login_state: LoginState,
     login_notify: Arc<Notify>,
-    background_login: Arc<BackgroundLogin>,
     default_project: Option<String>,
 }
 
@@ -197,12 +180,7 @@ impl BraintrustClient {
             let org_name = state
                 .org_name()
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-            let mut builder = DatasetBuilder::new(Arc::new(client.scoped()), api_key, org_name)
-                .org_id(state.org_id().unwrap_or_default());
-            if let Some(project) = &client.inner.default_project {
-                builder = builder.project_name(project);
-            }
-            Ok(builder)
+            Ok(DatasetBuilder::new(Arc::new(client), api_key, org_name))
         })
     }
 
@@ -519,29 +497,8 @@ impl BraintrustClient {
 
     /// Start login in a background task with retry logic.
     fn start_background_login(&self, api_key: String, org_name: Option<String>) {
-        *self.inner.background_login.pending.lock().unwrap() = Some((api_key, org_name));
-        self.resume_background_login();
-    }
-
-    /// Run the pending background login unless it is already running. A login
-    /// dropped with its runtime stays pending, so the next wait restarts it.
-    fn resume_background_login(&self) {
-        let login = &self.inner.background_login;
-        if login
-            .running
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return;
-        }
-        let running = LoginRunning(login.clone());
-        // Read only once running: a login that finished cleared `pending`
-        // before it stopped running, so this cannot start a stale second one.
-        let Some((api_key, org_name)) = login.pending.lock().unwrap().clone() else {
-            return;
-        };
         let client = self.clone();
-        crate::service::global().expect("initialized service").spawn_operation(async move {
-            let _running = running;
+        tokio::spawn(async move {
             const MAX_ATTEMPTS: usize = 10;
             let result = (|| client.perform_login(&api_key, org_name.as_deref()))
                 .retry(ExponentialBuilder::default()
@@ -550,7 +507,6 @@ impl BraintrustClient {
                     .with_max_times(MAX_ATTEMPTS - 1))
                 .notify(|error, delay| tracing::warn!(%error, ?delay, "Background login failed, retrying"))
                 .await;
-            client.inner.background_login.pending.lock().unwrap().take();
             match result {
                 Ok(()) => tracing::debug!("Background login completed successfully"),
                 Err(error) => tracing::error!(
@@ -569,7 +525,6 @@ impl BraintrustClient {
         if self.inner.login_state.is_logged_in() {
             return Ok(self.inner.login_state.clone());
         }
-        self.resume_background_login();
 
         // Get notification future BEFORE checking state to avoid race condition
         let notified = self.inner.login_notify.notified();
@@ -621,17 +576,7 @@ impl BraintrustClient {
         let token = token.into();
         let org_id = org_id.into();
 
-        let context = if self.inner.login_state.org_id().as_deref() == Some(&org_id) {
-            self.scoped()
-        } else {
-            // Explicit credentials for a different org must not inherit the selected org's endpoint.
-            self.derive_scope(
-                self.inner.queue.child_with_login(LoginState::new()),
-                LoginState::new(),
-                self.inner.default_project.clone(),
-            )
-        };
-        let submitter = Arc::new(context);
+        let submitter = Arc::new(self.clone());
         let mut builder = ExperimentBuilder::new(submitter, token, org_id);
         if let Some(project) = &self.inner.default_project {
             builder = builder.project_name(project);
@@ -718,35 +663,6 @@ impl BraintrustClient {
         self.inner
             .queue
             .submit_rows_with_provider(provider, org_id, org_name, rows);
-    }
-
-    /// A facade whose flush covers only the writes made through it, for
-    /// resources such as experiments and datasets. The parent's flush still
-    /// includes them.
-    fn scoped(&self) -> Self {
-        self.derive_scope(
-            self.inner.queue.child(),
-            self.inner.login_state.clone(),
-            self.inner.default_project.clone(),
-        )
-    }
-
-    fn derive_scope(
-        &self,
-        queue: LogQueue,
-        login_state: LoginState,
-        default_project: Option<String>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(ClientInner {
-                settings: self.inner.settings.clone(),
-                queue,
-                login_state,
-                login_notify: self.inner.login_notify.clone(),
-                background_login: self.inner.background_login.clone(),
-                default_project,
-            }),
-        }
     }
 
     /// Cumulative counts of rows this client discarded instead of uploading.

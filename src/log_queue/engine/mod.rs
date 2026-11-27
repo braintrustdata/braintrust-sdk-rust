@@ -11,22 +11,20 @@ use self::{
 use super::{core::LogQueueCore, observation::Observation, submission::SubmitCommand};
 use crate::{
     Completion, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushReport,
-    ServiceConfig, ShutdownError, ShutdownReport, WriteError,
+    ShutdownError, ShutdownReport, WriteError,
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 pub(crate) struct Engine {
-    config: ServiceConfig,
     intake: Mutex<Intake>,
     cancellations: Notify,
     #[cfg(test)]
     manual: bool,
 }
 impl Engine {
-    pub fn new(config: ServiceConfig) -> Self {
+    pub fn new() -> Self {
         Self {
-            config,
             intake: Mutex::new(Intake::default()),
             cancellations: Notify::new(),
             #[cfg(test)]
@@ -34,10 +32,10 @@ impl Engine {
         }
     }
     #[cfg(test)]
-    fn manual(config: ServiceConfig) -> Arc<Self> {
+    fn manual() -> Arc<Self> {
         Arc::new(Self {
             manual: true,
-            ..Self::new(config)
+            ..Self::new()
         })
     }
 
@@ -53,7 +51,7 @@ impl Engine {
             return;
         };
         if let Some(entries) = self.take_job(&key) {
-            runtime.spawn(self.clone().process_job(key, entries, Some(runtime.id())));
+            runtime.spawn(self.clone().process_job(key, entries));
         }
     }
 
@@ -101,19 +99,9 @@ impl Engine {
         let mut ready = Vec::new();
         let mut intake = self.intake.lock().unwrap();
         for (command, key, sender) in prepared {
-            let client_rows = core.observation.root().len();
+            let client_rows = core.observation.len();
             let closed = core.observation.closed();
-            if closed
-                || self
-                    .config
-                    .max_rows
-                    .is_some_and(|max| intake.records.len() >= max)
-                || self
-                    .config
-                    .max_org_rows
-                    .is_some_and(|max| intake.org_rows.get(&key.route).copied().unwrap_or(0) >= max)
-                || client_rows >= core.settings.config.queue_max_size()
-            {
+            if closed || client_rows >= core.settings.config.queue_max_size() {
                 let error = if closed {
                     EnqueueError::Closed
                 } else {
@@ -127,13 +115,11 @@ impl Engine {
             let sequence = intake.sequence;
             core.observation.accept(sequence);
             core.retained(client_rows + 1);
-            *intake.org_rows.entry(key.route.clone()).or_default() += 1;
             results.push(Ok(()));
             intake.records.insert(
                 sequence,
                 Record {
                     observer: core.observation.clone(),
-                    route: key.route.clone(),
                     sender,
                 },
             );
@@ -200,7 +186,7 @@ impl Engine {
         let sequences: Vec<_> = intake
             .records
             .iter()
-            .filter(|(_, record)| record.observer.includes(scope))
+            .filter(|(_, record)| Arc::ptr_eq(&record.observer, scope))
             .map(|(sequence, _)| *sequence)
             .collect();
         let error = WriteError::Execution(ExecutionError::TimedOut);
@@ -247,14 +233,13 @@ impl Engine {
     }
 
     /// The job exists before the future is first polled, so a runtime that
-    /// drops the task unpolled still requeues its rows.
+    /// drops the task unpolled still reports the lost worker.
     fn process_job(
         self: Arc<Self>,
         key: Key,
         entries: Vec<Entry>,
-        runtime: Option<tokio::runtime::Id>,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
-        Job::new(self, key, entries, runtime).run()
+        Job::new(self, key, entries).run()
     }
 }
 

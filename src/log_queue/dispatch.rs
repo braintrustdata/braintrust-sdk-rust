@@ -16,8 +16,6 @@ use crate::{
 };
 use futures::{stream, StreamExt};
 use indexmap::IndexMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use url::Url;
 
 impl QueueSettings {
@@ -154,24 +152,14 @@ impl QueueSettings {
         for (submissions, error) in failures {
             report.failed(submissions, &error, true);
         }
-        let batches: Vec<_> = batches
-            .into_iter()
-            .map(|mut batch| {
-                let delivered = Arc::new(AtomicUsize::new(0));
-                let submissions: Arc<[_]> = batch.take_submissions().into();
-                report
-                    .uploads
-                    .push((submissions.clone(), delivered.clone()));
-                (batch, submissions, delivered)
-            })
-            .collect();
-        let sends = batches.into_iter().map(|(batch, submissions, delivered)| {
+        let sends = batches.into_iter().map(|mut batch| {
+            let submissions = batch.take_submissions();
             let api_url = &api_url;
             let token = token.as_ref();
             async move {
                 let scope = crate::scheduler::SCOPE
                     .with(|scope| scope.for_destination(batch.destination()));
-                let result = crate::scheduler::SCOPE
+                let (delivered, result) = crate::scheduler::SCOPE
                     .scope(
                         scope,
                         send_batch_counting(
@@ -183,11 +171,10 @@ impl QueueSettings {
                             &self.config,
                             max_request_size,
                             overflow,
-                            &delivered,
                         ),
                     )
                     .await;
-                (submissions, delivered.load(Ordering::Acquire), result)
+                (submissions, delivered, result)
             }
         });
         // Keep only a bounded number of requests from this partition waiting

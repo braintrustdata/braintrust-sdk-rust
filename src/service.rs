@@ -2,10 +2,8 @@
 use crate::{BraintrustError, Result, ServiceRuntime};
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 /// Process-wide SDK limits. Configure before constructing the first SDK facade.
-/// Additional process and organization budgets are opt-in.
 /// Per-client retained work remains bounded by its configured queue capacity.
 #[derive(Clone, Debug, PartialEq, Eq, bon::Builder)]
 #[non_exhaustive]
@@ -15,17 +13,10 @@ pub struct ServiceConfig {
     /// when set to a positive number, otherwise 8.
     #[builder(default = default_max_concurrent_requests())]
     pub max_concurrent_requests: usize,
-    /// Maximum retained rows across all clients, including in-flight work.
-    pub max_rows: Option<usize>,
-    /// Maximum retained rows for one organization across client facades.
-    pub max_org_rows: Option<usize>,
     /// Target capacity for each shared project and server-capability cache.
     /// Entries in use may temporarily exceed this limit.
     #[builder(default = 256)]
     pub max_cached_resolutions: usize,
-    /// Maximum duration of one [`crate::TokenProvider::token`] call.
-    #[builder(default = Duration::from_secs(30))]
-    pub token_provider_timeout: Duration,
     /// The Tokio runtime that runs SDK work. See [`ServiceRuntime`].
     #[builder(default)]
     pub runtime: ServiceRuntime,
@@ -52,10 +43,9 @@ pub fn configure_service(config: ServiceConfig) -> Result<()> {
     if config.max_concurrent_requests == 0
         || config.max_concurrent_requests > tokio::sync::Semaphore::MAX_PERMITS
         || config.max_cached_resolutions == 0
-        || config.token_provider_timeout.is_zero()
     {
         return Err(BraintrustError::InvalidConfig(
-            "service concurrency, cache capacity, and preparation timeout must be positive and supported".into(),
+            "service concurrency and cache capacity must be positive and supported".into(),
         ));
     }
     if CONFIG.get_or_init(|| config.clone()) != &config {
@@ -91,8 +81,7 @@ pub(crate) fn global() -> Result<&'static Service> {
     }
     crate::runtime::handle()?;
     Ok(SERVICE.get_or_init(|| {
-        let config = config().clone();
-        let engine = Arc::new(crate::log_queue::engine::Engine::new(config));
+        let engine = Arc::new(crate::log_queue::engine::Engine::new());
         Service { engine }
     }))
 }

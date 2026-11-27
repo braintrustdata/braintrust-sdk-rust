@@ -8,7 +8,7 @@ use std::future::IntoFuture;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wiremock::{
-    matchers::{body_string_contains, header, method, path},
+    matchers::{body_string_contains, method, path},
     Mock, ResponseTemplate,
 };
 
@@ -57,33 +57,6 @@ async fn construction_and_submission_need_no_caller_runtime() {
         .unwrap()
         .iter()
         .any(|r| r.url.path() == "/logs3"));
-}
-
-#[tokio::test]
-async fn delivery_survives_the_constructing_runtime() {
-    let server = MockServer::start().await;
-    accept(&server).await;
-    let endpoint = server.uri();
-    let client = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async move {
-            BraintrustClient::builder()
-                .api_url(&endpoint)
-                .app_url(&endpoint)
-                .checked_delivery(true)
-                .skip_login(true)
-                .build()
-                .await
-                .unwrap()
-        })
-    })
-    .join()
-    .unwrap();
-    client.log_rows_with_credentials("token", "org", None, [row("row", "project")]);
-    client.flush().await.unwrap();
 }
 
 #[tokio::test]

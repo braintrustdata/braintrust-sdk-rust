@@ -1,4 +1,4 @@
-use super::partition::{Key, OrgKey};
+use super::partition::Key;
 use crate::log_queue::{
     core::LogQueueCore,
     observation::{Notification, Observation},
@@ -17,7 +17,6 @@ pub(super) struct Entry {
 pub(super) type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
 pub(super) struct Record {
     pub(super) observer: Arc<Observation>,
-    pub(super) route: OrgKey,
     pub(super) sender: Option<WriteSender>,
 }
 #[derive(Default)]
@@ -25,7 +24,6 @@ pub(super) struct Intake {
     pub(super) sequence: u64,
     pub(super) records: HashMap<u64, Record>,
     pub(super) partitions: HashMap<Key, Partition>,
-    pub(super) org_rows: HashMap<OrgKey, usize>,
 }
 
 #[derive(Default)]
@@ -46,12 +44,6 @@ impl FinishedWrites {
         let Some(record) = intake.records.remove(&sequence) else {
             return;
         };
-        if let Some(rows) = intake.org_rows.get_mut(&record.route) {
-            *rows -= 1;
-            if *rows == 0 {
-                intake.org_rows.remove(&record.route);
-            }
-        }
         record
             .observer
             .retire(sequence, error.as_ref(), &mut self.flushes);
