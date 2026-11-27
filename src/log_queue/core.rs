@@ -27,11 +27,15 @@ pub(crate) struct LogQueueCore {
 }
 
 impl LogQueueCore {
-    pub(super) fn new(settings: Arc<QueueSettings>, login_state: LoginState) -> Arc<Self> {
+    pub(super) fn new(
+        settings: Arc<QueueSettings>,
+        login_state: LoginState,
+        parent: Option<Arc<super::observation::Observation>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             settings,
             login_state,
-            observation: Arc::new(super::observation::Observation::default()),
+            observation: Arc::new(super::observation::Observation::new(parent)),
             dropped_count: AtomicUsize::new(0),
             last_drop_log_time: AtomicU64::new(0),
             queue_depth_warning_emitted: AtomicBool::new(false),

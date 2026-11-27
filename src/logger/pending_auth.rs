@@ -20,17 +20,41 @@ struct PendingReceipt {
 
 #[derive(Default)]
 pub(super) struct PendingAuth {
-    state: Mutex<State>,
-    cancelled: Notify,
+    shared: Arc<Mutex<State>>,
+    scope: Arc<Scope>,
+    cancelled: Arc<Notify>,
     draining: AtomicBool,
+}
+
+#[derive(Default)]
+struct Scope {
+    parent: Option<Arc<Scope>>,
+    closed: AtomicBool,
+    aborted: AtomicBool,
+}
+
+impl Scope {
+    fn includes(&self, ancestor: &Self) -> bool {
+        std::ptr::eq(self, ancestor)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.includes(ancestor))
+    }
+
+    fn any(&self, predicate: fn(&Scope) -> &AtomicBool) -> bool {
+        predicate(self).load(Ordering::Relaxed)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.any(predicate))
+    }
 }
 
 #[derive(Default)]
 struct State {
     next: u64,
-    pending: BTreeMap<u64, PendingReceipt>,
-    closed: bool,
-    aborted: bool,
+    pending: BTreeMap<u64, (Arc<Scope>, PendingReceipt)>,
 }
 
 pub(super) struct Reservation {
@@ -47,6 +71,18 @@ impl Drop for Drain {
 }
 
 impl PendingAuth {
+    pub(super) fn child(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            cancelled: self.cancelled.clone(),
+            draining: AtomicBool::new(false),
+            scope: Arc::new(Scope {
+                parent: Some(self.scope.clone()),
+                ..Scope::default()
+            }),
+        }
+    }
+
     pub(super) fn try_drain(self: &Arc<Self>) -> Option<Drain> {
         self.draining
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -55,8 +91,8 @@ impl PendingAuth {
     }
 
     pub(super) fn reserve(self: &Arc<Self>) -> Result<Reservation, BraintrustError> {
-        let mut state = self.state.lock().unwrap();
-        if state.closed {
+        let mut state = self.shared.lock().unwrap();
+        if self.scope.any(|scope| &scope.closed) {
             return Err(closed());
         }
         let (sender, receiver) = oneshot::channel();
@@ -72,7 +108,7 @@ impl PendingAuth {
             .shared(),
             sender,
         };
-        state.pending.insert(id, pending);
+        state.pending.insert(id, (self.scope.clone(), pending));
         Ok(Reservation {
             scope: self.clone(),
             id,
@@ -80,16 +116,23 @@ impl PendingAuth {
     }
 
     pub(super) fn direct<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
-        let state = self.state.lock().unwrap();
-        (!state.closed).then(f)
+        let _state = self.shared.lock().unwrap();
+        (!self.scope.any(|scope| &scope.closed)).then(f)
     }
 
     pub(super) fn abort(&self) {
         let pending = {
-            let mut state = self.state.lock().unwrap();
-            state.aborted = true;
-            std::mem::take(&mut state.pending)
-                .into_values()
+            let mut state = self.shared.lock().unwrap();
+            self.scope.aborted.store(true, Ordering::Relaxed);
+            let expired: Vec<_> = state
+                .pending
+                .iter()
+                .filter(|(_, (scope, _))| scope.includes(&self.scope))
+                .map(|(&id, _)| id)
+                .collect();
+            expired
+                .into_iter()
+                .filter_map(|id| state.pending.remove(&id).map(|(_, pending)| pending))
                 .collect::<Vec<_>>()
         };
         for pending in pending {
@@ -101,7 +144,7 @@ impl PendingAuth {
     async fn aborted(&self) {
         loop {
             let notified = self.cancelled.notified();
-            if self.state.lock().unwrap().aborted {
+            if self.scope.any(|scope| &scope.aborted) {
                 return;
             }
             notified.await;
@@ -114,14 +157,17 @@ impl PendingAuth {
         close: bool,
         callback: impl FnOnce(bool) -> T,
     ) -> (T, Vec<AwaitReceipt>) {
-        let mut state = self.state.lock().unwrap();
-        state.closed |= close;
-        let pending = state
+        let state = self.shared.lock().unwrap();
+        if close {
+            self.scope.closed.store(true, Ordering::Relaxed);
+        }
+        let pending: Vec<_> = state
             .pending
             .values()
-            .map(|pending| pending.receipt.clone())
+            .filter(|(scope, _)| scope.includes(&self.scope))
+            .map(|(_, pending)| pending.receipt.clone())
             .collect();
-        (callback(state.pending.is_empty()), pending)
+        (callback(pending.is_empty()), pending)
     }
 }
 
@@ -142,8 +188,8 @@ impl Reservation {
         self,
         submit: impl FnOnce() -> Result<Vec<Write>, BraintrustError>,
     ) -> Result<(), BraintrustError> {
-        let mut state = self.scope.state.lock().unwrap();
-        let Some(pending) = state.pending.remove(&self.id) else {
+        let mut state = self.scope.shared.lock().unwrap();
+        let Some(pending) = state.pending.remove(&self.id).map(|(_, pending)| pending) else {
             return Err(ExecutionError::TimedOut.into());
         };
         let result = submit();
@@ -179,7 +225,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.scope.state.lock().unwrap().pending.remove(&self.id);
+        self.scope.shared.lock().unwrap().pending.remove(&self.id);
     }
 }
 

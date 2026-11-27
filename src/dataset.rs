@@ -368,6 +368,7 @@ pub struct DatasetBuilder<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher +
     submitter: Arc<S>,
     token: String,
     org_name: String,
+    org_id: String,
     project_name: Option<String>,
     dataset_name: Option<String>,
     description: Option<String>,
@@ -382,6 +383,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> C
             submitter: Arc::clone(&self.submitter),
             token: self.token.clone(),
             org_name: self.org_name.clone(),
+            org_id: self.org_id.clone(),
             project_name: self.project_name.clone(),
             dataset_name: self.dataset_name.clone(),
             description: self.description.clone(),
@@ -404,11 +406,17 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             submitter,
             token: token.into(),
             org_name: org_name.into(),
+            org_id: String::new(),
             project_name: None,
             dataset_name: None,
             description: None,
             metadata: None,
         }
+    }
+
+    pub(crate) fn org_id(mut self, org_id: String) -> Self {
+        self.org_id = org_id;
+        self
     }
 
     /// Set the project name (required).
@@ -453,9 +461,10 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             .ok_or(DatasetBuilderError::MissingDatasetName)?;
 
         Ok(Dataset {
-            submitter: self.submitter,
+            submitter: self.submitter.for_resource(&self.org_id),
             token: self.token,
             org_name: self.org_name,
+            org_id: self.org_id,
             project_name,
             dataset_name,
             description: self.description,
@@ -485,6 +494,7 @@ pub struct Dataset<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + Datase
     submitter: Arc<S>,
     token: String,
     org_name: String,
+    org_id: String,
     project_name: String,
     dataset_name: String,
     description: Option<String>,
@@ -502,6 +512,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer> C
             submitter: self.submitter.clone(),
             token: self.token.clone(),
             org_name: self.org_name.clone(),
+            org_id: self.org_id.clone(),
             project_name: self.project_name.clone(),
             dataset_name: self.dataset_name.clone(),
             description: self.description.clone(),
@@ -751,7 +762,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                     span_id: row.id,
                     is_merge: row.is_merge,
                     span_components: None,
-                    org_id: String::new(),
+                    org_id: dataset.org_id.clone(),
                     org_name: Some(dataset.org_name.clone()),
                     project_name: Some(dataset.project_name.clone()),
                     input: row.input,
