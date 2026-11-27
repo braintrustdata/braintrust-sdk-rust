@@ -1,9 +1,13 @@
 //! Integration tests for Datasets API.
 
+mod support;
+
+use support::MockServer;
+
 use braintrust_sdk_rust::{BraintrustClient, DatasetInsert};
 use serde_json::json;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 // Helper to create a mock login response
 fn mock_login_response(orgs: &[(&str, &str)]) -> ResponseTemplate {

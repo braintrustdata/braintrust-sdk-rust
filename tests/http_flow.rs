@@ -1,7 +1,11 @@
+mod support;
+
+use support::MockServer;
+
 use braintrust_sdk_rust::{BraintrustClient, BraintrustError, SpanLog};
 use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 #[tokio::test]
 async fn submits_with_bearer_token() {

@@ -1,13 +1,18 @@
+mod support;
+
+use support::MockServer;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use braintrust_sdk_rust::Logs3BatchUploader;
 use serde_json::{json, Map, Value};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
 #[test]
 fn uploader_rejects_malformed_custom_ca_bundle() {
+    support::use_dedicated_runtime();
     let error = Logs3BatchUploader::new_with_custom_ca_bundle_pem(
         "https://example.com",
         "test-key",

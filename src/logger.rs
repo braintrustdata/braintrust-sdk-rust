@@ -406,8 +406,8 @@ impl BraintrustClientBuilder {
     /// Equivalent to `.skip_login(true).build()`, but synchronous, since only login
     /// needs to wait. Upload with per-call credentials, such as
     /// [`BraintrustClient::log_rows_with_credentials`] or
-    /// [`BraintrustClient::log_rows_with_token_provider`]. Must be called within a
-    /// Tokio runtime, which runs the client's background log worker.
+    /// [`BraintrustClient::log_rows_with_token_provider`]. The SDK selects its
+    /// background runtime on first use.
     pub fn build_without_login(mut self) -> Result<BraintrustClient> {
         self.skip_login = true;
         self.construct()
@@ -445,6 +445,7 @@ impl BraintrustClientBuilder {
         // URLs so that flushes with per-request credentials work without relying on
         // the shared (set-once) login state to hold URLs.
         let queue = LogQueue::new(
+            crate::runtime::handle()?,
             log_config,
             login_state.clone(),
             http_client.clone(),
@@ -2220,15 +2221,18 @@ mod tests {
 
     #[tokio::test]
     async fn log_rows_with_token_provider_fetches_the_token_when_sending() {
+        // Delivery starts immediately, so the gate holds sends until the token rotates.
         struct Rotating {
             token: std::sync::Mutex<String>,
             calls: std::sync::atomic::AtomicUsize,
+            gate: tokio::sync::Semaphore,
         }
         #[async_trait::async_trait]
         impl TokenProvider for Rotating {
             async fn token(
                 &self,
             ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                drop(self.gate.acquire().await?);
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(self.token.lock().unwrap().clone())
             }
@@ -2237,6 +2241,7 @@ mod tests {
             Arc::new(Rotating {
                 token: std::sync::Mutex::new(token.to_owned()),
                 calls: Default::default(),
+                gate: tokio::sync::Semaphore::new(0),
             })
         };
 
@@ -2258,11 +2263,18 @@ mod tests {
         let row = |id: &str| serde_json::json!({ "id": id }).as_object().unwrap().clone();
         let rotating = provider("first");
         let other = provider("other");
-        client.log_rows_with_token_provider(rotating.clone(), "org", Some("org-name"), [row("a")]);
-        client.log_rows_with_token_provider(rotating.clone(), "org", Some("org-name"), [row("b")]);
+        // One call is admitted atomically, so its rows share a job and a token fetch.
+        client.log_rows_with_token_provider(
+            rotating.clone(),
+            "org",
+            Some("org-name"),
+            [row("a"), row("b")],
+        );
         client.log_rows_with_token_provider(other.clone(), "org", Some("org-name"), [row("c")]);
         assert_eq!(rotating.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         *rotating.token.lock().unwrap() = "rotated".to_owned();
+        rotating.gate.add_permits(1);
+        other.gate.add_permits(1);
         client.flush().await.expect("flush");
 
         assert_eq!(client.dropped_rows(), DroppedRows::default());
@@ -2300,24 +2312,26 @@ mod tests {
         );
     }
 
-    // A batch of spans resolves its shared credential after the writes are queued.
+    // Spans resolve their shared credential when uploaded, once per batch.
     #[tokio::test]
-    async fn span_builder_with_token_provider_resolves_once_at_upload() {
+    async fn span_builder_with_token_provider_resolves_at_upload() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-        #[derive(Default)]
-        struct Rotating {
+        // Delivery starts immediately, so the gate holds sends until the token rotates.
+        struct State {
             rotated: AtomicBool,
             calls: AtomicUsize,
+            gate: tokio::sync::Semaphore,
         }
-
+        struct Rotating(Arc<State>);
         #[async_trait::async_trait]
         impl TokenProvider for Rotating {
             async fn token(
                 &self,
             ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(if self.rotated.load(Ordering::SeqCst) {
+                drop(self.0.gate.acquire().await?);
+                self.0.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(if self.0.rotated.load(Ordering::SeqCst) {
                     "refreshed"
                 } else {
                     "expired"
@@ -2334,16 +2348,21 @@ mod tests {
                 "Bearer refreshed",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-            .expect(1)
+            .expect(1..=2)
             .mount(&server)
             .await;
         let client = BraintrustClient::builder()
             .api_url(server.uri())
+            .checked_delivery(true)
             .build_without_login()
             .unwrap();
-        let provider = Arc::new(Rotating::default());
+        let state = Arc::new(State {
+            rotated: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            gate: tokio::sync::Semaphore::new(0),
+        });
         let builder = client
-            .span_builder_with_token_provider(provider.clone(), "org")
+            .span_builder_with_token_provider(Arc::new(Rotating(state.clone())), "org")
             .parent_info(ParentSpanInfo::ProjectLogs {
                 object_id: "project".into(),
             });
@@ -2352,23 +2371,32 @@ mod tests {
             span.log(crate::SpanLog::builder().name(id).build().unwrap());
         }
 
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-        provider.rotated.store(true, Ordering::SeqCst);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        state.rotated.store(true, Ordering::SeqCst);
+        state.gate.add_permits(1);
         client.flush().await.unwrap();
 
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-        let uploaded = server.received_requests().await.unwrap();
-        let batch = uploaded
-            .iter()
-            .find(|request| request.url.path() == "/logs3")
-            .unwrap();
-        let body: Value = serde_json::from_slice(&batch.body).unwrap();
-        let ids: Vec<_> = body["rows"]
-            .as_array()
+        let uploads: Vec<_> = server
+            .received_requests()
+            .await
             .unwrap()
-            .iter()
-            .map(|row| row["id"].as_str().unwrap())
+            .into_iter()
+            .filter(|request| request.url.path() == "/logs3")
             .collect();
+        assert_eq!(state.calls.load(Ordering::SeqCst), uploads.len());
+        let mut ids: Vec<String> = uploads
+            .iter()
+            .flat_map(|request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                body["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort();
         assert_eq!(ids, ["first", "second"]);
     }
 
@@ -2446,20 +2474,28 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_rows_excludes_rows_delivered_before_a_split_fails() {
-        struct SplitThenReject(std::sync::atomic::AtomicUsize);
+        struct SplitThenReject;
         impl wiremock::Respond for SplitThenReject {
-            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
-                match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-                    0 => ResponseTemplate::new(413).set_body_string("too large"),
-                    1 => ResponseTemplate::new(200).set_body_string("{}"),
-                    _ => ResponseTemplate::new(400).set_body_string("rejected"),
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let rows = body["rows"].as_array().unwrap();
+                let rejected = rows
+                    .iter()
+                    .filter(|row| matches!(row["id"].as_str(), Some("row-2" | "row-3")))
+                    .count();
+                if rejected == 0 {
+                    ResponseTemplate::new(200).set_body_string("{}")
+                } else if rejected == rows.len() {
+                    ResponseTemplate::new(400).set_body_string("rejected")
+                } else {
+                    ResponseTemplate::new(413).set_body_string("too large")
                 }
             }
         }
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/logs3"))
-            .respond_with(SplitThenReject(std::sync::atomic::AtomicUsize::new(0)))
+            .respond_with(SplitThenReject)
             .mount(&server)
             .await;
         let client = BraintrustClient::builder()
@@ -2479,7 +2515,7 @@ mod tests {
         client.log_rows_with_credentials("token", "org", None, rows);
         let _ = client.flush().await;
 
-        // The 413 splits the batch in half: the first half is delivered, the second rejected.
+        // The last two rows are dropped regardless of how the worker batches them.
         assert_eq!(client.dropped_rows().upload_failed, 2);
     }
 

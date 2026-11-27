@@ -1,10 +1,14 @@
+mod support;
+
+use support::MockServer;
+
 use braintrust_sdk_rust::{
     extract_anthropic_usage, extract_openai_usage, BraintrustClient, ParentSpanInfo,
     SpanComponents, SpanLog, SpanObjectType, SpanOrigin,
 };
 use serde_json::{json, Map, Value};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 const INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD: &str = "_bt_internal_override_pagination_key";
 
