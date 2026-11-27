@@ -13,7 +13,6 @@ fn row(id: &str) -> Map<String, Value> {
         .clone()
 }
 
-#[tokio::test]
 async fn credentialed_row_upload_stops_at_the_first_end_of_input() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -139,4 +138,6 @@ async fn flush_and_shutdown_cover_writes_waiting_for_login() {
     assert!(
         matches!(error, braintrust_sdk_rust::FlushError::Delivery(failure) if failure.failed() == 2)
     );
+
+    credentialed_row_upload_stops_at_the_first_end_of_input().await;
 }
