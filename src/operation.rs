@@ -42,7 +42,7 @@ where
     E: From<ExecutionError> + Send + 'static,
 {
     let (sender, mut completion) = Completion::pair();
-    match Handle::try_current().or_else(|_| dedicated()) {
+    match crate::runtime::handle() {
         Ok(runtime) => {
             let panic = completion.panic_slot();
             runtime.spawn(async move {

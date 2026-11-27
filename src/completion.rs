@@ -91,7 +91,7 @@ impl<T, E> Completion<T, E> {
 
     /// Wait for the operation's final result from synchronous code.
     ///
-    /// Work already runs on the runtime chosen when the operation was issued;
+    /// Work already runs on the SDK's runtime (see [`crate::ServiceRuntime`]);
     /// this only waits on its response. Ready results can be read anywhere.
     /// Pending waits return [`BlockingWaitError::InRuntime`] whenever a Tokio
     /// runtime context is entered, including contexts where blocking might happen

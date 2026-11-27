@@ -1,3 +1,5 @@
+mod support;
+
 use braintrust_sdk_rust::{BraintrustClient, SpanLog};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path, query_param};
@@ -5,6 +7,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 #[tokio::test]
 async fn dataset_queries_and_summaries_use_the_discovered_api() {
+    support::use_dedicated_runtime();
     let app = MockServer::start().await;
     let api = MockServer::start().await;
     Mock::given(method("POST"))
@@ -81,6 +84,7 @@ async fn dataset_queries_and_summaries_use_the_discovered_api() {
 
 #[tokio::test]
 async fn explicit_api_url_overrides_discovered_url() {
+    support::use_dedicated_runtime();
     let app = MockServer::start().await;
     let api = MockServer::start().await;
     Mock::given(method("POST"))
@@ -106,6 +110,7 @@ async fn explicit_api_url_overrides_discovered_url() {
 
 #[tokio::test]
 async fn experiment_summary_uses_api_host_and_accepts_a_missing_base() {
+    support::use_dedicated_runtime();
     let app = MockServer::start().await;
     let api = MockServer::start().await;
     Mock::given(method("POST")).and(path("/api/experiment/register"))
@@ -149,6 +154,7 @@ async fn experiment_summary_uses_api_host_and_accepts_a_missing_base() {
 
 #[tokio::test]
 async fn queued_overflow_retries_the_reference_without_reuploading_or_leaking_credentials() {
+    support::use_dedicated_runtime();
     let app = MockServer::start().await;
     let api = MockServer::start().await;
     let storage = MockServer::start().await;

@@ -648,6 +648,7 @@ pub struct LogQueue {
 }
 impl LogQueue {
     pub fn new(
+        runtime: tokio::runtime::Handle,
         config: LogQueueConfig,
         login_state: LoginState,
         client: reqwest::Client,
@@ -665,14 +666,10 @@ impl LogQueue {
         });
         let processor =
             SpanBatchProcessor::new(config, drops, login_state, client, api_url, app_url);
-        let writes = WriteService::new(
-            capacity,
-            tokio::runtime::Handle::current(),
-            move |commands| {
-                let processor = processor.clone();
-                Box::pin(async move { processor.process(commands).await })
-            },
-        );
+        let writes = WriteService::new(capacity, runtime, move |commands| {
+            let processor = processor.clone();
+            Box::pin(async move { processor.process(commands).await })
+        });
         Self { rejections, writes }
     }
 
@@ -814,6 +811,7 @@ mod tests {
     }
     fn queue(server: &MockServer) -> LogQueue {
         LogQueue::new(
+            crate::runtime::handle().unwrap(),
             LogQueueConfig::builder().num_retries(0).build(),
             LoginState::new(),
             reqwest::Client::new(),

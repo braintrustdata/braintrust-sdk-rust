@@ -404,8 +404,8 @@ impl BraintrustClientBuilder {
     /// Equivalent to `.skip_login(true).build()`, but synchronous, since only login
     /// needs to wait. Upload with per-call credentials, such as
     /// [`BraintrustClient::log_rows_with_credentials`] or
-    /// [`BraintrustClient::log_rows_with_token_provider`]. Must be called within a
-    /// Tokio runtime, which runs the client's background log worker.
+    /// [`BraintrustClient::log_rows_with_token_provider`]. The SDK selects its
+    /// background runtime on first use.
     pub fn build_without_login(mut self) -> Result<BraintrustClient> {
         self.skip_login = true;
         self.construct()
@@ -443,6 +443,7 @@ impl BraintrustClientBuilder {
         // URLs so that flushes with per-request credentials work without relying on
         // the shared (set-once) login state to hold URLs.
         let queue = LogQueue::new(
+            crate::runtime::handle()?,
             log_config,
             login_state.clone(),
             http_client.clone(),

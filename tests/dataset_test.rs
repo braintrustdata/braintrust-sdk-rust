@@ -1,5 +1,7 @@
 //! Integration tests for Datasets API.
 
+mod support;
+
 use braintrust_sdk_rust::{BraintrustClient, DatasetInsert};
 use serde_json::json;
 use wiremock::matchers::{method, path};
@@ -16,6 +18,7 @@ fn mock_login_response(orgs: &[(&str, &str)]) -> ResponseTemplate {
 
 #[tokio::test]
 async fn dataset_builder_requires_project_name() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -50,6 +53,7 @@ async fn dataset_builder_requires_project_name() {
 
 #[tokio::test]
 async fn dataset_builder_requires_dataset_name() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -84,6 +88,7 @@ async fn dataset_builder_requires_dataset_name() {
 
 #[tokio::test]
 async fn dataset_insert_flushes_to_logs_endpoint() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -159,6 +164,7 @@ async fn dataset_insert_flushes_to_logs_endpoint() {
 
 #[tokio::test]
 async fn dataset_fetch_returns_records() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -226,6 +232,7 @@ async fn dataset_fetch_returns_records() {
 
 #[tokio::test]
 async fn dataset_summarize_returns_summary() {
+    support::use_dedicated_runtime();
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
