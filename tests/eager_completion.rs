@@ -14,6 +14,29 @@ fn row(id: &str) -> Map<String, Value> {
 }
 
 #[tokio::test]
+async fn credentialed_row_upload_stops_at_the_first_end_of_input() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .api_key("test-key")
+        .api_url(server.uri())
+        .skip_login(true)
+        .build()
+        .await
+        .unwrap();
+    let rows = [Some(row("first")), None, Some(row("after-end"))]
+        .into_iter()
+        .scan((), |_, row| row);
+
+    client.log_rows_with_credentials("test-key", "org-id", None, rows);
+    assert_eq!(client.flush().await.unwrap().delivered(), 1);
+}
+
+#[tokio::test]
 async fn flush_and_shutdown_cover_writes_waiting_for_login() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
