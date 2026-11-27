@@ -14,6 +14,7 @@ mod logs3;
 mod operation;
 mod resolution;
 mod runtime;
+mod scheduler;
 mod service;
 mod span;
 mod span_components;
