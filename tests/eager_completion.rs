@@ -141,6 +141,7 @@ async fn flush_and_shutdown_cover_writes_waiting_for_login() {
 
     credentialed_row_upload_stops_at_the_first_end_of_input().await;
     pending_login_writes_respect_client_capacity().await;
+    pending_row_calls_publish_in_call_order().await;
 }
 
 async fn pending_login_writes_respect_client_capacity() {
@@ -172,4 +173,69 @@ async fn pending_login_writes_respect_client_capacity() {
     assert!(second.submission().is_err());
     first.await.unwrap();
     client.flush().await.unwrap();
+}
+
+async fn pending_row_calls_publish_in_call_order() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"org_info":[{"id":"org-id","name":"org"}]})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .api_key("key")
+        .blocking_login(true)
+        .build()
+        .await
+        .unwrap();
+    let first_client = client.clone();
+    let (started, entered) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let first = std::thread::spawn(move || {
+        first_client.log_rows(std::iter::once_with(move || {
+            started.send(()).unwrap();
+            resume.recv().unwrap();
+            let mut row = row("same");
+            row.insert("output".into(), json!("first"));
+            row
+        }))
+    });
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    let mut update = row("same");
+    update.insert("output".into(), json!("second"));
+    let mut second = client.log_rows([update]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut second)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    first.join().unwrap().await.unwrap();
+    second.await.unwrap();
+    client.flush().await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let outputs: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .flat_map(|request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            body["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["output"].clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(outputs, vec![json!("first"), json!("second")]);
 }
