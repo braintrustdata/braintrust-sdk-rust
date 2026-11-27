@@ -142,6 +142,10 @@ pub(crate) async fn api_result<T>(
         Err(crate::api::Error::Transport(
             crate::api::HttpError::Config(message) | crate::api::HttpError::Serialization(message),
         )) => Err(BraintrustError::InvalidConfig(message)),
+        // Other middleware failures and client timeouts can succeed on retry.
+        Err(crate::api::Error::Transport(error)) if error.is_retryable() => {
+            Err(BraintrustError::Network(error.to_string()))
+        }
         Err(error) => Err(BraintrustError::Background(error.to_string())),
     }
 }

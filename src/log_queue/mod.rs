@@ -2,6 +2,7 @@ mod batching;
 mod config;
 mod http;
 mod merge;
+mod prepare;
 mod queue;
 mod row_key;
 
