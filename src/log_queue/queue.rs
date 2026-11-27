@@ -795,8 +795,10 @@ mod tests {
         }
     }
     fn queue(server: &MockServer) -> LogQueue {
+        // Keep the worker on the test thread so submissions made before the
+        // first await are drained in one batch.
         LogQueue::new(
-            crate::runtime::handle().unwrap(),
+            tokio::runtime::Handle::current(),
             LogQueueConfig::builder().num_retries(0).build(),
             LoginState::new(),
             crate::http::build_http_client(std::time::Duration::from_secs(30), None, None).unwrap(),
