@@ -103,7 +103,12 @@ impl RetryBudget {
 fn retryable(error: &BraintrustError) -> bool {
     match error {
         BraintrustError::Http(error) => !error.is_builder(),
-        BraintrustError::Api { status, .. } => *status == 429 || (500..600).contains(status),
+        // A transport failure other than a reqwest error, such as a timeout.
+        BraintrustError::Network(_) => true,
+        // Request timeout, too early, rate limited, or a server error.
+        BraintrustError::Api { status, .. } => {
+            matches!(status, 408 | 425 | 429) || (500..600).contains(status)
+        }
         _ => false,
     }
 }
@@ -266,6 +271,26 @@ mod tests {
         matchers::{header, method, path},
         Mock, MockServer, ResponseTemplate,
     };
+
+    #[test]
+    fn transient_failures_are_retried_and_permanent_ones_are_not() {
+        let api = |status| BraintrustError::Api {
+            status,
+            message: String::new(),
+        };
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            assert!(retryable(&api(status)), "{status} should be retried");
+        }
+        for status in [400, 401, 403, 404, 413, 422] {
+            assert!(!retryable(&api(status)), "{status} should not be retried");
+        }
+        // How the API client reports its own timeouts and middleware failures.
+        let timeout: crate::api::Error<serde_json::Value> =
+            crate::api::Error::Transport(crate::api::HttpError::Timeout);
+        let error = futures::executor::block_on(api_result::<()>(Err(timeout))).unwrap_err();
+        assert!(retryable(&error), "{error} should be retried");
+        assert!(!retryable(&BraintrustError::InvalidConfig(String::new())));
+    }
 
     fn batch() -> EncodedBatch {
         EncodedBatch::partition(
