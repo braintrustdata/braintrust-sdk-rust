@@ -97,7 +97,7 @@ impl OrgIdentity {
             if let Some(id) = org_aliases()
                 .lock()
                 .unwrap()
-                .get(&(endpoint.to_owned(), name.clone()))
+                .get(&(endpoint.trim_end_matches('/').to_owned(), name.clone()))
             {
                 return format!("id:{id}");
             }
@@ -128,7 +128,7 @@ pub(crate) fn remember_org(endpoint: &str, id: &str, name: &str) {
         return;
     }
     let mut aliases = org_aliases().lock().unwrap();
-    let key = (endpoint.to_owned(), name.to_owned());
+    let key = (endpoint.trim_end_matches('/').to_owned(), name.to_owned());
     aliases.shift_remove(&key);
     if aliases.len() >= MAX_ALIASES {
         aliases.shift_remove_index(0);
@@ -168,7 +168,7 @@ pub(crate) fn capabilities(endpoint: &str) -> impl Deref<Target = OnceCell<Optio
     static CAPABILITIES: OnceLock<Cache<String, Option<usize>>> = OnceLock::new();
     CAPABILITIES
         .get_or_init(|| Cache::new(crate::service::config().max_cached_resolutions))
-        .entry(endpoint.to_owned())
+        .entry(endpoint.trim_end_matches('/').to_owned())
 }
 
 #[cfg(test)]
