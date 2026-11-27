@@ -5,7 +5,7 @@ use crate::log_queue::{
     submission::SubmitCommand,
 };
 use crate::{DeliveryReceipt, WriteError};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -39,7 +39,23 @@ pub(super) struct Intake {
     pub(super) sequence: u64,
     pub(super) records: HashMap<u64, Record>,
     pub(super) partitions: HashMap<Key, Partition>,
-    pub(super) row_order: HashMap<RowOrderKey, BTreeMap<u64, Key>>,
+    pub(super) row_order: HashMap<RowOrderKey, RowOrder>,
+}
+
+#[derive(Default)]
+pub(super) struct RowOrder {
+    pub(super) writes: BTreeMap<u64, Key>,
+    by_partition: HashMap<Key, BTreeSet<u64>>,
+}
+
+impl RowOrder {
+    pub(super) fn insert(&mut self, sequence: u64, key: Key) {
+        self.by_partition
+            .entry(key.clone())
+            .or_default()
+            .insert(sequence);
+        self.writes.insert(sequence, key);
+    }
 }
 
 impl Intake {
@@ -50,19 +66,31 @@ impl Intake {
         let Some(order) = self.row_order.get_mut(&row) else {
             return Vec::new();
         };
-        let Some(released) = order.remove(&sequence) else {
+        let Some(released) = order.writes.remove(&sequence) else {
             return Vec::new();
         };
-        if order.is_empty() {
+        if order.writes.is_empty() {
             self.row_order.remove(&row);
-            Vec::new()
-        } else {
-            order
-                .values()
-                .filter(|candidate| released.aliases(candidate))
-                .cloned()
-                .collect()
+            return Vec::new();
         }
+
+        let sequences = order
+            .by_partition
+            .get_mut(&released)
+            .expect("registered partition");
+        sequences.remove(&sequence);
+        if sequences.is_empty() {
+            order.by_partition.remove(&released);
+        }
+        order
+            .by_partition
+            .iter()
+            .filter(|(candidate, sequences)| {
+                sequences.first().is_some_and(|first| *first > sequence)
+                    && released.aliases(candidate)
+            })
+            .map(|(candidate, _)| candidate.clone())
+            .collect()
     }
 }
 

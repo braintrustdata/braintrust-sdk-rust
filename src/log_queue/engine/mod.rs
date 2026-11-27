@@ -15,6 +15,7 @@ use crate::{
     Completion, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushReport,
     ShutdownError, ShutdownReport, WriteError,
 };
+use futures::FutureExt;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -75,6 +76,7 @@ impl Engine {
             let predecessor = entry.row.as_ref().and_then(|row| {
                 row_order
                     .get(row)?
+                    .writes
                     .range(..entry.sequence)
                     .rev()
                     .find(|(_, earlier)| key.aliases(earlier))
@@ -197,22 +199,29 @@ impl Engine {
         scope: &Arc<Observation>,
         timeout: std::time::Duration,
     ) -> Completion<ShutdownReport, ShutdownError> {
-        let (sender, completion) = Completion::pair();
+        let (sender, mut completion) = Completion::pair();
         let intake = self.intake.lock().unwrap();
         scope.close();
-        let barrier = scope.barrier(intake.sequence, true);
+        let mut barrier = scope.barrier(intake.sequence, true);
         drop(intake);
+        if let Err(error) = barrier.submission() {
+            completion.record_issuance(Err(error.clone().into()));
+            return completion;
+        }
+        let shutdown_report = |report: FlushReport| ShutdownReport {
+            delivered: report.delivered,
+        };
+        if let Some(result) = (&mut barrier).now_or_never() {
+            let _ = sender.send(result.map(shutdown_report).map_err(ShutdownError::from));
+            return completion;
+        }
         let engine = self.clone();
         let scope = scope.clone();
         crate::service::global()
             .expect("initialized service")
             .spawn_operation(async move {
                 let result = match tokio::time::timeout(timeout, barrier).await {
-                    Ok(result) => result
-                        .map(|report| ShutdownReport {
-                            delivered: report.delivered,
-                        })
-                        .map_err(ShutdownError::from),
+                    Ok(result) => result.map(shutdown_report).map_err(ShutdownError::from),
                     Err(_) => {
                         engine.expire(&scope);
                         Err(ExecutionError::TimedOut.into())

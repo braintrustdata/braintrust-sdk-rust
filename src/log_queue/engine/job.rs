@@ -57,7 +57,9 @@ impl Job {
         };
         if panicked {
             self.report.settle_delivered();
-            let error = anyhow::anyhow!("delivery partition panicked");
+            let error = crate::log_queue::observation::DeliveryError::new(anyhow::anyhow!(
+                "delivery partition panicked"
+            ));
             for (index, entry) in self.entries.iter().enumerate() {
                 if entry.is_some() && matches!(self.report.outcomes[index], Outcome::Pending) {
                     self.report.failed(vec![index], &error, true);

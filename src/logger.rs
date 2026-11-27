@@ -757,11 +757,17 @@ impl BraintrustClient {
     /// Stop accepting writes through this facade and its derived handles, and
     /// wait for their accepted work to be delivered. Other clients sharing the
     /// service are unaffected. A timeout fails the remaining completions and
-    /// discards their rows.
+    /// discards their rows. While a shutdown is draining writes, another call
+    /// returns [`crate::EnqueueError::Full`].
     pub fn shutdown(
         &self,
         timeout: std::time::Duration,
     ) -> crate::Completion<crate::ShutdownReport, crate::ShutdownError> {
+        let Some(drain) = self.inner.pending_auth.try_drain() else {
+            let (_, mut completion) = crate::Completion::pair();
+            completion.record_issuance(Err(crate::EnqueueError::Full.into()));
+            return completion;
+        };
         let started = tokio::time::Instant::now();
         let (result, pending) = self.inner.pending_auth.snapshot(true, |empty| {
             if empty {
@@ -776,6 +782,7 @@ impl BraintrustClient {
         };
         let client = self.clone();
         crate::operation::submit(async move {
+            let _drain = drain;
             match tokio::time::timeout(
                 timeout.saturating_sub(started.elapsed()),
                 pending_auth::join(barrier, pending),

@@ -418,3 +418,89 @@ fn distinct_known_projects_can_reuse_the_same_row_id() {
     }
     assert_eq!(engine.take_jobs().len(), 2);
 }
+
+#[test]
+fn row_retirement_reports_each_waiting_partition_once() {
+    let queue = queue();
+    let engine = Engine::manual();
+    for _ in 0..128 {
+        engine.submit(queue.core.clone(), SubmitCommand::test_row("same"));
+    }
+    let (_, mut entries) = engine.take_jobs().pop().unwrap();
+    assert_eq!(entries.len(), 1);
+    let mut intake = engine.intake.lock().unwrap();
+    assert_eq!(
+        intake.release_row(entries.pop().unwrap().release()).len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn dropping_shutdown_completion_does_not_admit_a_second_drain() {
+    let queue = queue();
+    let engine = Arc::new(Engine::manual());
+    let scope = &queue.core.observation;
+    let write = engine.submit(queue.core.clone(), SubmitCommand::test_row("pending"));
+    drop(engine.shutdown(scope, std::time::Duration::from_secs(10)));
+
+    let repeated = engine.shutdown(scope, std::time::Duration::ZERO);
+    assert!(matches!(
+        repeated.submission(),
+        Err(ShutdownError::Admission(EnqueueError::Full))
+    ));
+    let (_, mut entries) = engine.take_jobs().pop().unwrap();
+    engine.retire_entries(vec![(entries.pop().unwrap().release(), None)]);
+    write.await.unwrap();
+    assert_eq!(
+        engine
+            .shutdown(scope, std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .delivered(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn upload_timeout_preserves_the_original_error_for_flush_and_write() {
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(1)))
+        .mount(&server)
+        .await;
+    let queue = LogQueue::new(
+        LogQueueConfig::builder()
+            .sync_flush(true)
+            .checked_delivery(true)
+            .num_retries(0)
+            .build(),
+        LoginState::new(),
+        crate::http::build_http_client(std::time::Duration::from_millis(100), None, None).unwrap(),
+        32,
+        server.uri().parse().unwrap(),
+        server.uri().parse().unwrap(),
+    );
+    let engine = Engine::manual();
+    let write = engine.submit(queue.core.clone(), SubmitCommand::test_row("timed-out"));
+    let flush = engine.barrier(&queue.core.observation);
+    let (key, entries) = engine.take_jobs().pop().unwrap();
+    engine.clone().process_job(key, entries).await;
+
+    let WriteError::Delivery(write) = write.await.unwrap_err() else {
+        panic!("expected delivery failure");
+    };
+    let FlushError::Delivery(flush) = flush.await.unwrap_err() else {
+        panic!("expected flush failure");
+    };
+    assert!(Arc::ptr_eq(&write, flush.cause()));
+    assert!(matches!(
+        write.cause().downcast_ref::<crate::BraintrustError>(),
+        Some(crate::BraintrustError::Http(error)) if error.is_timeout()
+    ));
+}
