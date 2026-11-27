@@ -8,7 +8,7 @@ use std::future::IntoFuture;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wiremock::{
-    matchers::{body_string_contains, header, method, path},
+    matchers::{body_string_contains, method, path},
     Mock, ResponseTemplate,
 };
 

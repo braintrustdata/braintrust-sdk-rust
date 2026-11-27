@@ -27,8 +27,6 @@ impl Capabilities {
             let endpoint = client.baseurl();
             let cell = crate::resolution::capabilities(endpoint);
             cell.get_or_try_init(|| async {
-                // Server capabilities are shared across orgs, so a throttled org
-                // must not delay a lookup needed by other callers.
                 // Capabilities are shared across orgs, so one org's cooldown
                 // must not delay a lookup needed by other callers.
                 let version = scheduled(Scope::new(endpoint, ""), 0, || client.version())
