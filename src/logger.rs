@@ -197,7 +197,7 @@ impl BraintrustClient {
             let org_name = state
                 .org_name()
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-            let mut builder = DatasetBuilder::new(Arc::new(client.scoped()), api_key, org_name)
+            let mut builder = DatasetBuilder::new(Arc::new(client.clone()), api_key, org_name)
                 .org_id(state.org_id().unwrap_or_default());
             if let Some(project) = &client.inner.default_project {
                 builder = builder.project_name(project);
@@ -621,17 +621,7 @@ impl BraintrustClient {
         let token = token.into();
         let org_id = org_id.into();
 
-        let context = if self.inner.login_state.org_id().as_deref() == Some(&org_id) {
-            self.scoped()
-        } else {
-            // Explicit credentials for a different org must not inherit the selected org's endpoint.
-            self.derive_scope(
-                self.inner.queue.child_with_login(LoginState::new()),
-                LoginState::new(),
-                self.inner.default_project.clone(),
-            )
-        };
-        let submitter = Arc::new(context);
+        let submitter = Arc::new(self.clone());
         let mut builder = ExperimentBuilder::new(submitter, token, org_id);
         if let Some(project) = &self.inner.default_project {
             builder = builder.project_name(project);
@@ -789,6 +779,20 @@ impl SpanSubmitter for BraintrustClient {
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         self.submit_payload(credential, payload, parent_info)
+    }
+
+    fn for_resource(self: Arc<Self>, org_id: &str) -> Arc<Self> {
+        if self.inner.login_state.org_id().as_deref() == Some(org_id) {
+            Arc::new(self.scoped())
+        } else {
+            // A resource's explicit organization owns its endpoint discovery.
+            let login = LoginState::new();
+            Arc::new(self.derive_scope(
+                self.inner.queue.child_with_login(login.clone()),
+                login,
+                self.inner.default_project.clone(),
+            ))
+        }
     }
 
     fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {

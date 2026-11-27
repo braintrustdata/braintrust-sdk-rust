@@ -258,6 +258,11 @@ pub(crate) trait SpanSubmitter: Send + Sync {
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
 
+    /// Derive an independent delivery observer for a newly built resource.
+    fn for_resource(self: Arc<Self>, _org_id: &str) -> Arc<Self> {
+        self
+    }
+
     /// Flush all queued span data through to the server.
     fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError>;
 }

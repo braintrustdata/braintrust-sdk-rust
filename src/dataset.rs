@@ -460,7 +460,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
             .ok_or(DatasetBuilderError::MissingDatasetName)?;
 
         Ok(Dataset {
-            submitter: self.submitter,
+            submitter: self.submitter.for_resource(&self.org_id),
             token: self.token,
             org_name: self.org_name,
             org_id: self.org_id,
