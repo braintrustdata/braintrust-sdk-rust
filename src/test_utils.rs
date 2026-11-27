@@ -69,7 +69,7 @@ impl SpanSubmitter for MockBraintrustClient {
             panic!("expected a static test credential");
         };
         self.collector.push(CapturedSpan {
-            token,
+            token: token.to_string(),
             payload,
             parent: parent_info,
         });
