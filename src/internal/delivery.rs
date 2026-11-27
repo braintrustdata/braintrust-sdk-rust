@@ -395,6 +395,7 @@ impl<C> Inner<C> {
         match self.terminal.load(Ordering::SeqCst) {
             0 => None,
             2 => Some(ExecutionError::TimedOut),
+            3 => Some(ExecutionError::AlreadyTaken),
             _ => Some(ExecutionError::WorkerLost),
         }
     }
@@ -469,6 +470,7 @@ impl<C> Inner<C> {
         let code = match error {
             ExecutionError::WorkerLost => 1,
             ExecutionError::TimedOut => 2,
+            ExecutionError::AlreadyTaken => 3,
         };
         let mut state = lock(&self.state);
         if let Some(error) = self.terminal_error() {
