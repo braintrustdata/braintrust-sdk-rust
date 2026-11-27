@@ -607,6 +607,24 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         completion
     }
 
+    /// Submit an already-finished event as one snapshot.
+    pub(crate) fn log_and_end(&self, event: SpanLog, end_time: f64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("span mutex should not be poisoned");
+        apply_span_log_to_data(&mut inner, event);
+        inner.end_time = Some(end_time);
+        let payload = current_span_payload(&mut inner);
+        let completion =
+            self.submitter
+                .submit(self.credential.clone(), payload, self.parent_info.clone());
+        if completion.is_ok() {
+            inner.has_flushed = true;
+            inner.end_submitted = true;
+        }
+    }
+
     /// Flush all queued span data through to Braintrust.
     ///
     /// This does not create a new queued span update. Call [`SpanHandle::log`] or

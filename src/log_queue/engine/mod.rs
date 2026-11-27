@@ -1,10 +1,11 @@
 //! Process-wide admission and dispatch for queued writes.
+mod dispatch;
 mod intake;
 mod job;
 mod partition;
 
 use self::{
-    intake::{Entry, FinishedWrites, Intake, Record, WriteSender},
+    intake::{Entry, FinishedWrites, Intake, Record, RowOrderKey, WriteSender},
     job::Job,
     partition::Key,
 };
@@ -13,6 +14,7 @@ use crate::{
     Completion, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushReport,
     ServiceConfig, ShutdownError, ShutdownReport, WriteError,
 };
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -59,12 +61,35 @@ impl Engine {
 
     fn take_job(&self, key: &Key) -> Option<Vec<Entry>> {
         let mut intake = self.intake.lock().unwrap();
-        let partition = intake.partitions.get_mut(key)?;
-        if partition.running || partition.pending.is_empty() {
+        let Intake {
+            partitions,
+            row_order,
+            ..
+        } = &mut *intake;
+        let partition = partitions.get_mut(key)?;
+        if partition.running {
+            return None;
+        }
+        let mut entries = Vec::new();
+        let mut selected = HashSet::new();
+        while let Some(entry) = partition.pending.front() {
+            let predecessor = entry
+                .row
+                .as_ref()
+                .and_then(|row| row_order.get(row)?.range(..entry.sequence).next_back());
+            if predecessor
+                .is_some_and(|(sequence, _)| !key.merges_spans() || !selected.contains(sequence))
+            {
+                break;
+            }
+            selected.insert(entry.sequence);
+            entries.push(partition.pending.pop_front().expect("front exists"));
+        }
+        if entries.is_empty() {
             return None;
         }
         partition.running = true;
-        Some(std::mem::take(&mut partition.pending).into())
+        Some(entries)
     }
 
     pub fn submit(
@@ -107,7 +132,7 @@ impl Engine {
                 || self
                     .config
                     .max_rows
-                    .is_some_and(|max| intake.records.len() >= max)
+                    .is_some_and(|max| intake.retained >= max)
                 || self
                     .config
                     .max_org_rows
@@ -127,16 +152,29 @@ impl Engine {
             let sequence = intake.sequence;
             core.observation.accept(sequence);
             core.retained(client_rows + 1);
+            intake.retained += 1;
             *intake.org_rows.entry(key.route.clone()).or_default() += 1;
             results.push(Ok(()));
             intake.records.insert(
                 sequence,
                 Record {
                     observer: core.observation.clone(),
-                    route: key.route.clone(),
                     sender,
                 },
             );
+            let row = command.row_id().map(|id| RowOrderKey {
+                route: key.route.clone(),
+                id: id.to_owned(),
+            });
+            if let Some(row) = &row {
+                intake
+                    .row_order
+                    .entry(row.clone())
+                    .or_default()
+                    .insert(sequence, key.clone());
+            }
+
+            let route = key.route.clone();
             let partition = intake.partitions.entry(key.clone()).or_default();
             if !partition.running && partition.pending.is_empty() {
                 ready.push(key);
@@ -145,6 +183,8 @@ impl Engine {
                 core: core.clone(),
                 command,
                 sequence,
+                row,
+                route,
             });
         }
         drop(intake);
@@ -194,7 +234,7 @@ impl Engine {
             });
         completion
     }
-    fn expire(&self, scope: &Arc<Observation>) {
+    fn expire(self: &Arc<Self>, scope: &Arc<Observation>) {
         let mut intake = self.intake.lock().unwrap();
         scope.time_out();
         let sequences: Vec<_> = intake
@@ -227,8 +267,36 @@ impl Engine {
         partitions.retain(|_, partition| partition.running || !partition.pending.is_empty());
         drop(intake);
         completed.notify();
-        drop(discarded);
+        self.release_entries(discarded);
         self.cancellations.notify_waiters();
+    }
+
+    fn release_entries(self: &Arc<Self>, entries: Vec<Entry>) {
+        let rows: Vec<_> = entries.into_iter().map(Entry::release).collect();
+        let mut intake = self.intake.lock().unwrap();
+        let ready = rows
+            .into_iter()
+            .filter_map(|row| intake.release_row(row))
+            .collect::<Vec<_>>();
+        drop(intake);
+        for key in ready {
+            self.schedule(key);
+        }
+    }
+
+    fn retire_entries(self: &Arc<Self>, writes: Vec<(intake::ReleasedEntry, Option<WriteError>)>) {
+        let mut intake = self.intake.lock().unwrap();
+        let mut completed = FinishedWrites::default();
+        let mut ready = Vec::new();
+        for (released, error) in writes {
+            completed.retire(&mut intake, released.sequence, error);
+            ready.extend(intake.release_row(released));
+        }
+        drop(intake);
+        completed.notify();
+        for key in ready {
+            self.schedule(key);
+        }
     }
 
     #[cfg(test)]
