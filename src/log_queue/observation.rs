@@ -1,7 +1,6 @@
 //! Scoped delivery observations shared by client and resource facades.
 use crate::{
-    BraintrustError, Completion, EnqueueError, ExecutionError, FlushError, FlushFailure,
-    FlushReport, WriteError,
+    Completion, EnqueueError, ExecutionError, FlushError, FlushFailure, FlushReport, WriteError,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
@@ -26,24 +25,10 @@ pub struct DroppedRows {
 pub(crate) struct DeliveryError {
     shared: Arc<crate::DeliveryError>,
 }
-/// Copy an error for another owner, keeping API status codes inspectable.
-pub(crate) fn duplicate_error(error: &anyhow::Error) -> anyhow::Error {
-    match error.downcast_ref::<BraintrustError>() {
-        Some(BraintrustError::Api { status, message }) => {
-            anyhow::Error::from(BraintrustError::Api {
-                status: *status,
-                message: message.clone(),
-            })
-        }
-        _ => anyhow::anyhow!(error.to_string()),
-    }
-}
 impl DeliveryError {
-    pub(crate) fn from_error(error: &anyhow::Error) -> Self {
+    pub(crate) fn new(source: anyhow::Error) -> Self {
         Self {
-            shared: Arc::new(crate::DeliveryError {
-                source: duplicate_error(error),
-            }),
+            shared: Arc::new(crate::DeliveryError { source }),
         }
     }
     pub fn write_error(&self) -> WriteError {
@@ -55,6 +40,7 @@ pub(crate) type Notification = (
     Result<FlushReport, FlushError>,
 );
 struct Waiter {
+    shutdown: bool,
     cutoff: u64,
     delivered: u64,
     failed: u64,
@@ -209,7 +195,7 @@ impl Observation {
     pub fn len(&self) -> usize {
         self.state.lock().unwrap().pending.len()
     }
-    pub fn barrier(&self, cutoff: u64, allow_closed: bool) -> Completion<FlushReport, FlushError> {
+    pub fn barrier(&self, cutoff: u64, shutdown: bool) -> Completion<FlushReport, FlushError> {
         let (sender, mut completion) = Completion::pair();
         let terminal = self.terminal();
         let closed = self.closed();
@@ -217,14 +203,17 @@ impl Observation {
         state.waiters.retain(|w| !w.sender.is_closed());
         if let Some(error) = terminal {
             completion.record_issuance(Err(error.into()));
-        } else if closed && !allow_closed {
+        } else if closed && !shutdown {
             completion.record_issuance(Err(EnqueueError::Closed.into()));
-        } else if !allow_closed && state.waiters.len() >= 1024 {
+        } else if (shutdown && state.waiters.iter().any(|w| w.shutdown))
+            || (!shutdown && state.waiters.len() >= 1024)
+        {
             completion.record_issuance(Err(EnqueueError::Full.into()));
         } else if state.pending.range(..=cutoff).next().is_none() {
             let _ = sender.send(Ok(FlushReport::default()));
         } else {
             state.waiters.push(Waiter {
+                shutdown,
                 cutoff,
                 delivered: 0,
                 failed: 0,

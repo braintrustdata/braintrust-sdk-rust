@@ -35,7 +35,7 @@ impl Job {
         let api_url = match Url::parse(&endpoint) {
             Ok(url) => url,
             Err(error) => {
-                let error = anyhow::Error::from(error);
+                let error = DeliveryError::new(error.into());
                 for i in 0..count {
                     self.report.failed(vec![i], &error, false);
                 }
@@ -54,6 +54,7 @@ impl Job {
                 }
                 (Err(error), None) => {
                     tracing::warn!(%error, "failed to get upload token, dropping rows");
+                    let error = DeliveryError::new(error);
                     for i in 0..count {
                         self.report.failed(vec![i], &error, false);
                     }
@@ -95,7 +96,7 @@ impl Job {
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(%error, "failed to prepare span, dropping");
+                            tracing::warn!(?error, "failed to prepare span, dropping");
                             self.report.failed(vec![index], &error, true);
                         }
                     }
@@ -148,7 +149,7 @@ impl Job {
         let (batches, failures) = match encoded {
             Ok(encoded) => encoded,
             Err(error) => {
-                let error = anyhow::Error::from(error);
+                let error = DeliveryError::new(error.into());
                 for i in 0..self.report.outcomes.len() {
                     if self.entries[i].is_some() {
                         self.report.failed(vec![i], &error, true);
@@ -158,7 +159,8 @@ impl Job {
             }
         };
         for (submissions, error) in failures {
-            self.report.failed(submissions, &error, true);
+            self.report
+                .failed(submissions, &DeliveryError::new(error), true);
         }
         self.retire_ready();
         let batches: Vec<_> = batches
@@ -231,7 +233,7 @@ impl Job {
                     .settle(rows.iter().take(delivered).flatten().copied());
             } else if let Err(error) = result {
                 tracing::warn!(%error,"destination upload failed");
-                let failure = DeliveryError::from_error(&error);
+                let failure = DeliveryError::new(error);
                 // A split may have delivered a prefix. The whole logical batch fails
                 // its checked observers, but only undelivered rows count as lost.
                 for (position, submissions) in rows.iter().enumerate() {

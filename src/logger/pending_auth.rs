@@ -23,6 +23,7 @@ pub(super) struct PendingAuth {
     shared: Arc<Mutex<State>>,
     scope: Arc<Scope>,
     cancelled: Arc<Notify>,
+    draining: AtomicBool,
 }
 
 #[derive(Default)]
@@ -61,16 +62,32 @@ pub(super) struct Reservation {
     id: u64,
 }
 
+pub(super) struct Drain(Arc<PendingAuth>);
+
+impl Drop for Drain {
+    fn drop(&mut self) {
+        self.0.draining.store(false, Ordering::Release);
+    }
+}
+
 impl PendingAuth {
     pub(super) fn child(&self) -> Self {
         Self {
             shared: self.shared.clone(),
             cancelled: self.cancelled.clone(),
+            draining: AtomicBool::new(false),
             scope: Arc::new(Scope {
                 parent: Some(self.scope.clone()),
                 ..Scope::default()
             }),
         }
+    }
+
+    pub(super) fn try_drain(self: &Arc<Self>) -> Option<Drain> {
+        self.draining
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Drain(self.clone()))
     }
 
     pub(super) fn reserve(self: &Arc<Self>) -> Result<Reservation, BraintrustError> {
