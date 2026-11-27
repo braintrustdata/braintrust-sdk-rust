@@ -52,6 +52,12 @@ impl LogQueue {
         }
     }
 
+    pub(crate) fn rebind(&self, state: LoginState) -> Self {
+        Self {
+            core: LogQueueCore::new(self.core.settings.clone(), state, None),
+        }
+    }
+
     pub(crate) fn submit(
         &self,
         credential: Credential,
