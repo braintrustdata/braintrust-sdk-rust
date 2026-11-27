@@ -71,6 +71,36 @@ where
         .await
 }
 
+/// Per-batch cancellation check, applied after admission and before issuing a request.
+pub(crate) struct RequestGuard {
+    cancelled: Box<dyn Fn() -> bool + Send + Sync>,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl RequestGuard {
+    pub(crate) fn new(cancelled: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            cancelled: Box::new(cancelled),
+            stopped: false.into(),
+        }
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn check(&self) -> bool {
+        if (self.cancelled)() {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+}
+
+tokio::task_local! { pub(crate) static REQUEST_GUARD: std::sync::Arc<RequestGuard>; }
+
 // Reuse the iterator across all overflow stages and splits.
 pub(crate) struct RetryBudget {
     delays: ExponentialBackoff,
@@ -95,6 +125,11 @@ impl RetryBudget {
     {
         loop {
             let permit = scheduler::shared().acquire().await;
+            if REQUEST_GUARD.try_with(|guard| guard.check()) == Ok(false) {
+                return Err(BraintrustError::Background(
+                    "delivery batch cancelled".into(),
+                ));
+            }
             self.requests += 1;
             let failure = match attempt(operation().await).await {
                 Ok(result) => return Ok(result),

@@ -2,7 +2,7 @@ mod support;
 
 use support::MockServer;
 
-use braintrust_sdk_rust::{BraintrustClient, BraintrustError, SpanLog};
+use braintrust_sdk_rust::{BraintrustClient, BraintrustError, SpanLog, TokenProvider};
 use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -222,4 +222,44 @@ async fn submission_and_flush_can_be_issued_without_a_call_site_runtime() {
     .unwrap();
     write.await.unwrap();
     assert_eq!(flush.await.unwrap().delivered(), 1);
+}
+
+#[tokio::test]
+async fn a_failing_token_provider_is_retried_before_rows_are_dropped() {
+    struct FailsOnce(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl TokenProvider for FailsOnce {
+        async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Err("token service unavailable".into()),
+                _ => Ok("token".into()),
+            }
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(header("authorization", "Bearer token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build_without_login()
+        .unwrap();
+    let provider = std::sync::Arc::new(FailsOnce(Default::default()));
+    client.log_rows_with_token_provider(
+        provider.clone(),
+        "org",
+        None,
+        [json!({"id": "row", "project_id": "p"})
+            .as_object()
+            .unwrap()
+            .clone()],
+    );
+    assert_eq!(client.flush().await.unwrap().delivered(), 1);
+    assert_eq!(client.dropped_rows().upload_failed, 0);
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 2);
 }

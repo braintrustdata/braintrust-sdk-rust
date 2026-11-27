@@ -115,6 +115,21 @@ let anthropic_response = json!({
 let usage = extract_anthropic_usage(&anthropic_response);
 ```
 
+## Service configuration
+
+Call `configure_service` before creating your first SDK client or bulk uploader.
+Use `ServiceConfig` to set process-wide request concurrency or select the
+Tokio runtime for SDK work.
+
+```rust,no_run
+use braintrust_sdk_rust::{configure_service, ServiceConfig};
+
+configure_service(ServiceConfig::builder()
+    .max_concurrent_requests(8)
+    .build())?;
+# Ok::<(), braintrust_sdk_rust::BraintrustError>(())
+```
+
 ## License
 
 This project is licensed under the [Apache License, Version 2.0](LICENSE).
