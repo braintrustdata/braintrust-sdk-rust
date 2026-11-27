@@ -747,7 +747,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                     };
 
                     dataset.submitter.submit(
-                        Credential::Token(dataset.token.clone()),
+                        Credential::token_value(dataset.token.clone()),
                         payload,
                         Some(parent_info),
                     );

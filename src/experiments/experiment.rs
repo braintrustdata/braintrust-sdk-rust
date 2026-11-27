@@ -278,7 +278,7 @@ impl<
             };
 
             experiment.submitter.submit(
-                Credential::Token(experiment.token.clone()),
+                Credential::token_value(experiment.token.clone()),
                 payload,
                 Some(parent_info),
             );
@@ -497,7 +497,7 @@ impl<
             };
 
             experiment.submitter.submit(
-                Credential::Token(experiment.token.clone()),
+                Credential::token_value(experiment.token.clone()),
                 payload,
                 Some(parent_info),
             );
