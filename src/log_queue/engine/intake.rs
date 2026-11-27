@@ -54,7 +54,7 @@ pub(super) struct Intake {
 }
 
 impl Intake {
-    pub(super) fn release_row(&mut self, released: ReleasedEntry) -> Option<Key> {
+    pub(super) fn release_row(&mut self, released: ReleasedEntry) -> Vec<Key> {
         let ReleasedEntry {
             row,
             sequence,
@@ -67,19 +67,24 @@ impl Intake {
                 self.org_rows.remove(&route);
             }
         }
-        let row = row?;
-        let order = self.row_order.get_mut(&row)?;
-        let was_first = order
-            .first_key_value()
-            .is_some_and(|(first, _)| *first == sequence);
-        order.remove(&sequence);
+        let Some(row) = row else {
+            return Vec::new();
+        };
+        let Some(order) = self.row_order.get_mut(&row) else {
+            return Vec::new();
+        };
+        let Some(released) = order.remove(&sequence) else {
+            return Vec::new();
+        };
         if order.is_empty() {
             self.row_order.remove(&row);
-            None
-        } else if was_first {
-            order.first_key_value().map(|(_, key)| key.clone())
+            Vec::new()
         } else {
-            None
+            order
+                .values()
+                .filter(|candidate| released.aliases(candidate))
+                .cloned()
+                .collect()
         }
     }
 }

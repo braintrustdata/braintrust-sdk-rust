@@ -599,3 +599,16 @@ fn a_dropped_job_requeues_unsettled_rows_ahead_of_later_ones() {
     let sequences: Vec<_> = jobs[0].1.iter().map(|entry| entry.sequence).collect();
     assert_eq!(sequences, [2, 3, 4]);
 }
+
+#[test]
+fn distinct_known_projects_can_reuse_the_same_row_id() {
+    let queue = queue();
+    let engine = Engine::manual(ServiceConfig::default());
+    for project in ["a", "b"] {
+        engine.submit(
+            queue.core.clone(),
+            SubmitCommand::test_scoped_row("same", project, "org"),
+        );
+    }
+    assert_eq!(engine.take_jobs().len(), 2);
+}
