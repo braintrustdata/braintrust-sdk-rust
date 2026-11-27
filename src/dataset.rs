@@ -471,32 +471,11 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 // Dataset
 // ============================================================================
 
+// Only delivered queue outcomes are shared. Each registration keeps its
+// own error, including any original reqwest transport cause.
 type DatasetFlush = futures::future::Shared<
-    futures::future::BoxFuture<'static, std::result::Result<(), Arc<crate::BraintrustError>>>,
+    futures::future::BoxFuture<'static, Option<std::result::Result<(), crate::FlushError>>>,
 >;
-
-fn copy_flush_error(error: Arc<crate::BraintrustError>) -> crate::BraintrustError {
-    match error.as_ref() {
-        crate::BraintrustError::Api { status, message } => crate::BraintrustError::Api {
-            status: *status,
-            message: message.clone(),
-        },
-        crate::BraintrustError::InvalidConfig(message) => {
-            crate::BraintrustError::InvalidConfig(message.clone())
-        }
-        crate::BraintrustError::Http(error) => crate::BraintrustError::Network(error.to_string()),
-        crate::BraintrustError::Network(message) => {
-            crate::BraintrustError::Network(message.clone())
-        }
-        crate::BraintrustError::Background(message) => {
-            crate::BraintrustError::Background(message.clone())
-        }
-        crate::BraintrustError::ChannelClosed => crate::BraintrustError::ChannelClosed,
-        crate::BraintrustError::StreamAggregation(message) => {
-            crate::BraintrustError::StreamAggregation(message.clone())
-        }
-    }
-}
 
 /// A dataset for storing test/evaluation data.
 ///
@@ -724,24 +703,36 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let mut active = self.active_flush.lock().unwrap();
         let cutoff = self.pending_rows.lock().unwrap().next;
-        let previous = active.take().filter(|flush| flush.peek().is_none());
-        let mut dataset = self.clone();
-        dataset.active_flush = Default::default();
-        let flush = async move {
+        let previous = active
+            .take()
+            .filter(|flush| flush.clone().now_or_never().is_none());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *active = Some(async move { receiver.await.ok() }.boxed().shared());
+        let dataset = self.clone();
+        crate::operation::submit(async move {
             let prior = match previous {
                 Some(flush) => flush.await,
-                None => Ok(()),
+                None => None,
             };
-            let result = dataset.flush_through(cutoff).await.map_err(Arc::new);
-            prior.and(result)
-        }
-        .boxed()
-        .shared();
-        *active = Some(flush.clone());
-        crate::operation::submit(async move { flush.await.map_err(copy_flush_error) })
+            let flush = match dataset.flush_through(cutoff).await {
+                Ok(flush) => flush,
+                Err(error) => {
+                    if let Some(prior) = prior {
+                        let _ = sender.send(prior);
+                    }
+                    return Err(error);
+                }
+            };
+            let result = prior.unwrap_or(Ok(())).and(flush.await.map(|_| ()));
+            let _ = sender.send(result.clone());
+            result.map_err(Into::into)
+        })
     }
 
-    async fn flush_through(&self, cutoff: u64) -> Result<()> {
+    async fn flush_through(
+        &self,
+        cutoff: u64,
+    ) -> Result<crate::Completion<crate::FlushReport, crate::FlushError>> {
         let dataset = self;
         let metadata = dataset.ensure_registered().await?;
         let flush = {
@@ -804,7 +795,7 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
 
             dataset.submitter.flush()
         };
-        flush.await.map(|_| ()).map_err(Into::into)
+        Ok(flush)
     }
 }
 
