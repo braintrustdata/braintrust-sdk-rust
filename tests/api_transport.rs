@@ -61,7 +61,13 @@ async fn dataset_queries_and_summaries_use_the_discovered_api() {
         .dataset_name("dataset")
         .build()
         .unwrap();
-    let records = dataset.fetch(Some(1)).await.unwrap().collect().await;
+    let records = dataset
+        .fetch(Some(1))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(
         records
             .iter()
