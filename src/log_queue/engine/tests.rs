@@ -566,3 +566,16 @@ fn expired_running_rows_hold_budgets_until_the_job_releases_them() {
             .is_ok());
     }
 }
+
+#[test]
+fn distinct_known_projects_can_reuse_the_same_row_id() {
+    let queue = queue();
+    let engine = Engine::manual(ServiceConfig::default());
+    for project in ["a", "b"] {
+        engine.submit(
+            queue.core.clone(),
+            SubmitCommand::test_scoped_row("same", project, "org"),
+        );
+    }
+    assert_eq!(engine.take_jobs().len(), 2);
+}

@@ -327,6 +327,7 @@ impl BraintrustClientBuilder {
                 login_notify: Arc::new(Notify::new()),
                 pending_auth: Arc::default(),
                 default_project: self.default_project,
+                resource_org: None,
             }),
         };
 
