@@ -183,9 +183,6 @@ impl SpanBatchProcessor {
         })
     }
 
-    /// Get the cached (max_request_size, can_use_overflow) from GET /version.
-    /// Fetches lazily on first call and caches the result.
-
     /// Prepare, merge, batch and upload one detached delivery generation.
     ///
     /// Commands are drained atomically. Each command is prepared (project
