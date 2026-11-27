@@ -101,7 +101,7 @@ impl Engine {
         let mut ready = Vec::new();
         let mut intake = self.intake.lock().unwrap();
         for (command, key, sender) in prepared {
-            let client_rows = core.observation.len();
+            let client_rows = core.observation.root().len();
             let closed = core.observation.closed();
             if closed
                 || self
@@ -200,7 +200,7 @@ impl Engine {
         let sequences: Vec<_> = intake
             .records
             .iter()
-            .filter(|(_, record)| Arc::ptr_eq(&record.observer, scope))
+            .filter(|(_, record)| record.observer.includes(scope))
             .map(|(sequence, _)| *sequence)
             .collect();
         let error = WriteError::Execution(ExecutionError::TimedOut);

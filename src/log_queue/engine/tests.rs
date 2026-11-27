@@ -431,3 +431,38 @@ fn a_dropped_job_requeues_unsettled_rows_ahead_of_later_ones() {
     let sequences: Vec<_> = jobs[0].1.iter().map(|entry| entry.sequence).collect();
     assert_eq!(sequences, [2, 3, 4]);
 }
+
+#[tokio::test]
+async fn merged_rows_complete_all_owners_and_count_ancestor_loss_once() {
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let engine = Engine::manual(ServiceConfig::default());
+    let root = http_queue(&server, 100);
+    let a = root.child();
+    let b = root.child();
+    engine.submit(a.core.clone(), SubmitCommand::test_span(false));
+    engine.submit(b.core.clone(), SubmitCommand::test_span(true));
+    let x = engine.barrier(&a.core.observation);
+    let y = engine.barrier(&b.core.observation);
+    let z = engine.barrier(&root.core.observation);
+    let jobs = engine.take_jobs();
+    assert_eq!(jobs.len(), 1);
+    for (key, entries) in jobs {
+        engine.clone().process_job(key, entries, None).await;
+    }
+    assert!(x.await.is_err());
+    assert!(y.await.is_err());
+    assert!(z.await.is_err());
+    assert_eq!(a.dropped_rows().upload_failed, 1);
+    assert_eq!(b.dropped_rows().upload_failed, 1);
+    assert_eq!(root.dropped_rows().upload_failed, 1);
+}

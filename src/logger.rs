@@ -197,7 +197,12 @@ impl BraintrustClient {
             let org_name = state
                 .org_name()
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-            Ok(DatasetBuilder::new(Arc::new(client), api_key, org_name))
+            let mut builder = DatasetBuilder::new(Arc::new(client.scoped()), api_key, org_name)
+                .org_id(state.org_id().unwrap_or_default());
+            if let Some(project) = &client.inner.default_project {
+                builder = builder.project_name(project);
+            }
+            Ok(builder)
         })
     }
 
@@ -564,7 +569,6 @@ impl BraintrustClient {
         if self.inner.login_state.is_logged_in() {
             return Ok(self.inner.login_state.clone());
         }
-
         self.resume_background_login();
 
         // Get notification future BEFORE checking state to avoid race condition
@@ -617,7 +621,17 @@ impl BraintrustClient {
         let token = token.into();
         let org_id = org_id.into();
 
-        let submitter = Arc::new(self.clone());
+        let context = if self.inner.login_state.org_id().as_deref() == Some(&org_id) {
+            self.scoped()
+        } else {
+            // Explicit credentials for a different org must not inherit the selected org's endpoint.
+            self.derive_scope(
+                self.inner.queue.child_with_login(LoginState::new()),
+                LoginState::new(),
+                self.inner.default_project.clone(),
+            )
+        };
+        let submitter = Arc::new(context);
         let mut builder = ExperimentBuilder::new(submitter, token, org_id);
         if let Some(project) = &self.inner.default_project {
             builder = builder.project_name(project);
@@ -704,6 +718,35 @@ impl BraintrustClient {
         self.inner
             .queue
             .submit_rows_with_provider(provider, org_id, org_name, rows);
+    }
+
+    /// A facade whose flush covers only the writes made through it, for
+    /// resources such as experiments and datasets. The parent's flush still
+    /// includes them.
+    fn scoped(&self) -> Self {
+        self.derive_scope(
+            self.inner.queue.child(),
+            self.inner.login_state.clone(),
+            self.inner.default_project.clone(),
+        )
+    }
+
+    fn derive_scope(
+        &self,
+        queue: LogQueue,
+        login_state: LoginState,
+        default_project: Option<String>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ClientInner {
+                settings: self.inner.settings.clone(),
+                queue,
+                login_state,
+                login_notify: self.inner.login_notify.clone(),
+                background_login: self.inner.background_login.clone(),
+                default_project,
+            }),
+        }
     }
 
     /// Cumulative counts of rows this client discarded instead of uploading.
