@@ -59,3 +59,65 @@ where
     }
     completion
 }
+
+type OperationDone = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+
+/// Reserve operation order at the call site before scheduling work.
+#[derive(Default)]
+pub(crate) struct Sequence {
+    tail: std::sync::Mutex<Option<OperationDone>>,
+}
+
+impl Sequence {
+    pub(crate) fn submit<T, E>(
+        &self,
+        operation: impl Future<Output = Result<T, E>> + Send + 'static,
+    ) -> Completion<T, E>
+    where
+        T: Send + 'static,
+        E: From<ExecutionError> + Send + 'static,
+    {
+        let mut tail = self.tail.lock().unwrap();
+        let previous = tail.take().filter(|done| done.peek().is_none());
+        let wait = previous.clone();
+        let (done, finished) = tokio::sync::oneshot::channel::<()>();
+        *tail = Some(
+            async move {
+                if let Some(previous) = previous {
+                    previous.await;
+                }
+                let _ = finished.await;
+            }
+            .boxed()
+            .shared(),
+        );
+        submit(async move {
+            let _done = done;
+            if let Some(wait) = wait {
+                wait.await;
+            }
+            operation.await
+        })
+    }
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn eager_calls_run_in_reservation_order() {
+        let sequence = Sequence::default();
+        let (send, receive) = tokio::sync::oneshot::channel::<()>();
+        let first = sequence.submit(async move {
+            receive.await.unwrap();
+            Ok::<_, ExecutionError>(())
+        });
+        let mut second = sequence.submit(async { Ok::<_, ExecutionError>(()) });
+        tokio::task::yield_now().await;
+        assert!(futures::poll!(&mut second).is_pending());
+        send.send(()).unwrap();
+        second.await.unwrap();
+        first.await.unwrap();
+    }
+}
