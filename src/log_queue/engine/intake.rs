@@ -50,6 +50,10 @@ pub(super) struct Intake {
     pub(super) partitions: HashMap<Key, Partition>,
     pub(super) row_order: HashMap<RowOrderKey, RowOrder>,
     pub(super) retained: usize,
+    pub(super) reserved: usize,
+    pub(super) reserved_clients: HashMap<usize, usize>,
+    pub(super) reserved_orgs: HashMap<OrgKey, usize>,
+    pub(super) reserved_unknown: usize,
     pub(super) org_rows: HashMap<OrgKey, usize>,
 }
 

@@ -58,6 +58,41 @@ impl LogQueue {
         }
     }
 
+    pub(crate) fn pending_capacity(&self, org_id: Option<&str>) -> super::engine::PendingCapacity {
+        crate::service::global()
+            .expect("initialized service")
+            .engine
+            .pending_capacity(&self.core, org_id)
+    }
+    pub(crate) fn reserve_row(
+        &self,
+        capacity: &mut super::engine::PendingCapacity,
+    ) -> Result<(), crate::EnqueueError> {
+        capacity.grow()
+    }
+    pub(crate) fn submit_reserved(
+        &self,
+        credential: Credential,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+        capacity: &mut super::engine::PendingCapacity,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+        crate::service::global()
+            .expect("initialized service")
+            .engine
+            .submit_reserved(
+                self.core.clone(),
+                SubmitCommand {
+                    credential,
+                    item: QueuedItem::Span {
+                        payload,
+                        parent_info,
+                    },
+                },
+                capacity,
+            )
+    }
+
     pub(crate) fn submit(
         &self,
         credential: Credential,
@@ -93,18 +128,26 @@ impl LogQueue {
         org_id: &str,
         org_name: Option<&str>,
         rows: Vec<Map<String, Value>>,
+        capacity: &mut super::engine::PendingCapacity,
     ) -> Vec<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
         let credential = Credential::token_value(token.to_owned());
         rows.into_iter()
             .map(|row| {
-                self.core.push(SubmitCommand {
-                    credential: credential.clone(),
-                    item: QueuedItem::Row {
-                        org_id: org_id.to_owned(),
-                        org_name: org_name.map(str::to_owned),
-                        row,
-                    },
-                })
+                crate::service::global()
+                    .expect("initialized service")
+                    .engine
+                    .submit_reserved(
+                        self.core.clone(),
+                        SubmitCommand {
+                            credential: credential.clone(),
+                            item: QueuedItem::Row {
+                                org_id: org_id.to_owned(),
+                                org_name: org_name.map(str::to_owned),
+                                row,
+                            },
+                        },
+                        capacity,
+                    )
             })
             .collect()
     }

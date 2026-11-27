@@ -733,3 +733,79 @@ async fn upload_timeout_preserves_the_original_error_for_flush_and_write() {
         Some(crate::BraintrustError::Http(error)) if error.is_timeout()
     ));
 }
+
+#[test]
+fn pending_reservations_share_capacity_with_queued_rows_and_release_on_drop() {
+    let engine = Engine::manual(ServiceConfig::builder().max_rows(2).max_org_rows(2).build());
+    let a = queue();
+    let b = queue();
+    let mut pending = engine.pending_capacity(&a.core, Some("org"));
+    pending.grow().unwrap();
+    engine.submit(b.core.clone(), SubmitCommand::test_row("queued"));
+    assert!(matches!(pending.grow(), Err(EnqueueError::Full)));
+    let submitted = engine.submit_reserved(
+        a.core.clone(),
+        SubmitCommand::test_row("pending"),
+        &mut pending,
+    );
+    assert!(submitted.submission().is_ok());
+    assert_eq!(engine.intake.lock().unwrap().retained, 2);
+    drop(pending);
+    assert_eq!(engine.intake.lock().unwrap().reserved, 0);
+}
+
+#[test]
+fn unknown_login_reservations_do_not_block_known_organizations() {
+    let engine = Engine::manual(ServiceConfig::builder().max_org_rows(1).build());
+    let pending = queue();
+    let healthy = queue();
+    let mut capacity = engine.pending_capacity(&pending.core, None);
+    capacity.grow().unwrap();
+    let write = engine.submit(
+        healthy.core.clone(),
+        SubmitCommand::test_scoped_row("healthy", "p", "other"),
+    );
+    assert!(write.submission().is_ok());
+    assert!(matches!(capacity.grow(), Err(EnqueueError::Full)));
+}
+
+#[test]
+fn abandoned_pending_capacity_is_released() {
+    let engine = Engine::manual(ServiceConfig::builder().max_rows(1).build());
+    let a = queue();
+    let b = queue();
+    let mut pending = engine.pending_capacity(&a.core, Some("org"));
+    pending.grow().unwrap();
+    assert!(engine
+        .submit(b.core.clone(), SubmitCommand::test_row("blocked"))
+        .submission()
+        .is_err());
+    drop(pending);
+    assert!(engine
+        .submit(b.core.clone(), SubmitCommand::test_row("accepted"))
+        .submission()
+        .is_ok());
+}
+
+#[test]
+fn pending_reservation_counts_against_its_organization_across_clients() {
+    let engine = Engine::manual(ServiceConfig::builder().max_org_rows(1).build());
+    let a = queue();
+    let b = queue();
+    let mut pending = engine.pending_capacity(&a.core, Some("org"));
+    pending.grow().unwrap();
+    assert!(engine
+        .submit(
+            b.core.clone(),
+            SubmitCommand::test_scoped_row("blocked", "p", "org")
+        )
+        .submission()
+        .is_err());
+    assert!(engine
+        .submit(
+            b.core.clone(),
+            SubmitCommand::test_scoped_row("healthy", "p", "other")
+        )
+        .submission()
+        .is_ok());
+}

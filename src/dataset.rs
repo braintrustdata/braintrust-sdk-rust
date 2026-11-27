@@ -746,8 +746,9 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
     ) -> Result<crate::Completion<crate::FlushReport, crate::FlushError>> {
         let dataset = self;
         let metadata = dataset.ensure_registered().await?;
-        let flush = {
+        let (flush, writes) = {
             let mut pending = dataset.pending_rows.lock().unwrap();
+            let mut writes = Vec::new();
             let count = pending.rows.partition_point(|(index, _)| *index < cutoff);
             // Keep draining and submitting in the same critical section
             // so concurrent flushes cannot reorder dataset rows.
@@ -797,16 +798,22 @@ impl<S: SpanSubmitter + DatasetRegistrar + DatasetFetcher + DatasetSummarizer + 
                     object_id: metadata.dataset_id.clone(),
                 };
 
-                dataset.submitter.submit(
+                writes.push(dataset.submitter.submit(
                     Credential::token_value(dataset.token.clone()),
                     payload,
                     Some(parent_info),
-                );
+                ));
             }
 
-            dataset.submitter.flush()
+            (dataset.submitter.flush(), writes)
         };
-        Ok(flush)
+        Ok(crate::operation::submit(async move {
+            let (barrier, writes) =
+                futures::join!(flush, crate::logger::pending_auth::summarize(writes));
+            let report = barrier?;
+            writes?;
+            Ok(report)
+        }))
     }
 }
 

@@ -258,6 +258,24 @@ pub(crate) trait SpanSubmitter: Send + Sync {
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError>;
 
+    fn reserve_pending(&self) -> Result<Option<crate::logger::pending_auth::Reservation>> {
+        Ok(None)
+    }
+
+    fn submit_reserved(
+        &self,
+        credential: Credential,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+        _capacity: &mut crate::log_queue::engine::PendingCapacity,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+        self.submit(credential, payload, parent_info)
+    }
+
+    fn tracks_pending(&self) -> bool {
+        false
+    }
+
     /// Derive an independent delivery observer for a newly built resource.
     fn for_resource(self: Arc<Self>, _org_id: &str) -> Arc<Self> {
         self
@@ -608,7 +626,12 @@ impl<S: SpanSubmitter> SpanHandle<S> {
     }
 
     /// Submit an already-finished event as one snapshot.
-    pub(crate) fn log_and_end(&self, event: SpanLog, end_time: f64) {
+    pub(crate) fn log_and_end(
+        &self,
+        event: SpanLog,
+        end_time: f64,
+        capacity: Option<&mut crate::log_queue::engine::PendingCapacity>,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         let mut inner = self
             .inner
             .lock()
@@ -616,13 +639,22 @@ impl<S: SpanSubmitter> SpanHandle<S> {
         apply_span_log_to_data(&mut inner, event);
         inner.end_time = Some(end_time);
         let payload = current_span_payload(&mut inner);
-        let completion =
+        let completion = if let Some(capacity) = capacity {
+            self.submitter.submit_reserved(
+                self.credential.clone(),
+                payload,
+                self.parent_info.clone(),
+                capacity,
+            )
+        } else {
             self.submitter
-                .submit(self.credential.clone(), payload, self.parent_info.clone());
+                .submit(self.credential.clone(), payload, self.parent_info.clone())
+        };
         if completion.is_ok() {
             inner.has_flushed = true;
             inner.end_submitted = true;
         }
+        completion
     }
 
     /// Flush all queued span data through to Braintrust.
@@ -1636,7 +1668,7 @@ mod tests {
     fn a_finished_event_submits_one_snapshot() {
         let (builder, collector) = crate::test_utils::mock_span_builder();
         let span = builder.build();
-        span.log_and_end(SpanLog::default(), 12.0);
+        drop(span.log_and_end(SpanLog::default(), 12.0, None));
         span.end_with_time(13.0);
         assert_eq!(collector.spans().len(), 1);
     }

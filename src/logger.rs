@@ -27,7 +27,7 @@ use backon::{ExponentialBuilder, Retryable};
 mod builder;
 mod facades;
 mod login_state;
-mod pending_auth;
+pub(crate) mod pending_auth;
 
 pub use builder::BraintrustClientBuilder;
 pub use login_state::{LoginState, OrgInfo};
@@ -269,10 +269,20 @@ impl BraintrustClient {
         exported: &str,
         event: crate::span::SpanLog,
     ) -> crate::Completion<(), BraintrustError> {
-        let reservation = match self.inner.pending_auth.reserve() {
+        let mut reservation = match self.inner.pending_auth.reserve() {
             Ok(reservation) => reservation,
             Err(error) => return pending_auth::rejected(error),
         };
+        let mut capacity = self
+            .inner
+            .queue
+            .pending_capacity(self.inner.login_state.org_id().as_deref());
+        if let Err(error) = self.inner.queue.reserve_row(&mut capacity) {
+            self.inner.queue.account_closed(1);
+            reservation.reject(error);
+            return pending_auth::rejected(BraintrustError::Background(error.to_string()));
+        }
+        reservation.set_capacity(capacity);
         let client = self.clone();
         let exported = exported.to_owned();
         crate::operation::submit(async move {
@@ -295,10 +305,11 @@ impl BraintrustClient {
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
                 Ok((api_key, org_id, login_state.org_name()))
             }).await;
-            reservation.publish(|| {
+            reservation.wait_turn().await?;
+            reservation.publish(|capacity| {
                 let (api_key, org_id, org_name) = auth?;
                 client
-                    .update_span_internal(api_key, org_id, org_name, &exported, event)
+                    .update_span_internal(api_key, org_id, org_name, &exported, event, capacity)
                     .map(|write| vec![write])
             })
         })
@@ -337,7 +348,7 @@ impl BraintrustClient {
         self.inner
             .pending_auth
             .direct(|| {
-                self.update_span_internal(token.into(), org_id.into(), None, exported, event)
+                self.update_span_internal(token.into(), org_id.into(), None, exported, event, None)
             })
             .unwrap_or_else(|| Err(pending_auth::closed()))
     }
@@ -349,6 +360,7 @@ impl BraintrustClient {
         org_name: Option<String>,
         exported: &str,
         event: crate::span::SpanLog,
+        capacity: Option<&mut crate::log_queue::engine::PendingCapacity>,
     ) -> Result<crate::Completion<crate::DeliveryReceipt, crate::WriteError>> {
         let components = SpanComponents::parse(exported)?;
         let row_id = components.row_id.clone().ok_or_else(|| {
@@ -442,10 +454,18 @@ impl BraintrustClient {
             extra: event_data.extra,
         };
 
-        let completion = self
-            .inner
-            .queue
-            .submit(Credential::token_value(token), payload, None);
+        let completion = match capacity {
+            Some(capacity) => self.inner.queue.submit_reserved(
+                Credential::token_value(token),
+                payload,
+                None,
+                capacity,
+            ),
+            None => self
+                .inner
+                .queue
+                .submit(Credential::token_value(token), payload, None),
+        };
         if let Err(error) = completion.submission() {
             return Err(BraintrustError::Background(error.to_string()));
         }
@@ -709,17 +729,32 @@ impl BraintrustClient {
     /// Queue caller-built rows for upload to `/logs3` using the logged-in credentials.
     ///
     /// See [`BraintrustClient::log_rows_with_credentials`] for how rows are uploaded.
-    /// This waits for login to complete if it hasn't already.
+    /// This waits for login to complete if it hasn't already. If the input
+    /// exceeds available pre-login capacity, this call rejects it before publishing.
     pub fn log_rows(
         &self,
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) -> crate::Completion<(), BraintrustError> {
-        let reservation = match self.inner.pending_auth.reserve() {
+        let mut reservation = match self.inner.pending_auth.reserve() {
             Ok(reservation) => reservation,
             Err(error) => return pending_auth::rejected(error),
         };
+        let mut capacity = self
+            .inner
+            .queue
+            .pending_capacity(self.inner.login_state.org_id().as_deref());
+        let mut retained = Vec::new();
+        for row in rows {
+            if let Err(error) = self.inner.queue.reserve_row(&mut capacity) {
+                self.inner.queue.account_closed(retained.len() + 1);
+                reservation.reject(error);
+                return pending_auth::rejected(BraintrustError::Background(error.to_string()));
+            }
+            retained.push(row);
+        }
+        reservation.set_capacity(capacity);
         let client = self.clone();
-        let rows: Vec<_> = rows.into_iter().collect();
+        let rows = retained;
         crate::operation::submit(async move {
             let auth = reservation.wait(async {
             if client.inner.settings.login_skipped {
@@ -736,13 +771,17 @@ impl BraintrustClient {
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
                 Ok((api_key, org_id, state.org_name()))
             }).await;
-            reservation.publish(|| {
+            reservation.wait_turn().await?;
+            reservation.publish(|capacity| {
                 let (api_key, org_id, org_name) = auth?;
                 Ok(client.inner.queue.submit_rows_tracked(
                     &api_key,
                     &org_id,
                     org_name.as_deref(),
                     rows,
+                    capacity.ok_or_else(|| {
+                        BraintrustError::Background("missing pending capacity".into())
+                    })?,
                 ))
             })
         })
@@ -937,6 +976,36 @@ impl SpanSubmitter for BraintrustClient {
         parent_info: Option<ParentSpanInfo>,
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         self.submit_payload(credential, payload, parent_info)
+    }
+
+    fn reserve_pending(&self) -> Result<Option<pending_auth::Reservation>> {
+        let mut capacity = self
+            .inner
+            .queue
+            .pending_capacity(self.inner.resource_org.as_deref());
+        if let Err(error) = self.inner.queue.reserve_row(&mut capacity) {
+            self.inner.queue.account_closed(1);
+            return Err(BraintrustError::Background(error.to_string()));
+        }
+        let mut reservation = self.inner.pending_auth.reserve()?;
+        reservation.set_capacity(capacity);
+        Ok(Some(reservation))
+    }
+
+    fn submit_reserved(
+        &self,
+        credential: Credential,
+        payload: SpanPayload,
+        parent_info: Option<ParentSpanInfo>,
+        capacity: &mut crate::log_queue::engine::PendingCapacity,
+    ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
+        self.inner
+            .queue
+            .submit_reserved(credential, payload, parent_info, capacity)
+    }
+
+    fn tracks_pending(&self) -> bool {
+        true
     }
 
     fn for_resource(self: Arc<Self>, org_id: &str) -> Arc<Self> {

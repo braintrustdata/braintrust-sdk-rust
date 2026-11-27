@@ -18,6 +18,7 @@ pub struct ServiceConfig {
     /// Maximum retained rows across all clients, including in-flight work.
     pub max_rows: Option<usize>,
     /// Maximum retained rows for one organization across client facades.
+    /// Writes waiting to identify their organization share a separate provisional budget.
     pub max_org_rows: Option<usize>,
     /// Target capacity for each shared project and server-capability cache.
     /// Entries in use may temporarily exceed this limit.

@@ -57,9 +57,10 @@ struct State {
     pending: BTreeMap<u64, (Arc<Scope>, PendingReceipt)>,
 }
 
-pub(super) struct Reservation {
+pub(crate) struct Reservation {
     scope: Arc<PendingAuth>,
     id: u64,
+    capacity: Option<crate::log_queue::engine::PendingCapacity>,
 }
 
 pub(super) struct Drain(Arc<PendingAuth>);
@@ -112,6 +113,7 @@ impl PendingAuth {
         Ok(Reservation {
             scope: self.clone(),
             id,
+            capacity: None,
         })
     }
 
@@ -172,7 +174,7 @@ impl PendingAuth {
 }
 
 impl Reservation {
-    pub(super) async fn wait<T>(
+    pub(crate) async fn wait<T>(
         &self,
         prepare: impl std::future::Future<Output = Result<T, BraintrustError>>,
     ) -> Result<T, BraintrustError> {
@@ -183,26 +185,68 @@ impl Reservation {
         }
     }
 
+    pub(super) fn reject(self, error: EnqueueError) {
+        let pending = self.scope.shared.lock().unwrap().pending.remove(&self.id);
+        if let Some((_, pending)) = pending {
+            let _ = pending.sender.send(Err(error.into()));
+        }
+        self.scope.cancelled.notify_waiters();
+    }
+
+    pub(crate) fn set_capacity(&mut self, capacity: crate::log_queue::engine::PendingCapacity) {
+        self.capacity = Some(capacity);
+    }
+
+    pub(crate) async fn wait_turn(&self) -> Result<(), BraintrustError> {
+        loop {
+            let notified = self.scope.cancelled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.scope.shared.lock().unwrap();
+                if !state.pending.contains_key(&self.id) {
+                    return Err(ExecutionError::TimedOut.into());
+                }
+                let earlier = state
+                    .pending
+                    .range(..self.id)
+                    .any(|(_, (scope, _))| Arc::ptr_eq(scope, &self.scope.scope));
+                if !earlier {
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
     /// Atomically move a reservation into the queue, so a flush covers it once.
-    pub(super) fn publish(
-        self,
-        submit: impl FnOnce() -> Result<Vec<Write>, BraintrustError>,
+    pub(crate) fn publish(
+        mut self,
+        submit: impl FnOnce(
+            Option<&mut crate::log_queue::engine::PendingCapacity>,
+        ) -> Result<Vec<Write>, BraintrustError>,
     ) -> Result<(), BraintrustError> {
         let mut state = self.scope.shared.lock().unwrap();
         let Some(pending) = state.pending.remove(&self.id).map(|(_, pending)| pending) else {
             return Err(ExecutionError::TimedOut.into());
         };
-        let result = submit();
+        let result = submit(self.capacity.as_mut());
         drop(state);
+        self.scope.cancelled.notify_waiters();
         let sender = pending.sender;
         match result {
             Ok(writes) => {
+                let rejected = writes
+                    .iter()
+                    .find_map(|write| write.submission().as_ref().err().cloned());
                 crate::operation::submit(async move {
                     let result = summarize(writes).await;
                     let _ = sender.send(result);
                     Ok::<_, ExecutionError>(())
                 });
-                Ok(())
+                rejected.map_or(Ok(()), |error| {
+                    Err(BraintrustError::Background(error.to_string()))
+                })
             }
             Err(error) => {
                 let failure = match &error {
@@ -226,10 +270,11 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.scope.shared.lock().unwrap().pending.remove(&self.id);
+        self.scope.cancelled.notify_waiters();
     }
 }
 
-pub(super) fn rejected<T, E>(error: E) -> Completion<T, E> {
+pub(crate) fn rejected<T, E>(error: E) -> Completion<T, E> {
     let (_, mut completion) = Completion::pair();
     completion.record_issuance(Err(error));
     completion
@@ -239,7 +284,7 @@ pub(super) fn closed() -> BraintrustError {
     BraintrustError::Background(EnqueueError::Closed.to_string())
 }
 
-async fn summarize(writes: Vec<Write>) -> Receipt {
+pub(crate) async fn summarize(writes: Vec<Write>) -> Receipt {
     let results = futures::future::join_all(writes).await;
     let mut delivered = 0;
     let mut failed = 0;
@@ -281,5 +326,50 @@ pub(super) async fn join(
     match failure {
         Some(failure) => Err(FlushError::Delivery(failure)),
         None => Ok(FlushReport { delivered }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejected_reservation_is_reported_to_existing_snapshot() {
+        let pending = Arc::new(PendingAuth::default());
+        let reservation = pending.reserve().unwrap();
+        let (barrier, receipts) =
+            pending.snapshot(false, |_| Completion::finished(Ok(FlushReport::default())));
+        reservation.reject(EnqueueError::Full);
+        assert!(matches!(
+            join(barrier, receipts).await,
+            Err(FlushError::Admission(EnqueueError::Full))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_published_write_reaches_operation_and_snapshot() {
+        let pending = Arc::new(PendingAuth::default());
+        let reservation = pending.reserve().unwrap();
+        let (barrier, receipts) =
+            pending.snapshot(false, |_| Completion::finished(Ok(FlushReport::default())));
+        let (_, mut write) = Completion::pair();
+        write.record_issuance(Err(WriteError::Admission(EnqueueError::Full)));
+        assert!(reservation.publish(|_| Ok(vec![write])).is_err());
+        assert!(matches!(
+            join(barrier, receipts).await,
+            Err(FlushError::Admission(EnqueueError::Full))
+        ));
+    }
+
+    #[tokio::test]
+    async fn later_reservation_waits_for_earlier_publication() {
+        let pending = Arc::new(PendingAuth::default());
+        let first = pending.reserve().unwrap();
+        let second = pending.reserve().unwrap();
+        let mut waiting = Box::pin(second.wait_turn());
+        assert!(futures::poll!(&mut waiting).is_pending());
+        first.publish(|_| Ok(Vec::new())).unwrap();
+        waiting.await.unwrap();
+        second.publish(|_| Ok(Vec::new())).unwrap();
     }
 }

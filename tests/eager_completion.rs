@@ -140,4 +140,36 @@ async fn flush_and_shutdown_cover_writes_waiting_for_login() {
     );
 
     credentialed_row_upload_stops_at_the_first_end_of_input().await;
+    pending_login_writes_respect_client_capacity().await;
+}
+
+async fn pending_login_writes_respect_client_capacity() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(json!({"org_info":[{"id":"org-id","name":"org"}]})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .api_key("key")
+        .with_queue_max_size(1)
+        .build()
+        .await
+        .unwrap();
+    let first = client.log_rows([row("first")]);
+    let second = client.log_rows([row("second")]);
+    assert!(second.submission().is_err());
+    first.await.unwrap();
+    client.flush().await.unwrap();
 }

@@ -361,3 +361,114 @@ async fn a_failed_registration_is_not_retried_by_every_write() {
         .count();
     assert_eq!(registrations, 1);
 }
+
+#[tokio::test]
+async fn client_flush_covers_experiment_log_during_registration() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/experiment/register"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(200))
+                .set_body_json(json!({
+                    "project": {"id":"proj-id","name":"test-project"},
+                    "experiment": {"id":"exp-id","name":"test-experiment"}
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .build_without_login()
+        .unwrap();
+    let experiment = client
+        .experiment_builder_with_credentials("token", "org-id")
+        .project_name("test-project")
+        .build()
+        .unwrap();
+    let write = experiment.log(ExperimentLog::builder().input(json!("pending")).build());
+    let report = client.flush().await.unwrap();
+    write.await.unwrap();
+    assert_eq!(report.delivered(), 1);
+}
+
+#[tokio::test]
+async fn client_shutdown_drains_experiment_log_during_registration() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/experiment/register"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(100))
+                .set_body_json(json!({
+                    "project":{"id":"proj-id","name":"test-project"},
+                    "experiment":{"id":"exp-id","name":"test-experiment"}
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .build_without_login()
+        .unwrap();
+    let experiment = client
+        .experiment_builder_with_credentials("token", "org-id")
+        .project_name("test-project")
+        .build()
+        .unwrap();
+    let write = experiment.log(ExperimentLog::builder().input(json!("pending")).build());
+    let report = client
+        .shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    write.await.unwrap();
+    assert_eq!(report.delivered(), 1);
+}
+
+#[tokio::test]
+async fn experiment_flush_reports_failure_of_write_waiting_for_registration() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/experiment/register"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(100))
+                .set_body_json(json!({
+                    "project":{"id":"proj-id","name":"test-project"},
+                    "experiment":{"id":"exp-id","name":"test-experiment"}
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("rejected"))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .build_without_login()
+        .unwrap();
+    let experiment = client
+        .experiment_builder_with_credentials("token", "org-id")
+        .project_name("test-project")
+        .build()
+        .unwrap();
+    let write = experiment.log(ExperimentLog::builder().input(json!("pending")).build());
+    let flush = experiment.flush();
+    write.await.unwrap();
+    assert!(flush.await.is_err());
+}
