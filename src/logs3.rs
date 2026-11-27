@@ -1,7 +1,7 @@
 use crate::error::{BraintrustError, Result};
 use crate::http::{api_client, build_http_client, CaBundleConfig};
 use crate::internal::ingest::{EncodedBatch, EncodedRow};
-use crate::internal::upload::{Capabilities, UploadCoordinator, UploadPolicy};
+use crate::internal::upload::{UploadCoordinator, UploadPolicy};
 use reqwest::Url;
 use serde_json::{Map, Value};
 use std::time::Duration;
@@ -22,7 +22,6 @@ pub struct Logs3BatchUploader {
     api_key: String,
     org_name: Option<String>,
     max_request_size_override: Option<usize>,
-    payload_limits: std::sync::Arc<tokio::sync::Mutex<Option<Capabilities>>>,
 }
 
 impl std::fmt::Debug for Logs3BatchUploader {
@@ -82,7 +81,6 @@ impl Logs3BatchUploader {
             api_key: api_key.into(),
             org_name,
             max_request_size_override: None,
-            payload_limits: Default::default(),
         };
         // Report invalid credentials or URLs here rather than at upload time.
         let _entered = runtime.enter();
@@ -104,7 +102,6 @@ impl Logs3BatchUploader {
 
     pub fn with_max_request_size_override(mut self, max_bytes: usize) -> Self {
         self.max_request_size_override = Some(max_bytes.max(1));
-        self.payload_limits = Default::default();
         self
     }
 
@@ -124,18 +121,9 @@ impl Logs3BatchUploader {
             }
 
             let coordinator = uploader.coordinator()?;
-            let mut cached = uploader.payload_limits.lock().await;
-            let limits = match *cached {
-                Some(limits) => limits,
-                None => {
-                    let limits = coordinator
-                        .capabilities(DEFAULT_MAX_REQUEST_SIZE, uploader.max_request_size_override)
-                        .await;
-                    *cached = Some(limits);
-                    limits
-                }
-            };
-            drop(cached);
+            let limits = coordinator
+                .capabilities(DEFAULT_MAX_REQUEST_SIZE, uploader.max_request_size_override)
+                .await;
             let row_payloads = rows
                 .iter()
                 .map(EncodedRow::from_map)

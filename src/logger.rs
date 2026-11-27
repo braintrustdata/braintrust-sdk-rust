@@ -1667,7 +1667,9 @@ mod tests {
                 .span_builder()
                 .await
                 .expect("span_builder")
-                .project_name("demo-project")
+                // Other tests register "demo-project" in the same org, and a reused
+                // mock-server port would share their cache entry.
+                .project_name("project-registration-is-cached")
                 .build();
             span.log(
                 SpanLog::builder()
