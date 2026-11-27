@@ -193,7 +193,7 @@ impl SpanBatchProcessor {
             return first_error.map_or(Ok(()), Err);
         }
 
-        for ((credential, _org_id), group) in groups {
+        for ((credential, org_id), group) in groups {
             let CredentialGroup {
                 org_name,
                 spans,
@@ -213,6 +213,8 @@ impl SpanBatchProcessor {
                 }
             };
 
+            let org = crate::resolution::OrgIdentity::new(&org_id, org_name.as_deref(), &token);
+            let scope = crate::scheduler::Scope::new(api_url.as_str(), org.scope_key());
             // Version info reflects a server-wide limit, so it is fetched once
             // (with the first group's credentials) and cached.
             let (max_request_size, can_use_overflow) =
@@ -249,6 +251,7 @@ impl SpanBatchProcessor {
                 let batches = self.serialized_batches(batches, count, &mut first_error);
                 if let Err(e) = self
                     .send_batches(
+                        &scope,
                         &api_url,
                         &token,
                         org_name.as_deref(),
@@ -273,6 +276,7 @@ impl SpanBatchProcessor {
                 let batches = self.serialized_batches(batches, count, &mut first_error);
                 if let Err(e) = self
                     .send_batches(
+                        &scope,
                         &api_url,
                         &token,
                         org_name.as_deref(),
@@ -341,6 +345,7 @@ impl SpanBatchProcessor {
     #[allow(clippy::too_many_arguments)]
     async fn send_batches(
         &self,
+        scope: &crate::scheduler::Scope,
         api_url: &Url,
         token: &str,
         org_name: Option<&str>,
@@ -369,9 +374,13 @@ impl SpanBatchProcessor {
             result
         });
         let mut first_error = None;
-        let results: Vec<_> = stream::iter(send_futures)
-            .buffer_unordered(self.config.max_concurrent_log_requests())
-            .collect()
+        let results: Vec<_> = crate::scheduler::SCOPE
+            .scope(
+                scope.clone(),
+                stream::iter(send_futures)
+                    .buffer_unordered(self.config.max_concurrent_log_requests())
+                    .collect(),
+            )
             .await;
         for result in results {
             if let Err(e) = result {
@@ -448,9 +457,13 @@ impl SpanBatchProcessor {
                     &token,
                     org_name,
                 )?;
-                let response = crate::http::api_result(client.register_project(&request).await)
-                    .await?
-                    .into_inner();
+                let org = crate::resolution::OrgIdentity::new(org_id, org_name, &token);
+                let scope = crate::scheduler::Scope::new(app_url.as_str(), org.scope_key());
+                let response = crate::internal::request::scheduled(scope, 0, || {
+                    client.register_project(&request)
+                })
+                .await?
+                .into_inner();
                 Ok(response.project.id)
             })
             .await

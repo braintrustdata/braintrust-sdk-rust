@@ -91,6 +91,19 @@ impl OrgIdentity {
             Self::Credential(token.to_owned())
         }
     }
+    /// A non-secret label for scheduler scopes.
+    pub fn scope_key(&self) -> String {
+        match self {
+            Self::Id(id) => id.clone(),
+            Self::Name(name) => format!("name:{name}"),
+            Self::Credential(token) => format!("credential:{:016x}", credential_digest(token)),
+        }
+    }
+}
+/// Stable within a process. Collisions only merge pauses, never cached values.
+pub(crate) fn credential_digest(token: &str) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault};
+    BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(token)
 }
 /// Project IDs belong to an organization, not to whichever token resolved them,
 /// so rotating credentials reuse earlier registrations.

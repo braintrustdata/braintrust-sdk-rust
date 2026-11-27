@@ -115,7 +115,14 @@ impl Logs3BatchUploader {
     ) -> crate::Completion<Logs3UploadResult, BraintrustError> {
         let uploader = self.clone();
         let rows = rows.to_vec();
-        crate::operation::submit(async move {
+        // Requests count against this uploader's org, or its credential when
+        // it has none, like the queue's.
+        let scope = crate::scheduler::Scope::new(
+            self.api_url.as_str(),
+            crate::resolution::OrgIdentity::new("", self.org_name.as_deref(), &self.api_key)
+                .scope_key(),
+        );
+        crate::operation::submit(crate::scheduler::SCOPE.scope(scope, async move {
             if rows.is_empty() {
                 return Ok(Logs3UploadResult::default());
             }
@@ -146,7 +153,7 @@ impl Logs3BatchUploader {
                 result.rows_uploaded += uploaded.rows_uploaded;
             }
             Ok(result)
-        })
+        }))
     }
 }
 
