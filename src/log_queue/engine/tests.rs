@@ -271,3 +271,137 @@ async fn transient_project_registration_failures_are_retried() {
     }
     assert_eq!(flush.await.unwrap().delivered(), 1);
 }
+
+#[test]
+fn project_name_span_reserves_its_row_before_a_raw_update() {
+    let queue = queue();
+    let engine = Engine::manual();
+    let first = engine.submit(
+        queue.core.clone(),
+        SubmitCommand::test_named_span("row", "name"),
+    );
+    engine.submit(
+        queue.core.clone(),
+        SubmitCommand::test_scoped_row("row", "id", "org"),
+    );
+    engine.submit(
+        queue.core.clone(),
+        SubmitCommand::test_scoped_row("independent", "other", "org"),
+    );
+
+    let jobs = engine.take_jobs();
+    let (name_key, before) = jobs
+        .into_iter()
+        .find(|(_, rows)| rows[0].sequence == 1)
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    assert!(
+        engine.take_jobs().is_empty(),
+        "the raw update still waits for the span"
+    );
+    drop(Job::new(engine.clone(), name_key, before));
+    drop(first);
+    let after = engine.take_jobs();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].1[0].sequence, 2);
+}
+
+#[tokio::test]
+async fn completed_batch_retires_while_another_batch_is_waiting() {
+    use wiremock::{
+        matchers::{body_string_contains, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(body_string_contains("held"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(10)))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let a = http_queue(&server, 1);
+    let b = http_queue(&server, 1);
+    let engine = Engine::manual();
+    engine.submit(a.core.clone(), SubmitCommand::test_row("quick"));
+    engine.submit(b.core.clone(), SubmitCommand::test_row("held"));
+    let barrier = engine.barrier(&a.core.observation);
+    let (key, entries) = engine.take_jobs().pop().unwrap();
+    let job = tokio::spawn(engine.clone().process_job(key, entries));
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), barrier)
+            .await
+            .unwrap()
+            .unwrap()
+            .delivered(),
+        1
+    );
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn a_timed_out_owner_is_removed_before_a_shared_batch_uploads() {
+    use crate::TokenProvider;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    struct Gated {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl TokenProvider for Gated {
+        async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok("token".into())
+        }
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let a = http_queue(&server, 10);
+    let b = http_queue(&server, 10);
+    let engine = Engine::manual();
+    let provider = Arc::new(Gated {
+        started: Default::default(),
+        release: Default::default(),
+    });
+    for (queue, id) in [(&a, "expired"), (&b, "active")] {
+        let mut row = SubmitCommand::test_row(id);
+        row.credential = Credential::Provider(provider.clone());
+        engine.submit(queue.core.clone(), row);
+    }
+    let (key, entries) = engine.take_jobs().pop().unwrap();
+    assert_eq!(entries.len(), 2);
+    let job = tokio::spawn(engine.clone().process_job(key, entries));
+    provider.started.notified().await;
+    engine.expire(&a.core.observation);
+    provider.release.notify_one();
+    job.await.unwrap();
+
+    let uploads = server.received_requests().await.unwrap();
+    let upload = uploads
+        .iter()
+        .find(|request| request.url.path() == "/logs3")
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(body["rows"][0]["id"], "active");
+}

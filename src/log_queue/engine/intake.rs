@@ -1,11 +1,11 @@
-use super::partition::Key;
+use super::partition::{Key, OrgKey};
 use crate::log_queue::{
     core::LogQueueCore,
     observation::{Notification, Observation},
     submission::SubmitCommand,
 };
 use crate::{DeliveryReceipt, WriteError};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -13,7 +13,22 @@ pub(super) struct Entry {
     pub(super) core: Arc<LogQueueCore>,
     pub(super) command: SubmitCommand,
     pub(super) sequence: u64,
+    pub(super) row: Option<RowOrderKey>,
 }
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(super) struct RowOrderKey {
+    pub(super) route: OrgKey,
+    pub(super) id: String,
+}
+
+pub(super) type ReleasedEntry = (Option<RowOrderKey>, u64);
+
+impl Entry {
+    pub(super) fn release(self) -> ReleasedEntry {
+        (self.row, self.sequence)
+    }
+}
+
 pub(super) type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
 pub(super) struct Record {
     pub(super) observer: Arc<Observation>,
@@ -24,6 +39,26 @@ pub(super) struct Intake {
     pub(super) sequence: u64,
     pub(super) records: HashMap<u64, Record>,
     pub(super) partitions: HashMap<Key, Partition>,
+    pub(super) row_order: HashMap<RowOrderKey, BTreeMap<u64, Key>>,
+}
+
+impl Intake {
+    pub(super) fn release_row(&mut self, (row, sequence): ReleasedEntry) -> Option<Key> {
+        let row = row?;
+        let order = self.row_order.get_mut(&row)?;
+        let was_first = order
+            .first_key_value()
+            .is_some_and(|(first, _)| *first == sequence);
+        order.remove(&sequence);
+        if order.is_empty() {
+            self.row_order.remove(&row);
+            None
+        } else if was_first {
+            order.first_key_value().map(|(_, key)| key.clone())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
