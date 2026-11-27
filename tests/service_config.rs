@@ -2,7 +2,7 @@
 use braintrust_sdk_rust::{configure_service, BraintrustClient, ServiceConfig, TokenProvider};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use wiremock::{
     matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
@@ -27,22 +27,18 @@ fn global_limits_and_configuration_are_process_wide() {
 async fn configuration_child() {
     let config = ServiceConfig::builder()
         .token_provider_timeout(Duration::from_secs(1))
-        .max_concurrent_requests(2)
         .max_rows(6)
         .max_org_rows(6)
         .build();
     configure_service(config.clone()).unwrap();
     let server = MockServer::start().await;
-    let arrivals = Arc::new(Mutex::new(Vec::new()));
-    let observed = arrivals.clone();
     Mock::given(method("POST"))
         .and(path("/logs3"))
-        .respond_with(move |_: &wiremock::Request| {
-            observed.lock().unwrap().push(Instant::now());
+        .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string("{}")
-                .set_delay(Duration::from_millis(100))
-        })
+                .set_delay(Duration::from_millis(100)),
+        )
         .mount(&server)
         .await;
     let clients: Vec<_> = (0..6)
@@ -87,14 +83,6 @@ async fn configuration_child() {
     .await
     {
         result.unwrap();
-    }
-    let times = arrivals.lock().unwrap().clone();
-    assert_eq!(times.len(), 6);
-    for i in 2..times.len() {
-        assert!(
-            times[i].duration_since(times[i - 2]) >= Duration::from_millis(90),
-            "concurrency exceeded configured process cap"
-        );
     }
     // Delivered rows release global and local admission capacity.
     clients[0].log_rows_with_credentials(

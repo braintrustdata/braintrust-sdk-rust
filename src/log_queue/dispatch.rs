@@ -1,10 +1,12 @@
 //! Preserve submission ownership through preparation, merging, batching, and split uploads.
 use super::batching::build_overflow_row_from_logs3row;
+use super::core::QueueSettings;
 use super::http::send_batch_counting;
 use super::merge::merge_row_into;
 use super::observation::DeliveryError;
-use super::queue::{QueueSettings, QueuedItem, SubmitCommand};
+use super::report::{Loss, Outcome, Report};
 use super::row_key::RowKey;
+use super::submission::{QueuedItem, SubmitCommand};
 use crate::{
     internal::{
         ingest::{EncodedBatch, EncodedRow},
@@ -17,75 +19,6 @@ use indexmap::IndexMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use url::Url;
-
-pub(super) struct Loss {
-    pub submissions: Vec<usize>,
-    pub preparation: bool,
-}
-type BatchSubmissions = Arc<[Vec<usize>]>;
-
-#[derive(Clone)]
-pub(super) enum Outcome {
-    Pending,
-    Delivered,
-    Failed(DeliveryError),
-}
-
-/// Outcomes recorded as a job progresses, so a job that is dropped part-way
-/// can requeue exactly the submissions that have no outcome yet.
-pub(super) struct Report {
-    pub outcomes: Vec<Outcome>,
-    pub losses: Vec<Loss>,
-    /// Batches being uploaded: each row's submissions in batch order, and how
-    /// many leading rows have been delivered so far.
-    pub uploads: Vec<(BatchSubmissions, Arc<AtomicUsize>)>,
-}
-impl Report {
-    pub fn new(count: usize) -> Self {
-        Self {
-            outcomes: vec![Outcome::Pending; count],
-            losses: Vec::new(),
-            uploads: Vec::new(),
-        }
-    }
-    /// Settle rows whose request already succeeded, so a job dropped mid-upload
-    /// does not send them again.
-    pub fn settle_delivered(&mut self) {
-        for (rows, delivered) in std::mem::take(&mut self.uploads) {
-            let delivered = delivered.load(Ordering::Acquire);
-            for submissions in rows.iter().take(delivered) {
-                self.settle(submissions.iter().copied());
-            }
-        }
-    }
-    pub fn settle(&mut self, submissions: impl IntoIterator<Item = usize>) {
-        for index in submissions {
-            if matches!(self.outcomes[index], Outcome::Pending) {
-                self.outcomes[index] = Outcome::Delivered;
-            }
-        }
-    }
-    pub fn failed(&mut self, submissions: Vec<usize>, error: &anyhow::Error, preparation: bool) {
-        let error = DeliveryError::from_error(error);
-        self.fail_submissions(&submissions, &error);
-        self.losses.push(Loss {
-            submissions,
-            preparation,
-        });
-    }
-
-    fn fail_submissions(&mut self, submissions: &[usize], error: &DeliveryError) {
-        for &index in submissions {
-            self.outcomes[index] = Outcome::Failed(error.clone());
-        }
-    }
-
-    pub fn has_pending(&self) -> bool {
-        self.outcomes
-            .iter()
-            .any(|outcome| matches!(outcome, Outcome::Pending))
-    }
-}
 
 impl QueueSettings {
     /// The engine seals a compatible partition before assigning local submission indices.
@@ -114,7 +47,7 @@ impl QueueSettings {
         };
         // One token serves the whole job: preparation, registration, and uploads.
         // A provider can fail transiently, so it is retried like an upload.
-        let mut delays = crate::internal::upload::queue_delays(self.config.num_retries());
+        let mut delays = crate::internal::request::queue_delays(self.config.num_retries());
         let token = loop {
             match (credential.token().await, delays.next()) {
                 (Ok(token), _) => break token,
@@ -259,10 +192,7 @@ impl QueueSettings {
         });
         // Keep only a bounded number of requests from this partition waiting
         // for permits, even when its backlog splits into many batches.
-        let concurrency = crate::service::global()
-            .expect("initialized service")
-            .config
-            .max_concurrent_requests;
+        let concurrency = crate::service::config().max_concurrent_requests;
         let mut sends = stream::iter(sends).buffer_unordered(concurrency);
         while let Some((rows, delivered, result)) = sends.next().await {
             report.settle(rows.iter().flatten().copied());

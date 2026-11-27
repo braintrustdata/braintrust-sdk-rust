@@ -1,13 +1,13 @@
 //! SDK ingestion orchestration, built on the one-attempt API.
 use super::ingest::EncodedBatch;
+use super::request::{queue_delays, scheduled, RetryBudget};
 use crate::api::{self, transport::Logs3OverflowRequest};
 use crate::error::{BraintrustError, Result};
-use crate::http::api_result;
-use crate::scheduler::{Scope, SCOPE};
+use crate::scheduler::Scope;
 use crate::types::LOGS_API_VERSION;
-use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, Retryable};
+use backon::{BackoffBuilder, ExponentialBuilder};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 use tracing::warn;
 
 #[derive(Clone, Copy, Debug)]
@@ -29,8 +29,11 @@ impl Capabilities {
             cell.get_or_try_init(|| async {
                 // Server capabilities are shared across orgs, so a throttled org
                 // must not delay a lookup needed by other callers.
-                let scope = Scope::new(endpoint, "");
-                let version = scheduled(scope, 0, || client.version()).await?.into_inner();
+                // Capabilities are shared across orgs, so one org's cooldown
+                // must not delay a lookup needed by other callers.
+                let version = scheduled(Scope::new(endpoint, ""), 0, || client.version())
+                    .await?
+                    .into_inner();
                 Ok::<_, BraintrustError>(version.logs3_payload_max_bytes.filter(|limit| *limit > 0))
             })
             .await
@@ -72,139 +75,10 @@ impl UploadPolicy {
                 .with_jitter()
                 .build(),
         };
-        RetryBudget {
-            delays,
-            requests: 0,
-        }
-    }
-}
-/// Delays between the attempts of queued work, which retries `retries` times.
-pub(crate) fn queue_delays(retries: usize) -> ExponentialBackoff {
-    ExponentialBuilder::default()
-        .with_min_delay(Duration::from_secs(1))
-        .with_max_delay(Duration::from_secs(30))
-        .with_max_times(retries)
-        .build()
-}
-// The data plane's rate-limit window is 60 seconds, so a longer Retry-After is never useful.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
-
-/// A failed request attempt, with the server's Retry-After hint when it sent one.
-struct Attempt {
-    error: BraintrustError,
-    retry_after: Option<Duration>,
-}
-
-async fn attempt<T>(
-    result: std::result::Result<T, crate::api::Error<serde_json::Value>>,
-) -> std::result::Result<T, Attempt> {
-    let retry_after = match &result {
-        Err(crate::api::Error::Api(response)) => response
-            .headers
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse().ok())
-            .map(Duration::from_secs),
-        _ => None,
-    };
-    api_result(result)
-        .await
-        .map_err(|error| Attempt { error, retry_after })
-}
-
-/// Wait at least as long as the server asked, without retrying once the budget is exhausted.
-/// A 429 pauses its scope, even when this request has no retries left, so
-/// other requests sharing the limit do not repeat the rejected attempt.
-fn retry_delay(attempt: &Attempt, backoff: Option<Duration>) -> Option<Duration> {
-    let hint = attempt.retry_after.map(|hint| hint.min(MAX_RETRY_AFTER));
-    let delay = backoff.map(|backoff| hint.map_or(backoff, |hint| hint.max(backoff)));
-    if matches!(attempt.error, BraintrustError::Api { status: 429, .. }) {
-        if let (Ok(service), Some(wait)) = (crate::service::global(), delay.or(hint)) {
-            service.attempts.cool_down(wait);
-        }
-    }
-    delay
-}
-
-/// Issue a request through the shared scheduler within `scope`: it waits out
-/// cooldowns, holds a request permit only while in flight, and retries
-/// transient failures `retries` times. A 429 pauses the scope even when no
-/// retries are left.
-pub(crate) async fn scheduled<T, F, Fut>(
-    scope: Scope,
-    retries: usize,
-    mut operation: F,
-) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = std::result::Result<T, crate::api::Error<serde_json::Value>>>,
-{
-    let mut budget = UploadPolicy::Queue { retries }.budget();
-    SCOPE
-        .scope(
-            scope,
-            budget.run(|| {
-                let request = operation();
-                async move { attempt(request.await).await }
-            }),
-        )
-        .await
-}
-
-/// Hold a request permit for an operation whose errors are not API responses,
-/// such as login, after waiting out any cooldown for `scope`.
-pub(crate) async fn admitted<T>(scope: Scope, operation: impl Future<Output = T>) -> Result<T> {
-    let service = crate::service::global()?;
-    let admitted = SCOPE.scope(scope, async {
-        let _permit = service.attempts.acquire().await;
-        operation.await
-    });
-    Ok(admitted.await)
-}
-
-// Borrowing the iterator lets backon share retries across overflow stages and splits.
-struct RetryBudget {
-    delays: ExponentialBackoff,
-    requests: usize,
-}
-impl RetryBudget {
-    async fn run<T, F, Fut>(&mut self, mut operation: F) -> Result<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = std::result::Result<T, Attempt>>,
-    {
-        (|| {
-            self.requests += 1;
-            let operation = operation();
-            async move {
-                let service = crate::service::global().map_err(|error| Attempt { error, retry_after: None })?;
-                let _permit = service.attempts.acquire().await;
-                operation.await
-            }
-        })
-        .retry(&mut self.delays)
-        .when(|attempt| retryable(&attempt.error))
-        .adjust(retry_delay)
-        .notify(|attempt, delay| {
-            warn!(error = %attempt.error, ?delay, "ingestion request failed, retrying")
-        })
-        .await
-        .map_err(|attempt| attempt.error)
+        RetryBudget::new(delays)
     }
 }
 
-fn retryable(error: &BraintrustError) -> bool {
-    match error {
-        BraintrustError::Http(error) => !error.is_builder(),
-        // A transport failure other than a reqwest error, such as a timeout.
-        BraintrustError::Network(_) => true,
-        // Request timeout, too early, rate limited, or a server error.
-        BraintrustError::Api { status, .. } => {
-            matches!(status, 408 | 425 | 429) || (500..600).contains(status)
-        }
-        _ => false,
-    }
-}
 #[derive(Default)]
 pub(crate) struct UploadResult {
     pub rows_uploaded: usize,
@@ -220,13 +94,6 @@ pub(crate) struct UploadCoordinator {
 impl UploadCoordinator {
     pub fn new(logs: api::Client, policy: UploadPolicy) -> Self {
         Self { logs, policy }
-    }
-
-    /// The caller's scope; every caller sets one for its org.
-    fn scope(&self) -> Scope {
-        SCOPE
-            .try_with(Clone::clone)
-            .unwrap_or_else(|_| Scope::new(self.logs.baseurl(), ""))
     }
 
     pub async fn capabilities(
@@ -261,15 +128,10 @@ impl UploadCoordinator {
     ) -> (UploadResult, Result<()>) {
         let mut budget = self.policy.budget();
         let mut result = UploadResult::default();
-        // Resolution may have replaced a project name with its canonical ID.
-        let scope = self.scope();
-        let outcome = SCOPE
-            .scope(
-                scope,
-                self.upload_into(batch, capabilities, &mut budget, &mut result, delivered),
-            )
+        let outcome = self
+            .upload_into(batch, capabilities, &mut budget, &mut result, delivered)
             .await;
-        result.requests_sent = budget.requests;
+        result.requests_sent = budget.requests();
         (result, outcome)
     }
 
@@ -284,15 +146,8 @@ impl UploadCoordinator {
         let mut pending = vec![batch];
         while let Some(batch) = pending.pop() {
             if batch.data.len() <= capabilities.max_request_size {
-                match budget
-                    .run(|| async {
-                        attempt(self.logs.logs3_raw(batch.data.clone()).await)
-                            .await
-                            .map(|_| ())
-                    })
-                    .await
-                {
-                    Ok(()) => {
+                match budget.run(|| self.logs.logs3_raw(batch.data.clone())).await {
+                    Ok(_) => {
                         delivered.fetch_add(batch.len(), Ordering::Release);
                         result.rows_uploaded += batch.len();
                         result.bytes_processed += batch.data.len();
@@ -328,31 +183,18 @@ impl UploadCoordinator {
                 let mut request = Logs3OverflowRequest::new(batch.overflow_rows());
                 request.content_type = Some("application/json".into());
                 request.size_bytes = Some(batch.data.len());
-                attempt(
-                    self.logs
-                        .logs3_overflow_with_org_name(&request, self.logs.organization_name())
-                        .await,
-                )
-                .await
-                .map(|v| v.into_inner())
+                self.logs
+                    .logs3_overflow_with_org_name(&request, self.logs.organization_name())
+                    .await
             })
-            .await?;
+            .await?
+            .into_inner();
         budget
-            .run(|| async {
-                attempt(
-                    self.logs
-                        .upload_logs3_overflow(&grant, batch.data.clone())
-                        .await,
-                )
-                .await
-                .map(|_| ())
-            })
+            .run(|| self.logs.upload_logs3_overflow(&grant, batch.data.clone()))
             .await?;
-        budget
-            .run(|| async {
-                attempt(self.logs.logs3(&serde_json::json!({"rows":grant.reference(), "api_version":LOGS_API_VERSION})).await).await.map(|_| ())
-            })
-            .await
+        let request = serde_json::json!({"rows":grant.reference(), "api_version":LOGS_API_VERSION});
+        budget.run(|| self.logs.logs3(&request)).await?;
+        Ok(())
     }
 }
 
@@ -361,31 +203,12 @@ mod tests {
     use super::*;
     use crate::api::transport::Logs3OverflowUpload;
     use crate::internal::ingest::EncodedRow;
+    use crate::scheduler::{self, SCOPE};
     use serde_json::{json, Value};
     use wiremock::{
         matchers::{header, method, path},
         Mock, MockServer, ResponseTemplate,
     };
-
-    #[test]
-    fn transient_failures_are_retried_and_permanent_ones_are_not() {
-        let api = |status| BraintrustError::Api {
-            status,
-            message: String::new(),
-        };
-        for status in [408, 425, 429, 500, 502, 503, 504] {
-            assert!(retryable(&api(status)), "{status} should be retried");
-        }
-        for status in [400, 401, 403, 404, 413, 422] {
-            assert!(!retryable(&api(status)), "{status} should not be retried");
-        }
-        // How the API client reports its own timeouts and middleware failures.
-        let timeout: crate::api::Error<serde_json::Value> =
-            crate::api::Error::Transport(crate::api::HttpError::Timeout);
-        let error = futures::executor::block_on(api_result::<()>(Err(timeout))).unwrap_err();
-        assert!(retryable(&error), "{error} should be retried");
-        assert!(!retryable(&BraintrustError::InvalidConfig(String::new())));
-    }
 
     fn batch() -> EncodedBatch {
         EncodedBatch::partition(
@@ -718,38 +541,8 @@ mod tests {
             )
             .await;
         assert!(outcome.is_err());
-        let scheduler = &crate::service::global().unwrap().attempts;
+        let scheduler = scheduler::shared();
         assert!(scheduler.paused(&org));
         assert!(!scheduler.paused(&Scope::new(server.uri(), "other-org")));
-    }
-
-    #[test]
-    fn retry_after_never_shortens_backoff_and_is_capped() {
-        let rate_limited = |retry_after| Attempt {
-            error: BraintrustError::Api {
-                status: 429,
-                message: String::new(),
-            },
-            retry_after,
-        };
-        let backoff = Some(Duration::from_secs(2));
-        assert_eq!(
-            retry_delay(&rate_limited(Some(Duration::from_secs(20))), backoff),
-            Some(Duration::from_secs(20))
-        );
-        assert_eq!(
-            retry_delay(&rate_limited(Some(Duration::ZERO)), backoff),
-            backoff
-        );
-        assert_eq!(retry_delay(&rate_limited(None), backoff), backoff);
-        assert_eq!(
-            retry_delay(&rate_limited(Some(Duration::from_secs(3600))), backoff),
-            Some(MAX_RETRY_AFTER)
-        );
-        assert_eq!(
-            retry_delay(&rate_limited(Some(Duration::from_secs(20))), None),
-            None,
-            "an exhausted retry budget must stay exhausted"
-        );
     }
 }

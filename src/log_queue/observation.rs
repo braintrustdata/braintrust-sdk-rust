@@ -1,11 +1,26 @@
 //! Scoped delivery observations shared by client and resource facades.
 use crate::{
-    BraintrustError, Completion, DroppedRows, EnqueueError, ExecutionError, FlushError,
-    FlushFailure, FlushReport, WriteError,
+    BraintrustError, Completion, EnqueueError, ExecutionError, FlushError, FlushFailure,
+    FlushReport, WriteError,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
+
+/// Cumulative counts of rows the log queue discarded instead of uploading.
+///
+/// Counts only grow over the life of the client, so callers can export them as
+/// monotonic counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DroppedRows {
+    /// Rejected because the queue was full or already closed.
+    pub queue_full: u64,
+    /// Discarded because the row could not be prepared or serialized for upload.
+    pub preparation_failed: u64,
+    /// Discarded after an upload failed and any retries were exhausted.
+    pub upload_failed: u64,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct DeliveryError {
@@ -39,24 +54,24 @@ pub(crate) type Notification = (
     oneshot::Sender<Result<FlushReport, FlushError>>,
     Result<FlushReport, FlushError>,
 );
-pub(crate) struct Waiter {
-    pub cutoff: u64,
-    pub delivered: u64,
-    pub failed: u64,
-    pub error: Option<WriteError>,
-    pub sender: oneshot::Sender<Result<FlushReport, FlushError>>,
+struct Waiter {
+    cutoff: u64,
+    delivered: u64,
+    failed: u64,
+    error: Option<WriteError>,
+    sender: oneshot::Sender<Result<FlushReport, FlushError>>,
 }
 #[derive(Default)]
-pub(crate) struct State {
-    pub pending: BTreeSet<u64>,
-    pub waiters: Vec<Waiter>,
-    pub drops: DroppedRows,
-    pub closed: bool,
-    pub terminal: Option<ExecutionError>,
+struct State {
+    pending: BTreeSet<u64>,
+    waiters: Vec<Waiter>,
+    drops: DroppedRows,
+    closed: bool,
+    terminal: Option<ExecutionError>,
 }
 pub(crate) struct Observation {
-    pub parent: Option<Arc<Observation>>,
-    pub state: Mutex<State>,
+    parent: Option<Arc<Observation>>,
+    state: Mutex<State>,
 }
 impl Observation {
     pub fn new(parent: Option<Arc<Self>>) -> Self {
@@ -72,13 +87,25 @@ impl Observation {
     pub fn closed(&self) -> bool {
         self.state.lock().unwrap().closed || self.parent.as_ref().is_some_and(|p| p.closed())
     }
-    pub fn terminal(&self) -> Option<ExecutionError> {
+    fn terminal(&self) -> Option<ExecutionError> {
         self.state
             .lock()
             .unwrap()
             .terminal
             .or_else(|| self.parent.as_ref().and_then(|p| p.terminal()))
     }
+    pub fn root(&self) -> &Self {
+        self.parent.as_deref().map_or(self, Self::root)
+    }
+
+    pub fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+    }
+
+    pub fn time_out(&self) {
+        self.state.lock().unwrap().terminal = Some(ExecutionError::TimedOut);
+    }
+
     pub fn accept(&self, sequence: u64) {
         self.state.lock().unwrap().pending.insert(sequence);
         if let Some(parent) = &self.parent {

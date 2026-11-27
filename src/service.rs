@@ -72,8 +72,6 @@ pub(crate) fn config() -> &'static ServiceConfig {
 
 pub(crate) struct Service {
     pub engine: Arc<crate::log_queue::engine::Engine>,
-    pub attempts: Arc<crate::scheduler::Scheduler>,
-    pub config: ServiceConfig,
 }
 impl Service {
     pub fn spawn_operation<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
@@ -94,11 +92,7 @@ pub(crate) fn global() -> Result<&'static Service> {
     crate::runtime::handle()?;
     Ok(SERVICE.get_or_init(|| {
         let config = config().clone();
-        let engine = Arc::new(crate::log_queue::engine::Engine::new(config.clone()));
-        Service {
-            engine,
-            attempts: crate::scheduler::Scheduler::new(config.max_concurrent_requests),
-            config,
-        }
+        let engine = Arc::new(crate::log_queue::engine::Engine::new(config));
+        Service { engine, config }
     }))
 }

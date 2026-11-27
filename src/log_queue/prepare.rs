@@ -1,5 +1,5 @@
 //! Span routing and construction of logs3 rows.
-use super::queue::QueueSettings;
+use super::core::QueueSettings;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use anyhow::{anyhow, Result};
@@ -228,7 +228,7 @@ impl QueueSettings {
             // cooldowns, counts against request concurrency, and retries
             // transient failures instead of dropping the span on the first one.
             let retries = self.config.num_retries();
-            let register_response = crate::internal::upload::scheduled(scope, retries, || {
+            let register_response = crate::internal::request::scheduled(scope, retries, || {
                 client.register_project(&request)
             })
             .await?
