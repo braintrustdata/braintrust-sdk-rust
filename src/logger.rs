@@ -242,7 +242,7 @@ impl BraintrustClient {
     ) -> crate::Completion<(), BraintrustError> {
         let reservation = match self.inner.pending_auth.reserve() {
             Ok(reservation) => reservation,
-            Err(error) => return crate::Completion::finished(Err(error)),
+            Err(error) => return pending_auth::rejected(error),
         };
         let client = self.clone();
         let exported = exported.to_owned();
@@ -588,7 +588,10 @@ impl BraintrustClient {
         self.inner
             .pending_auth
             .direct(|| self.inner.queue.submit(credential, payload, parent_info))
-            .unwrap_or_else(|| crate::Completion::finished(Err(crate::EnqueueError::Closed.into())))
+            .unwrap_or_else(|| {
+                self.inner.queue.account_closed(1);
+                pending_auth::rejected(crate::EnqueueError::Closed.into())
+            })
     }
 
     /// Queue caller-built rows for upload to `/logs3` using the logged-in credentials.
@@ -601,7 +604,7 @@ impl BraintrustClient {
     ) -> crate::Completion<(), BraintrustError> {
         let reservation = match self.inner.pending_auth.reserve() {
             Ok(reservation) => reservation,
-            Err(error) => return crate::Completion::finished(Err(error)),
+            Err(error) => return pending_auth::rejected(error),
         };
         let client = self.clone();
         let rows: Vec<_> = rows.into_iter().collect();
@@ -654,9 +657,15 @@ impl BraintrustClient {
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
         let rows: Vec<_> = rows.into_iter().collect();
-        self.inner
+        let count = rows.len();
+        if self
+            .inner
             .pending_auth
-            .direct(|| self.inner.queue.submit_rows(token, org_id, org_name, rows));
+            .direct(|| self.inner.queue.submit_rows(token, org_id, org_name, rows))
+            .is_none()
+        {
+            self.inner.queue.account_closed(count);
+        }
     }
 
     /// Queue caller-built rows for upload to `/logs3`, fetching the token from
@@ -675,11 +684,19 @@ impl BraintrustClient {
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
         let rows: Vec<_> = rows.into_iter().collect();
-        self.inner.pending_auth.direct(|| {
-            self.inner
-                .queue
-                .submit_rows_with_provider(provider, org_id, org_name, rows)
-        });
+        let count = rows.len();
+        if self
+            .inner
+            .pending_auth
+            .direct(|| {
+                self.inner
+                    .queue
+                    .submit_rows_with_provider(provider, org_id, org_name, rows)
+            })
+            .is_none()
+        {
+            self.inner.queue.account_closed(count);
+        }
     }
 
     /// Cumulative counts of rows this client discarded instead of uploading.
