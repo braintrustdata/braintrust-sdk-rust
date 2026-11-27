@@ -153,14 +153,17 @@ impl<
                  Use start_span() consistently or log() consistently, but not both."
             );
         }
+        let reservation = match self.submitter.reserve_pending() {
+            Ok(reservation) => reservation,
+            Err(error) => return crate::logger::pending_auth::rejected(error),
+        };
         let experiment = self.clone();
         let write = self.writes.start();
         crate::operation::submit(async move {
-            write.0.wait(write.1).await;
+            let metadata = experiment
+                .prepare_write(&write, reservation.as_ref())
+                .await?;
             let _write = write;
-
-            // Get or create experiment registration
-            let metadata = experiment.ensure_registered().await;
 
             // Create a span for this log event
             let start_time = f64::from_bits(experiment.last_start_time.load(Ordering::Acquire));
@@ -184,13 +187,41 @@ impl<
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
-            span.log_and_end(event.into_span_log(), end_time);
+            if let Some(reservation) = reservation {
+                reservation.publish(|capacity| {
+                    let capacity = capacity.ok_or_else(|| {
+                        crate::BraintrustError::Background("missing pending capacity".into())
+                    })?;
+                    Ok(vec![span.log_and_end(
+                        event.into_span_log(),
+                        end_time,
+                        Some(capacity),
+                    )])
+                })?;
+            } else {
+                drop(span.log_and_end(event.into_span_log(), end_time, None));
+            }
             // The next log() call starts where this one ended.
             experiment
                 .last_start_time
                 .store(end_time.to_bits(), Ordering::Release);
             Ok(row_id)
         })
+    }
+
+    async fn prepare_write(
+        &self,
+        write: &Write,
+        reservation: Option<&crate::logger::pending_auth::Reservation>,
+    ) -> Result<ExperimentMetadata, crate::BraintrustError> {
+        let prepare = async {
+            write.0.wait(write.1).await;
+            Ok(self.ensure_registered().await)
+        };
+        match reservation {
+            Some(reservation) => reservation.wait(prepare).await,
+            None => prepare.await,
+        }
     }
 
     /// Start a new root span for this experiment.
@@ -221,13 +252,18 @@ impl<
         id: &str,
         feedback: Feedback,
     ) -> crate::Completion<(), crate::BraintrustError> {
+        let reservation = match self.submitter.reserve_pending() {
+            Ok(reservation) => reservation,
+            Err(error) => return crate::logger::pending_auth::rejected(error),
+        };
         let experiment = self.clone();
         let id = id.to_owned();
         let write = self.writes.start();
         crate::operation::submit(async move {
-            write.0.wait(write.1).await;
+            let metadata = experiment
+                .prepare_write(&write, reservation.as_ref())
+                .await?;
             let _write = write;
-            let metadata = experiment.ensure_registered().await;
 
             // Create a merge payload for the existing span
             let mut scores = HashMap::new();
@@ -275,12 +311,25 @@ impl<
                 object_id: metadata.experiment_id.clone(),
             };
 
-            experiment.submitter.submit(
-                Credential::token_value(experiment.token.clone()),
-                payload,
-                Some(parent_info),
-            );
-
+            let credential = Credential::token_value(experiment.token.clone());
+            if let Some(reservation) = reservation {
+                reservation.publish(|capacity| {
+                    Ok(vec![experiment.submitter.submit_reserved(
+                        credential,
+                        payload,
+                        Some(parent_info),
+                        capacity.ok_or_else(|| {
+                            crate::BraintrustError::Background("missing pending capacity".into())
+                        })?,
+                    )])
+                })?;
+            } else {
+                drop(
+                    experiment
+                        .submitter
+                        .submit(credential, payload, Some(parent_info)),
+                );
+            }
             Ok(())
         })
     }
@@ -380,11 +429,14 @@ impl<
     pub fn flush(&self) -> crate::Completion<(), crate::BraintrustError> {
         let experiment = self.clone();
         let cutoff = self.writes.cutoff();
+        let flush = self
+            .submitter
+            .tracks_pending()
+            .then(|| self.submitter.flush());
         crate::operation::submit(async move {
             experiment.writes.wait(cutoff).await;
-            experiment
-                .submitter
-                .flush()
+            flush
+                .unwrap_or_else(|| experiment.submitter.flush())
                 .await
                 .map(|_| ())
                 .map_err(Into::into)
@@ -457,13 +509,18 @@ impl<
         id: &str,
         event: SpanLog,
     ) -> crate::Completion<(), crate::BraintrustError> {
+        let reservation = match self.submitter.reserve_pending() {
+            Ok(reservation) => reservation,
+            Err(error) => return crate::logger::pending_auth::rejected(error),
+        };
         let experiment = self.clone();
         let id = id.to_owned();
         let write = self.writes.start();
         crate::operation::submit(async move {
-            write.0.wait(write.1).await;
+            let metadata = experiment
+                .prepare_write(&write, reservation.as_ref())
+                .await?;
             let _write = write;
-            let metadata = experiment.ensure_registered().await;
 
             let payload = SpanPayload {
                 row_id: id.to_string(),
@@ -495,12 +552,25 @@ impl<
                 object_id: metadata.experiment_id.clone(),
             };
 
-            experiment.submitter.submit(
-                Credential::token_value(experiment.token.clone()),
-                payload,
-                Some(parent_info),
-            );
-
+            let credential = Credential::token_value(experiment.token.clone());
+            if let Some(reservation) = reservation {
+                reservation.publish(|capacity| {
+                    Ok(vec![experiment.submitter.submit_reserved(
+                        credential,
+                        payload,
+                        Some(parent_info),
+                        capacity.ok_or_else(|| {
+                            crate::BraintrustError::Background("missing pending capacity".into())
+                        })?,
+                    )])
+                })?;
+            } else {
+                drop(
+                    experiment
+                        .submitter
+                        .submit(credential, payload, Some(parent_info)),
+                );
+            }
             Ok(())
         })
     }

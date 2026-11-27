@@ -20,6 +20,90 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
+pub(crate) struct PendingCapacity {
+    engine: Arc<Engine>,
+    core: Arc<LogQueueCore>,
+    root: usize,
+    route: Option<partition::OrgKey>,
+    count: usize,
+}
+
+impl PendingCapacity {
+    pub fn grow(&mut self) -> Result<(), EnqueueError> {
+        let core = &self.core;
+        let mut intake = self.engine.intake.lock().unwrap();
+        let client_rows = core.observation.root().len()
+            + intake
+                .reserved_clients
+                .get(&self.root)
+                .copied()
+                .unwrap_or(0);
+        let org_rows = match &self.route {
+            Some(route) => {
+                intake.org_rows.get(route).copied().unwrap_or(0)
+                    + intake.reserved_orgs.get(route).copied().unwrap_or(0)
+            }
+            None => intake.reserved_unknown,
+        };
+        if core.observation.closed() {
+            return Err(EnqueueError::Closed);
+        }
+        if self
+            .engine
+            .config
+            .max_rows
+            .is_some_and(|max| intake.retained + intake.reserved >= max)
+            || self
+                .engine
+                .config
+                .max_org_rows
+                .is_some_and(|max| org_rows >= max)
+            || client_rows >= core.settings.config.queue_max_size()
+        {
+            return Err(EnqueueError::Full);
+        }
+        intake.reserved += 1;
+        *intake.reserved_clients.entry(self.root).or_default() += 1;
+        if let Some(route) = &self.route {
+            *intake.reserved_orgs.entry(route.clone()).or_default() += 1;
+        } else {
+            intake.reserved_unknown += 1;
+        }
+        self.count += 1;
+        Ok(())
+    }
+    fn release_one(&mut self, intake: &mut Intake) {
+        if self.count == 0 {
+            return;
+        }
+        self.count -= 1;
+        intake.reserved -= 1;
+        let n = intake.reserved_clients.get_mut(&self.root).unwrap();
+        *n -= 1;
+        if *n == 0 {
+            intake.reserved_clients.remove(&self.root);
+        }
+        if let Some(route) = &self.route {
+            let n = intake.reserved_orgs.get_mut(route).unwrap();
+            *n -= 1;
+            if *n == 0 {
+                intake.reserved_orgs.remove(route);
+            }
+        } else {
+            intake.reserved_unknown -= 1;
+        }
+    }
+}
+impl Drop for PendingCapacity {
+    fn drop(&mut self) {
+        let engine = self.engine.clone();
+        let mut intake = engine.intake.lock().unwrap();
+        while self.count > 0 {
+            self.release_one(&mut intake);
+        }
+    }
+}
+
 pub(crate) struct Engine {
     config: ServiceConfig,
     intake: Mutex<Intake>,
@@ -43,6 +127,26 @@ impl Engine {
             manual: true,
             ..Self::new(config)
         })
+    }
+
+    pub fn pending_capacity(
+        self: &Arc<Self>,
+        core: &Arc<LogQueueCore>,
+        org_id: Option<&str>,
+    ) -> PendingCapacity {
+        let route = org_id.filter(|id| !id.is_empty()).map(|id| {
+            let (endpoint, name) = core.route(id, None);
+            let org = crate::resolution::OrgIdentity::new(id, name.as_deref(), "")
+                .request_scope_key(&endpoint);
+            partition::OrgKey { endpoint, org }
+        });
+        PendingCapacity {
+            engine: self.clone(),
+            core: core.clone(),
+            root: core.observation.root() as *const _ as usize,
+            route,
+            count: 0,
+        }
     }
 
     /// Start a job for a partition made ready by submission or retirement.
@@ -104,7 +208,24 @@ impl Engine {
         command: SubmitCommand,
     ) -> Completion<DeliveryReceipt, WriteError> {
         let (sender, mut completion) = Completion::pair();
-        let result = self.enqueue(core, [(command, Some(sender))]).pop().unwrap();
+        let result = self
+            .enqueue(core, [(command, Some(sender))], None)
+            .pop()
+            .unwrap();
+        completion.record_issuance(result.map_err(WriteError::Admission));
+        completion
+    }
+    pub fn submit_reserved(
+        self: &Arc<Self>,
+        core: Arc<LogQueueCore>,
+        command: SubmitCommand,
+        permit: &mut PendingCapacity,
+    ) -> Completion<DeliveryReceipt, WriteError> {
+        let (sender, mut completion) = Completion::pair();
+        let result = self
+            .enqueue(core, [(command, Some(sender))], Some(permit))
+            .pop()
+            .unwrap();
         completion.record_issuance(result.map_err(WriteError::Admission));
         completion
     }
@@ -113,12 +234,17 @@ impl Engine {
         core: Arc<LogQueueCore>,
         commands: impl IntoIterator<Item = SubmitCommand>,
     ) {
-        self.enqueue(core, commands.into_iter().map(|command| (command, None)));
+        self.enqueue(
+            core,
+            commands.into_iter().map(|command| (command, None)),
+            None,
+        );
     }
     fn enqueue(
         self: &Arc<Self>,
         core: Arc<LogQueueCore>,
         commands: impl IntoIterator<Item = (SubmitCommand, Option<WriteSender>)>,
+        mut reserved: Option<&mut PendingCapacity>,
     ) -> Vec<Result<(), EnqueueError>> {
         let prepared: Vec<_> = commands
             .into_iter()
@@ -132,17 +258,26 @@ impl Engine {
         let mut ready = Vec::new();
         let mut intake = self.intake.lock().unwrap();
         for (command, key, sender) in prepared {
-            let client_rows = core.observation.root().len();
+            if let Some(permit) = reserved.as_deref_mut() {
+                permit.release_one(&mut intake);
+            }
+            let client_rows = core.observation.root().len()
+                + intake
+                    .reserved_clients
+                    .get(&(core.observation.root() as *const _ as usize))
+                    .copied()
+                    .unwrap_or(0);
             let closed = core.observation.closed();
             if closed
                 || self
                     .config
                     .max_rows
-                    .is_some_and(|max| intake.retained >= max)
-                || self
-                    .config
-                    .max_org_rows
-                    .is_some_and(|max| intake.org_rows.get(&key.route).copied().unwrap_or(0) >= max)
+                    .is_some_and(|max| intake.retained + intake.reserved >= max)
+                || self.config.max_org_rows.is_some_and(|max| {
+                    intake.org_rows.get(&key.route).copied().unwrap_or(0)
+                        + intake.reserved_orgs.get(&key.route).copied().unwrap_or(0)
+                        >= max
+                })
                 || client_rows >= core.settings.config.queue_max_size()
             {
                 let error = if closed {

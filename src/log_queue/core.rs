@@ -68,10 +68,16 @@ impl LogQueueCore {
     }
 
     pub(crate) fn rejected(&self, cmd: SubmitCommand) {
-        self.dropped_count.fetch_add(1, Ordering::Relaxed);
-        self.observation.queue_full();
-        self.log_drop_warning();
+        self.record_full(1);
         self.dump_dropped_row_if_configured(cmd);
+    }
+
+    pub(crate) fn record_full(&self, count: usize) {
+        self.dropped_count.fetch_add(count, Ordering::Relaxed);
+        for _ in 0..count {
+            self.observation.queue_full();
+        }
+        self.log_drop_warning();
     }
 
     pub(crate) fn retained(&self, rows: usize) {
