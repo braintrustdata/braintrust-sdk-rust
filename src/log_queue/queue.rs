@@ -192,6 +192,12 @@ impl LogQueue {
                 .submit_many(self.core.clone(), commands);
         }
     }
+    pub(crate) fn account_rejected(&self, count: usize, error: crate::EnqueueError) {
+        match error {
+            crate::EnqueueError::Full => self.core.record_full(count),
+            crate::EnqueueError::Closed => self.account_closed(count),
+        }
+    }
     pub(crate) fn account_closed(&self, count: usize) {
         for _ in 0..count {
             self.core.observation.queue_full();

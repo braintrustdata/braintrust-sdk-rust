@@ -278,7 +278,7 @@ impl BraintrustClient {
             .queue
             .pending_capacity(self.inner.login_state.org_id().as_deref());
         if let Err(error) = self.inner.queue.reserve_row(&mut capacity) {
-            self.inner.queue.account_closed(1);
+            self.inner.queue.account_rejected(1, error);
             reservation.reject(error);
             return pending_auth::rejected(BraintrustError::Background(error.to_string()));
         }
@@ -746,7 +746,7 @@ impl BraintrustClient {
         let mut retained = Vec::new();
         for row in rows {
             if let Err(error) = self.inner.queue.reserve_row(&mut capacity) {
-                self.inner.queue.account_closed(retained.len() + 1);
+                self.inner.queue.account_rejected(retained.len() + 1, error);
                 reservation.reject(error);
                 return pending_auth::rejected(BraintrustError::Background(error.to_string()));
             }
@@ -984,7 +984,7 @@ impl SpanSubmitter for BraintrustClient {
             .queue
             .pending_capacity(self.inner.resource_org.as_deref());
         if let Err(error) = self.inner.queue.reserve_row(&mut capacity) {
-            self.inner.queue.account_closed(1);
+            self.inner.queue.account_rejected(1, error);
             return Err(BraintrustError::Background(error.to_string()));
         }
         let mut reservation = self.inner.pending_auth.reserve()?;
