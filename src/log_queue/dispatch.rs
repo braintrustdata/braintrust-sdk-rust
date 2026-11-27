@@ -247,18 +247,24 @@ impl QueueSettings {
             let api_url = &api_url;
             let token = token.as_ref();
             async move {
-                let result = send_batch_counting(
-                    &self.client.client(),
-                    api_url,
-                    token,
-                    org_name,
-                    batch,
-                    &self.config,
-                    max_request_size,
-                    overflow,
-                    &delivered,
-                )
-                .await;
+                let scope = crate::scheduler::SCOPE
+                    .with(|scope| scope.for_destination(batch.destination()));
+                let result = crate::scheduler::SCOPE
+                    .scope(
+                        scope,
+                        send_batch_counting(
+                            &self.client.client(),
+                            api_url,
+                            token,
+                            org_name,
+                            batch,
+                            &self.config,
+                            max_request_size,
+                            overflow,
+                            &delivered,
+                        ),
+                    )
+                    .await;
                 (submissions, delivered.load(Ordering::Acquire), result)
             }
         });

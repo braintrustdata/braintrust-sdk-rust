@@ -74,7 +74,7 @@ async fn attempt<T>(
 }
 
 /// Wait at least as long as the server asked, without retrying once the budget is exhausted.
-/// Every 429 pauses its scope, even when this request has no retries left, so
+/// A 429 pauses its scope, even when this request has no retries left, so
 /// other requests sharing the limit do not repeat the rejected attempt.
 fn retry_delay(attempt: &Attempt, backoff: Option<Duration>) -> Option<Duration> {
     let hint = attempt.retry_after.map(|hint| hint.min(MAX_RETRY_AFTER));
@@ -89,7 +89,7 @@ fn retry_delay(attempt: &Attempt, backoff: Option<Duration>) -> Option<Duration>
 
 /// Issue a request through the shared scheduler within `scope`: it waits out
 /// cooldowns, holds a request permit only while in flight, and retries
-/// transient failures `retries` times. A 429 pauses the org even when no
+/// transient failures `retries` times. A 429 pauses the scope even when no
 /// retries are left.
 pub(crate) async fn scheduled<T, F, Fut>(
     scope: Scope,

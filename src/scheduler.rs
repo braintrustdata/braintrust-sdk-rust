@@ -6,19 +6,32 @@ use std::time::Duration;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 /// Who a request counts against. Every SDK request runs inside one, so permits
-/// rotate fairly across orgs and a 429 pauses only the requests sharing its org.
+/// rotate fairly across orgs and cooldowns can cover an org or a destination.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct Scope {
     pub endpoint: String,
     /// The org's identity; see [`crate::resolution::OrgIdentity::scope_key`].
     pub org: String,
+    destination: Option<String>,
 }
 impl Scope {
     pub fn new(endpoint: impl Into<String>, org: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
             org: org.into(),
+            destination: None,
         }
+    }
+
+    pub fn for_destination(&self, destination: Option<String>) -> Self {
+        Self {
+            destination,
+            ..self.clone()
+        }
+    }
+
+    fn org_scope(&self) -> Self {
+        self.for_destination(None)
     }
 }
 tokio::task_local! { pub(crate) static SCOPE: Scope; }
@@ -48,14 +61,19 @@ impl Scheduler {
         let scope = scope?;
         let mut cooldowns = self.cooldowns.lock().unwrap();
         cooldowns.retain(|_, until| *until > tokio::time::Instant::now());
-        cooldowns.get(scope).copied()
+        let scoped = cooldowns.get(scope).copied();
+        if scope.destination.is_some() {
+            scoped.max(cooldowns.get(&scope.org_scope()).copied())
+        } else {
+            scoped
+        }
     }
     #[cfg(test)]
     pub fn paused(&self, scope: &Scope) -> bool {
         self.deadline(Some(scope)).is_some()
     }
-    /// Pause every request in the current scope's org. A 429 does not say
-    /// whether a project or an org limit was hit, so the whole org waits.
+    /// Pause the request's destination when it has one. Requests without a
+    /// destination pause the organization.
     pub fn cool_down(&self, delay: Duration) {
         let Ok(scope) = SCOPE.try_with(Clone::clone) else {
             return;
@@ -90,7 +108,7 @@ impl Scheduler {
             self.orgs
                 .lock()
                 .unwrap()
-                .entry(scope.clone())
+                .entry(scope.as_ref().map(Scope::org_scope))
                 .or_default()
                 .push_back(sender);
             self.dispatch();
@@ -178,6 +196,30 @@ mod tests {
         assert_eq!(scheduler.slots.available_permits(), 1);
         assert!(scheduler.orgs.lock().unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn destination_cooldown_is_local_and_org_cooldown_covers_every_destination() {
+        let scheduler = Scheduler::new(1);
+        let org = scope("org");
+        let throttled = org.for_destination(Some("throttled".into()));
+        let healthy = org.for_destination(Some("healthy".into()));
+        SCOPE
+            .scope(throttled.clone(), async {
+                scheduler.cool_down(Duration::from_secs(30));
+            })
+            .await;
+        assert!(scheduler.paused(&throttled));
+        assert!(!scheduler.paused(&healthy));
+        assert!(!scheduler.paused(&org));
+
+        SCOPE
+            .scope(org.clone(), async {
+                scheduler.cool_down(Duration::from_secs(30));
+            })
+            .await;
+        assert!(scheduler.paused(&healthy));
+        assert!(scheduler.paused(&org));
+    }
+
     #[tokio::test]
     async fn a_full_cooldown_table_still_pauses_newly_throttled_orgs() {
         let scheduler = Scheduler::new(1);

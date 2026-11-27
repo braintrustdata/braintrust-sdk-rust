@@ -245,7 +245,7 @@ pub(crate) const PLAYGROUND_LOG_ID: &str = "x";
 /// NOTE: The `untagged` attribute is only safe if the field sets are also
 /// mutually exclusive. Variants are tried in order, so more specific ones
 /// (with unique fields) must come before broader ones.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum LogDestination {
     /// Log to an experiment (for evaluation runs).

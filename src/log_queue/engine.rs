@@ -2,7 +2,7 @@
 use super::dispatch::Report;
 use super::{
     observation::Observation,
-    queue::{Credential, LogQueueCore, SubmitCommand},
+    queue::{Credential, LogQueueCore, PartitionDestination, SubmitCommand},
 };
 use crate::ServiceConfig;
 use crate::{
@@ -34,7 +34,7 @@ struct Key {
     policy: Arc<super::config::LogQueueConfig>,
     transport: u64,
     app_url: String,
-    raw: bool,
+    destination: PartitionDestination,
 }
 struct Entry {
     core: Arc<LogQueueCore>,
@@ -53,9 +53,14 @@ struct Intake {
     sequence: u64,
     records: HashMap<u64, Record>,
     bytes: usize,
-    partitions: HashMap<Key, VecDeque<Entry>>,
-    active: HashSet<Key>,
+    partitions: HashMap<Key, Partition>,
     org_rows: HashMap<OrgKey, usize>,
+}
+
+#[derive(Default)]
+struct Partition {
+    pending: VecDeque<Entry>,
+    running: bool,
 }
 
 pub(crate) struct Engine {
@@ -100,12 +105,12 @@ impl Engine {
 
     fn take_job(&self, key: &Key) -> Option<Vec<Entry>> {
         let mut intake = self.intake.lock().unwrap();
-        if intake.active.contains(key) {
+        let partition = intake.partitions.get_mut(key)?;
+        if partition.running || partition.pending.is_empty() {
             return None;
         }
-        let entries = intake.partitions.remove(key)?;
-        intake.active.insert(key.clone());
-        Some(entries.into())
+        partition.running = true;
+        Some(std::mem::take(&mut partition.pending).into())
     }
 
     pub fn submit(
@@ -137,15 +142,16 @@ impl Engine {
                     .config
                     .max_bytes
                     .map_or(0, |_| command.estimated_bytes());
-                let partition = command.partition();
-                (command, bytes, partition, sender)
+                let route = command.partition();
+                let destination = command.destination();
+                (command, bytes, route, destination, sender)
             })
             .collect();
         let mut rejected = Vec::new();
         let mut results = Vec::new();
         let mut ready = Vec::new();
         let mut intake = self.intake.lock().unwrap();
-        for (command, bytes, (credential, org, org_name), sender) in prepared {
+        for (command, bytes, (credential, org, org_name), destination, sender) in prepared {
             let (endpoint, org_name) = core.route(&org, org_name.as_deref());
             let route = OrgKey {
                 endpoint,
@@ -199,7 +205,7 @@ impl Engine {
                 policy: core.settings.config.clone(),
                 transport: core.settings.client.identity,
                 app_url: core.settings.app_url.to_string(),
-                raw: command.is_raw(),
+                destination,
             };
             results.push(Ok(()));
             intake.records.insert(
@@ -211,12 +217,11 @@ impl Engine {
                     sender,
                 },
             );
-            let idle = !intake.active.contains(&key);
             let partition = intake.partitions.entry(key.clone()).or_default();
-            if idle && partition.is_empty() {
+            if !partition.running && partition.pending.is_empty() {
                 ready.push(key);
             }
-            partition.push_back(Entry {
+            partition.pending.push_back(Entry {
                 core: core.clone(),
                 command,
                 sequence,
@@ -303,19 +308,23 @@ impl Engine {
                 }
             }
         }
-        let live: HashSet<_> = intake.records.keys().copied().collect();
+        let Intake {
+            records,
+            partitions,
+            ..
+        } = &mut *intake;
         let mut discarded = Vec::new();
-        for entries in intake.partitions.values_mut() {
-            let old = std::mem::take(entries);
+        for partition in partitions.values_mut() {
+            let old = std::mem::take(&mut partition.pending);
             for entry in old {
-                if live.contains(&entry.sequence) {
-                    entries.push_back(entry);
+                if records.contains_key(&entry.sequence) {
+                    partition.pending.push_back(entry);
                 } else {
                     discarded.push(entry);
                 }
             }
         }
-        intake.partitions.retain(|_, entries| !entries.is_empty());
+        partitions.retain(|_, partition| partition.running || !partition.pending.is_empty());
         drop(intake);
         for (sender, result) in signals {
             let _ = sender.send(result);
@@ -434,7 +443,6 @@ impl Drop for Job {
         }
         let engine = &self.engine;
         let mut intake = engine.intake.lock().unwrap_or_else(PoisonError::into_inner);
-        intake.active.remove(&self.key);
         for loss in report.losses {
             let mut visited = HashSet::new();
             for index in loss.submissions {
@@ -472,12 +480,18 @@ impl Drop for Job {
             }
             discarded.push(entry);
         }
-        if !requeue.is_empty() {
-            // Ahead of rows accepted since, so the partition keeps submission order.
-            let queue = intake.partitions.entry(self.key.clone()).or_default();
-            for entry in requeue.into_iter().rev() {
-                queue.push_front(entry);
-            }
+        let partition = intake
+            .partitions
+            .get_mut(&self.key)
+            .expect("running partition");
+        partition.running = false;
+        // Recovered rows precede work accepted while this job was running.
+        for entry in requeue.into_iter().rev() {
+            partition.pending.push_front(entry);
+        }
+        let ready = !partition.pending.is_empty();
+        if !ready {
+            intake.partitions.remove(&self.key);
         }
         drop(intake);
         drop(discarded);
@@ -487,7 +501,9 @@ impl Drop for Job {
         for (sender, result) in writes {
             let _ = sender.send(result);
         }
-        engine.schedule(self.key.clone());
+        if ready {
+            engine.schedule(self.key.clone());
+        }
     }
 }
 
@@ -672,7 +688,7 @@ mod tests {
         y.await.unwrap();
         let state = engine.intake.lock().unwrap();
         assert_eq!((state.records.len(), state.bytes), (0, 0));
-        assert!(state.org_rows.is_empty() && state.active.is_empty());
+        assert!(state.org_rows.is_empty() && state.partitions.is_empty());
     }
 
     #[tokio::test]

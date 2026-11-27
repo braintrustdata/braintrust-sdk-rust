@@ -243,7 +243,7 @@ async fn retry_sleep_releases_capacity_for_healthy_orgs() {
         .checked_delivery(true)
         .build_without_login()
         .unwrap();
-    // A 429 pauses its whole org, so the healthy row belongs to another one.
+    // A different org must be able to send while this one retries.
     client.log_rows_with_credentials(
         "token",
         "throttled-org",
@@ -505,4 +505,45 @@ async fn invalid_public_login_state_does_not_stop_other_clients() {
     let good = client(&server);
     good.log_rows_with_credentials("token", "org", None, [row("good", "p")]);
     good.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_project_submitted_after_a_sibling_429_delivers_before_the_retry() {
+    let server = MockServer::start().await;
+    let first_attempt = Arc::new(tokio::sync::Notify::new());
+    let signal = first_attempt.clone();
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(body_string_contains("throttled-project"))
+        .respond_with(move |_: &wiremock::Request| {
+            signal.notify_one();
+            ResponseTemplate::new(429).insert_header("retry-after", "10")
+        })
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    accept(&server).await;
+    let client = client(&server);
+    let throttled = client.project("throttled-project");
+    let healthy = client.project("healthy-project");
+    throttled.log_rows_with_credentials(
+        "token",
+        "same-org",
+        None,
+        [row("throttled", "throttled-project")],
+    );
+    tokio::time::timeout(Duration::from_secs(5), first_attempt.notified())
+        .await
+        .expect("first upload attempt");
+    healthy.log_rows_with_credentials(
+        "token",
+        "same-org",
+        None,
+        [row("healthy", "healthy-project")],
+    );
+    tokio::time::timeout(Duration::from_secs(3), healthy.flush())
+        .await
+        .expect("healthy project must deliver before the throttled project's retry")
+        .expect("healthy project delivery");
+    let _ = throttled.shutdown(Duration::ZERO).await;
 }

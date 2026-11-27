@@ -1,250 +1,193 @@
-//! Resolve resource destinations without borrowing global login state from another facade.
+//! Span routing and construction of logs3 rows.
 use super::queue::QueueSettings;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
-use chrono::Utc;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
-/// Project names that failed to resolve during one delivery job. Later spans for
-/// the same name fail with the same error instead of repeating the request.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(super) enum Destination {
+    Known(LogDestination),
+    ProjectName(String),
+}
+
+impl Destination {
+    fn from_span(
+        kind: SpanObjectType,
+        id: Option<&str>,
+        metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Self> {
+        let known = match kind {
+            SpanObjectType::Experiment => LogDestination::experiment(
+                id.ok_or_else(|| anyhow!("experiment span is missing object_id"))?,
+            ),
+            SpanObjectType::PlaygroundLogs => LogDestination::playground_logs(
+                id.ok_or_else(|| anyhow!("playground span is missing object_id"))?,
+            ),
+            SpanObjectType::ProjectLogs => match project_logs_identifier(id, metadata) {
+                Some(ProjectLogsIdentifier::ObjectId(id)) => LogDestination::project_logs(id),
+                Some(ProjectLogsIdentifier::ProjectName(name)) => {
+                    return Ok(Self::ProjectName(name))
+                }
+                None => anyhow::bail!(
+                    "project-log span is missing object_id, project_id, or project_name"
+                ),
+            },
+        };
+        Ok(Self::Known(known))
+    }
+}
+
+pub(super) struct SpanRoute {
+    pub destination: Destination,
+    root_span_id: String,
+    parents: Option<Vec<String>>,
+}
+
+impl SpanRoute {
+    pub fn new(payload: &SpanPayload, parent: Option<&ParentSpanInfo>) -> Result<Self> {
+        if let Some(span) = &payload.span_components {
+            return Ok(Self {
+                destination: Destination::from_span(
+                    span.object_type,
+                    span.object_id.as_deref(),
+                    span.compute_object_metadata_args.as_ref(),
+                )?,
+                root_span_id: span
+                    .root_span_id
+                    .clone()
+                    .unwrap_or_else(|| payload.span_id.clone()),
+                parents: span.span_parents.clone(),
+            });
+        }
+        let destination = match parent {
+            Some(ParentSpanInfo::FullSpan {
+                object_type,
+                object_id,
+                compute_object_metadata_args,
+                span_id,
+                root_span_id,
+                ..
+            }) => {
+                return Ok(Self {
+                    destination: Destination::from_span(
+                        *object_type,
+                        object_id.as_deref(),
+                        compute_object_metadata_args.as_ref(),
+                    )?,
+                    root_span_id: root_span_id.clone(),
+                    parents: Some(vec![span_id.clone()]),
+                })
+            }
+            Some(ParentSpanInfo::Experiment { object_id }) => {
+                Destination::Known(LogDestination::experiment(object_id))
+            }
+            Some(ParentSpanInfo::Dataset { object_id }) => {
+                Destination::Known(LogDestination::dataset(object_id))
+            }
+            Some(ParentSpanInfo::ProjectLogs { object_id }) => {
+                Destination::Known(LogDestination::project_logs(object_id))
+            }
+            Some(ParentSpanInfo::PlaygroundLogs { object_id }) => {
+                Destination::Known(LogDestination::playground_logs(object_id))
+            }
+            Some(ParentSpanInfo::ProjectName { project_name }) => {
+                Destination::ProjectName(project_name.clone())
+            }
+            None => Destination::ProjectName(payload.project_name.clone().ok_or_else(|| {
+                anyhow!("no destination: either parent_info or project_name required")
+            })?),
+        };
+        Ok(Self {
+            destination,
+            root_span_id: payload.span_id.clone(),
+            parents: None,
+        })
+    }
+
+    pub async fn into_row(
+        self,
+        payload: SpanPayload,
+        resolve: impl AsyncFnOnce(&str, Option<&str>, &str) -> Result<String>,
+    ) -> Result<Logs3Row> {
+        let destination = match self.destination {
+            Destination::Known(destination) => destination,
+            Destination::ProjectName(name) => LogDestination::project_logs(
+                resolve(&payload.org_id, payload.org_name.as_deref(), &name).await?,
+            ),
+        };
+        Ok(Self::build_row(
+            payload,
+            self.root_span_id,
+            self.parents,
+            destination,
+        ))
+    }
+
+    /// A rejected row can be written for debugging without resolving a project name.
+    pub fn into_known_row(self, payload: SpanPayload) -> Option<Logs3Row> {
+        let Destination::Known(destination) = self.destination else {
+            return None;
+        };
+        Some(Self::build_row(
+            payload,
+            self.root_span_id,
+            self.parents,
+            destination,
+        ))
+    }
+
+    fn build_row(
+        payload: SpanPayload,
+        root_span_id: String,
+        span_parents: Option<Vec<String>>,
+        destination: LogDestination,
+    ) -> Logs3Row {
+        Logs3Row {
+            id: payload.row_id,
+            is_merge: payload.is_merge.then_some(true),
+            merge_paths: None,
+            span_id: payload.span_id,
+            root_span_id,
+            span_parents,
+            destination,
+            org_id: payload.org_id,
+            org_name: payload.org_name,
+            input: payload.input,
+            output: payload.output,
+            expected: payload.expected,
+            error: payload.error,
+            scores: payload.scores,
+            metadata: payload.metadata,
+            metrics: payload.metrics,
+            tags: payload.tags,
+            context: payload.context,
+            span_attributes: payload.span_attributes,
+            extra: payload.extra,
+            created: chrono::Utc::now(),
+            xact_id: None,
+            object_delete: None,
+            audit_source: Some("api".into()),
+        }
+    }
+}
+
 pub(super) type ProjectFailures = HashMap<String, anyhow::Error>;
 
 impl QueueSettings {
-    /// Prepare a `Logs3Row` from the job's token, payload, and parent info.
-    ///
-    /// Resolves the destination (including calling the project registration API
-    /// if needed) and builds the complete row for the flush pipeline.
     pub(super) async fn prepare_span(
         &self,
         token: &str,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
         failures: &mut ProjectFailures,
-    ) -> std::result::Result<Logs3Row, anyhow::Error> {
-        let SpanPayload {
-            row_id,
-            span_id,
-            is_merge,
-            span_components,
-            org_id,
-            org_name,
-            project_name,
-            input,
-            output,
-            expected,
-            error,
-            scores,
-            metadata,
-            metrics,
-            tags,
-            context,
-            span_attributes,
-            extra,
-        } = payload;
-
-        if let Some(span_components) = span_components {
-            let destination = self
-                .destination_from_span_components(
-                    token,
-                    &org_id,
-                    org_name.as_deref(),
-                    &span_components,
-                    failures,
-                )
-                .await?;
-            let root_span_id = span_components
-                .root_span_id
-                .clone()
-                .unwrap_or_else(|| span_id.clone());
-
-            return Ok(Logs3Row {
-                id: row_id,
-                is_merge: if is_merge { Some(true) } else { None },
-                merge_paths: None,
-                span_id,
-                root_span_id,
-                span_parents: span_components.span_parents.clone(),
-                destination,
-                org_id,
-                org_name,
-                input,
-                output,
-                expected,
-                error,
-                scores,
-                metadata,
-                metrics,
-                tags,
-                context,
-                span_attributes,
-                extra,
-                created: Utc::now(),
-                xact_id: None,
-                object_delete: None,
-                audit_source: Some("api".to_string()),
-            });
-        }
-
-        let project_id = if parent_info.is_none() {
-            if let Some(ref pn) = project_name {
-                Some(
-                    self.ensure_project_id(token, &org_id, org_name.as_deref(), pn, failures)
-                        .await?,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let (root_span_id, span_parents, destination) = match parent_info {
-            None => {
-                let dest = match project_id {
-                    Some(pid) => LogDestination::project_logs(pid),
-                    None => {
-                        anyhow::bail!("no destination: either parent_info or project_name required")
-                    }
-                };
-                (span_id.clone(), None, dest)
-            }
-            Some(ParentSpanInfo::Experiment { object_id }) => {
-                (span_id.clone(), None, LogDestination::experiment(object_id))
-            }
-            Some(ParentSpanInfo::ProjectLogs { object_id }) => (
-                span_id.clone(),
-                None,
-                LogDestination::project_logs(object_id),
-            ),
-            Some(ParentSpanInfo::ProjectName { project_name }) => {
-                let proj_id = self
-                    .ensure_project_id(token, &org_id, org_name.as_deref(), &project_name, failures)
-                    .await?;
-                (span_id.clone(), None, LogDestination::project_logs(proj_id))
-            }
-            Some(ParentSpanInfo::PlaygroundLogs { object_id }) => (
-                span_id.clone(),
-                None,
-                LogDestination::playground_logs(object_id),
-            ),
-            Some(ParentSpanInfo::Dataset { object_id }) => {
-                (span_id.clone(), None, LogDestination::dataset(object_id))
-            }
-            Some(ParentSpanInfo::FullSpan {
-                object_type,
-                object_id,
-                compute_object_metadata_args,
-                span_id: parent_span_id,
-                root_span_id: parent_root_span_id,
-                span_parents: _,
-                propagated_event: _,
-            }) => {
-                let span_parents = Some(vec![parent_span_id]);
-                let dest = match object_type {
-                    SpanObjectType::Experiment => {
-                        LogDestination::experiment(object_id.ok_or_else(|| {
-                            anyhow::anyhow!("experiment parent span is missing object_id")
-                        })?)
-                    }
-                    SpanObjectType::ProjectLogs => {
-                        match project_logs_identifier(
-                            object_id.as_deref(),
-                            compute_object_metadata_args.as_ref(),
-                        ) {
-                            Some(ProjectLogsIdentifier::ObjectId(object_id)) => {
-                                LogDestination::project_logs(object_id)
-                            }
-                            Some(ProjectLogsIdentifier::ProjectName(project_name)) => {
-                                let project_id = self
-                                    .ensure_project_id(
-                                        token,
-                                        &org_id,
-                                        org_name.as_deref(),
-                                        &project_name,
-                                        failures,
-                                    )
-                                    .await?;
-                                LogDestination::project_logs(project_id)
-                            }
-                            None => {
-                                anyhow::bail!(
-                                    "project-log parent span is missing object_id, project_id, or project_name"
-                                )
-                            }
-                        }
-                    }
-                    SpanObjectType::PlaygroundLogs => {
-                        LogDestination::playground_logs(object_id.ok_or_else(|| {
-                            anyhow::anyhow!("playground parent span is missing object_id")
-                        })?)
-                    }
-                };
-                (parent_root_span_id, span_parents, dest)
-            }
-        };
-
-        Ok(Logs3Row {
-            id: row_id,
-            is_merge: if is_merge { Some(true) } else { None },
-            merge_paths: None,
-            span_id,
-            root_span_id,
-            span_parents,
-            destination,
-            org_id,
-            org_name,
-            input,
-            output,
-            expected,
-            error,
-            scores,
-            metadata,
-            metrics,
-            tags,
-            context,
-            span_attributes,
-            extra,
-            created: Utc::now(),
-            xact_id: None,
-            object_delete: None,
-            audit_source: Some("api".to_string()),
-        })
-    }
-
-    async fn destination_from_span_components(
-        &self,
-        token: &str,
-        org_id: &str,
-        org_name: Option<&str>,
-        span_components: &crate::span_components::SpanComponents,
-        failures: &mut ProjectFailures,
-    ) -> std::result::Result<LogDestination, anyhow::Error> {
-        match span_components.object_type {
-            SpanObjectType::Experiment => span_components
-                .object_id
-                .as_ref()
-                .map(|object_id| LogDestination::experiment(object_id.clone()))
-                .ok_or_else(|| anyhow::anyhow!("experiment span is missing object_id")),
-            SpanObjectType::ProjectLogs => match span_components.project_logs_identifier() {
-                Some(ProjectLogsIdentifier::ObjectId(object_id)) => {
-                    Ok(LogDestination::project_logs(object_id))
-                }
-                Some(ProjectLogsIdentifier::ProjectName(project_name)) => {
-                    let project_id = self
-                        .ensure_project_id(token, org_id, org_name, &project_name, failures)
-                        .await?;
-                    Ok(LogDestination::project_logs(project_id))
-                }
-                None => anyhow::bail!(
-                    "project-log span is missing object_id, project_id, or project_name"
-                ),
-            },
-            SpanObjectType::PlaygroundLogs => span_components
-                .object_id
-                .as_ref()
-                .map(|object_id| LogDestination::playground_logs(object_id.clone()))
-                .ok_or_else(|| anyhow::anyhow!("playground span is missing object_id")),
-        }
+    ) -> Result<Logs3Row> {
+        SpanRoute::new(&payload, parent_info.as_ref())?
+            .into_row(payload, async |org_id, org_name, name| {
+                self.ensure_project_id(token, org_id, org_name, name, failures)
+                    .await
+            })
+            .await
     }
 
     /// Ensure a project ID is available for the given project name, registering

@@ -1,9 +1,8 @@
 use super::config::LogQueueConfig;
 use super::http::save_payload_debug;
+use super::prepare::SpanRoute;
 use crate::logger::LoginState;
-use crate::span_components::ProjectLogsIdentifier;
-use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
-use chrono::Utc;
+use crate::types::{ParentSpanInfo, SpanPayload};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
@@ -278,103 +277,12 @@ impl LogQueueCore {
                 }
             };
 
-            let span_components = payload.span_components.clone();
-
-            let span_id = payload.span_id.clone();
-            let destination = match span_components.as_ref() {
-                Some(span_components) => match (
-                    span_components.object_type,
-                    span_components.object_id.as_ref(),
-                ) {
-                    (SpanObjectType::Experiment, Some(object_id)) => {
-                        LogDestination::experiment(object_id.clone())
-                    }
-                    (SpanObjectType::ProjectLogs, Some(object_id)) => {
-                        LogDestination::project_logs(object_id.clone())
-                    }
-                    (SpanObjectType::PlaygroundLogs, Some(object_id)) => {
-                        LogDestination::playground_logs(object_id.clone())
-                    }
-                    (SpanObjectType::ProjectLogs, None) => {
-                        match span_components.project_logs_identifier() {
-                            Some(ProjectLogsIdentifier::ObjectId(project_id)) => {
-                                LogDestination::project_logs(project_id)
-                            }
-                            _ => return,
-                        }
-                    }
-                    (SpanObjectType::Experiment, None) => return,
-                    (SpanObjectType::PlaygroundLogs, None) => return,
-                },
-                None => match parent_info.as_ref() {
-                    Some(ParentSpanInfo::Experiment { object_id }) => {
-                        LogDestination::experiment(object_id.clone())
-                    }
-                    Some(ParentSpanInfo::ProjectLogs { object_id }) => {
-                        LogDestination::project_logs(object_id.clone())
-                    }
-                    Some(ParentSpanInfo::ProjectName { .. }) => return,
-                    Some(ParentSpanInfo::PlaygroundLogs { object_id }) => {
-                        LogDestination::playground_logs(object_id.clone())
-                    }
-                    Some(ParentSpanInfo::Dataset { object_id }) => {
-                        LogDestination::dataset(object_id.clone())
-                    }
-                    Some(ParentSpanInfo::FullSpan {
-                        object_type,
-                        object_id,
-                        ..
-                    }) => match object_type {
-                        SpanObjectType::Experiment => match object_id.clone() {
-                            Some(object_id) => LogDestination::experiment(object_id),
-                            None => return,
-                        },
-                        SpanObjectType::ProjectLogs => match object_id.clone() {
-                            Some(object_id) => LogDestination::project_logs(object_id),
-                            None => return,
-                        },
-                        SpanObjectType::PlaygroundLogs => match object_id.clone() {
-                            Some(object_id) => LogDestination::playground_logs(object_id),
-                            None => return,
-                        },
-                    },
-                    None => return,
-                },
+            let Ok(route) = SpanRoute::new(&payload, parent_info.as_ref()) else {
+                return;
             };
-
-            let root_span_id = span_components
-                .as_ref()
-                .and_then(|components| components.root_span_id.clone())
-                .unwrap_or_else(|| span_id.clone());
-            let row = Logs3Row {
-                id: payload.row_id,
-                span_id: span_id.clone(),
-                is_merge: if payload.is_merge { Some(true) } else { None },
-                merge_paths: None,
-                root_span_id,
-                span_parents: span_components
-                    .as_ref()
-                    .and_then(|components| components.span_parents.clone()),
-                destination,
-                org_id: payload.org_id,
-                org_name: payload.org_name,
-                input: payload.input,
-                output: payload.output,
-                expected: payload.expected,
-                error: payload.error,
-                scores: payload.scores,
-                metadata: payload.metadata,
-                metrics: payload.metrics,
-                tags: payload.tags,
-                context: payload.context,
-                span_attributes: payload.span_attributes,
-                extra: payload.extra,
-                created: Utc::now(),
-                xact_id: None,
-                object_delete: None,
-                audit_source: Some("api".to_string()),
+            let Some(row) = route.into_known_row(payload) else {
+                return;
             };
-
             write_dropped_row_debug(dirs, &row);
         });
     }
@@ -397,6 +305,13 @@ fn write_dropped_row_debug(dirs: Vec<std::path::PathBuf>, row: &impl serde::Seri
             warn!(error = %e, "failed to write dropped row to debug dir");
         }
     }
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(super) enum PartitionDestination {
+    Span(super::prepare::Destination),
+    InvalidSpan,
+    Raw(String),
 }
 
 impl SubmitCommand {
@@ -478,8 +393,19 @@ impl SubmitCommand {
             } => (self.credential.clone(), org_id.clone(), org_name.clone()),
         }
     }
-    pub(crate) fn is_raw(&self) -> bool {
-        matches!(self.item, QueuedItem::Row { .. })
+    pub(super) fn destination(&self) -> PartitionDestination {
+        match &self.item {
+            QueuedItem::Span {
+                payload,
+                parent_info,
+            } => SpanRoute::new(payload, parent_info.as_ref())
+                .map_or(PartitionDestination::InvalidSpan, |route| {
+                    PartitionDestination::Span(route.destination)
+                }),
+            QueuedItem::Row { row, .. } => {
+                PartitionDestination::Raw(crate::internal::ingest::raw_destination_key(row))
+            }
+        }
     }
     pub(crate) fn estimated_bytes(&self) -> usize {
         // The serializer counts bytes without allocating a second encoded payload.
