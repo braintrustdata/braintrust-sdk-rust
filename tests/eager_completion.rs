@@ -54,4 +54,66 @@ async fn flush_and_shutdown_cover_writes_waiting_for_login() {
     let body: Value = serde_json::from_slice(&body.body).unwrap();
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
     assert_eq!(body["rows"][0]["id"], "covered");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(1))
+                .set_body_json(json!({"org_info":[{"id":"org-id","name":"org"}]})),
+        )
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .api_key("test-key")
+        .build()
+        .await
+        .unwrap();
+    let write = client.log_rows([row("cancelled")]);
+    let flush = client.flush();
+    assert!(client.shutdown(Duration::from_millis(10)).await.is_err());
+    assert!(tokio::time::timeout(Duration::from_millis(300), write)
+        .await
+        .unwrap()
+        .is_err());
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_millis(300), flush)
+            .await
+            .unwrap(),
+        Err(braintrust_sdk_rust::FlushError::Execution(
+            braintrust_sdk_rust::ExecutionError::TimedOut
+        ))
+    ));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(100))
+                .set_body_json(json!({"org_info":[{"id":"org-id","name":"org"}]})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .api_key("test-key")
+        .build()
+        .await
+        .unwrap();
+    drop(client.log_rows([row("first-failure")]));
+    drop(client.log_rows([row("second-failure")]));
+    let error = client.flush().await.unwrap_err();
+    assert!(
+        matches!(error, braintrust_sdk_rust::FlushError::Delivery(failure) if failure.failed() == 2)
+    );
 }
