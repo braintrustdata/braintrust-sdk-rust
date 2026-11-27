@@ -60,6 +60,33 @@ async fn construction_and_submission_need_no_caller_runtime() {
 }
 
 #[tokio::test]
+async fn delivery_survives_the_constructing_runtime() {
+    let server = MockServer::start().await;
+    accept(&server).await;
+    let endpoint = server.uri();
+    let client = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            BraintrustClient::builder()
+                .api_url(&endpoint)
+                .app_url(&endpoint)
+                .checked_delivery(true)
+                .skip_login(true)
+                .build()
+                .await
+                .unwrap()
+        })
+    })
+    .join()
+    .unwrap();
+    client.log_rows_with_credentials("token", "org", None, [row("row", "project")]);
+    client.flush().await.unwrap();
+}
+
+#[tokio::test]
 async fn shutdown_drains_accepted_writes_even_if_its_completion_is_dropped() {
     use braintrust_sdk_rust::{EnqueueError, FlushError};
     let server = MockServer::start().await;

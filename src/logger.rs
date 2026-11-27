@@ -34,6 +34,22 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
 pub const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
 
+/// A background login that resumes if its runtime stops before it finishes.
+#[derive(Default)]
+struct BackgroundLogin {
+    /// The API key and organization, until the login succeeds or gives up.
+    pending: std::sync::Mutex<Option<(String, Option<String>)>>,
+    running: std::sync::atomic::AtomicBool,
+}
+struct LoginRunning(Arc<BackgroundLogin>);
+impl Drop for LoginRunning {
+    fn drop(&mut self) {
+        self.0
+            .running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BraintrustClient {
     inner: Arc<ClientInner>,
@@ -44,6 +60,7 @@ struct ClientInner {
     queue: LogQueue,
     login_state: LoginState,
     login_notify: Arc<Notify>,
+    background_login: Arc<BackgroundLogin>,
     default_project: Option<String>,
 }
 
@@ -497,8 +514,29 @@ impl BraintrustClient {
 
     /// Start login in a background task with retry logic.
     fn start_background_login(&self, api_key: String, org_name: Option<String>) {
+        *self.inner.background_login.pending.lock().unwrap() = Some((api_key, org_name));
+        self.resume_background_login();
+    }
+
+    /// Run the pending background login unless it is already running. A login
+    /// dropped with its runtime stays pending, so the next wait restarts it.
+    fn resume_background_login(&self) {
+        let login = &self.inner.background_login;
+        if login
+            .running
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let running = LoginRunning(login.clone());
+        // Read only once running: a login that finished cleared `pending`
+        // before it stopped running, so this cannot start a stale second one.
+        let Some((api_key, org_name)) = login.pending.lock().unwrap().clone() else {
+            return;
+        };
         let client = self.clone();
-        tokio::spawn(async move {
+        crate::service::global().expect("initialized service").spawn_operation(async move {
+            let _running = running;
             const MAX_ATTEMPTS: usize = 10;
             let result = (|| client.perform_login(&api_key, org_name.as_deref()))
                 .retry(ExponentialBuilder::default()
@@ -507,6 +545,7 @@ impl BraintrustClient {
                     .with_max_times(MAX_ATTEMPTS - 1))
                 .notify(|error, delay| tracing::warn!(%error, ?delay, "Background login failed, retrying"))
                 .await;
+            client.inner.background_login.pending.lock().unwrap().take();
             match result {
                 Ok(()) => tracing::debug!("Background login completed successfully"),
                 Err(error) => tracing::error!(
@@ -525,6 +564,8 @@ impl BraintrustClient {
         if self.inner.login_state.is_logged_in() {
             return Ok(self.inner.login_state.clone());
         }
+
+        self.resume_background_login();
 
         // Get notification future BEFORE checking state to avoid race condition
         let notified = self.inner.login_notify.notified();

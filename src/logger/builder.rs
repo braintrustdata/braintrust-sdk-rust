@@ -325,6 +325,7 @@ impl BraintrustClientBuilder {
                 queue,
                 login_state,
                 login_notify: Arc::new(Notify::new()),
+                background_login: Arc::default(),
                 default_project: self.default_project,
             }),
         };

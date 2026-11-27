@@ -46,13 +46,14 @@ pub(crate) async fn send_batch_with_retry(
         config,
         max_request_size,
         can_use_overflow,
+        &std::sync::atomic::AtomicUsize::new(0),
     )
     .await
-    .1
 }
 
-/// Like [`send_batch_with_retry`], also returning how many of the batch's rows
-/// were delivered, which can be nonzero when a split part fails.
+/// Like [`send_batch_with_retry`], also counting the batch's leading rows that
+/// were delivered as each request succeeds. See
+/// [`UploadCoordinator::upload_counting`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_batch_counting(
     client: &reqwest::Client,
@@ -63,10 +64,11 @@ pub(crate) async fn send_batch_counting(
     config: &LogQueueConfig,
     max_request_size: usize,
     can_use_overflow: bool,
-) -> (usize, Result<(), anyhow::Error>) {
+    delivered: &std::sync::atomic::AtomicUsize,
+) -> Result<(), anyhow::Error> {
     save_payload_debug(&batch.data, config.all_publish_payloads_dir(), "all").ok();
     let data = batch.data.clone();
-    let (delivered, result) = match crate::http::api_client(
+    let result = match crate::http::api_client(
         client,
         api_url.as_str(),
         api_url.as_str(),
@@ -74,7 +76,7 @@ pub(crate) async fn send_batch_counting(
         org_name,
     ) {
         Ok(api) => {
-            let (result, outcome) = UploadCoordinator::new(
+            let (_, outcome) = UploadCoordinator::new(
                 api,
                 UploadPolicy::Queue {
                     retries: config.num_retries(),
@@ -86,16 +88,17 @@ pub(crate) async fn send_batch_counting(
                     max_request_size,
                     overflow: can_use_overflow,
                 },
+                delivered,
             )
             .await;
-            (result.rows_uploaded, outcome)
+            outcome
         }
-        Err(error) => (0, Err(error)),
+        Err(error) => Err(error),
     };
     if result.is_err() {
         save_payload_debug(&data, config.failed_publish_payloads_dir(), "failed").ok();
     }
-    (delivered, result.map_err(Into::into))
+    result.map_err(Into::into)
 }
 
 #[cfg(test)]
