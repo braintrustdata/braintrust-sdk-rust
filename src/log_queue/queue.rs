@@ -19,7 +19,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex as TokioMutex, OnceCell};
 use tracing::warn;
 use url::Url;
 
@@ -164,8 +163,6 @@ struct SpanBatchProcessor {
     client: crate::http::SharedHttp,
     api_url: Url,
     app_url: Url,
-    project_cache: TokioMutex<IndexMap<String, String>>,
-    version_info: OnceCell<(usize, bool)>,
 }
 impl SpanBatchProcessor {
     fn new(
@@ -183,25 +180,7 @@ impl SpanBatchProcessor {
             client,
             api_url,
             app_url,
-            project_cache: TokioMutex::new(IndexMap::new()),
-            version_info: OnceCell::new(),
         })
-    }
-
-    /// Get the cached (max_request_size, can_use_overflow) from GET /version.
-    /// Fetches lazily on first call and caches the result.
-    async fn get_version_info(
-        &self,
-        api_url: &Url,
-        token: &str,
-        org_name: Option<&str>,
-    ) -> (usize, bool) {
-        *self
-            .version_info
-            .get_or_init(|| async {
-                fetch_version_info(&self.client.client(), api_url, token, org_name).await
-            })
-            .await
     }
 
     /// Prepare, merge, batch and upload one detached delivery generation.
@@ -305,9 +284,9 @@ impl SpanBatchProcessor {
 
             // Version info reflects a server-wide limit, so it is fetched once
             // (with the first group's credentials) and cached.
-            let (max_request_size, can_use_overflow) = self
-                .get_version_info(&api_url, &token, org_name.as_deref())
-                .await;
+            let (max_request_size, can_use_overflow) =
+                fetch_version_info(&self.client.client(), &api_url, &token, org_name.as_deref())
+                    .await;
 
             // Effective batch byte limit: the smaller of the locally configured limit and half the
             // server-advertised max request size. This mirrors the TypeScript SDK which uses
@@ -502,14 +481,6 @@ impl SpanBatchProcessor {
         org_name: Option<&str>,
         project_name: &str,
     ) -> std::result::Result<String, anyhow::Error> {
-        let cache_key = format!("{org_id}:{project_name}");
-        {
-            let cache = self.project_cache.lock().await;
-            if let Some(project_id) = cache.get(&cache_key) {
-                return Ok(project_id.clone());
-            }
-        }
-
         // Prefer the login-state control-plane URL (logged-in path), falling back
         // to the client-configured URL for per-request-credential callers.
         let app_url = match self.login_state.app_url() {
@@ -518,27 +489,41 @@ impl SpanBatchProcessor {
             }
             None => self.app_url.clone(),
         };
-        let mut request = crate::api::ProjectRegisterRequest::new(project_name.to_owned());
-        request.org_id = (!org_id.is_empty()).then(|| org_id.to_owned());
-        request.org_name = org_name.map(str::to_owned);
-
-        let token = credential.token().await?;
-        let client = crate::http::api_client(
-            &self.client.client(),
-            self.api_url.as_str(),
-            app_url.as_str(),
-            &token,
+        // Resolve credentials before keying requests that have no known org.
+        let token = if org_id.is_empty() && org_name.is_none_or(str::is_empty) {
+            Some(credential.token().await?)
+        } else {
+            None
+        };
+        let org = crate::resolution::OrgIdentity::new(
+            org_id,
             org_name,
-        )?;
-        let register_response = crate::http::api_result(client.register_project(&request).await)
-            .await?
-            .into_inner();
-
-        {
-            let mut cache = self.project_cache.lock().await;
-            cache.insert(cache_key, register_response.project.id.clone());
-        }
-        Ok(register_response.project.id)
+            token.as_deref().unwrap_or_default(),
+        );
+        let project = crate::resolution::project(app_url.as_str(), org, project_name);
+        project
+            .get_or_try_init(|| async {
+                let token = match token {
+                    Some(token) => token,
+                    None => credential.token().await?,
+                };
+                let mut request = crate::api::ProjectRegisterRequest::new(project_name.to_owned());
+                request.org_id = (!org_id.is_empty()).then(|| org_id.to_owned());
+                request.org_name = org_name.map(str::to_owned);
+                let client = crate::http::api_client(
+                    &self.client.client(),
+                    self.api_url.as_str(),
+                    app_url.as_str(),
+                    &token,
+                    org_name,
+                )?;
+                let response = crate::http::api_result(client.register_project(&request).await)
+                    .await?
+                    .into_inner();
+                Ok(response.project.id)
+            })
+            .await
+            .cloned()
     }
 }
 
