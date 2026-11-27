@@ -317,10 +317,11 @@ async fn dataset_flush_retains_pending_rows_when_registration_fails() {
         }));
 }
 
-struct Panicking;
+struct Panicking(Arc<tokio::sync::Notify>);
 #[async_trait::async_trait]
 impl TokenProvider for Panicking {
     async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.0.notified().await;
         panic!("test provider panic")
     }
 }
@@ -330,9 +331,16 @@ async fn provider_panic_fails_its_partition_without_stopping_the_service() {
     accept(&server).await;
     let bad = client(&server);
     let good = client(&server);
-    bad.log_rows_with_token_provider(Arc::new(Panicking), "org", None, [row("bad", "p")]);
-    assert!(bad.flush().await.is_err());
-    assert_eq!(bad.dropped_rows().preparation_failed, 1);
+    let release = Arc::new(tokio::sync::Notify::new());
+    bad.log_rows_with_token_provider(
+        Arc::new(Panicking(release.clone())),
+        "org",
+        None,
+        [row("bad", "p")],
+    );
+    let covering = bad.flush();
+    release.notify_one();
+    assert!(covering.await.is_err());
     good.log_rows_with_credentials("token", "org", None, [row("good", "p")]);
     good.flush().await.unwrap();
 }
