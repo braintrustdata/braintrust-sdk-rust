@@ -33,6 +33,21 @@ impl LogQueue {
                     app_url,
                 }),
                 login_state,
+                None,
+            ),
+        }
+    }
+
+    pub(crate) fn child(&self) -> Self {
+        self.child_with_login(self.core.login_state.clone())
+    }
+
+    pub(crate) fn child_with_login(&self, state: LoginState) -> Self {
+        Self {
+            core: LogQueueCore::new(
+                self.core.settings.clone(),
+                state,
+                Some(self.core.observation.clone()),
             ),
         }
     }

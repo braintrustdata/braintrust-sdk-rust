@@ -205,7 +205,12 @@ impl BraintrustClient {
             let org_name = state
                 .org_name()
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
-            Ok(DatasetBuilder::new(Arc::new(client), api_key, org_name))
+            let mut builder = DatasetBuilder::new(Arc::new(client.clone()), api_key, org_name)
+                .org_id(state.org_id().unwrap_or_default());
+            if let Some(project) = &client.inner.default_project {
+                builder = builder.project_name(project);
+            }
+            Ok(builder)
         })
     }
 
@@ -458,19 +463,33 @@ impl BraintrustClient {
         }
     }
 
-    fn request_client(&self, token: &str) -> Result<crate::api::Client> {
-        let same_auth = self.uses_login_route(token);
-        let api_url = if same_auth {
-            self.inner.login_state.api_url()
-        } else {
-            None
+    async fn request_client(&self, token: &str) -> Result<crate::api::Client> {
+        let wants_endpoint = self.inner.resource_org.is_some()
+            && !self.inner.settings.explicit_api_url
+            && !self.inner.login_state.is_logged_in();
+        let pending_same_key = wants_endpoint
+            && self
+                .inner
+                .background_login
+                .pending
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(key, _)| key == token);
+        if pending_same_key {
+            // Explicit credentials can still use the configured route if discovery fails.
+            let _ = self.wait_for_login_state().await;
         }
-        .unwrap_or_else(|| self.inner.queue.core.settings.api_url.to_string());
-        let app_url = same_auth
+        let uses_login = self.uses_login_route(token);
+        let api_url = uses_login
+            .then(|| self.inner.login_state.api_url())
+            .flatten()
+            .unwrap_or_else(|| self.inner.queue.core.settings.api_url.to_string());
+        let app_url = uses_login
             .then(|| self.inner.login_state.app_url())
             .flatten()
             .unwrap_or_else(|| self.inner.queue.core.settings.app_url.to_string());
-        let org_name = same_auth
+        let org_name = uses_login
             .then(|| self.inner.login_state.org_name())
             .flatten();
         api_client(
@@ -794,6 +813,37 @@ impl BraintrustClient {
         }
     }
 
+    /// A facade whose flush covers only the writes made through it, for
+    /// resources such as experiments and datasets. The parent's flush still
+    /// includes them.
+    fn scoped(&self) -> Self {
+        self.derive_scope(
+            self.inner.queue.child(),
+            self.inner.login_state.clone(),
+            self.inner.default_project.clone(),
+        )
+    }
+
+    fn derive_scope(
+        &self,
+        queue: LogQueue,
+        login_state: LoginState,
+        default_project: Option<String>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ClientInner {
+                pending_auth: Arc::new(self.inner.pending_auth.child()),
+                settings: self.inner.settings.clone(),
+                queue,
+                login_state,
+                login_notify: self.inner.login_notify.clone(),
+                background_login: self.inner.background_login.clone(),
+                default_project,
+                resource_org: self.inner.resource_org.clone(),
+            }),
+        }
+    }
+
     /// Cumulative counts of rows this client discarded instead of uploading.
     pub fn dropped_rows(&self) -> DroppedRows {
         self.inner.queue.dropped_rows()
@@ -888,6 +938,15 @@ impl SpanSubmitter for BraintrustClient {
         self.submit_payload(credential, payload, parent_info)
     }
 
+    fn for_resource(self: Arc<Self>, org_id: &str) -> Arc<Self> {
+        // Use the shared login snapshot. Only a matching org may use its route.
+        let mut scoped = self.scoped();
+        Arc::get_mut(&mut scoped.inner)
+            .expect("new scope")
+            .resource_org = Some(org_id.to_owned());
+        Arc::new(scoped)
+    }
+
     fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         BraintrustClient::flush(self)
     }
@@ -905,7 +964,7 @@ impl ExperimentRegistrar for BraintrustClient {
         let handle = self.clone();
         let token = token.to_owned();
         crate::operation::submit(async move {
-            let client = handle.request_client(&token)?;
+            let client = handle.request_client(&token).await?;
             let scope = handle.request_scope(&client, &token, true);
             let response = crate::internal::request::scheduled(scope, 0, || {
                 client.register_experiment(&request)
@@ -923,7 +982,7 @@ impl BaseExperimentFetcher for BraintrustClient {
         token: &str,
         experiment_id: &str,
     ) -> Result<Option<BaseExperimentInfo>> {
-        let client = self.request_client(token)?;
+        let client = self.request_client(token).await?;
         let scope = self.request_scope(&client, token, true);
         let response =
             crate::internal::request::scheduled(scope, 0, || client.base_experiment(experiment_id))
@@ -950,7 +1009,7 @@ impl ExperimentComparisonFetcher for BraintrustClient {
         experiment_id: &str,
         base_experiment_id: Option<&str>,
     ) -> Result<ExperimentComparisonResponse> {
-        let client = self.request_client(token)?;
+        let client = self.request_client(token).await?;
         let scope = self.request_scope(&client, token, false);
         let response = crate::internal::request::scheduled(scope, 0, || {
             client.experiment_comparison(experiment_id, base_experiment_id)
@@ -967,7 +1026,7 @@ impl DatasetRegistrar for BraintrustClient {
         token: &str,
         request: DatasetRegisterRequest,
     ) -> Result<DatasetRegisterResponse> {
-        let client = self.request_client(token)?;
+        let client = self.request_client(token).await?;
         let scope = self.request_scope(&client, token, true);
         let response =
             crate::internal::request::scheduled(scope, 0, || client.register_dataset(&request));
@@ -978,7 +1037,7 @@ impl DatasetRegistrar for BraintrustClient {
 #[async_trait::async_trait]
 impl DatasetFetcher for BraintrustClient {
     async fn fetch_dataset_records(&self, token: &str, query: BTQLQuery) -> Result<BTQLResponse> {
-        let client = self.request_client(token)?;
+        let client = self.request_client(token).await?;
         let scope = self.request_scope(&client, token, false);
         let response = crate::internal::request::scheduled(scope, 0, || {
             client.btql_json_as::<_, BTQLResponse>(&query)
@@ -994,7 +1053,7 @@ impl DatasetSummarizer for BraintrustClient {
         token: &str,
         dataset_id: &str,
     ) -> Result<DatasetSummaryResponse> {
-        let client = self.request_client(token)?;
+        let client = self.request_client(token).await?;
         let scope = self.request_scope(&client, token, false);
         let response =
             crate::internal::request::scheduled(scope, 0, || client.dataset_summary(dataset_id))
@@ -2239,6 +2298,65 @@ mod tests {
             "/api/project/register should not go to api_server"
         );
     }
+    #[tokio::test]
+    async fn experiment_built_before_login_uses_the_discovered_endpoint() {
+        let app = MockServer::start().await;
+        let data = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/apikey/login"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_json(serde_json::json!({
+                        "org_info":[{"id":"same-org","name":"name","api_url":data.uri()}]
+                    })),
+            )
+            .mount(&app)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/experiment/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "project":{"id":"p","name":"project"},
+                "experiment":{"id":"e","name":"experiment"}
+            })))
+            .mount(&app)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&data)
+            .await;
+
+        let mut client = BraintrustClient::builder()
+            .app_url(app.uri())
+            .api_url(app.uri())
+            .build_without_login()
+            .unwrap();
+        // Use a local fallback in this test while allowing login to override it.
+        let inner = Arc::get_mut(&mut client.inner).unwrap();
+        Arc::get_mut(&mut inner.settings).unwrap().explicit_api_url = false;
+        client.start_background_login("key".to_owned(), None);
+        let experiment = client
+            .experiment_builder_with_credentials("key", "same-org")
+            .project_name("project")
+            .experiment_name("experiment")
+            .build()
+            .unwrap();
+        assert!(!client.is_logged_in());
+        experiment
+            .log(crate::ExperimentLog::builder().build())
+            .await
+            .unwrap();
+        experiment.flush().await.unwrap();
+        assert!(app
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() != "/logs3"));
+    }
+
     #[test]
     fn experiment_routes_by_organization_when_credentials_rotate() {
         let client = BraintrustClient::builder()

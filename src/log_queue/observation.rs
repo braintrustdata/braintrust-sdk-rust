@@ -55,17 +55,35 @@ struct State {
     closed: bool,
     terminal: Option<ExecutionError>,
 }
-#[derive(Default)]
 pub(crate) struct Observation {
+    parent: Option<Arc<Observation>>,
     state: Mutex<State>,
 }
 impl Observation {
+    pub fn new(parent: Option<Arc<Self>>) -> Self {
+        Self {
+            parent,
+            state: Mutex::new(State::default()),
+        }
+    }
+    pub fn includes(&self, target: &Arc<Self>) -> bool {
+        std::ptr::eq(self, Arc::as_ptr(target))
+            || self.parent.as_ref().is_some_and(|p| p.includes(target))
+    }
     pub fn closed(&self) -> bool {
-        self.state.lock().unwrap().closed
+        self.state.lock().unwrap().closed || self.parent.as_ref().is_some_and(|p| p.closed())
     }
     fn terminal(&self) -> Option<ExecutionError> {
-        self.state.lock().unwrap().terminal
+        self.state
+            .lock()
+            .unwrap()
+            .terminal
+            .or_else(|| self.parent.as_ref().and_then(|p| p.terminal()))
     }
+    pub fn root(&self) -> &Self {
+        self.parent.as_deref().map_or(self, Self::root)
+    }
+
     pub fn close(&self) {
         self.state.lock().unwrap().closed = true;
     }
@@ -76,6 +94,9 @@ impl Observation {
 
     pub fn accept(&self, sequence: u64) {
         self.state.lock().unwrap().pending.insert(sequence);
+        if let Some(parent) = &self.parent {
+            parent.accept(sequence);
+        }
     }
     #[cfg(test)]
     pub fn finish(
@@ -143,6 +164,9 @@ impl Observation {
             }
         }
         drop(state);
+        if let Some(parent) = &self.parent {
+            parent.retire(sequence, error, notifications);
+        }
     }
     pub fn record_loss(&self, preparation: bool, visited: &mut HashSet<usize>) {
         if !visited.insert(self as *const Self as usize) {
@@ -155,9 +179,15 @@ impl Observation {
             state.drops.upload_failed += 1;
         }
         drop(state);
+        if let Some(parent) = &self.parent {
+            parent.record_loss(preparation, visited);
+        }
     }
     pub fn queue_full(&self) {
         self.state.lock().unwrap().drops.queue_full += 1;
+        if let Some(parent) = &self.parent {
+            parent.queue_full();
+        }
     }
     pub fn dropped_rows(&self) -> DroppedRows {
         self.state.lock().unwrap().drops
