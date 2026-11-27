@@ -1632,4 +1632,12 @@ mod tests {
             ))
         );
     }
+    #[test]
+    fn a_finished_event_submits_one_snapshot() {
+        let (builder, collector) = crate::test_utils::mock_span_builder();
+        let span = builder.build();
+        span.log_and_end(SpanLog::default(), 12.0);
+        span.end_with_time(13.0);
+        assert_eq!(collector.spans().len(), 1);
+    }
 }
