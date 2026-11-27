@@ -347,3 +347,159 @@ async fn dataset_summarize_returns_summary() {
     assert_eq!(summary.dataset_id(), Some("ds-456"));
     assert_eq!(summary.total_records(), Some(42));
 }
+
+#[tokio::test]
+async fn dataset_flush_covers_its_unawaited_writes_and_only_its_own() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(mock_login_response(&[("org-id", "Test Org")]))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/dataset/register"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "project": { "id": "proj-123", "name": "test-project" },
+            "dataset": { "id": "ds-456", "name": "test-dataset" }
+        })))
+        .mount(&server)
+        .await;
+    // The client's unrelated rows fail permanently.
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(wiremock::matchers::body_string_contains("unrelated"))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let client = BraintrustClient::builder()
+        .api_key("test-key")
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .blocking_login(true)
+        .build()
+        .await
+        .unwrap();
+    let dataset = client
+        .dataset_builder()
+        .await
+        .unwrap()
+        .project_name("test-project")
+        .dataset_name("test-dataset")
+        .build()
+        .unwrap();
+    client.log_rows_with_credentials(
+        "test-key",
+        "org-id",
+        None,
+        [json!({"id": "unrelated", "project_id": "p"})
+            .as_object()
+            .unwrap()
+            .clone()],
+    );
+    // Queued when called, though never awaited.
+    drop(
+        dataset.insert(
+            DatasetInsert::builder()
+                .input(json!("row"))
+                .build()
+                .unwrap(),
+        ),
+    );
+    dataset
+        .flush()
+        .await
+        .expect("the client's failed rows are not the dataset's");
+    let uploaded = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .any(|request| String::from_utf8_lossy(&request.body).contains("ds-456"));
+    assert!(uploaded);
+}
+
+#[tokio::test]
+async fn datasets_built_from_clones_flush_independently() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use wiremock::matchers::body_string_contains;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apikey/login"))
+        .respond_with(mock_login_response(&[("org-id", "Org")]))
+        .mount(&server)
+        .await;
+    for name in ["first", "second"] {
+        Mock::given(method("POST"))
+            .and(path("/api/dataset/register"))
+            .and(body_string_contains(name))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "project": {"id":"project","name":"project"},
+                "dataset": {"id":format!("{name}-id"),"name":name}
+            })))
+            .mount(&server)
+            .await;
+    }
+    let blocked = Arc::new(Notify::new());
+    let entered = blocked.clone();
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(body_string_contains("first-id"))
+        .respond_with(move |_: &wiremock::Request| {
+            entered.notify_one();
+            ResponseTemplate::new(400).set_delay(Duration::from_millis(500))
+        })
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(body_string_contains("second-id"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = BraintrustClient::builder()
+        .api_key("key")
+        .app_url(server.uri())
+        .api_url(server.uri())
+        .blocking_login(true)
+        .build()
+        .await
+        .unwrap();
+    let builder = client
+        .dataset_builder()
+        .await
+        .unwrap()
+        .project_name("project");
+    let first = builder.clone().dataset_name("first").build().unwrap();
+    let second = builder.dataset_name("second").build().unwrap();
+
+    first
+        .insert(DatasetInsert::builder().input(json!(1)).build().unwrap())
+        .await
+        .unwrap();
+    let failed = first.flush();
+    tokio::time::timeout(Duration::from_secs(5), blocked.notified())
+        .await
+        .unwrap();
+    second
+        .insert(DatasetInsert::builder().input(json!(2)).build().unwrap())
+        .await
+        .unwrap();
+    let successful = second.flush();
+    successful.await.unwrap();
+    assert!(failed.await.is_err());
+}
