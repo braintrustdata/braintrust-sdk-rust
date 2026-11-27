@@ -152,7 +152,7 @@ impl QueueSettings {
                 }
             }
         };
-        let mut failures = super::prepare::ProjectFailures::new();
+        let project = super::prepare::ProjectResolution::new();
         let mut spans: IndexMap<RowKey, (Logs3Row, Vec<usize>)> = IndexMap::new();
         let mut raw = Vec::new();
         for (index, command) in commands.iter().enumerate() {
@@ -165,7 +165,7 @@ impl QueueSettings {
                     parent_info,
                 } => {
                     let result = self
-                        .prepare_span(&token, payload.clone(), parent_info.clone(), &mut failures)
+                        .prepare_span(&token, payload.clone(), parent_info.clone(), &project)
                         .await;
                     match result {
                         Ok(row) => {

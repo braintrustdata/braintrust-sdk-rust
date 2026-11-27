@@ -3,7 +3,7 @@ use super::queue::QueueSettings;
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use tokio::sync::OnceCell;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(super) enum Destination {
@@ -172,7 +172,7 @@ impl SpanRoute {
     }
 }
 
-pub(super) type ProjectFailures = HashMap<String, anyhow::Error>;
+pub(super) type ProjectResolution = OnceCell<Result<String>>;
 
 impl QueueSettings {
     pub(super) async fn prepare_span(
@@ -180,12 +180,18 @@ impl QueueSettings {
         token: &str,
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
-        failures: &mut ProjectFailures,
+        project: &ProjectResolution,
     ) -> Result<Logs3Row> {
         SpanRoute::new(&payload, parent_info.as_ref())?
             .into_row(payload, async |org_id, org_name, name| {
-                self.ensure_project_id(token, org_id, org_name, name, failures)
+                // A job has at most one unresolved project name. Reuse its
+                // result for each row, including a failed registration.
+                project
+                    .get_or_init(|| self.ensure_project_id(token, org_id, org_name, name))
                     .await
+                    .as_ref()
+                    .cloned()
+                    .map_err(super::observation::duplicate_error)
             })
             .await
     }
@@ -199,11 +205,7 @@ impl QueueSettings {
         org_id: &str,
         org_name: Option<&str>,
         project_name: &str,
-        failures: &mut ProjectFailures,
-    ) -> std::result::Result<String, anyhow::Error> {
-        if let Some(error) = failures.get(project_name) {
-            return Err(super::observation::duplicate_error(error));
-        }
+    ) -> Result<String> {
         let app_url_key = self.app_url.to_string();
         let org = crate::resolution::OrgIdentity::new(org_id, org_name, token);
         let scope = crate::scheduler::Scope::new(app_url_key.clone(), org.scope_key());
@@ -239,13 +241,6 @@ impl QueueSettings {
 
             Ok::<_, anyhow::Error>(register_response.project.id)
         });
-        let result = resolve.await.cloned();
-        if let Err(error) = &result {
-            failures.insert(
-                project_name.to_owned(),
-                super::observation::duplicate_error(error),
-            );
-        }
-        result
+        resolve.await.cloned()
     }
 }
