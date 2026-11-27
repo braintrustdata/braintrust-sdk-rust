@@ -185,6 +185,7 @@ impl LogQueueCore {
     ) -> crate::Completion<crate::DeliveryReceipt, crate::WriteError> {
         crate::service::global()
             .expect("initialized service")
+            .engine
             .submit(self.clone(), cmd)
     }
 
@@ -523,6 +524,7 @@ impl LogQueue {
             }
             crate::service::global()
                 .expect("initialized service")
+                .engine
                 .submit_many(self.core.clone(), commands);
         }
     }
@@ -532,6 +534,7 @@ impl LogQueue {
     pub fn flush(&self) -> crate::Completion<crate::FlushReport, crate::FlushError> {
         crate::service::global()
             .expect("initialized service")
+            .engine
             .barrier(&self.core.observation)
     }
     pub fn shutdown(

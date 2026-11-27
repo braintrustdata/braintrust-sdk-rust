@@ -73,14 +73,6 @@ pub(crate) struct Service {
     pub engine: Arc<crate::log_queue::engine::Engine>,
     pub attempts: Arc<crate::scheduler::Scheduler>,
     pub config: ServiceConfig,
-    pub projects: crate::resolution::Cache<crate::resolution::ProjectKey, String>,
-    pub capabilities: crate::resolution::Cache<String, Option<usize>>,
-}
-impl std::ops::Deref for Service {
-    type Target = crate::log_queue::engine::Engine;
-    fn deref(&self) -> &Self::Target {
-        &self.engine
-    }
 }
 impl Service {
     pub fn spawn_operation<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
@@ -101,15 +93,11 @@ pub(crate) fn global() -> Result<&'static Service> {
     crate::runtime::handle()?;
     Ok(SERVICE.get_or_init(|| {
         let config = config().clone();
-        let cache_capacity = config.max_cached_resolutions;
         let engine = Arc::new(crate::log_queue::engine::Engine::new(config.clone()));
-        engine.start_jobs();
         Service {
             engine,
             attempts: crate::scheduler::Scheduler::new(config.max_concurrent_requests),
             config,
-            projects: crate::resolution::Cache::new(cache_capacity),
-            capabilities: crate::resolution::Cache::new(cache_capacity),
         }
     }))
 }

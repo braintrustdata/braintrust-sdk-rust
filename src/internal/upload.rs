@@ -25,9 +25,7 @@ impl Capabilities {
         let server_limit = async {
             let client = client?;
             let endpoint = client.baseurl();
-            let cell = crate::service::global()?
-                .capabilities
-                .entry(endpoint.to_owned());
+            let cell = crate::resolution::capabilities(endpoint);
             cell.get_or_try_init(|| async {
                 // Server capabilities are shared across orgs, so a throttled org
                 // must not delay a lookup needed by other callers.

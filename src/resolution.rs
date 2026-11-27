@@ -1,11 +1,11 @@
 //! Bounded successful resolution shared by compatible authentication contexts.
 use indexmap::IndexMap;
 use std::hash::Hash;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::OnceCell;
 
 /// A bounded map of single-flight resolutions, evicting least recently used.
-pub(crate) struct Cache<K, V> {
+struct Cache<K, V> {
     entries: Mutex<IndexMap<K, Arc<OnceCell<V>>>>,
     capacity: usize,
 }
@@ -40,7 +40,7 @@ impl<K: Hash + Eq, V> Cache<K, V> {
 /// The organization a request acts for. When neither its ID nor its name is
 /// known, the credential stands in, so unrelated tenants never share a cached
 /// resolution or a rate-limit pause.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 pub(crate) enum OrgIdentity {
     Id(String),
     Name(String),
@@ -73,11 +73,29 @@ pub(crate) fn credential_digest(token: &str) -> u64 {
 /// Project IDs belong to an organization, not to whichever token resolved them,
 /// so rotating credentials reuse earlier registrations.
 #[derive(Hash, PartialEq, Eq)]
-pub(crate) struct ProjectKey {
-    pub app_url: String,
-    pub org: OrgIdentity,
-    pub project: String,
+struct ProjectKey {
+    app_url: String,
+    org: OrgIdentity,
+    project: String,
 }
+pub(crate) fn project(app_url: &str, org: OrgIdentity, project: &str) -> Arc<OnceCell<String>> {
+    static PROJECTS: OnceLock<Cache<ProjectKey, String>> = OnceLock::new();
+    PROJECTS
+        .get_or_init(|| Cache::new(crate::service::config().max_cached_resolutions))
+        .entry(ProjectKey {
+            app_url: app_url.to_owned(),
+            org,
+            project: project.to_owned(),
+        })
+}
+
+pub(crate) fn capabilities(endpoint: &str) -> Arc<OnceCell<Option<usize>>> {
+    static CAPABILITIES: OnceLock<Cache<String, Option<usize>>> = OnceLock::new();
+    CAPABILITIES
+        .get_or_init(|| Cache::new(crate::service::config().max_cached_resolutions))
+        .entry(endpoint.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

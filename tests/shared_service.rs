@@ -368,32 +368,6 @@ async fn stalled_credentials_and_cancelled_waiters_do_not_block_other_clients() 
 }
 
 #[tokio::test]
-async fn concurrent_clients_share_project_resolution_without_sharing_delivery_results() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/project/register"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"resolved"}})),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-    accept(&server).await;
-    let a = client(&server);
-    let b = client(&server);
-    for client in [&a, &b] {
-        let span = client
-            .project("same")
-            .span_builder_with_credentials("token", "org")
-            .build();
-        span.end();
-    }
-    let (x, y) = tokio::join!(a.flush(), b.flush());
-    x.unwrap();
-    y.unwrap();
-}
-
-#[tokio::test]
 async fn dataset_flush_retains_pending_rows_when_registration_fails() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

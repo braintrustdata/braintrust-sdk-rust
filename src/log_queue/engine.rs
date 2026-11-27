@@ -11,7 +11,7 @@ use crate::{
 };
 use futures::FutureExt;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::{oneshot, Notify};
 
 /// An org at one endpoint: what budgets and request scheduling count against.
@@ -65,8 +65,8 @@ pub(crate) struct Engine {
     config: ServiceConfig,
     intake: Mutex<Intake>,
     cancellations: Notify,
-    /// Set by the service, which runs jobs; standalone engines in tests start none.
-    this: OnceLock<Weak<Engine>>,
+    #[cfg(test)]
+    manual: bool,
 }
 impl Engine {
     pub fn new(config: ServiceConfig) -> Self {
@@ -74,25 +74,31 @@ impl Engine {
             config,
             intake: Mutex::new(Intake::default()),
             cancellations: Notify::new(),
-            this: OnceLock::new(),
+            #[cfg(test)]
+            manual: false,
         }
     }
-    /// Start jobs from now on, as rows arrive and earlier jobs finish.
-    pub fn start_jobs(self: &Arc<Self>) {
-        let _ = self.this.set(Arc::downgrade(self));
+    #[cfg(test)]
+    fn manual(config: ServiceConfig) -> Arc<Self> {
+        Arc::new(Self {
+            manual: true,
+            ..Self::new(config)
+        })
     }
+
     /// Start a job for a partition made ready by submission or retirement.
-    fn schedule(&self, key: Key) {
-        let Some(engine) = self.this.get().and_then(Weak::upgrade) else {
+    fn schedule(self: &Arc<Self>, key: Key) {
+        #[cfg(test)]
+        if self.manual {
             return;
-        };
+        }
         // Leave the queued rows in place if no runtime can accept them.
         let Ok(runtime) = crate::runtime::handle() else {
             tracing::error!("no runtime can run SDK delivery");
             return;
         };
         if let Some(entries) = self.take_job(&key) {
-            runtime.spawn(engine.process_job(key, entries, Some(runtime.id())));
+            runtime.spawn(self.clone().process_job(key, entries, Some(runtime.id())));
         }
     }
 
@@ -107,7 +113,7 @@ impl Engine {
     }
 
     pub fn submit(
-        &self,
+        self: &Arc<Self>,
         core: Arc<LogQueueCore>,
         command: SubmitCommand,
     ) -> Completion<DeliveryReceipt, WriteError> {
@@ -117,14 +123,14 @@ impl Engine {
         completion
     }
     pub fn submit_many(
-        &self,
+        self: &Arc<Self>,
         core: Arc<LogQueueCore>,
         commands: impl IntoIterator<Item = SubmitCommand>,
     ) {
         self.enqueue(core, commands.into_iter().map(|command| (command, None)));
     }
     fn enqueue(
-        &self,
+        self: &Arc<Self>,
         core: Arc<LogQueueCore>,
         commands: impl IntoIterator<Item = (SubmitCommand, Option<WriteSender>)>,
     ) -> Vec<Result<(), EnqueueError>> {
@@ -507,7 +513,7 @@ mod tests {
     }
     #[test]
     fn global_limits_include_buffered_scopes_and_reject_only_incoming_rows() {
-        let engine = Engine::new(ServiceConfig::builder().max_rows(2).build());
+        let engine = Engine::manual(ServiceConfig::builder().max_rows(2).build());
         let a = queue();
         let b = queue();
         engine.submit_many(
@@ -523,7 +529,7 @@ mod tests {
     }
     #[tokio::test]
     async fn barriers_cover_only_work_accepted_before_them() {
-        let engine = Engine::new(ServiceConfig::default());
+        let engine = Engine::manual(ServiceConfig::default());
         let a = queue();
         let b = queue();
         engine.submit(a.core.clone(), SubmitCommand::test_row("covered"));
@@ -540,7 +546,7 @@ mod tests {
     }
     #[test]
     fn a_dropped_job_requeues_unsettled_rows_ahead_of_later_ones() {
-        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let engine = Engine::manual(ServiceConfig::default());
         let a = queue();
         engine.submit_many(
             a.core.clone(),
@@ -575,7 +581,7 @@ mod tests {
     }
     #[test]
     fn org_budgets_are_shared_across_facades() {
-        let engine = Engine::new(ServiceConfig::builder().max_org_rows(3).build());
+        let engine = Engine::manual(ServiceConfig::builder().max_org_rows(3).build());
         let a = queue();
         let b = queue();
         engine.submit(
@@ -604,7 +610,7 @@ mod tests {
 
     #[test]
     fn accepting_work_freezes_routing_before_later_login_discovery() {
-        let engine = Engine::new(ServiceConfig::default());
+        let engine = Engine::manual(ServiceConfig::default());
         let queue = queue();
         engine.submit(queue.core.clone(), SubmitCommand::test_row("first"));
         queue.core.login_state.set(
@@ -646,7 +652,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let engine = Engine::manual(ServiceConfig::default());
         let a = http_queue(&server, 100);
         let b = http_queue(&server, 100);
         engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
@@ -687,7 +693,7 @@ mod tests {
             })
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let engine = Engine::manual(ServiceConfig::default());
         let a = http_queue(&server, 100);
         let b = http_queue(&server, 100);
         engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
@@ -722,7 +728,7 @@ mod tests {
             })
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let engine = Engine::manual(ServiceConfig::default());
         let a = http_queue(&server, 1);
         let b = http_queue(&server, 1);
         engine.submit(a.core.clone(), SubmitCommand::test_row("a"));
@@ -750,7 +756,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let engine = Engine::manual(ServiceConfig::default());
         let root = http_queue(&server, 100);
         let a = root.child();
         let b = root.child();
@@ -784,7 +790,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let engine = Engine::manual(ServiceConfig::default());
         let queue = http_queue(&server, 100);
         for i in 0..20 {
             engine.submit(
@@ -824,7 +830,7 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let engine = Engine::manual(ServiceConfig::default());
         let queue = http_queue(&server, 100);
         for token in ["first-token", "rotated-token"] {
             let mut command = SubmitCommand::test_named_span(token, "rotation-project");
@@ -867,7 +873,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let engine = Arc::new(Engine::new(ServiceConfig::default()));
+        let engine = Engine::manual(ServiceConfig::default());
         let queue = http_queue(&server, 100);
         engine.submit(
             queue.core.clone(),
@@ -882,7 +888,7 @@ mod tests {
 
     #[test]
     fn racing_producers_share_one_bounded_admission_budget() {
-        let engine = Arc::new(Engine::new(ServiceConfig::builder().max_rows(17).build()));
+        let engine = Engine::manual(ServiceConfig::builder().max_rows(17).build());
         let queue = queue();
         std::thread::scope(|threads| {
             for _ in 0..8 {
@@ -933,7 +939,7 @@ mod tests {
             .mount(&server)
             .await;
         let queue = http_queue(&server, 1);
-        let engine = Arc::new(Engine::new(ServiceConfig::builder().max_rows(1).build()));
+        let engine = Engine::manual(ServiceConfig::builder().max_rows(1).build());
         let write = engine.submit(queue.core.clone(), SubmitCommand::test_row("first"));
         let rejected = engine.submit(queue.core.clone(), SubmitCommand::test_row("rejected"));
         assert!(matches!(

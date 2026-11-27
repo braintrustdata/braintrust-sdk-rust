@@ -18,7 +18,8 @@ pub struct MockServer(wiremock::MockServer);
 impl MockServer {
     pub async fn start() -> Self {
         use_dedicated_runtime();
-        Self(wiremock::MockServer::start().await)
+        // Each fixture needs its own endpoint for the process-wide SDK caches.
+        Self(wiremock::MockServer::builder().start().await)
     }
 }
 

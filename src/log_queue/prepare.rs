@@ -209,12 +209,7 @@ impl QueueSettings {
         let app_url_key = self.app_url.to_string();
         let org = crate::resolution::OrgIdentity::new(org_id, org_name, token);
         let scope = crate::scheduler::Scope::new(app_url_key.clone(), org.scope_key());
-        let key = crate::resolution::ProjectKey {
-            app_url: app_url_key,
-            org,
-            project: project_name.into(),
-        };
-        let entry = crate::service::global()?.projects.entry(key);
+        let entry = crate::resolution::project(&app_url_key, org, project_name);
         // Bounded by the retry budget and request timeouts, not a deadline, so
         // registration can wait out a 429 cooldown.
         let resolve = entry.get_or_try_init(|| async {
