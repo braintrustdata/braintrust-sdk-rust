@@ -155,14 +155,18 @@ impl Logs3BatchUploader {
                         "failed to serialize logs3 row: {error}"
                     ))
                 })?;
-            let batches = EncodedBatch::partition(
+            let batches = EncodedBatch::partition_contiguous_by_destination(
                 row_payloads,
                 batch_max_num_items.max(1),
                 (limits.max_request_size / 2).max(1),
             );
             let mut result = Logs3UploadResult::default();
             for batch in batches {
-                let uploaded = coordinator.upload(batch, limits).await?;
+                let scope = crate::scheduler::SCOPE
+                    .with(|scope| scope.for_destination(batch.destination()));
+                let uploaded = crate::scheduler::SCOPE
+                    .scope(scope, coordinator.upload(batch, limits))
+                    .await?;
                 result.bytes_processed += uploaded.bytes_processed;
                 result.requests_sent += uploaded.requests_sent;
                 result.rows_uploaded += uploaded.rows_uploaded;
