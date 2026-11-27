@@ -6,19 +6,27 @@ use crate::{
 use futures::{future::BoxFuture, future::Shared, FutureExt};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 
 type Write = Completion<DeliveryReceipt, WriteError>;
 type Receipt = Result<FlushReport, FlushError>;
 type AwaitReceipt = Shared<BoxFuture<'static, Receipt>>;
 
+struct PendingReceipt {
+    receipt: AwaitReceipt,
+    sender: oneshot::Sender<Receipt>,
+}
+
 #[derive(Default)]
-pub(super) struct PendingAuth(Mutex<State>);
+pub(super) struct PendingAuth {
+    state: Mutex<State>,
+    cancelled: Notify,
+}
 
 #[derive(Default)]
 struct State {
     next: u64,
-    pending: BTreeMap<u64, AwaitReceipt>,
+    pending: BTreeMap<u64, PendingReceipt>,
     closed: bool,
     aborted: bool,
 }
@@ -26,42 +34,61 @@ struct State {
 pub(super) struct Reservation {
     scope: Arc<PendingAuth>,
     id: u64,
-    sender: Option<oneshot::Sender<Receipt>>,
 }
 
 impl PendingAuth {
     pub(super) fn reserve(self: &Arc<Self>) -> Result<Reservation, BraintrustError> {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if state.closed {
             return Err(closed());
         }
         let (sender, receiver) = oneshot::channel();
         let id = state.next;
         state.next += 1;
-        state.pending.insert(
-            id,
-            async move {
+        let pending = PendingReceipt {
+            receipt: async move {
                 receiver
                     .await
                     .unwrap_or(Err(ExecutionError::WorkerLost.into()))
             }
             .boxed()
             .shared(),
-        );
+            sender,
+        };
+        state.pending.insert(id, pending);
         Ok(Reservation {
             scope: self.clone(),
             id,
-            sender: Some(sender),
         })
     }
 
     pub(super) fn direct<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
-        let state = self.0.lock().unwrap();
+        let state = self.state.lock().unwrap();
         (!state.closed).then(f)
     }
 
     pub(super) fn abort(&self) {
-        self.0.lock().unwrap().aborted = true;
+        let pending = {
+            let mut state = self.state.lock().unwrap();
+            state.aborted = true;
+            std::mem::take(&mut state.pending)
+                .into_values()
+                .collect::<Vec<_>>()
+        };
+        for pending in pending {
+            let _ = pending.sender.send(Err(ExecutionError::TimedOut.into()));
+        }
+        self.cancelled.notify_waiters();
+    }
+
+    async fn aborted(&self) {
+        loop {
+            let notified = self.cancelled.notified();
+            if self.state.lock().unwrap().aborted {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Capture synchronous queue work and unpublished writes under one lock.
@@ -70,28 +97,41 @@ impl PendingAuth {
         close: bool,
         callback: impl FnOnce(bool) -> T,
     ) -> (T, Vec<AwaitReceipt>) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         state.closed |= close;
-        let pending = state.pending.values().cloned().collect();
+        let pending = state
+            .pending
+            .values()
+            .map(|pending| pending.receipt.clone())
+            .collect();
         (callback(state.pending.is_empty()), pending)
     }
 }
 
 impl Reservation {
+    pub(super) async fn wait<T>(
+        &self,
+        prepare: impl std::future::Future<Output = Result<T, BraintrustError>>,
+    ) -> Result<T, BraintrustError> {
+        tokio::select! {
+            biased;
+            _ = self.scope.aborted() => Err(ExecutionError::TimedOut.into()),
+            result = prepare => result,
+        }
+    }
+
     /// Atomically move a reservation into the queue, so a flush covers it once.
     pub(super) fn publish(
-        mut self,
+        self,
         submit: impl FnOnce() -> Result<Vec<Write>, BraintrustError>,
     ) -> Result<(), BraintrustError> {
-        let mut state = self.scope.0.lock().unwrap();
-        let result = if state.aborted {
-            Err(closed())
-        } else {
-            submit()
+        let mut state = self.scope.state.lock().unwrap();
+        let Some(pending) = state.pending.remove(&self.id) else {
+            return Err(ExecutionError::TimedOut.into());
         };
-        state.pending.remove(&self.id);
+        let result = submit();
         drop(state);
-        let sender = self.sender.take().expect("unpublished receipt");
+        let sender = pending.sender;
         match result {
             Ok(writes) => {
                 crate::operation::submit(async move {
@@ -122,9 +162,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if self.sender.is_some() {
-            self.scope.0.lock().unwrap().pending.remove(&self.id);
-        }
+        self.scope.state.lock().unwrap().pending.remove(&self.id);
     }
 }
 
@@ -165,10 +203,20 @@ pub(super) async fn join(
     pending: Vec<AwaitReceipt>,
 ) -> Receipt {
     let (barrier, receipts) = futures::join!(barrier, futures::future::join_all(pending));
-    receipts
-        .into_iter()
-        .try_fold(barrier?, |mut report, receipt| {
-            report.delivered += receipt?.delivered;
-            Ok(report)
-        })
+    let mut delivered = 0;
+    let mut failure: Option<FlushFailure> = None;
+    for result in std::iter::once(barrier).chain(receipts) {
+        match result {
+            Ok(report) => delivered += report.delivered,
+            Err(FlushError::Delivery(next)) => match &mut failure {
+                Some(failure) => failure.failed += next.failed,
+                None => failure = Some(next),
+            },
+            Err(error) => return Err(error),
+        }
+    }
+    match failure {
+        Some(failure) => Err(FlushError::Delivery(failure)),
+        None => Ok(FlushReport { delivered }),
+    }
 }
