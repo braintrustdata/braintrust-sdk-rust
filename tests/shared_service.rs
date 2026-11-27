@@ -292,6 +292,8 @@ async fn a_flush_excludes_submissions_after_its_cutoff() {
 
 #[tokio::test]
 async fn org_selection_uses_discovered_endpoints_without_retargeting_existing_work() {
+    use wiremock::matchers::header;
+
     let app = MockServer::start().await;
     let a = MockServer::start().await;
     let b = MockServer::start().await;
