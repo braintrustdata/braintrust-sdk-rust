@@ -1,7 +1,11 @@
+mod support;
+
+use support::MockServer;
+
 use braintrust_sdk_rust::{BraintrustClient, SpanLog};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, Request, ResponseTemplate};
 
 #[tokio::test]
 async fn dataset_queries_and_summaries_use_the_discovered_api() {

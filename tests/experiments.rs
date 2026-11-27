@@ -1,7 +1,11 @@
+mod support;
+
+use support::MockServer;
+
 use braintrust_sdk_rust::{BraintrustClient, ExperimentLog, Feedback};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 #[tokio::test]
 async fn experiment_log_flushes_to_logs_endpoint() {
@@ -73,6 +77,7 @@ async fn experiment_log_flushes_to_logs_endpoint() {
 
 #[tokio::test]
 async fn experiment_builder_requires_project_name() {
+    support::use_dedicated_runtime();
     let client = BraintrustClient::builder()
         .api_key("token")
         .api_url("https://api.braintrust.dev")

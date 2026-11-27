@@ -1,8 +1,12 @@
+mod support;
+
+use support::MockServer;
+
 use braintrust_sdk_rust::{BraintrustClient, SpanComponents, SpanLog, SpanObjectType};
 use serde_json::json;
 use std::time::{Duration, Instant};
 use wiremock::matchers::{body_string_contains, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 const LOGS3_DELAY: Duration = Duration::from_millis(500);
 
