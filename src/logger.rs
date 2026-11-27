@@ -491,7 +491,7 @@ struct ClientInner {
     queue: LogQueue,
     login_state: LoginState,
     login_notify: Notify,
-    http_client: reqwest::Client,
+    http_client: crate::http::SharedHttp,
     default_project: Option<String>,
     login_skipped: bool,
     environment: Option<SpanOriginEnvironment>,
@@ -856,16 +856,23 @@ impl BraintrustClient {
             .login_state
             .app_url()
             .unwrap_or_else(|| self.inner.app_url.to_string());
-        api_client(&self.inner.http_client, &api_url, &app_url, token, None)
+        api_client(
+            &self.inner.http_client.client(),
+            &api_url,
+            &app_url,
+            token,
+            None,
+        )
     }
 
     /// Log in and discover the selected organization's API endpoint.
     async fn perform_login(&self, api_key: &str, org_name: Option<&str>) -> Result<()> {
+        let http = self.inner.http_client.client();
         let mut builder = crate::api::Client::builder()
             .api_key(api_key)
             .app_url(self.inner.app_url.as_str())
-            .http_client(self.inner.http_client.clone())
-            .upload_http_client(self.inner.http_client.clone());
+            .http_client(http.clone())
+            .upload_http_client(http);
         if self.inner.explicit_api_url {
             builder = builder.api_url(self.inner.api_url.as_str());
         }
@@ -2352,20 +2359,28 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_rows_excludes_rows_delivered_before_a_split_fails() {
-        struct SplitThenReject(std::sync::atomic::AtomicUsize);
+        struct SplitThenReject;
         impl wiremock::Respond for SplitThenReject {
-            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
-                match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-                    0 => ResponseTemplate::new(413).set_body_string("too large"),
-                    1 => ResponseTemplate::new(200).set_body_string("{}"),
-                    _ => ResponseTemplate::new(400).set_body_string("rejected"),
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let rows = body["rows"].as_array().unwrap();
+                let rejected = rows
+                    .iter()
+                    .filter(|row| matches!(row["id"].as_str(), Some("row-2" | "row-3")))
+                    .count();
+                if rejected == 0 {
+                    ResponseTemplate::new(200).set_body_string("{}")
+                } else if rejected == rows.len() {
+                    ResponseTemplate::new(400).set_body_string("rejected")
+                } else {
+                    ResponseTemplate::new(413).set_body_string("too large")
                 }
             }
         }
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/logs3"))
-            .respond_with(SplitThenReject(std::sync::atomic::AtomicUsize::new(0)))
+            .respond_with(SplitThenReject)
             .mount(&server)
             .await;
         let client = BraintrustClient::builder()
@@ -2385,7 +2400,7 @@ mod tests {
         client.log_rows_with_credentials("token", "org", None, rows);
         let _ = client.flush().await;
 
-        // The 413 splits the batch in half: the first half is delivered, the second rejected.
+        // The last two rows are dropped regardless of how the worker batches them.
         assert_eq!(client.dropped_rows().upload_failed, 2);
     }
 

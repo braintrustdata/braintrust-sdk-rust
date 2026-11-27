@@ -309,7 +309,9 @@ mod tests {
     fn coordinator(server: &MockServer, policy: UploadPolicy) -> UploadCoordinator {
         UploadCoordinator::new(
             crate::http::api_client(
-                &crate::http::build_http_client(Duration::from_secs(3), None, None).unwrap(),
+                &crate::http::build_http_client(Duration::from_secs(3), None, None)
+                    .unwrap()
+                    .client(),
                 &server.uri(),
                 &server.uri(),
                 "secret",
