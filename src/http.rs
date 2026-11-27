@@ -7,10 +7,12 @@ use tokio::runtime::Id as RuntimeId;
 
 use crate::error::{BraintrustError, Result};
 
-/// A reusable HTTP connection pool for a transport profile.
+/// A reusable transport profile and its identity, so only rows sharing a
+/// profile share a request.
 #[derive(Clone, Debug)]
 pub(crate) struct SharedHttp {
     pool: Arc<ProfilePool>,
+    pub identity: u64,
 }
 #[derive(Debug)]
 struct Settings {
@@ -168,11 +170,13 @@ pub(crate) fn build_http_client(
         certificates,
     };
     let http = settings.build()?;
+    static NEXT_PROFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let client = SharedHttp {
         pool: Arc::new(ProfilePool {
             settings,
             client: Mutex::new((None, http)),
         }),
+        identity: NEXT_PROFILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     };
     if pools.len() >= 32 {
         pools.pop_front();
