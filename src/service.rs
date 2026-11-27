@@ -93,6 +93,6 @@ pub(crate) fn global() -> Result<&'static Service> {
     Ok(SERVICE.get_or_init(|| {
         let config = config().clone();
         let engine = Arc::new(crate::log_queue::engine::Engine::new(config));
-        Service { engine, config }
+        Service { engine }
     }))
 }
