@@ -691,7 +691,7 @@ impl BraintrustClient {
         let client = self.clone();
         let exported = exported.to_owned();
         crate::operation::submit(async move {
-            let auth = async {
+            let auth = reservation.wait(async {
                 let login_state = if client.inner.login_state.is_logged_in() {
                 client.inner.login_state.clone()
             } else if client.inner.login_skipped {
@@ -709,7 +709,7 @@ impl BraintrustClient {
                 .org_id()
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
                 Ok((api_key, org_id, login_state.org_name()))
-            }.await;
+            }).await;
             reservation.publish(|| {
                 let (api_key, org_id, org_name) = auth?;
                 client
@@ -1053,7 +1053,7 @@ impl BraintrustClient {
         let client = self.clone();
         let rows: Vec<_> = rows.into_iter().collect();
         crate::operation::submit(async move {
-            let auth = async {
+            let auth = reservation.wait(async {
             if client.inner.login_skipped {
                 return Err(BraintrustError::InvalidConfig(
                 "log_rows() requires login; use log_rows_with_credentials() when skip_login is enabled".into(),
@@ -1067,7 +1067,7 @@ impl BraintrustClient {
                 .org_id()
                 .ok_or_else(|| BraintrustError::InvalidConfig("Not logged in".into()))?;
                 Ok((api_key, org_id, state.org_name()))
-            }.await;
+            }).await;
             reservation.publish(|| {
                 let (api_key, org_id, org_name) = auth?;
                 Ok(client.inner.queue.submit_rows_tracked(
@@ -1100,16 +1100,9 @@ impl BraintrustClient {
         org_name: Option<&str>,
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
-        let rows: Vec<_> = rows.into_iter().collect();
-        let count = rows.len();
-        if self
-            .inner
-            .pending_auth
-            .direct(|| self.inner.queue.submit_rows(token, org_id, org_name, rows))
-            .is_none()
-        {
-            self.inner.queue.account_closed(count);
-        }
+        self.submit_row_chunks(rows, |rows| {
+            self.inner.queue.submit_rows(token, org_id, org_name, rows);
+        });
     }
 
     /// Queue caller-built rows for upload to `/logs3`, fetching the token from
@@ -1127,19 +1120,29 @@ impl BraintrustClient {
         org_name: Option<&str>,
         rows: impl IntoIterator<Item = Map<String, Value>>,
     ) {
-        let rows: Vec<_> = rows.into_iter().collect();
-        let count = rows.len();
-        if self
-            .inner
-            .pending_auth
-            .direct(|| {
-                self.inner
-                    .queue
-                    .submit_rows_with_provider(provider, org_id, org_name, rows)
-            })
-            .is_none()
-        {
-            self.inner.queue.account_closed(count);
+        self.submit_row_chunks(rows, |rows| {
+            self.inner
+                .queue
+                .submit_rows_with_provider(provider.clone(), org_id, org_name, rows);
+        });
+    }
+
+    fn submit_row_chunks(
+        &self,
+        rows: impl IntoIterator<Item = Map<String, Value>>,
+        mut submit: impl FnMut(Vec<Map<String, Value>>),
+    ) {
+        let mut rows = rows.into_iter();
+        loop {
+            // Run arbitrary caller iterator code outside the admission lock.
+            let chunk: Vec<_> = rows.by_ref().take(64).collect();
+            let count = chunk.len();
+            if count == 0 {
+                break;
+            }
+            if self.inner.pending_auth.direct(|| submit(chunk)).is_none() {
+                self.inner.queue.account_closed(count);
+            }
         }
     }
 
