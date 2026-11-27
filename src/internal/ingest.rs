@@ -133,7 +133,28 @@ impl EncodedBatch {
             .collect()
     }
 
-    /// All rows in a queued batch share a destination.
+    /// Preserve input order while keeping each upload in one cooldown scope.
+    pub(crate) fn partition_contiguous_by_destination(
+        rows: Vec<EncodedRow>,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Vec<Self> {
+        let mut batches = Vec::new();
+        let mut rows = rows.into_iter().peekable();
+        while let Some(first) = rows.next() {
+            let mut group = vec![first];
+            while rows
+                .peek()
+                .is_some_and(|row| row.overflow.object_ids == group[0].overflow.object_ids)
+            {
+                group.push(rows.next().expect("peeked row"));
+            }
+            batches.extend(Self::partition(group, max_items, max_bytes));
+        }
+        batches
+    }
+
+    /// All rows in a scheduled batch share a destination.
     pub(crate) fn destination(&self) -> Option<String> {
         let ids = &self.rows.first()?.overflow.object_ids;
         (!ids.is_empty()).then(|| destination_key(ids))
