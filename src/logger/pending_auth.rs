@@ -5,6 +5,7 @@ use crate::{
 };
 use futures::{future::BoxFuture, future::Shared, FutureExt};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Notify};
 
@@ -21,6 +22,7 @@ struct PendingReceipt {
 pub(super) struct PendingAuth {
     state: Mutex<State>,
     cancelled: Notify,
+    draining: AtomicBool,
 }
 
 #[derive(Default)]
@@ -36,7 +38,22 @@ pub(super) struct Reservation {
     id: u64,
 }
 
+pub(super) struct Drain(Arc<PendingAuth>);
+
+impl Drop for Drain {
+    fn drop(&mut self) {
+        self.0.draining.store(false, Ordering::Release);
+    }
+}
+
 impl PendingAuth {
+    pub(super) fn try_drain(self: &Arc<Self>) -> Option<Drain> {
+        self.draining
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Drain(self.clone()))
+    }
+
     pub(super) fn reserve(self: &Arc<Self>) -> Result<Reservation, BraintrustError> {
         let mut state = self.state.lock().unwrap();
         if state.closed {

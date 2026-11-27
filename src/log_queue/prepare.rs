@@ -1,5 +1,5 @@
 //! Span routing and construction of logs3 rows.
-use super::core::QueueSettings;
+use super::{core::QueueSettings, observation::DeliveryError};
 use crate::span_components::{project_logs_identifier, ProjectLogsIdentifier};
 use crate::types::{LogDestination, Logs3Row, ParentSpanInfo, SpanObjectType, SpanPayload};
 use anyhow::{anyhow, Result};
@@ -105,11 +105,11 @@ impl SpanRoute {
         })
     }
 
-    pub async fn into_row(
+    async fn into_row<E>(
         self,
         payload: SpanPayload,
-        resolve: impl AsyncFnOnce(&str, Option<&str>, &str) -> Result<String>,
-    ) -> Result<Logs3Row> {
+        resolve: impl AsyncFnOnce(&str, Option<&str>, &str) -> Result<String, E>,
+    ) -> Result<Logs3Row, E> {
         let destination = match self.destination {
             Destination::Known(destination) => destination,
             Destination::ProjectName(name) => LogDestination::project_logs(
@@ -172,7 +172,7 @@ impl SpanRoute {
     }
 }
 
-pub(super) type ProjectResolution = OnceCell<Result<String>>;
+pub(super) type ProjectResolution = OnceCell<Result<String, DeliveryError>>;
 
 impl QueueSettings {
     pub(super) async fn prepare_span(
@@ -181,17 +181,20 @@ impl QueueSettings {
         payload: SpanPayload,
         parent_info: Option<ParentSpanInfo>,
         project: &ProjectResolution,
-    ) -> Result<Logs3Row> {
-        SpanRoute::new(&payload, parent_info.as_ref())?
+    ) -> Result<Logs3Row, DeliveryError> {
+        SpanRoute::new(&payload, parent_info.as_ref())
+            .map_err(DeliveryError::new)?
             .into_row(payload, async |org_id, org_name, name| {
                 // A job has at most one unresolved project name. Reuse its
                 // result for each row, including a failed registration.
                 project
-                    .get_or_init(|| self.ensure_project_id(token, org_id, org_name, name))
+                    .get_or_init(|| async {
+                        self.ensure_project_id(token, org_id, org_name, name)
+                            .await
+                            .map_err(DeliveryError::new)
+                    })
                     .await
-                    .as_ref()
-                    .cloned()
-                    .map_err(super::observation::duplicate_error)
+                    .clone()
             })
             .await
     }

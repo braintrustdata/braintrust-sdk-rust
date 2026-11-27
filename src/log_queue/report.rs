@@ -52,9 +52,8 @@ impl Report {
             }
         }
     }
-    pub fn failed(&mut self, submissions: Vec<usize>, error: &anyhow::Error, preparation: bool) {
-        let error = DeliveryError::from_error(error);
-        self.fail_submissions(&submissions, &error);
+    pub fn failed(&mut self, submissions: Vec<usize>, error: &DeliveryError, preparation: bool) {
+        self.fail_submissions(&submissions, error);
         self.losses.push(Loss {
             submissions,
             preparation,
