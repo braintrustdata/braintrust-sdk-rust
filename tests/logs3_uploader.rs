@@ -1,5 +1,7 @@
 mod support;
 
+use support::MockServer;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -74,7 +76,7 @@ impl Respond for RejectMultiRowResponder {
 
 #[tokio::test]
 async fn uploader_splits_batches_on_413_without_overflow() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
 
     Mock::given(method("GET"))
@@ -111,7 +113,7 @@ async fn uploader_splits_batches_on_413_without_overflow() {
 
 #[tokio::test]
 async fn uploader_uses_overflow_protocol_for_large_payloads() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     let signed_upload_url = format!("{}/signed-upload", server.uri());
 
     Mock::given(method("GET"))
@@ -195,7 +197,7 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
 
 #[tokio::test]
 async fn uploader_does_not_retry_malformed_overflow_responses() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/version"))
         .respond_with(

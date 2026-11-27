@@ -1,5 +1,7 @@
 mod support;
 
+use support::MockServer;
+
 use braintrust_sdk_rust::{BraintrustClient, TokenProvider};
 use serde_json::{json, Map, Value};
 use std::future::IntoFuture;
@@ -7,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wiremock::{
     matchers::{body_string_contains, header, method, path},
-    Mock, MockServer, ResponseTemplate,
+    Mock, ResponseTemplate,
 };
 
 fn row(id: &str, project: &str) -> Map<String, Value> {
@@ -34,7 +36,7 @@ async fn accept(server: &MockServer) {
 
 #[tokio::test]
 async fn construction_and_submission_need_no_caller_runtime() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     accept(&server).await;
     let endpoint = server.uri();
     let client = std::thread::spawn(move || {
@@ -59,7 +61,7 @@ async fn construction_and_submission_need_no_caller_runtime() {
 
 #[tokio::test]
 async fn delivery_survives_the_constructing_runtime() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     accept(&server).await;
     let endpoint = server.uri();
     let client = std::thread::spawn(move || {
@@ -97,7 +99,7 @@ impl TokenProvider for Gate {
 
 #[tokio::test]
 async fn project_flush_excludes_siblings_and_parent_includes_children() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     accept(&server).await;
     let client = client(&server);
     let a = client.project("a");
@@ -135,7 +137,7 @@ async fn project_flush_excludes_siblings_and_parent_includes_children() {
 #[tokio::test]
 async fn project_shutdown_times_out_its_work_without_closing_siblings() {
     use braintrust_sdk_rust::{EnqueueError, ExecutionError, ShutdownError, WriteError};
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     accept(&server).await;
     let client = client(&server);
     let stopped = client.project("stopped");
@@ -165,7 +167,7 @@ async fn project_shutdown_times_out_its_work_without_closing_siblings() {
 #[tokio::test]
 async fn shutdown_drains_accepted_writes_even_if_its_completion_is_dropped() {
     use braintrust_sdk_rust::{EnqueueError, FlushError};
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     accept(&server).await;
     let client = client(&server);
     let span = client
@@ -189,7 +191,7 @@ async fn shutdown_drains_accepted_writes_even_if_its_completion_is_dropped() {
 
 #[tokio::test]
 async fn terminal_failure_is_scoped_and_does_not_poison_later_flushes() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/logs3"))
         .and(body_string_contains("bad"))
@@ -213,7 +215,7 @@ async fn terminal_failure_is_scoped_and_does_not_poison_later_flushes() {
 
 #[tokio::test]
 async fn retry_sleep_releases_capacity_for_healthy_orgs() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     let healthy_at = Arc::new(Mutex::new(None));
     Mock::given(method("POST"))
         .and(path("/logs3"))
@@ -257,7 +259,7 @@ async fn retry_sleep_releases_capacity_for_healthy_orgs() {
 
 #[tokio::test]
 async fn a_flush_excludes_submissions_after_its_cutoff() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     let started = Arc::new(tokio::sync::Notify::new());
     let observe = started.clone();
     Mock::given(method("POST"))
@@ -292,9 +294,9 @@ async fn a_flush_excludes_submissions_after_its_cutoff() {
 
 #[tokio::test]
 async fn org_selection_uses_discovered_endpoints_without_retargeting_existing_work() {
-    let app = support::mock_server().await;
-    let a = support::mock_server().await;
-    let b = support::mock_server().await;
+    let app = MockServer::start().await;
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/apikey/login"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"org_info":[
@@ -341,7 +343,7 @@ impl TokenProvider for Blocked {
 }
 #[tokio::test]
 async fn stalled_credentials_and_cancelled_waiters_do_not_block_other_clients() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     accept(&server).await;
     let blocked = client(&server);
     let healthy = client(&server);
@@ -367,7 +369,7 @@ async fn stalled_credentials_and_cancelled_waiters_do_not_block_other_clients() 
 
 #[tokio::test]
 async fn concurrent_clients_share_project_resolution_without_sharing_delivery_results() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/project/register"))
         .respond_with(
@@ -393,7 +395,7 @@ async fn concurrent_clients_share_project_resolution_without_sharing_delivery_re
 
 #[tokio::test]
 async fn dataset_flush_retains_pending_rows_when_registration_fails() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/apikey/login"))
         .respond_with(
@@ -470,7 +472,7 @@ impl TokenProvider for Panicking {
 }
 #[tokio::test]
 async fn provider_panic_fails_its_partition_without_stopping_the_service() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     accept(&server).await;
     let bad = client(&server);
     let good = client(&server);
@@ -483,7 +485,7 @@ async fn provider_panic_fails_its_partition_without_stopping_the_service() {
 
 #[tokio::test]
 async fn invalid_public_login_state_does_not_stop_other_clients() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     accept(&server).await;
     let bad = client(&server);
     bad.login_state().set(
@@ -503,7 +505,7 @@ async fn invalid_public_login_state_does_not_stop_other_clients() {
 
 #[tokio::test]
 async fn a_project_submitted_after_a_sibling_429_delivers_before_the_retry() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     let first_attempt = Arc::new(tokio::sync::Notify::new());
     let signal = first_attempt.clone();
     Mock::given(method("POST"))

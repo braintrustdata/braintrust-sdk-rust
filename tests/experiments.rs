@@ -1,13 +1,15 @@
 mod support;
 
+use support::MockServer;
+
 use braintrust_sdk_rust::{BraintrustClient, ExperimentLog, Feedback};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 #[tokio::test]
 async fn experiment_log_flushes_to_logs_endpoint() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
@@ -93,7 +95,7 @@ async fn experiment_builder_requires_project_name() {
 
 #[tokio::test]
 async fn experiment_log_feedback_sends_merge_event() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
@@ -160,7 +162,7 @@ async fn experiment_log_feedback_sends_merge_event() {
 
 #[tokio::test]
 async fn experiment_summarize_returns_summary() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
@@ -242,7 +244,7 @@ async fn experiment_summarize_returns_summary() {
 }
 
 async fn experiment_server(register: ResponseTemplate) -> MockServer {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
         .respond_with(register)

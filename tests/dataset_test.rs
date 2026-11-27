@@ -2,6 +2,8 @@
 
 mod support;
 
+use support::MockServer;
+
 use braintrust_sdk_rust::{BraintrustClient, DatasetInsert};
 use serde_json::json;
 use wiremock::matchers::{method, path};
@@ -18,7 +20,7 @@ fn mock_login_response(orgs: &[(&str, &str)]) -> ResponseTemplate {
 
 #[tokio::test]
 async fn dataset_builder_requires_project_name() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/apikey/login"))
@@ -52,7 +54,7 @@ async fn dataset_builder_requires_project_name() {
 
 #[tokio::test]
 async fn dataset_builder_requires_dataset_name() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/apikey/login"))
@@ -86,7 +88,7 @@ async fn dataset_builder_requires_dataset_name() {
 
 #[tokio::test]
 async fn dataset_insert_flushes_to_logs_endpoint() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/apikey/login"))
@@ -161,7 +163,7 @@ async fn dataset_insert_flushes_to_logs_endpoint() {
 
 #[tokio::test]
 async fn dataset_fetch_returns_records() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/apikey/login"))
@@ -228,7 +230,7 @@ async fn dataset_fetch_returns_records() {
 
 #[tokio::test]
 async fn dataset_summarize_returns_summary() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/apikey/login"))
@@ -291,7 +293,7 @@ async fn dataset_summarize_returns_summary() {
 
 #[tokio::test]
 async fn dataset_flush_covers_its_unawaited_writes_and_only_its_own() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/apikey/login"))
         .respond_with(mock_login_response(&[("org-id", "Test Org")]))
