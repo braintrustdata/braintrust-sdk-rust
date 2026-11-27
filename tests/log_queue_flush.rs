@@ -4,13 +4,12 @@ use braintrust_sdk_rust::{BraintrustClient, SpanComponents, SpanLog, SpanObjectT
 use serde_json::json;
 use std::time::{Duration, Instant};
 use wiremock::matchers::{body_string_contains, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 const LOGS3_DELAY: Duration = Duration::from_millis(500);
 
 async fn flush_rows(rows: usize) -> (Vec<usize>, Duration) {
-    support::use_dedicated_runtime();
-    let server = MockServer::start().await;
+    let server = support::mock_server().await;
     Mock::given(method("POST"))
         .and(path("/logs3"))
         .respond_with(
@@ -95,8 +94,7 @@ async fn flush_sends_full_batches_with_bounded_concurrency() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rate_limited_project_does_not_block_other_projects() {
-    support::use_dedicated_runtime();
-    let server = MockServer::start().await;
+    let server = support::mock_server().await;
     Mock::given(method("POST"))
         .and(path("/logs3"))
         .and(body_string_contains("throttled-project"))

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use braintrust_sdk_rust::Logs3BatchUploader;
 use serde_json::{json, Map, Value};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
 #[test]
 fn uploader_rejects_malformed_custom_ca_bundle() {
@@ -74,8 +74,7 @@ impl Respond for RejectMultiRowResponder {
 
 #[tokio::test]
 async fn uploader_splits_batches_on_413_without_overflow() {
-    support::use_dedicated_runtime();
-    let server = MockServer::start().await;
+    let server = support::mock_server().await;
     let calls = Arc::new(AtomicUsize::new(0));
 
     Mock::given(method("GET"))
@@ -112,8 +111,7 @@ async fn uploader_splits_batches_on_413_without_overflow() {
 
 #[tokio::test]
 async fn uploader_uses_overflow_protocol_for_large_payloads() {
-    support::use_dedicated_runtime();
-    let server = MockServer::start().await;
+    let server = support::mock_server().await;
     let signed_upload_url = format!("{}/signed-upload", server.uri());
 
     Mock::given(method("GET"))
@@ -197,8 +195,7 @@ async fn uploader_uses_overflow_protocol_for_large_payloads() {
 
 #[tokio::test]
 async fn uploader_does_not_retry_malformed_overflow_responses() {
-    support::use_dedicated_runtime();
-    let server = MockServer::start().await;
+    let server = support::mock_server().await;
     Mock::given(method("GET"))
         .and(path("/version"))
         .respond_with(

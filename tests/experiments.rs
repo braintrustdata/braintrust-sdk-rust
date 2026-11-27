@@ -7,8 +7,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
 async fn experiment_log_flushes_to_logs_endpoint() {
-    support::use_dedicated_runtime();
-    let server = MockServer::start().await;
+    let server = support::mock_server().await;
 
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
@@ -94,8 +93,7 @@ async fn experiment_builder_requires_project_name() {
 
 #[tokio::test]
 async fn experiment_log_feedback_sends_merge_event() {
-    support::use_dedicated_runtime();
-    let server = MockServer::start().await;
+    let server = support::mock_server().await;
 
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
@@ -162,8 +160,7 @@ async fn experiment_log_feedback_sends_merge_event() {
 
 #[tokio::test]
 async fn experiment_summarize_returns_summary() {
-    support::use_dedicated_runtime();
-    let server = MockServer::start().await;
+    let server = support::mock_server().await;
 
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
@@ -245,7 +242,7 @@ async fn experiment_summarize_returns_summary() {
 }
 
 async fn experiment_server(register: ResponseTemplate) -> MockServer {
-    let server = MockServer::start().await;
+    let server = support::mock_server().await;
     Mock::given(method("POST"))
         .and(path("/api/experiment/register"))
         .respond_with(register)
@@ -280,7 +277,6 @@ async fn uploaded_rows(server: &MockServer) -> Vec<Value> {
 
 #[tokio::test]
 async fn feedback_is_not_overwritten_by_a_later_flush() {
-    support::use_dedicated_runtime();
     let server = experiment_server(registered()).await;
     let client = BraintrustClient::builder()
         .app_url(server.uri())
@@ -314,7 +310,6 @@ async fn feedback_is_not_overwritten_by_a_later_flush() {
 
 #[tokio::test]
 async fn flush_covers_writes_started_before_it_even_if_not_awaited() {
-    support::use_dedicated_runtime();
     let server = experiment_server(registered()).await;
     let client = BraintrustClient::builder()
         .app_url(server.uri())
@@ -338,7 +333,6 @@ async fn flush_covers_writes_started_before_it_even_if_not_awaited() {
 
 #[tokio::test]
 async fn a_failed_registration_is_not_retried_by_every_write() {
-    support::use_dedicated_runtime();
     let server = experiment_server(ResponseTemplate::new(500)).await;
     let client = BraintrustClient::builder()
         .app_url(server.uri())
