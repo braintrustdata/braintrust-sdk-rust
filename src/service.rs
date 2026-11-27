@@ -19,7 +19,8 @@ pub struct ServiceConfig {
     pub max_rows: Option<usize>,
     /// Maximum retained rows for one organization across client facades.
     pub max_org_rows: Option<usize>,
-    /// Maximum entries in each shared project and server-capability cache.
+    /// Target capacity for each shared project and server-capability cache.
+    /// Entries in use may temporarily exceed this limit.
     #[builder(default = 256)]
     pub max_cached_resolutions: usize,
     /// Maximum duration of one [`crate::TokenProvider::token`] call.

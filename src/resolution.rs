@@ -1,10 +1,11 @@
 //! Bounded successful resolution shared by compatible authentication contexts.
 use indexmap::IndexMap;
 use std::hash::Hash;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::OnceCell;
 
-/// A bounded map of single-flight resolutions, evicting least recently used.
+/// A single-flight cache with least-recently-used eviction of idle entries.
 struct Cache<K, V> {
     entries: Mutex<IndexMap<K, Arc<OnceCell<V>>>>,
     capacity: usize,
@@ -16,27 +17,61 @@ impl<K: Hash + Eq, V> Cache<K, V> {
             capacity,
         }
     }
-    pub fn entry(&self, key: K) -> Arc<OnceCell<V>> {
+    pub fn entry(&self, key: K) -> CacheEntry<'_, K, V> {
         let mut entries = self.entries.lock().unwrap();
-        if let Some(index) = entries.get_index_of(&key) {
+        let cell = if let Some(index) = entries.get_index_of(&key) {
             let last = entries.len() - 1;
             entries.move_index(index, last);
-            return entries[last].clone();
+            entries[last].clone()
+        } else {
+            let cell = Arc::new(OnceCell::new());
+            entries.insert(key, cell.clone());
+            self.trim(&mut entries);
+            cell
+        };
+        CacheEntry {
+            cache: self,
+            cell: Some(cell),
         }
-        if entries.len() >= self.capacity {
-            // Unresolved entries, such as ones whose resolution failed, go
-            // first, so they cannot crowd out working ones.
+    }
+
+    fn trim(&self, entries: &mut IndexMap<K, Arc<OnceCell<V>>>) {
+        while entries.len() > self.capacity {
+            // Keep cells in use and prefer evicting failed lookups over cached results.
             let victim = entries
                 .values()
-                .position(|cell| !cell.initialized())
-                .unwrap_or(0);
-            entries.shift_remove_index(victim);
+                .enumerate()
+                .filter(|(_, cell)| Arc::strong_count(cell) == 1)
+                .min_by_key(|(_, cell)| cell.initialized());
+            let Some((index, _)) = victim else {
+                break;
+            };
+            entries.shift_remove_index(index);
         }
-        let value = Arc::new(OnceCell::new());
-        entries.insert(key, value.clone());
-        value
     }
 }
+
+struct CacheEntry<'a, K: Hash + Eq, V> {
+    cache: &'a Cache<K, V>,
+    cell: Option<Arc<OnceCell<V>>>,
+}
+
+impl<K: Hash + Eq, V> Deref for CacheEntry<'_, K, V> {
+    type Target = OnceCell<V>;
+
+    fn deref(&self) -> &Self::Target {
+        // The cell is present until the handle is dropped.
+        self.cell.as_deref().expect("live cache entry")
+    }
+}
+
+impl<K: Hash + Eq, V> Drop for CacheEntry<'_, K, V> {
+    fn drop(&mut self) {
+        drop(self.cell.take());
+        self.cache.trim(&mut self.cache.entries.lock().unwrap());
+    }
+}
+
 /// The organization a request acts for. When neither its ID nor its name is
 /// known, the credential stands in, so unrelated tenants never share a cached
 /// resolution or a rate-limit pause.
@@ -78,7 +113,11 @@ struct ProjectKey {
     org: OrgIdentity,
     project: String,
 }
-pub(crate) fn project(app_url: &str, org: OrgIdentity, project: &str) -> Arc<OnceCell<String>> {
+pub(crate) fn project(
+    app_url: &str,
+    org: OrgIdentity,
+    project: &str,
+) -> impl Deref<Target = OnceCell<String>> + use<> {
     static PROJECTS: OnceLock<Cache<ProjectKey, String>> = OnceLock::new();
     PROJECTS
         .get_or_init(|| Cache::new(crate::service::config().max_cached_resolutions))
@@ -89,7 +128,7 @@ pub(crate) fn project(app_url: &str, org: OrgIdentity, project: &str) -> Arc<Onc
         })
 }
 
-pub(crate) fn capabilities(endpoint: &str) -> Arc<OnceCell<Option<usize>>> {
+pub(crate) fn capabilities(endpoint: &str) -> impl Deref<Target = OnceCell<Option<usize>>> + use<> {
     static CAPABILITIES: OnceLock<Cache<String, Option<usize>>> = OnceLock::new();
     CAPABILITIES
         .get_or_init(|| Cache::new(crate::service::config().max_cached_resolutions))
@@ -117,5 +156,28 @@ mod tests {
         // ...and is evicted before resolved entries.
         cache.entry("d").set(4).unwrap();
         assert_eq!(keys(&cache), ["c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn a_burst_joins_running_lookups_and_keeps_the_idle_cache_bounded() {
+        let cache = Cache::new(1);
+        {
+            let a = cache.entry("a");
+            let (release, gate) = tokio::sync::oneshot::channel();
+            let first = a.get_or_init(|| async { gate.await.unwrap() });
+            tokio::pin!(first);
+            assert!(futures::poll!(&mut first).is_pending());
+
+            let b = cache.entry("b");
+            let again = cache.entry("a");
+            let joined = again.get_or_init(|| async { panic!("started a duplicate lookup") });
+            tokio::pin!(joined);
+            assert!(futures::poll!(&mut joined).is_pending());
+            release.send(1).unwrap();
+            assert_eq!(*first.await, 1);
+            assert_eq!(*joined.await, 1);
+            b.set(2).unwrap();
+        }
+        assert_eq!(keys(&cache).len(), 1);
     }
 }
