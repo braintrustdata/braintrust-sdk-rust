@@ -128,6 +128,12 @@ impl LogQueue {
                 .submit_many(self.core.clone(), commands);
         }
     }
+    pub(crate) fn account_closed(&self, count: usize) {
+        for _ in 0..count {
+            self.core.observation.queue_full();
+        }
+    }
+
     pub(crate) fn dropped_rows(&self) -> DroppedRows {
         self.core.observation.dropped_rows()
     }
