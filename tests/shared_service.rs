@@ -200,16 +200,14 @@ async fn terminal_failure_is_scoped_and_does_not_poison_later_flushes() {
         .mount(&server)
         .await;
     accept(&server).await;
-    let client = client(&server);
-    let bad = client.project("bad");
-    let good = client.project("good");
+    let bad = client(&server);
+    let good = client(&server);
     bad.log_rows_with_credentials("token", "org", None, [row("bad", "bad")]);
     good.log_rows_with_credentials("token", "org", None, [row("good", "good")]);
     assert!(bad.flush().await.is_err());
     good.flush().await.unwrap();
     assert_eq!(bad.dropped_rows().upload_failed, 1);
     assert_eq!(good.dropped_rows().upload_failed, 0);
-    assert_eq!(client.dropped_rows().upload_failed, 1);
     bad.flush().await.unwrap();
 }
 
@@ -404,10 +402,10 @@ async fn dataset_flush_retains_pending_rows_when_registration_fails() {
         .await
         .unwrap();
     let dataset = client
-        .project("p")
         .dataset_builder()
         .await
         .unwrap()
+        .project_name("p")
         .dataset_name("d")
         .build()
         .unwrap();
@@ -493,9 +491,8 @@ async fn a_project_submitted_after_a_sibling_429_delivers_before_the_retry() {
         .mount(&server)
         .await;
     accept(&server).await;
-    let client = client(&server);
-    let throttled = client.project("throttled-project");
-    let healthy = client.project("healthy-project");
+    let throttled = client(&server);
+    let healthy = client(&server);
     throttled.log_rows_with_credentials(
         "token",
         "same-org",
