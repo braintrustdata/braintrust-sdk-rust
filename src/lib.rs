@@ -14,6 +14,7 @@ mod logs3;
 mod operation;
 mod project;
 mod resolution;
+mod runtime;
 mod scheduler;
 mod service;
 mod span;
@@ -66,6 +67,7 @@ pub use types::{
     SpanObjectType, SpanType, Usage, UsageMetrics,
 };
 
-pub use service::{configure_service, ServiceConfig, ServiceRuntime};
+pub use runtime::ServiceRuntime;
+pub use service::{configure_service, ServiceConfig};
 
 pub use project::Project;

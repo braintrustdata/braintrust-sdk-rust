@@ -1,15 +1,14 @@
-//! Process-wide executor and resources; facades never own a runtime.
-use crate::{operation::dedicated, BraintrustError, Result};
+//! Process-wide SDK configuration.
+use crate::{BraintrustError, Result, ServiceRuntime};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::runtime::{Handle, Id as RuntimeId};
 
 /// Process-wide SDK limits. Configure before constructing the first SDK facade.
 /// Additional process and organization budgets are opt-in.
 /// Per-client retained work remains bounded by its configured queue capacity.
 #[derive(Clone, Debug, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct ServiceConfig {
     /// Maximum simultaneous SDK HTTP requests across every client, including
     /// uploads and API calls. Defaults to `BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS`
@@ -18,8 +17,6 @@ pub struct ServiceConfig {
     pub max_concurrent_requests: usize,
     /// Maximum retained rows across all clients, including in-flight work.
     pub max_rows: Option<usize>,
-    /// Maximum estimated retained payload bytes across all clients.
-    pub max_bytes: Option<usize>,
     /// Maximum retained rows for one organization across client facades.
     pub max_org_rows: Option<usize>,
     /// Maximum entries in each shared project and server-capability cache.
@@ -33,35 +30,6 @@ pub struct ServiceConfig {
     pub runtime: ServiceRuntime,
 }
 
-/// Where the SDK runs its work.
-///
-/// The SDK selects one runtime when the process first uses the service.
-/// The selected runtime must have I/O and timers enabled. Keep driving a
-/// current-thread runtime until its SDK work finishes. If the selected
-/// application runtime shuts down, the SDK moves pending rows to its own thread.
-/// In-flight operations can fail with [`crate::ExecutionError::WorkerLost`].
-#[derive(Clone, Debug, Default)]
-#[non_exhaustive]
-pub enum ServiceRuntime {
-    /// The default: use the runtime current at first use, or start the SDK's
-    /// own runtime if there is none.
-    #[default]
-    Current,
-    /// Everything runs on the SDK's own single-threaded runtime on a dedicated thread.
-    Dedicated,
-    /// Everything runs on a runtime the application provides and keeps running.
-    Handle(Handle),
-}
-impl PartialEq for ServiceRuntime {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Current, Self::Current) | (Self::Dedicated, Self::Dedicated) => true,
-            (Self::Handle(a), Self::Handle(b)) => a.id() == b.id(),
-            _ => false,
-        }
-    }
-}
-impl Eq for ServiceRuntime {}
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -74,12 +42,10 @@ fn default_max_concurrent_requests() -> usize {
         .filter(|v| (1..=tokio::sync::Semaphore::MAX_PERMITS).contains(v))
         .unwrap_or(8)
 }
-static CONFIG: Mutex<Option<ServiceConfig>> = Mutex::new(None);
-static SERVICE: OnceLock<std::result::Result<Service, String>> = OnceLock::new();
+static CONFIG: OnceLock<ServiceConfig> = OnceLock::new();
 
-/// Set process-wide limits before the first SDK client or uploader is built.
-/// The service initializes on first use. Setting configuration alone does not
-/// start it or select the current runtime.
+/// Set SDK configuration before the first client or uploader is used.
+/// Configuration is applied on first use without starting the SDK immediately.
 /// Repeating identical configuration is allowed. Conflicting configuration fails.
 pub fn configure_service(config: ServiceConfig) -> Result<()> {
     if config.max_concurrent_requests == 0
@@ -91,64 +57,25 @@ pub fn configure_service(config: ServiceConfig) -> Result<()> {
             "service concurrency, cache capacity, and preparation timeout must be positive and supported".into(),
         ));
     }
-    let mut configured = CONFIG.lock().unwrap();
-    if let Some(existing) = configured.as_ref() {
-        if existing != &config {
-            return Err(BraintrustError::InvalidConfig(
-                "SDK service configuration is already fixed".into(),
-            ));
-        }
-    } else {
-        *configured = Some(config);
+    if CONFIG.get_or_init(|| config.clone()) != &config {
+        return Err(BraintrustError::InvalidConfig(
+            "SDK service configuration is already fixed".into(),
+        ));
     }
     Ok(())
 }
 
+pub(crate) fn config() -> &'static ServiceConfig {
+    CONFIG.get_or_init(ServiceConfig::default)
+}
+
 pub(crate) struct Service {
-    runtime: Executor,
     pub engine: Arc<crate::log_queue::engine::Engine>,
     pub attempts: Arc<crate::scheduler::Scheduler>,
     pub config: ServiceConfig,
     pub projects: crate::resolution::Cache<crate::resolution::ProjectKey, String>,
     pub capabilities: crate::resolution::Cache<crate::resolution::CapabilityKey, (usize, bool)>,
 }
-/// One selected runtime with a dedicated fallback after shutdown.
-struct Executor {
-    primary: Option<Handle>,
-    stopped: Arc<AtomicBool>,
-}
-
-struct RuntimeLifetime(Arc<AtomicBool>);
-
-impl Drop for RuntimeLifetime {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
-impl Executor {
-    fn new(config: &ServiceRuntime) -> std::result::Result<Self, String> {
-        let primary = match config {
-            ServiceRuntime::Current => Handle::try_current().ok(),
-            ServiceRuntime::Dedicated => None,
-            ServiceRuntime::Handle(handle) => Some(handle.clone()),
-        };
-        let stopped = Arc::new(AtomicBool::new(false));
-        if let Some(handle) = &primary {
-            // Capture the guard before spawning so it also drops if the
-            // chosen runtime shuts down before the task is first polled.
-            let lifetime = RuntimeLifetime(stopped.clone());
-            handle.spawn(async move {
-                let _lifetime = lifetime;
-                std::future::pending::<()>().await;
-            });
-        } else {
-            dedicated()?;
-        }
-        Ok(Self { primary, stopped })
-    }
-}
-
 impl std::ops::Deref for Service {
     type Target = crate::log_queue::engine::Engine;
     fn deref(&self) -> &Self::Target {
@@ -156,63 +83,33 @@ impl std::ops::Deref for Service {
     }
 }
 impl Service {
-    pub fn runtime_handle(&self) -> Option<Handle> {
-        if !self.runtime.stopped.load(Ordering::Acquire) {
-            if let Some(handle) = &self.runtime.primary {
-                return Some(handle.clone());
-            }
-        }
-        dedicated().ok()
-    }
-
-    pub fn runtime_stopped(&self, id: RuntimeId) {
-        if self
-            .runtime
-            .primary
-            .as_ref()
-            .is_some_and(|handle| handle.id() == id)
-        {
-            self.runtime.stopped.store(true, Ordering::Release);
-        }
-    }
-
     pub fn spawn_operation<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.runtime_handle()
-            .unwrap_or_else(|| panic!("no Tokio runtime is available for SDK work"))
+        crate::runtime::handle()
+            .expect("SDK runtime is available")
             .spawn(future)
     }
 }
-/// The service, if it has been started, without starting it.
-pub(crate) fn started() -> Option<&'static Service> {
-    SERVICE.get()?.as_ref().ok()
-}
 pub(crate) fn global() -> Result<&'static Service> {
-    let service = SERVICE
-        .get_or_init(|| {
-            let config = {
-                let mut configured = CONFIG.lock().unwrap();
-                configured
-                    .get_or_insert_with(ServiceConfig::default)
-                    .clone()
-            };
-            let engine = Arc::new(crate::log_queue::engine::Engine::new(config.clone()));
-            let cache_capacity = config.max_cached_resolutions;
-            Ok(Service {
-                runtime: Executor::new(&config.runtime)?,
-                engine,
-                attempts: crate::scheduler::Scheduler::new(config.max_concurrent_requests),
-                config,
-                projects: crate::resolution::Cache::new(cache_capacity),
-                capabilities: crate::resolution::Cache::new(cache_capacity),
-            })
-        })
-        .as_ref()
-        .map_err(|error| BraintrustError::Background(error.clone()))?;
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| service.engine.start_jobs());
-    Ok(service)
+    static SERVICE: OnceLock<Service> = OnceLock::new();
+    if let Some(service) = SERVICE.get() {
+        return Ok(service);
+    }
+    crate::runtime::handle()?;
+    Ok(SERVICE.get_or_init(|| {
+        let config = config().clone();
+        let cache_capacity = config.max_cached_resolutions;
+        let engine = Arc::new(crate::log_queue::engine::Engine::new(config.clone()));
+        engine.start_jobs();
+        Service {
+            engine,
+            attempts: crate::scheduler::Scheduler::new(config.max_concurrent_requests),
+            config,
+            projects: crate::resolution::Cache::new(cache_capacity),
+            capabilities: crate::resolution::Cache::new(cache_capacity),
+        }
+    }))
 }

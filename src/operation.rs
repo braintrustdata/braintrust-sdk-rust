@@ -42,11 +42,8 @@ where
     E: From<ExecutionError> + Send + 'static,
 {
     let (sender, mut completion) = Completion::pair();
-    match crate::service::global()
-        .ok()
-        .and_then(crate::service::Service::runtime_handle)
-    {
-        Some(runtime) => {
+    match crate::runtime::handle() {
+        Ok(runtime) => {
             let panic = completion.panic_slot();
             runtime.spawn(async move {
                 match std::panic::AssertUnwindSafe(operation).catch_unwind().await {
@@ -58,7 +55,7 @@ where
                 }
             });
         }
-        None => completion.record_issuance(Err(ExecutionError::WorkerLost.into())),
+        Err(_) => completion.record_issuance(Err(ExecutionError::WorkerLost.into())),
     }
     completion
 }

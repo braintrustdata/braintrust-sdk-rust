@@ -174,8 +174,8 @@ fn named_runtime(name: &str) -> Runtime {
 #[test]
 #[ignore = "executed in an isolated subprocess"]
 fn current_runtime_child() {
-    // Setting limits outside Tokio must not initialize a dedicated runtime.
-    configure_service(ServiceConfig::builder().max_concurrent_requests(2).build()).unwrap();
+    // Configuring outside Tokio must not initialize a dedicated runtime.
+    configure_service(ServiceConfig::default()).unwrap();
     let fixture = Fixture::new();
     let app = named_runtime("app-runtime");
     let client = app.block_on(async { fixture.client() });

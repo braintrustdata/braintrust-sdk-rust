@@ -407,29 +407,6 @@ impl SubmitCommand {
             }
         }
     }
-    pub(crate) fn estimated_bytes(&self) -> usize {
-        // The serializer counts bytes without allocating a second encoded payload.
-        struct Count(usize);
-        impl std::io::Write for Count {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 = self.0.saturating_add(bytes.len());
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut count = Count(std::mem::size_of::<Self>());
-        match &self.item {
-            QueuedItem::Row { row, .. } => {
-                let _ = serde_json::to_writer(&mut count, row);
-            }
-            QueuedItem::Span { payload, .. } => {
-                let _ = serde_json::to_writer(&mut count, payload);
-            }
-        }
-        count.0
-    }
 }
 
 /// A scoped facade over the process-wide delivery service.

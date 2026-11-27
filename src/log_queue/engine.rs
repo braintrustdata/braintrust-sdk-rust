@@ -1,5 +1,5 @@
 //! One intake and dispatcher for every facade. Observation and routing are independent.
-use super::dispatch::Report;
+use super::dispatch::{Outcome, Report};
 use super::{
     observation::Observation,
     queue::{Credential, LogQueueCore, PartitionDestination, SubmitCommand},
@@ -44,7 +44,6 @@ struct Entry {
 type WriteSender = oneshot::Sender<Result<DeliveryReceipt, WriteError>>;
 struct Record {
     observer: Arc<Observation>,
-    bytes: usize,
     route: OrgKey,
     sender: Option<WriteSender>,
 }
@@ -52,7 +51,6 @@ struct Record {
 struct Intake {
     sequence: u64,
     records: HashMap<u64, Record>,
-    bytes: usize,
     partitions: HashMap<Key, Partition>,
     org_rows: HashMap<OrgKey, usize>,
 }
@@ -85,16 +83,11 @@ impl Engine {
     }
     /// Start a job for a partition made ready by submission or retirement.
     fn schedule(&self, key: Key) {
-        let Some((engine, service)) = self
-            .this
-            .get()
-            .and_then(Weak::upgrade)
-            .zip(crate::service::started())
-        else {
+        let Some(engine) = self.this.get().and_then(Weak::upgrade) else {
             return;
         };
         // Leave the queued rows in place if no runtime can accept them.
-        let Some(runtime) = service.runtime_handle() else {
+        let Ok(runtime) = crate::runtime::handle() else {
             tracing::error!("no runtime can run SDK delivery");
             return;
         };
@@ -138,20 +131,16 @@ impl Engine {
         let prepared: Vec<_> = commands
             .into_iter()
             .map(|(command, sender)| {
-                let bytes = self
-                    .config
-                    .max_bytes
-                    .map_or(0, |_| command.estimated_bytes());
                 let route = command.partition();
                 let destination = command.destination();
-                (command, bytes, route, destination, sender)
+                (command, route, destination, sender)
             })
             .collect();
         let mut rejected = Vec::new();
         let mut results = Vec::new();
         let mut ready = Vec::new();
         let mut intake = self.intake.lock().unwrap();
-        for (command, bytes, (credential, org, org_name), destination, sender) in prepared {
+        for (command, (credential, org, org_name), destination, sender) in prepared {
             let (endpoint, org_name) = core.route(&org, org_name.as_deref());
             let route = OrgKey {
                 endpoint,
@@ -174,10 +163,6 @@ impl Engine {
                     .config
                     .max_rows
                     .is_some_and(|max| intake.records.len() >= max)
-                || self
-                    .config
-                    .max_bytes
-                    .is_some_and(|max| intake.bytes.saturating_add(bytes) > max)
                 || self
                     .config
                     .max_org_rows
@@ -212,7 +197,6 @@ impl Engine {
                 sequence,
                 Record {
                     observer: core.observation.clone(),
-                    bytes,
                     route: key.route.clone(),
                     sender,
                 },
@@ -226,7 +210,6 @@ impl Engine {
                 command,
                 sequence,
             });
-            intake.bytes = intake.bytes.saturating_add(bytes);
         }
         drop(intake);
         for (command, sender, error) in rejected {
@@ -247,7 +230,6 @@ impl Engine {
     }
     fn retire(intake: &mut Intake, sequence: u64) -> Option<Record> {
         let record = intake.records.remove(&sequence)?;
-        intake.bytes = intake.bytes.saturating_sub(record.bytes);
         if let Some(rows) = intake.org_rows.get_mut(&record.route) {
             *rows -= 1;
             if *rows == 0 {
@@ -409,7 +391,7 @@ impl Job {
             job.report.settle_delivered();
             let error = anyhow::anyhow!("delivery partition panicked");
             for index in 0..count {
-                if !job.report.settled[index] {
+                if matches!(job.report.outcomes[index], Outcome::Pending) {
                     job.report.failed(vec![index], &error, true);
                 }
             }
@@ -434,12 +416,10 @@ impl Drop for Job {
         let entries = std::mem::take(&mut self.entries);
         let mut report = std::mem::replace(&mut self.report, Report::new(0));
         report.settle_delivered();
-        if let (Some(runtime), true) = (self.runtime, report.settled.contains(&false)) {
+        if let Some(runtime) = self.runtime.filter(|_| report.has_pending()) {
             // Only a runtime shutting down drops an unfinished job. Move its
             // work now rather than spawning it there again.
-            if let Some(service) = crate::service::started() {
-                service.runtime_stopped(runtime);
-            }
+            crate::runtime::mark_stopped(runtime);
         }
         let engine = &self.engine;
         let mut intake = engine.intake.lock().unwrap_or_else(PoisonError::into_inner);
@@ -459,18 +439,20 @@ impl Drop for Job {
         let mut writes = Vec::new();
         let mut requeue = Vec::new();
         let mut discarded = Vec::new();
-        for ((entry, error), settled) in entries.into_iter().zip(report.errors).zip(report.settled)
-        {
-            if !settled {
-                if intake.records.contains_key(&entry.sequence) {
-                    requeue.push(entry);
-                } else {
-                    discarded.push(entry);
+        for (entry, outcome) in entries.into_iter().zip(report.outcomes) {
+            let error = match outcome {
+                Outcome::Pending => {
+                    if intake.records.contains_key(&entry.sequence) {
+                        requeue.push(entry);
+                    } else {
+                        discarded.push(entry);
+                    }
+                    continue;
                 }
-                continue;
-            }
+                Outcome::Delivered => None,
+                Outcome::Failed(error) => Some(error.write_error()),
+            };
             if let Some(record) = Engine::retire(&mut intake, entry.sequence) {
-                let error = error.as_ref().map(|e| e.write_error());
                 record
                     .observer
                     .retire(entry.sequence, error.as_ref(), &mut signals);
@@ -537,14 +519,6 @@ mod tests {
         assert_eq!(b.dropped_rows().queue_full, 1);
         assert_eq!(a.core.observation.len(), 2);
         assert_eq!(b.core.observation.len(), 0);
-    }
-    #[test]
-    fn the_byte_limit_rejects_rows_that_would_exceed_it() {
-        let engine = Engine::new(ServiceConfig::builder().max_bytes(1).build());
-        let a = queue();
-        engine.submit(a.core.clone(), SubmitCommand::test_row("oversized"));
-        assert_eq!(engine.intake.lock().unwrap().bytes, 0);
-        assert_eq!(a.dropped_rows().queue_full, 1);
     }
     #[tokio::test]
     async fn barriers_cover_only_work_accepted_before_them() {
@@ -687,7 +661,7 @@ mod tests {
         x.await.unwrap();
         y.await.unwrap();
         let state = engine.intake.lock().unwrap();
-        assert_eq!((state.records.len(), state.bytes), (0, 0));
+        assert!(state.records.is_empty());
         assert!(state.org_rows.is_empty() && state.partitions.is_empty());
     }
 

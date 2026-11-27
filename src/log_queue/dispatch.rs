@@ -22,12 +22,18 @@ pub(super) struct Loss {
 }
 type BatchSubmissions = Arc<[Vec<usize>]>;
 
+#[derive(Clone)]
+pub(super) enum Outcome {
+    Pending,
+    Delivered,
+    Failed(DeliveryError),
+}
+
 /// Outcomes recorded as a job progresses, so a job that is dropped part-way
 /// can requeue exactly the submissions that have no outcome yet.
 pub(super) struct Report {
-    pub errors: Vec<Option<DeliveryError>>,
+    pub outcomes: Vec<Outcome>,
     pub losses: Vec<Loss>,
-    pub settled: Vec<bool>,
     /// Batches being uploaded: each row's submissions in batch order, and how
     /// many leading rows have been delivered so far.
     pub uploads: Vec<(BatchSubmissions, Arc<AtomicUsize>)>,
@@ -35,9 +41,8 @@ pub(super) struct Report {
 impl Report {
     pub fn new(count: usize) -> Self {
         Self {
-            errors: vec![None; count],
+            outcomes: vec![Outcome::Pending; count],
             losses: Vec::new(),
-            settled: vec![false; count],
             uploads: Vec::new(),
         }
     }
@@ -53,19 +58,30 @@ impl Report {
     }
     pub fn settle(&mut self, submissions: impl IntoIterator<Item = usize>) {
         for index in submissions {
-            self.settled[index] = true;
+            if matches!(self.outcomes[index], Outcome::Pending) {
+                self.outcomes[index] = Outcome::Delivered;
+            }
         }
     }
     pub fn failed(&mut self, submissions: Vec<usize>, error: &anyhow::Error, preparation: bool) {
         let error = DeliveryError::from_error(error);
-        for index in &submissions {
-            self.errors[*index] = Some(error.clone());
-            self.settled[*index] = true;
-        }
+        self.fail_submissions(&submissions, &error);
         self.losses.push(Loss {
             submissions,
             preparation,
         });
+    }
+
+    fn fail_submissions(&mut self, submissions: &[usize], error: &DeliveryError) {
+        for &index in submissions {
+            self.outcomes[index] = Outcome::Failed(error.clone());
+        }
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Pending))
     }
 }
 
@@ -221,8 +237,8 @@ impl QueueSettings {
             Ok(encoded) => encoded,
             Err(error) => {
                 let error = anyhow::Error::from(error);
-                for i in 0..report.errors.len() {
-                    if report.errors[i].is_none() {
+                for i in 0..report.outcomes.len() {
+                    if matches!(report.outcomes[i], Outcome::Pending) {
                         report.failed(vec![i], &error, true);
                     }
                 }
@@ -283,9 +299,7 @@ impl QueueSettings {
                 // A split may have delivered a prefix. The whole logical batch fails
                 // its checked observers, but only undelivered rows count as lost.
                 for (position, submissions) in rows.iter().enumerate() {
-                    for index in submissions {
-                        report.errors[*index] = Some(failure.clone());
-                    }
+                    report.fail_submissions(submissions, &failure);
                     if position >= delivered {
                         report.losses.push(Loss {
                             submissions: submissions.clone(),
