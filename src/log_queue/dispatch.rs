@@ -6,9 +6,11 @@ use super::observation::DeliveryError;
 use super::queue::{QueueSettings, QueuedItem, SubmitCommand};
 use super::row_key::RowKey;
 use crate::{
-    internal::ingest::{EncodedBatch, EncodedRow},
+    internal::{
+        ingest::{EncodedBatch, EncodedRow},
+        upload::Capabilities,
+    },
     types::Logs3Row,
-    BraintrustError,
 };
 use futures::{stream, StreamExt};
 use indexmap::IndexMap;
@@ -86,45 +88,6 @@ impl Report {
 }
 
 impl QueueSettings {
-    async fn get_version_info(
-        &self,
-        api_url: &Url,
-        token: &str,
-        org_name: Option<&str>,
-    ) -> (usize, bool) {
-        let service = crate::service::global().expect("initialized service");
-        let key = crate::resolution::CapabilityKey {
-            api_url: api_url.to_string(),
-        };
-        // Capabilities belong to the server, and every org waits for the first
-        // lookup, so it must not wait out one org's cooldown.
-        let scope = crate::scheduler::Scope::new(api_url.as_str(), "");
-        let cell = service.capabilities.entry(key);
-        *cell
-            .get_or_try_init(|| async {
-                let api = crate::http::api_client(
-                    &self.client.client(),
-                    api_url.as_str(),
-                    self.app_url.as_str(),
-                    token,
-                    org_name,
-                )?;
-                let version = crate::internal::upload::scheduled(scope, 0, || api.version())
-                    .await?
-                    .into_inner();
-                let bytes = version.logs3_payload_max_bytes.filter(|n| *n > 0);
-                Ok::<_, BraintrustError>((
-                    bytes.unwrap_or(super::config::DEFAULT_BATCH_MAX_BYTES * 2),
-                    bytes.is_some(),
-                ))
-            })
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error,"failed to fetch ingestion capabilities");
-                &(super::config::DEFAULT_BATCH_MAX_BYTES * 2, false)
-            })
-    }
-
     /// The engine seals a compatible partition before assigning local submission indices.
     /// Commands are borrowed so the engine can requeue them if this job is
     /// dropped before every submission is settled in `report`.
@@ -209,7 +172,17 @@ impl QueueSettings {
         if spans.is_empty() && raw.is_empty() {
             return;
         }
-        let (max_request_size, overflow) = self.get_version_info(&api_url, &token, org_name).await;
+        let client = crate::http::api_client(
+            &self.client.client(),
+            endpoint,
+            self.app_url.as_str(),
+            &token,
+            org_name,
+        );
+        let Capabilities {
+            max_request_size,
+            overflow,
+        } = Capabilities::resolve(client, super::config::DEFAULT_BATCH_MAX_BYTES * 2, None).await;
         let max_bytes = self.config.batch_max_bytes().min(max_request_size / 2);
         let max_items = self.config.batch_max_items();
         let encoded = tokio::task::spawn_blocking(move || {

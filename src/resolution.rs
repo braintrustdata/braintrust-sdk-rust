@@ -78,12 +78,6 @@ pub(crate) struct ProjectKey {
     pub org: OrgIdentity,
     pub project: String,
 }
-/// Ingestion limits are a property of the data-plane endpoint.
-#[derive(Hash, PartialEq, Eq)]
-pub(crate) struct CapabilityKey {
-    pub api_url: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 //! One intake and dispatcher for every facade. Observation and routing are independent.
 use super::dispatch::{Outcome, Report};
 use super::{
-    observation::Observation,
+    observation::{Notification, Observation},
     queue::{Credential, LogQueueCore, PartitionDestination, SubmitCommand},
 };
 use crate::ServiceConfig;
@@ -228,16 +228,6 @@ impl Engine {
         let intake = self.intake.lock().unwrap();
         scope.barrier(intake.sequence, false)
     }
-    fn retire(intake: &mut Intake, sequence: u64) -> Option<Record> {
-        let record = intake.records.remove(&sequence)?;
-        if let Some(rows) = intake.org_rows.get_mut(&record.route) {
-            *rows -= 1;
-            if *rows == 0 {
-                intake.org_rows.remove(&record.route);
-            }
-        }
-        Some(record)
-    }
     pub fn shutdown(
         self: &Arc<Self>,
         scope: &Arc<Observation>,
@@ -278,17 +268,9 @@ impl Engine {
             .map(|(sequence, _)| *sequence)
             .collect();
         let error = WriteError::Execution(ExecutionError::TimedOut);
-        let mut signals = Vec::new();
-        let mut writes = Vec::new();
-        for sequence in &sequences {
-            if let Some(record) = Self::retire(&mut intake, *sequence) {
-                record
-                    .observer
-                    .retire(*sequence, Some(&error), &mut signals);
-                if let Some(sender) = record.sender {
-                    writes.push(sender);
-                }
-            }
+        let mut completed = FinishedWrites::default();
+        for sequence in sequences {
+            completed.retire(&mut intake, sequence, Some(error.clone()));
         }
         let Intake {
             records,
@@ -308,12 +290,7 @@ impl Engine {
         }
         partitions.retain(|_, partition| partition.running || !partition.pending.is_empty());
         drop(intake);
-        for (sender, result) in signals {
-            let _ = sender.send(result);
-        }
-        for sender in writes {
-            let _ = sender.send(Err(error.clone()));
-        }
+        completed.notify();
         drop(discarded);
         self.cancellations.notify_waiters();
     }
@@ -411,6 +388,43 @@ struct Job {
     entries: Vec<Entry>,
     report: Report,
 }
+/// Complete writes under the intake lock, then notify callers after unlocking.
+#[derive(Default)]
+struct FinishedWrites {
+    flushes: Vec<Notification>,
+    writes: Vec<(WriteSender, Result<DeliveryReceipt, WriteError>)>,
+}
+
+impl FinishedWrites {
+    fn retire(&mut self, intake: &mut Intake, sequence: u64, error: Option<WriteError>) {
+        let Some(record) = intake.records.remove(&sequence) else {
+            return;
+        };
+        if let Some(rows) = intake.org_rows.get_mut(&record.route) {
+            *rows -= 1;
+            if *rows == 0 {
+                intake.org_rows.remove(&record.route);
+            }
+        }
+        record
+            .observer
+            .retire(sequence, error.as_ref(), &mut self.flushes);
+        if let Some(sender) = record.sender {
+            self.writes
+                .push((sender, error.map_or(Ok(DeliveryReceipt::new()), Err)));
+        }
+    }
+
+    fn notify(self) {
+        for (sender, result) in self.flushes {
+            let _ = sender.send(result);
+        }
+        for (sender, result) in self.writes {
+            let _ = sender.send(result);
+        }
+    }
+}
+
 impl Drop for Job {
     fn drop(&mut self) {
         let entries = std::mem::take(&mut self.entries);
@@ -435,8 +449,7 @@ impl Drop for Job {
                 }
             }
         }
-        let mut signals = Vec::new();
-        let mut writes = Vec::new();
+        let mut completed = FinishedWrites::default();
         let mut requeue = Vec::new();
         let mut discarded = Vec::new();
         for (entry, outcome) in entries.into_iter().zip(report.outcomes) {
@@ -452,14 +465,7 @@ impl Drop for Job {
                 Outcome::Delivered => None,
                 Outcome::Failed(error) => Some(error.write_error()),
             };
-            if let Some(record) = Engine::retire(&mut intake, entry.sequence) {
-                record
-                    .observer
-                    .retire(entry.sequence, error.as_ref(), &mut signals);
-                if let Some(sender) = record.sender {
-                    writes.push((sender, error.map_or(Ok(DeliveryReceipt::new()), Err)));
-                }
-            }
+            completed.retire(&mut intake, entry.sequence, error);
             discarded.push(entry);
         }
         let partition = intake
@@ -477,12 +483,7 @@ impl Drop for Job {
         }
         drop(intake);
         drop(discarded);
-        for (sender, result) in signals {
-            let _ = sender.send(result);
-        }
-        for (sender, result) in writes {
-            let _ = sender.send(result);
-        }
+        completed.notify();
         if ready {
             engine.schedule(self.key.clone());
         }

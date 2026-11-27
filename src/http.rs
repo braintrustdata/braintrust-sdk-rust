@@ -303,6 +303,16 @@ cb0bfZ7fHHs=
 -----END CERTIFICATE-----
 "#;
 
+    #[test]
+    fn pools_are_reused_only_for_matching_transport_profiles() {
+        let timeout = Duration::from_secs(3);
+        let first = build_http_client(timeout, None, Some("pool-test")).unwrap();
+        let same = build_http_client(timeout, None, Some("pool-test")).unwrap();
+        let different = build_http_client(timeout, None, Some("other-pool-test")).unwrap();
+        assert!(Arc::ptr_eq(&first.pool, &same.pool));
+        assert!(!Arc::ptr_eq(&first.pool, &different.pool));
+    }
+
     pub(crate) fn write_temp_bundle(contents: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "braintrust-sdk-rust-ca-bundle-{}.pem",
