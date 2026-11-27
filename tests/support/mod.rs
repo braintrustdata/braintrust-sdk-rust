@@ -15,3 +15,9 @@ pub fn use_dedicated_runtime() {
         .expect("configure the integration test SDK runtime");
     });
 }
+
+/// Start the mock API after configuring the process-wide SDK runtime.
+pub async fn mock_server() -> wiremock::MockServer {
+    use_dedicated_runtime();
+    wiremock::MockServer::start().await
+}

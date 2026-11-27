@@ -7,13 +7,12 @@ use braintrust_sdk_rust::{
 use serde_json::json;
 use wiremock::{
     matchers::{method, path},
-    Mock, MockServer, ResponseTemplate,
+    Mock, ResponseTemplate,
 };
 
 #[tokio::test]
 async fn high_level_operations_work_from_a_plain_sync_thread() {
-    support::use_dedicated_runtime();
-    let server = MockServer::start().await;
+    let server = support::mock_server().await;
     for (route, response) in [
         (
             "/api/apikey/login",
