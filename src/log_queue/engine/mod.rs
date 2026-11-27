@@ -11,20 +11,22 @@ use self::{
 use super::{core::LogQueueCore, observation::Observation, submission::SubmitCommand};
 use crate::{
     Completion, DeliveryReceipt, EnqueueError, ExecutionError, FlushError, FlushReport,
-    ShutdownError, ShutdownReport, WriteError,
+    ServiceConfig, ShutdownError, ShutdownReport, WriteError,
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 pub(crate) struct Engine {
+    config: ServiceConfig,
     intake: Mutex<Intake>,
     cancellations: Notify,
     #[cfg(test)]
     manual: bool,
 }
 impl Engine {
-    pub fn new() -> Self {
+    pub fn new(config: ServiceConfig) -> Self {
         Self {
+            config,
             intake: Mutex::new(Intake::default()),
             cancellations: Notify::new(),
             #[cfg(test)]
@@ -32,10 +34,10 @@ impl Engine {
         }
     }
     #[cfg(test)]
-    fn manual() -> Arc<Self> {
+    fn manual(config: ServiceConfig) -> Arc<Self> {
         Arc::new(Self {
             manual: true,
-            ..Self::new()
+            ..Self::new(config)
         })
     }
 
@@ -101,7 +103,17 @@ impl Engine {
         for (command, key, sender) in prepared {
             let client_rows = core.observation.len();
             let closed = core.observation.closed();
-            if closed || client_rows >= core.settings.config.queue_max_size() {
+            if closed
+                || self
+                    .config
+                    .max_rows
+                    .is_some_and(|max| intake.records.len() >= max)
+                || self
+                    .config
+                    .max_org_rows
+                    .is_some_and(|max| intake.org_rows.get(&key.route).copied().unwrap_or(0) >= max)
+                || client_rows >= core.settings.config.queue_max_size()
+            {
                 let error = if closed {
                     EnqueueError::Closed
                 } else {
@@ -115,11 +127,13 @@ impl Engine {
             let sequence = intake.sequence;
             core.observation.accept(sequence);
             core.retained(client_rows + 1);
+            *intake.org_rows.entry(key.route.clone()).or_default() += 1;
             results.push(Ok(()));
             intake.records.insert(
                 sequence,
                 Record {
                     observer: core.observation.clone(),
+                    route: key.route.clone(),
                     sender,
                 },
             );

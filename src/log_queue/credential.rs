@@ -5,8 +5,10 @@ use std::sync::Arc;
 /// Supplies the bearer token for queued uploads when they are sent.
 ///
 /// The queue calls [`TokenProvider::token`] on the SDK service's runtime. Cache
-/// tokens that are expensive to mint. Failed calls are retried like an upload.
-/// Once retries run out, rows waiting on the provider are counted in [`crate::DroppedRows::upload_failed`].
+/// tokens that are expensive to mint. Each
+/// call is bounded by [`crate::ServiceConfig::token_provider_timeout`], and a
+/// failed call is retried like an upload. Once retries run out, the rows
+/// waiting on it are dropped and counted in [`crate::DroppedRows::upload_failed`].
 #[async_trait::async_trait]
 pub trait TokenProvider: Send + Sync {
     /// Return the token for the next upload.
@@ -48,11 +50,14 @@ impl Credential {
     pub(crate) async fn token(&self) -> std::result::Result<Cow<'_, str>, anyhow::Error> {
         match self {
             Self::Token(token) => Ok(Cow::Borrowed(token.as_ref())),
-            Self::Provider(provider) => provider
-                .token()
-                .await
-                .map(Cow::Owned)
-                .map_err(|error| anyhow::anyhow!("token provider failed: {error}")),
+            Self::Provider(provider) => tokio::time::timeout(
+                crate::service::config().token_provider_timeout,
+                provider.token(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("token provider timed out"))?
+            .map(Cow::Owned)
+            .map_err(|error| anyhow::anyhow!("token provider failed: {error}")),
         }
     }
 }

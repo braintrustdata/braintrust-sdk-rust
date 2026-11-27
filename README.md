@@ -118,14 +118,17 @@ let usage = extract_anthropic_usage(&anthropic_response);
 ## Service configuration
 
 Call `configure_service` before creating your first SDK client or bulk uploader.
-Use `ServiceConfig` to set process-wide request concurrency or select the
-Tokio runtime for SDK work.
+Use `ServiceConfig` to set process-wide request concurrency, limit how many
+pending rows the SDK holds across all clients or per organization, or select
+the Tokio runtime for SDK work.
 
 ```rust,no_run
 use braintrust_sdk_rust::{configure_service, ServiceConfig};
 
 configure_service(ServiceConfig::builder()
     .max_concurrent_requests(8)
+    .max_rows(100_000)
+    .max_org_rows(10_000)
     .build())?;
 # Ok::<(), braintrust_sdk_rust::BraintrustError>(())
 ```
