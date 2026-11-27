@@ -12,6 +12,7 @@ mod log_queue;
 mod logger;
 mod logs3;
 mod operation;
+mod resolution;
 mod runtime;
 mod service;
 mod span;

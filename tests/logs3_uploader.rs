@@ -221,3 +221,56 @@ async fn uploader_does_not_retry_malformed_overflow_responses() {
         braintrust_sdk_rust::BraintrustError::Api { status: 200, .. }
     ));
 }
+
+#[tokio::test]
+async fn queue_and_bulk_uploads_share_successful_capability_lookups() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/version"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "logs3_payload_max_bytes": 512,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let uploader = Logs3BatchUploader::new(server.uri(), "bulk-key", None).unwrap();
+    assert_eq!(
+        uploader
+            .upload_rows(&[make_row("fallback", 16)], 10)
+            .await
+            .unwrap()
+            .rows_uploaded,
+        1
+    );
+    let client = braintrust_sdk_rust::BraintrustClient::builder()
+        .api_url(server.uri())
+        .app_url(server.uri())
+        .build_without_login()
+        .unwrap();
+    client.log_rows_with_credentials("queue-key", "queue-org", None, [make_row("queued", 16)]);
+    client.flush().await.unwrap();
+    let retried = uploader
+        .upload_rows(&[make_row("cached-a", 64), make_row("cached-b", 64)], 10)
+        .await
+        .unwrap();
+    assert_eq!(retried.rows_uploaded, 2);
+    assert_eq!(
+        retried.requests_sent, 2,
+        "use the server limit resolved by the queue"
+    );
+}

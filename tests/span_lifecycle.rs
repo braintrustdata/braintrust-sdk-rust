@@ -824,3 +824,40 @@ fn usage_extractors_return_expected_metrics() {
     assert_eq!(anthropic_usage.completion_tokens(), Some(7));
     assert_eq!(anthropic_usage.total_tokens(), Some(10));
 }
+
+#[tokio::test]
+async fn clients_share_project_resolution_within_an_organization() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/project/register"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"resolved"}})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let make_client = || {
+        BraintrustClient::builder()
+            .app_url(server.uri())
+            .api_url(server.uri())
+            .checked_delivery(true)
+            .build_without_login()
+            .unwrap()
+    };
+    let (a, b) = (make_client(), make_client());
+    for (client, token) in [(&a, "key-a"), (&b, "key-b")] {
+        client
+            .span_builder_with_credentials(token, "org")
+            .project_name("same")
+            .build()
+            .end();
+    }
+    let (first, second) = tokio::join!(a.flush(), b.flush());
+    first.unwrap();
+    second.unwrap();
+}
