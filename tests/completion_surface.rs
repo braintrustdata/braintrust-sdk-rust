@@ -1,5 +1,7 @@
 mod support;
 
+use support::MockServer;
+
 use braintrust_sdk_rust::{
     eval::{Case, Dataset, Scorer, ScorerArgs, SimpleAsyncFnTask, Task, TaskHooks},
     BraintrustClient, DatasetInsert, Logs3BatchUploader, ParentSpanInfo,
@@ -12,7 +14,7 @@ use wiremock::{
 
 #[tokio::test]
 async fn high_level_operations_work_from_a_plain_sync_thread() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     for (route, response) in [
         (
             "/api/apikey/login",

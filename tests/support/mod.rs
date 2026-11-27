@@ -12,8 +12,20 @@ pub fn use_dedicated_runtime() {
     .expect("configure the integration test SDK runtime");
 }
 
-/// Start the mock API after configuring the process-wide SDK runtime.
-pub async fn mock_server() -> wiremock::MockServer {
-    use_dedicated_runtime();
-    wiremock::MockServer::start().await
+/// A Wiremock server whose startup configures the integration test SDK runtime.
+pub struct MockServer(wiremock::MockServer);
+
+impl MockServer {
+    pub async fn start() -> Self {
+        use_dedicated_runtime();
+        Self(wiremock::MockServer::start().await)
+    }
+}
+
+impl std::ops::Deref for MockServer {
+    type Target = wiremock::MockServer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }

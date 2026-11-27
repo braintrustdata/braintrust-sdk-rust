@@ -1,5 +1,7 @@
 mod support;
 
+use support::MockServer;
+
 use braintrust_sdk_rust::{
     extract_anthropic_usage, extract_openai_usage, BraintrustClient, ParentSpanInfo,
     SpanComponents, SpanLog, SpanObjectType, SpanOrigin,
@@ -12,7 +14,7 @@ const INTERNAL_OVERRIDE_PAGINATION_KEY_FIELD: &str = "_bt_internal_override_pagi
 
 #[tokio::test]
 async fn span_lifecycle_flushes_to_logs_endpoint() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/project/register"))
@@ -74,7 +76,7 @@ async fn span_lifecycle_flushes_to_logs_endpoint() {
 
 #[tokio::test]
 async fn client_update_span_uses_exported_ids_for_project_logs() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/logs3"))
@@ -147,7 +149,7 @@ async fn client_update_span_uses_exported_ids_for_project_logs() {
 
 #[tokio::test]
 async fn client_update_span_with_credentials_works_without_priming_login_state() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/logs3"))
@@ -211,7 +213,7 @@ async fn client_update_span_with_credentials_works_without_priming_login_state()
 
 #[tokio::test]
 async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/logs3"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
@@ -296,7 +298,7 @@ async fn client_update_span_skip_span_origin_preserves_only_explicit_context() {
 
 #[tokio::test]
 async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/logs3"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
@@ -371,7 +373,7 @@ async fn span_handle_skip_span_origin_persists_through_logs_and_end() {
 
 #[tokio::test]
 async fn client_update_span_includes_exported_span_parents() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/logs3"))
@@ -430,7 +432,7 @@ async fn client_update_span_includes_exported_span_parents() {
 
 #[tokio::test]
 async fn client_update_span_with_credentials_includes_exported_span_parents() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/logs3"))
@@ -490,7 +492,7 @@ async fn client_update_span_with_credentials_includes_exported_span_parents() {
 
 #[tokio::test]
 async fn client_update_span_with_credentials_inherits_exported_propagated_event() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/logs3"))
@@ -623,7 +625,7 @@ async fn client_update_span_with_credentials_inherits_exported_propagated_event(
 
 #[tokio::test]
 async fn child_span_inherits_parent_propagated_event() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/logs3"))
@@ -724,7 +726,7 @@ async fn child_span_inherits_parent_propagated_event() {
 
 #[tokio::test]
 async fn client_update_span_resolves_project_name_from_exported_compute_metadata_args() {
-    let server = support::mock_server().await;
+    let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/project/register"))
