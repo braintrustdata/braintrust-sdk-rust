@@ -759,6 +759,13 @@ impl LogQueue {
         }
     }
 
+    pub(crate) fn account_closed(&self, count: usize) {
+        self.rejections
+            .drops
+            .queue_full
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
     /// Cumulative counts of discarded rows.
     pub(crate) fn dropped_rows(&self) -> DroppedRows {
         self.rejections.drops.snapshot()
