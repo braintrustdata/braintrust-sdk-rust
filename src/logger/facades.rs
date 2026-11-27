@@ -39,6 +39,7 @@ impl BraintrustClient {
             let inner = Arc::get_mut(&mut client.inner).unwrap();
             inner.login_notify = Arc::new(Notify::new());
             inner.background_login = Arc::default();
+            inner.pending_auth = Arc::default();
             client.perform_login(&state_key, Some(&name)).await?;
             Ok(client)
         })
