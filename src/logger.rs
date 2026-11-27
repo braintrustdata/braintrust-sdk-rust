@@ -800,7 +800,7 @@ impl BraintrustClient {
         rows: impl IntoIterator<Item = Map<String, Value>>,
         mut submit: impl FnMut(Vec<Map<String, Value>>),
     ) {
-        let mut rows = rows.into_iter();
+        let mut rows = rows.into_iter().fuse();
         loop {
             // Run arbitrary caller iterator code outside the admission lock.
             let chunk: Vec<_> = rows.by_ref().take(64).collect();
