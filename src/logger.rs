@@ -25,6 +25,7 @@ use crate::types::{ParentSpanInfo, SpanAttributes, SpanEventData, SpanObjectType
 use backon::{ExponentialBuilder, Retryable};
 
 mod builder;
+mod facades;
 mod login_state;
 mod pending_auth;
 
@@ -660,7 +661,7 @@ impl BraintrustClient {
     /// Create an experiment builder with explicit credentials.
     ///
     /// Credentials travel with this resource without changing the client's login
-    /// state.
+    /// state. Use [`Self::experiment_builder`] for the selected org's credentials.
     ///
     /// # Example
     ///

@@ -12,6 +12,7 @@ mod log_queue;
 mod logger;
 mod logs3;
 mod operation;
+mod project;
 mod resolution;
 mod runtime;
 mod scheduler;
@@ -68,3 +69,5 @@ pub use types::{
 
 pub use runtime::ServiceRuntime;
 pub use service::{configure_service, ServiceConfig};
+
+pub use project::Project;
