@@ -1,11 +1,15 @@
+#[cfg(test)]
 use super::config::LogQueueConfig;
 use crate::types::{Logs3OverflowInputRow, Logs3OverflowInputRowMeta, Logs3Row};
+#[cfg(test)]
 use tracing::warn;
 
 pub(crate) use crate::internal::ingest::EncodedBatch as SerializedBatch;
+#[cfg(test)]
 use crate::internal::ingest::EncodedRow;
 
 /// Encode rows once, then partition using the complete request size.
+#[cfg(test)]
 pub(crate) fn batch_and_serialize_rows(
     rows: Vec<Logs3Row>,
     config: &LogQueueConfig,
@@ -27,33 +31,11 @@ pub(crate) fn batch_and_serialize_rows(
     ))
 }
 
-/// Encode caller-built rows as given, then partition using the complete request size.
-pub(crate) fn batch_and_serialize_maps(
-    rows: Vec<serde_json::Map<String, serde_json::Value>>,
-    config: &LogQueueConfig,
-    batch_max_bytes: usize,
-) -> Result<Vec<SerializedBatch>, anyhow::Error> {
-    let rows = rows
-        .iter()
-        .map(|row| {
-            EncodedRow::from_map(row).map_err(|error| {
-                warn!(%error, "failed to serialize row");
-                error
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(SerializedBatch::partition_by_destination(
-        rows,
-        config.batch_max_items(),
-        batch_max_bytes,
-    ))
-}
-
 /// Build overflow metadata directly from a Logs3Row struct.
 ///
 /// Extracts object IDs from the destination and object_delete flag without
 /// serializing to an intermediate JSON Value representation.
-fn build_overflow_row_from_logs3row(row: &Logs3Row) -> Logs3OverflowInputRow {
+pub(super) fn build_overflow_row_from_logs3row(row: &Logs3Row) -> Logs3OverflowInputRow {
     let mut object_ids = serde_json::Map::new();
 
     // Extract destination fields as object IDs
