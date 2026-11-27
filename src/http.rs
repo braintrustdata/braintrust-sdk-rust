@@ -359,7 +359,19 @@ cb0bfZ7fHHs=
                         break;
                     }
                     request.extend_from_slice(&chunk[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                    let body_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + body_len {
                         break;
                     }
                 }
@@ -369,6 +381,7 @@ cb0bfZ7fHHs=
                     )
                     .await
                     .expect("write test response");
+                stream.shutdown().await.expect("close test connection");
             }
         });
 
