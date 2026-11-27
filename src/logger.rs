@@ -457,7 +457,9 @@ impl BraintrustClient {
         if let Some(org_name) = org_name {
             builder = builder.org_name(org_name);
         }
-        let result = builder.build_with_login().await;
+        let org = crate::resolution::OrgIdentity::new("", org_name, api_key);
+        let scope = crate::scheduler::Scope::new(self.inner.app_url.as_str(), org.scope_key());
+        let result = crate::scheduler::admitted(scope, builder.build_with_login()).await;
         let client = match result {
             Ok(client) => client,
             Err(crate::api::ClientInitError::Login(error)) => {
@@ -480,6 +482,7 @@ impl BraintrustClient {
                 "Login state already set".to_string(),
             ));
         }
+        crate::resolution::remember_org(client.baseurl(), &org.id, &org.name);
         self.inner.login_notify.notify_waiters();
         Ok(())
     }

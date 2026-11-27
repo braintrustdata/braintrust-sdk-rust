@@ -21,6 +21,7 @@ pub struct Logs3BatchUploader {
     api_url: Url,
     api_key: String,
     org_name: Option<String>,
+    org_id: Option<String>,
     max_request_size_override: Option<usize>,
 }
 
@@ -80,6 +81,7 @@ impl Logs3BatchUploader {
             api_url,
             api_key: api_key.into(),
             org_name,
+            org_id: None,
             max_request_size_override: None,
         };
         // Report invalid credentials or URLs here rather than at upload time.
@@ -100,6 +102,15 @@ impl Logs3BatchUploader {
         Ok(UploadCoordinator::new(api, UploadPolicy::Standalone))
     }
 
+    /// Use the organization ID for shared request limits and cooldowns.
+    ///
+    /// Supply the ID when sending for a known organization without logging in
+    /// through the SDK. The configured organization name still routes HTTP requests.
+    pub fn with_organization_id(mut self, id: impl Into<String>) -> Self {
+        self.org_id = Some(id.into());
+        self
+    }
+
     pub fn with_max_request_size_override(mut self, max_bytes: usize) -> Self {
         self.max_request_size_override = Some(max_bytes.max(1));
         self
@@ -115,7 +126,18 @@ impl Logs3BatchUploader {
     ) -> crate::Completion<Logs3UploadResult, BraintrustError> {
         let uploader = self.clone();
         let rows = rows.to_vec();
-        crate::operation::submit(async move {
+        // Requests count against this uploader's org, or its credential when
+        // it has none, like the queue's.
+        let scope = crate::scheduler::Scope::new(
+            self.api_url.as_str(),
+            crate::resolution::OrgIdentity::new(
+                self.org_id.as_deref().unwrap_or_default(),
+                self.org_name.as_deref(),
+                &self.api_key,
+            )
+            .request_scope_key(self.api_url.as_str()),
+        );
+        crate::operation::submit(crate::scheduler::SCOPE.scope(scope, async move {
             if rows.is_empty() {
                 return Ok(Logs3UploadResult::default());
             }
@@ -146,7 +168,7 @@ impl Logs3BatchUploader {
                 result.rows_uploaded += uploaded.rows_uploaded;
             }
             Ok(result)
-        })
+        }))
     }
 }
 

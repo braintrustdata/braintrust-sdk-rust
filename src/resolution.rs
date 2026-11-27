@@ -91,6 +91,55 @@ impl OrgIdentity {
             Self::Credential(token.to_owned())
         }
     }
+    /// A scheduler key, using a canonical ID when login verified an alias.
+    pub fn request_scope_key(&self, endpoint: &str) -> String {
+        if let Self::Name(name) = self {
+            if let Some(id) = org_aliases()
+                .lock()
+                .unwrap()
+                .get(&(endpoint.trim_end_matches('/').to_owned(), name.clone()))
+            {
+                return format!("id:{id}");
+            }
+        }
+        self.scope_key()
+    }
+
+    /// A non-secret label for scheduler scopes.
+    pub fn scope_key(&self) -> String {
+        match self {
+            Self::Id(id) => format!("id:{id}"),
+            Self::Name(name) => format!("name:{name}"),
+            Self::Credential(token) => format!("credential:{:016x}", credential_digest(token)),
+        }
+    }
+}
+type OrgAliases = IndexMap<(String, String), String>;
+
+fn org_aliases() -> &'static Mutex<OrgAliases> {
+    static ALIASES: OnceLock<Mutex<OrgAliases>> = OnceLock::new();
+    ALIASES.get_or_init(|| Mutex::new(IndexMap::new()))
+}
+
+/// Learn aliases only from a successful login response for this endpoint.
+pub(crate) fn remember_org(endpoint: &str, id: &str, name: &str) {
+    const MAX_ALIASES: usize = 256;
+    if id.is_empty() || name.is_empty() {
+        return;
+    }
+    let mut aliases = org_aliases().lock().unwrap();
+    let key = (endpoint.trim_end_matches('/').to_owned(), name.to_owned());
+    aliases.shift_remove(&key);
+    if aliases.len() >= MAX_ALIASES {
+        aliases.shift_remove_index(0);
+    }
+    aliases.insert(key, id.to_owned());
+}
+
+/// Stable within a process. Collisions only merge pauses, never cached values.
+pub(crate) fn credential_digest(token: &str) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault};
+    BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(token)
 }
 /// Project IDs belong to an organization, not to whichever token resolved them,
 /// so rotating credentials reuse earlier registrations.
@@ -119,7 +168,7 @@ pub(crate) fn capabilities(endpoint: &str) -> impl Deref<Target = OnceCell<Optio
     static CAPABILITIES: OnceLock<Cache<String, Option<usize>>> = OnceLock::new();
     CAPABILITIES
         .get_or_init(|| Cache::new(crate::service::config().max_cached_resolutions))
-        .entry(endpoint.to_owned())
+        .entry(endpoint.trim_end_matches('/').to_owned())
 }
 
 #[cfg(test)]
