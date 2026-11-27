@@ -1,3 +1,7 @@
+mod support;
+
+use support::MockServer;
+
 use braintrust_sdk_rust::{
     eval::{Case, Dataset, Scorer, ScorerArgs, SimpleAsyncFnTask, Task, TaskHooks},
     BraintrustClient, DatasetInsert, Logs3BatchUploader, ParentSpanInfo,
@@ -5,7 +9,7 @@ use braintrust_sdk_rust::{
 use serde_json::json;
 use wiremock::{
     matchers::{method, path},
-    Mock, MockServer, ResponseTemplate,
+    Mock, ResponseTemplate,
 };
 
 #[tokio::test]
@@ -203,6 +207,7 @@ impl braintrust_sdk_rust::TokenProvider for BorrowedProvider<'_> {
 
 #[tokio::test]
 async fn extension_traits_preserve_borrowed_async_implementations() {
+    support::use_dedicated_runtime();
     use braintrust_sdk_rust::TokenProvider;
     let client = BraintrustClient::builder().build_without_login().unwrap();
     let span = client.span_builder_with_credentials("key", "org").build();

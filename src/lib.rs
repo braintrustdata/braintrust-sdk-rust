@@ -12,6 +12,8 @@ mod log_queue;
 mod logger;
 mod logs3;
 mod operation;
+mod runtime;
+mod service;
 mod span;
 mod span_components;
 mod stream;
@@ -61,3 +63,6 @@ pub use types::{
     CompletionTokensDetails, InvalidSpanObjectType, ParentSpanInfo, PromptTokensDetails,
     SpanObjectType, SpanType, Usage, UsageMetrics,
 };
+
+pub use runtime::ServiceRuntime;
+pub use service::{configure_service, ServiceConfig};
